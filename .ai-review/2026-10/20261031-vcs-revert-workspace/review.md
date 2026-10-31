@@ -1,26 +1,39 @@
 ---
 schema_version: 1
-title: "vcs: 修复工作区还原残留暂存改动与新增文件"
-module: vcs
-audit_type: bugfix
-created_at: "2026-10-31T23:20:00+08:00"
-owner: "cxs"
-tags: [git, svn, workspace, approval, bug]
-status: pending
+title: 'vcs: 修复工作区还原残留暂存改动与新增文件'
+created_at: '2026-10-31T23:20:00+08:00'
+owner: cxs
+tags:
+  - git
+  - svn
+  - workspace
+  - approval
+  - bug
+status: changes_requested
 ticket: null
 current_revision: 2
 revisions:
   - id: 1
-    base_revision: "402012744bcdd89fba50bb60cbf6fed84785ad67"
-    patch: "001.patch"
+    base_revision: 402012744bcdd89fba50bb60cbf6fed84785ad67
+    patch: 001.patch
   - id: 2
-    base_revision: "402012744bcdd89fba50bb60cbf6fed84785ad67"
-    patch: "002.patch"
+    base_revision: 402012744bcdd89fba50bb60cbf6fed84785ad67
+    patch: 002.patch
 gate_checks:
-  - "npm run typecheck"
-  - "npm test"
-comments: []
+  - npm run typecheck
+  - npm test
+comments:
+  - id: cmvwnsvxof0ye
+    revision: 2
+    file: ''
+    line: 0
+    author: cxs
+    content: 检查下应该提交吗？应该的话就提交
+    status: unresolved
+    created_at: '2026-10-31T17:12:39.084Z'
 approval: null
+module: vcs
+audit_type: bugfix
 ---
 
 # 问题与影响
