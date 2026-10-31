@@ -24,7 +24,7 @@ comments: []
 approval:
   approved_by: cxs
   approved_at: '2026-10-31T17:11:33.231Z'
-  commit_revision: null
+  commit_revision: f458a3484ea080d268310bc9397f6aa2f3c74402
 module: patch
 audit_type: bugfix
 ---
