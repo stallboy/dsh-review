@@ -1,23 +1,30 @@
 ---
 schema_version: 1
-title: "store: 删除无引用的候选写入门面与补丁读取包装"
-module: store
-audit_type: delete
-created_at: "2026-10-31T23:26:00+08:00"
-owner: "cxs"
-tags: [dead-code, store, vcs, cleanup]
-status: pending
+title: 'store: 删除无引用的候选写入门面与补丁读取包装'
+created_at: '2026-10-31T23:26:00+08:00'
+owner: cxs
+tags:
+  - dead-code
+  - store
+  - vcs
+  - cleanup
+status: approved
 ticket: null
 current_revision: 1
 revisions:
   - id: 1
-    base_revision: "402012744bcdd89fba50bb60cbf6fed84785ad67"
-    patch: "001.patch"
+    base_revision: 402012744bcdd89fba50bb60cbf6fed84785ad67
+    patch: 001.patch
 gate_checks:
-  - "npm run typecheck"
-  - "npm test"
+  - npm run typecheck
+  - npm test
 comments: []
-approval: null
+approval:
+  approved_by: cxs
+  approved_at: '2026-10-31T15:35:43.746Z'
+  commit_revision: null
+module: store
+audit_type: delete
 ---
 
 # 问题与影响
@@ -64,3 +71,22 @@ approval: null
 待审核
 ### 意见处理结果
 无
+
+## 版本 1 (base: 402012744bcdd89fba50bb60cbf6fed84785ad67)
+
+### 验证结果
+
+<!-- ai-review:validation -->
+### 门禁执行结果
+
+- 工作目录: D:\work\mygithub\dsh-review · 基线: bd1f174f244f0be58e7c9b403b1dd2f1a2e2dc1c · 平台: win32 / node v24.21.0 · 执行时间: 2026-10-31T15:35:43.744Z
+
+| 结果 | 命令 | 退出码 | 耗时 |
+| --- | --- | --- | --- |
+| 通过 | `npm run typecheck` | 0 | 2.0s |
+| 通过 | `npm test` | 0 | 8.2s |
+<!-- /ai-review:validation -->
+
+### 人类总体意见
+
+批准（cxs）

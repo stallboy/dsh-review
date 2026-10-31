@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises';
+import { readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import {
@@ -15,7 +15,6 @@ import { parsePatch } from './patch.js';
 import type {
   CandidateSummary,
   ConcurrencyGuard,
-  GateCheckResult,
   PatchStats,
   ReviewCandidate,
   ReviewComment,
@@ -291,12 +290,6 @@ export class ReviewStore {
     return readFile(this.patchPathFor(candidate, patchName), 'utf8');
   }
 
-  async renamePatch(candidate: ReviewCandidate, patchName: string): Promise<string> {
-    const target = this.patchPathFor(candidate, patchName);
-    await mkdir(path.dirname(target), { recursive: true });
-    return target;
-  }
-
   async write(candidate: ReviewCandidate): Promise<void> {
     const text = serializeReviewMarkdown(candidate.meta, candidate.sections.rawBody);
     const temp = `${candidate.reviewPath}.tmp-${String(process.pid)}`;
@@ -304,23 +297,6 @@ export class ReviewStore {
     await rename(temp, candidate.reviewPath);
     candidate.sections = parseSections(candidate.sections.rawBody);
     candidate.humanJudgment = extractHumanJudgment(candidate.sections.humanJudgment);
-  }
-
-  async savePatch(candidate: ReviewCandidate, patchName: string, text: string): Promise<string> {
-    const target = this.patchPathFor(candidate, patchName);
-    await writeFile(target, text, 'utf8');
-    return target;
-  }
-
-  async deletePatchFiles(candidate: ReviewCandidate): Promise<string[]> {
-    const entries = await readdir(candidate.dirPath, { withFileTypes: true });
-    const deleted: string[] = [];
-    for (const entry of entries) {
-      if (!entry.isFile() || !/\.patch$/i.test(entry.name)) continue;
-      await unlink(path.join(candidate.dirPath, entry.name));
-      deleted.push(path.join(candidate.dirPath, entry.name));
-    }
-    return deleted;
   }
 
   async ensureWriteAllowed(candidate: ReviewCandidate, guard: ConcurrencyGuard): Promise<void> {
@@ -436,25 +412,6 @@ export class ReviewStore {
     await this.write(candidate);
   }
 
-  async bumpRevision(
-    candidate: ReviewCandidate,
-    baseRevision: string,
-    patchText: string,
-    note: string,
-    status: ReviewStatus = 'pending',
-  ): Promise<{ revision: number; patchName: string }> {
-    const revision = candidate.meta.currentRevision + 1;
-    const patchName = `${String(revision).padStart(3, '0')}.patch`;
-    await this.savePatch(candidate, patchName, patchText);
-    candidate.meta.revisions.push({ id: revision, baseRevision, patch: patchName });
-    candidate.meta.currentRevision = revision;
-    candidate.meta.status = status;
-    candidate.meta.approval = null;
-    candidate.sections.rawBody = appendVersionSection(candidate.sections.rawBody, revision, baseRevision, note);
-    await this.write(candidate);
-    return { revision, patchName };
-  }
-
   async validateCandidate(candidate: ReviewCandidate): Promise<string[]> {
     const errors: string[] = [];
     const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
@@ -478,14 +435,6 @@ export class ReviewStore {
     return errors;
   }
 
-  async readPatchStats(candidate: ReviewCandidate): Promise<PatchStats> {
-    const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
-    if (!current) return EMPTY_STATS;
-    const file = this.patchPathFor(candidate, current.patch);
-    if (!existsSync(file)) return EMPTY_STATS;
-    return parsePatch(await readFile(file, 'utf8')).stats;
-  }
-
   async currentPatch(candidate: ReviewCandidate): Promise<{ path: string; text: string; baseRevision: string }> {
     const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
     if (!current) throw new ApiError(500, 'internal', '当前版本缺失');
@@ -495,20 +444,6 @@ export class ReviewStore {
       text: await readFile(patchPath, 'utf8'),
       baseRevision: current.baseRevision,
     };
-  }
-
-  async writeGateEvidence(candidate: ReviewCandidate, results: GateCheckResult[]): Promise<void> {
-    const lines = results.map((result) => {
-      const state = result.passed ? '通过' : result.timedOut ? '超时' : '失败';
-      return `- [${state}] \`${result.command}\`（exit ${String(result.exitCode ?? 'null')}，${String(Math.round(result.durationMs / 1000))}s）`;
-    });
-    const block = ['**本次批准门禁执行记录**', '', ...lines].join('\n');
-    const marker = /<!-- ai-review:gate-evidence -->[\s\S]*?<!-- \/ai-review:gate-evidence -->/;
-    const wrapped = `<!-- ai-review:gate-evidence -->\n${block}\n<!-- /ai-review:gate-evidence -->`;
-    candidate.sections.rawBody = marker.test(candidate.sections.rawBody)
-      ? candidate.sections.rawBody.replace(marker, wrapped)
-      : `${candidate.sections.rawBody.replace(/\s+$/, '')}\n\n${wrapped}\n`;
-    await this.write(candidate);
   }
 
   async listStatusCounts(owner: string): Promise<Record<ReviewStatus, number>> {

@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm } from 'node:fs/promises';
+import { mkdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -439,9 +439,4 @@ export function createVcs(type: VcsType, root: string): VcsAdapter {
 /** Make sure an incremental patch never carries review data (it must stay out of the candidate patch). */
 export function patchTouchesReviewData(text: string): boolean {
   return parsePatch(text).paths.some(isAiReviewPath);
-}
-
-/** Read a patch from disk; exposed for the API/runner. */
-export async function readPatchText(file: string): Promise<string> {
-  return readFile(file, 'utf8');
 }
