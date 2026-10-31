@@ -975,7 +975,7 @@ function createPlugin(requireModule: (id: string) => any) {
               ),
               h('div', { className: 'dcr-row' },
                 !detail.canAct ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void takeover(); } }, '接管审核') : null,
-                canAct ? h('button', { className: 'dcr-btn', disabled: busy, title: '读取所有未解决意见，生成下一版修复', onClick: aiFix }, '让 AI 修复') : null,
+                canAct ? h('button', { className: 'dcr-btn', disabled: busy, title: '不新增意见，直接读取未解决意见并生成下一版', onClick: aiFix }, 'AI 再修一版') : null,
                 canAct ? h('button', { className: 'dcr-btn d', disabled: busy, onClick: () => setPanel(panel === 'reject' ? '' : 'reject') }, panel === 'reject' ? '收起放弃' : '放弃') : null,
                 canAct ? h('button', {
                   className: 'dcr-btn p',
