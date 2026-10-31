@@ -1,7 +1,7 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { stat } from 'node:fs/promises';
+import { mkdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../dist/api.js';
 import { DEFAULT_SETTINGS } from '../dist/settings.js';
@@ -152,3 +152,64 @@ test('API rejects an audit request with a target outside the repository', async 
   const body = await response.json();
   assert.match(body.error.message, /越界|仓库/);
 });
+
+async function writeQueueCandidate(root, slug, status, baseRevision) {
+  const dir = path.join(root, '.ai-review', '2026-10', slug);
+  await mkdir(dir, { recursive: true });
+  await writeFile(path.join(dir, 'review.md'), [
+    '---',
+    'schema_version: 1',
+    `title: "${slug}: 队列过滤夹具"`,
+    'created_at: "2026-10-31T20:00:00+08:00"',
+    'owner: tester',
+    'tags: [queue]',
+    `status: ${status}`,
+    'ticket: null',
+    'current_revision: 1',
+    'revisions:',
+    '  - id: 1',
+    `    base_revision: "${baseRevision}"`,
+    '    patch: "001.patch"',
+    'gate_checks:',
+    '  - "node --version"',
+    'comments: []',
+    'approval: null',
+    '---',
+    '',
+    '# 问题与影响',
+    '夹具。',
+    '',
+    '# 需人工判断项',
+    '- 无：夹具。',
+    '',
+  ].join('\n'), 'utf8');
+  if (status === 'approved') return;
+  await writeFile(path.join(dir, '001.patch'), [
+    'diff --git a/src/math.js b/src/math.js',
+    '--- a/src/math.js',
+    '+++ b/src/math.js',
+    '@@ -1 +1 @@',
+    '-export const add = (a, b) => a - b;',
+    '+export const add = (a, b) => a + b;',
+    '',
+  ].join('\n'), 'utf8');
+}
+
+test('API queue filters items but keeps owner-wide status counts', async () => {
+  const root = await createGitFixture();
+  const baseRevision = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  await writeQueueCandidate(root, 'pending-one', 'pending', baseRevision);
+  await writeQueueCandidate(root, 'approved-one', 'approved', baseRevision);
+  const server = await startApi(root);
+  servers.push(server);
+
+  const filtered = await getJson(`${server.base}/queue?statuses=pending`);
+  assert.deepEqual(filtered.items.map((item) => item.id), ['2026-10/pending-one']);
+  assert.equal(filtered.counts.pending, 1);
+  assert.equal(filtered.counts.approved, 1);
+
+  const all = await getJson(`${server.base}/queue`);
+  assert.equal(all.items.length, 2);
+  assert.deepEqual(all.errors, []);
+});
+

@@ -15,7 +15,7 @@ import { JobManager } from './jobs.js';
 import { parsePatch, isAiReviewPath } from './patch.js';
 import { Runner, wrapAgentPrompt } from './runner.js';
 import { loadReviewers } from './reviewers.js';
-import { ReviewStore } from './store.js';
+import { matchesReviewFilter, ReviewStore } from './store.js';
 import { detectVcs, suggestOwner, validateSettings } from './settings.js';
 import type {
   AppSettings,
@@ -402,14 +402,16 @@ export class ReviewApi {
     const owner = ownerParam !== null ? ownerParam.trim() : await this.ownerFor(runtime.root);
     const filter = filterFrom(url, owner);
     const base = await runtime.vcs.getCurrentBase().catch(() => null);
-    const { items, errors } = await runtime.store.list(filter, base);
+    // One scan for both the filtered page and the owner-wide status counts: the
+    // filtered items are always a subset of the owner's candidates.
     const all = await runtime.store.list({ owner }, base);
+    const items = all.items.filter((item) => matchesReviewFilter(item, filter));
     const counts: Record<ReviewStatus, number> = { pending: 0, changes_requested: 0, approved: 0, rejected: 0 };
     for (const item of all.items) counts[item.status] += 1;
     sendJson(res, 200, {
       configured: true,
       items,
-      errors,
+      errors: all.errors,
       currentBase: base,
       counts,
       owner,

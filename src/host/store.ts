@@ -49,6 +49,27 @@ function ensureInside(parent: string, child: string): void {
   }
 }
 
+/** Queue filter shared by `list()` and the API, which reuses one scan for items and counts. */
+export function matchesReviewFilter(summary: CandidateSummary, filter: ReviewFilter): boolean {
+  if (filter.owner && summary.owner !== filter.owner) return false;
+  if (filter.statuses && filter.statuses.length > 0 && !filter.statuses.includes(summary.status)) return false;
+  if (filter.tag && !summary.tags.some((tag) => tag.toLowerCase() === filter.tag?.toLowerCase())) return false;
+  if (filter.dir) {
+    const needle = filter.dir.replaceAll('\\', '/').toLowerCase();
+    if (!summary.id.toLowerCase().includes(needle) && !summary.patchStats.entries.some((entry) => entry.path.toLowerCase().includes(needle))) {
+      return false;
+    }
+  }
+  if (filter.text) {
+    const needle = filter.text.toLowerCase();
+    const haystack = `${summary.title} ${summary.id} ${summary.ticket ?? ''} ${summary.tags.join(' ')}`.toLowerCase();
+    if (!haystack.includes(needle)) return false;
+  }
+  if (filter.createdAfter && summary.createdAt < filter.createdAfter) return false;
+  if (filter.createdBefore && summary.createdAt > filter.createdBefore) return false;
+  return true;
+}
+
 export class ReviewStore {
   constructor(readonly repoRoot: string) {}
 
@@ -173,7 +194,7 @@ export class ReviewStore {
             if (existsSync(patchPath)) stats = parsePatch(await readFile(patchPath, 'utf8')).stats;
           }
           const summary = this.toSummary(candidate, stats, currentBase);
-          if (!this.matchesFilter(summary, filter)) continue;
+          if (!matchesReviewFilter(summary, filter)) continue;
           items.push(summary);
         } catch (error) {
           const message = `${month}/${slug}: ${error instanceof Error ? error.message : String(error)}`;
@@ -196,7 +217,7 @@ export class ReviewStore {
             lastFeedback: '',
             parseError: message,
           };
-          if (this.matchesFilter(summary, filter)) items.push(summary);
+          if (matchesReviewFilter(summary, filter)) items.push(summary);
         }
       }
     }
@@ -205,26 +226,6 @@ export class ReviewStore {
       return byDate !== 0 ? byDate : right.id.localeCompare(left.id);
     });
     return { items, errors };
-  }
-
-  private matchesFilter(summary: CandidateSummary, filter: ReviewFilter): boolean {
-    if (filter.owner && summary.owner !== filter.owner) return false;
-    if (filter.statuses && filter.statuses.length > 0 && !filter.statuses.includes(summary.status)) return false;
-    if (filter.tag && !summary.tags.some((tag) => tag.toLowerCase() === filter.tag?.toLowerCase())) return false;
-    if (filter.dir) {
-      const needle = filter.dir.replaceAll('\\', '/').toLowerCase();
-      if (!summary.id.toLowerCase().includes(needle) && !summary.patchStats.entries.some((entry) => entry.path.toLowerCase().includes(needle))) {
-        return false;
-      }
-    }
-    if (filter.text) {
-      const needle = filter.text.toLowerCase();
-      const haystack = `${summary.title} ${summary.id} ${summary.ticket ?? ''} ${summary.tags.join(' ')}`.toLowerCase();
-      if (!haystack.includes(needle)) return false;
-    }
-    if (filter.createdAfter && summary.createdAt < filter.createdAfter) return false;
-    if (filter.createdBefore && summary.createdAt > filter.createdBefore) return false;
-    return true;
   }
 
   private toSummary(candidate: ReviewCandidate, stats: PatchStats, currentBase: string | null): CandidateSummary {
