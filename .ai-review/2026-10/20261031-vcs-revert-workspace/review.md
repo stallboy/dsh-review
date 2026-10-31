@@ -37,7 +37,7 @@ comments:
 approval:
   approved_by: cxs
   approved_at: '2026-10-31T17:45:11.650Z'
-  commit_revision: null
+  commit_revision: 8928db505ced42210939dfaa70062270561b2b13
 module: vcs
 audit_type: bugfix
 ---
