@@ -157,7 +157,7 @@ Host 端在 `/dsh-code-review/api` 下注册：
 - SVN：本地 `file://` 仓库，`svn patch`、门禁、原子提交 r2、回填提交 r3、补丁删除。
 - 仓库审查（自动化夹具）：临时 Git 仓库 + 假执行器/假 `dsh` 命令完整走通「审查 → 生成 A 类候选 → 解析 B/Deferred → 复核补丁 → 还原工作区 → 提交 `.ai-review`」；仅 B 类时只提交报告；无效候选会回传校验错误；失败且无候选时不产生提交。`/audit/session` 使用假的 `createAuditSession` 验证了 sessionId、标题、owner 会话与 session 提示词；Host 侧 `createDshAuditSession` 用假 `sessionController` 覆盖了工作区挂载、cwd 回退、改名失败、错误码、提示词受理，以及权限预设/审批策略继承（含 `custom` 回退）。`npm test` 34 项通过。
 - 仓库审查（真实 DSH 会话，`scripts/verify-audit-session.mjs` 实跑）：`POST /audit/session` 创建会话 → 写入 `workspace.json` 挂到 `dsh-review` 工作区（侧边栏可见，标题「仓库审查 · src/host」）→ 继承 `danger-full-access` + `never` → 审查代理完成 132 次工具调用 / 104 步、基线 `npm test` 29/29 通过 → 在 `src/host` 生成 4 个独立候选与 `.ai-review/audits/20261031-230629-src-host.md` → 只提交 `.ai-review`（`audit(src/host): 仓库审查生成 4 个候选 [skip ci]`，commit `2bfbb86`），业务工作区保持干净。
-- 审批 UI：批准 / AI 修复 / 放弃改为页内面板与页内运行日志，不再使用全屏 modal 遮罩；人工判断项过滤“无 / 暂无 / 无：…”占位；正文按 Markdown-lite 渲染并限宽。用真实 `dist/client.js` + React 18 + 真实 `/queue`、`/candidate` 数据在无头 Chrome 中渲染详情、勾选人工项并打开内联审批面板，控制台 0 error。
+- 审批 UI：批准 / AI 修复 / 放弃改为页内面板与页内运行日志，不再使用全屏 modal 遮罩；人工判断项过滤“无 / 暂无 / 无：…”占位；正文按 Markdown-lite 渲染并限宽。用真实 `dist/client.js` + React 18 + 真实 `/queue`、`/candidate` 数据在无头 Chrome 中渲染详情、勾选人工项、打开内联审批面板并点击“确认批准并提交”（approve 用假 job 响应），确认 `.dcr-modal-mask` 数量为 0、页内 job 卡片出现，控制台 0 error。
 - `npm run typecheck`（host + client 双 program）通过；`node --check dist/client.js` 通过。
 
 未自动验证：DSH 桌面窗口内的真实鼠标点击（已用真实 client bundle + React + 真实 API 数据在无头 Chrome 渲染并自动点击验证；页面加载后仍建议刷新一次以取到新 client bundle）。
