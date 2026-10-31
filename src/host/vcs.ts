@@ -153,7 +153,13 @@ export class GitAdapter implements VcsAdapter {
 
   async revertBusinessWorkspace(): Promise<void> {
     // Restore only business files: `.ai-review` may contain the freshly generated
-    // review.md/patch that the AI fixer is about to commit.
+    // review.md/patch that the AI fixer is about to commit. Reset the whole index
+    // first because `git checkout -- .` restores from the index: staged changes (a
+    // failed commit, a gate check that ran `git add`, an intent-to-add from `git add -N`)
+    // would otherwise survive. Resetting `.ai-review` as well drops index entries left
+    // by a failed atomic commit, while its files stay on disk because checkout and
+    // clean still exclude that path.
+    await git(this.root, ['reset', '-q', '--', '.']);
     await git(this.root, ['checkout', '--', '.', ':(exclude).ai-review']);
     await git(this.root, ['clean', '-fdq', '-e', '.ai-review']);
   }
@@ -370,6 +376,11 @@ export class SvnAdapter implements VcsAdapter {
           await rm(absolute, { force: true, recursive: true }).catch(() => undefined);
         } else {
           await svn(this.root, ['revert', '-R', '--', entry.path]);
+          // `svn revert` of a scheduled add only unschedules it: the file stays on
+          // disk as unversioned, so remove it to really return to the baseline.
+          if (entry.state === 'A') {
+            await rm(absolute, { force: true, recursive: true }).catch(() => undefined);
+          }
         }
       }
     }
