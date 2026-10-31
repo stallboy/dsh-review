@@ -172,7 +172,8 @@ approval: null
 
 # Workspace & Commit Restrictions
 
-- 严禁执行 `git commit` / `svn commit`；提交由审核插件在人工批准后完成。
+- 默认严禁执行 `git commit` / `svn commit`；提交由审核插件在人工批准后完成。
+- 唯一例外：当本次任务的用户提示词明确要求“提交 `.ai-review`”时（例如用户从 DSH 直接发起的审查会话），只允许执行 `.ai-review` 的提交，且提交前必须用 `git status` 确认业务工作区干净；**绝不能提交业务代码**。
 - 所有候选导出后，业务工作区必须还原到基线，只允许 `.ai-review/` 下有新增/修改文件。
 - 不得修改或删除已存在的候选目录、历史补丁或人类评论。
 - 不得新增无关的格式化、重命名或跨模块改动。
@@ -190,4 +191,4 @@ approval: null
 - [ ] 所有候选都独立基于同一基线，没有依赖链。
 - [ ] 审查报告已写入指定路径，A/B/Deferred 三节完整。
 - [ ] `git status` / `svn status` 除 `.ai-review/` 外干净。
-- [ ] 输出一行 `DONE` 和本次新增候选/报告的简短摘要。
+- [ ] 按本次用户提示词的要求输出最终摘要（headless 模式为一行 `DONE`，DSH 会话模式为中文摘要）。

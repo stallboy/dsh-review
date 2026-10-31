@@ -1,6 +1,6 @@
 {
   "name": "dsh-code-review",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Session-scoped review tab for DeepSeek Harness: repository-backed queue, repository audit, patches, gate checks and approval.",

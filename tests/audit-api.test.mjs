@@ -62,14 +62,21 @@ test('API exposes audit prompt and runs a full audit job', async (t) => {
   t.after(() => server.close());
   const baseRevision = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
 
-  const exported = await getJson(`${server.base}/audit/prompt?targetPath=src&note=${encodeURIComponent('重点看错误处理')}`);
+  const exported = await getJson(`${server.base}/audit/prompt?targetPath=src&note=${encodeURIComponent('重点看错误处理')}&mode=session`);
   assert.equal(exported.baseRevision, baseRevision);
   assert.equal(exported.targetPath, 'src');
   assert.equal(exported.owner, 'tester');
+  assert.equal(exported.mode, 'session');
   assert.match(exported.prompt, /重点看错误处理/);
   assert.match(exported.prompt, /基线独立性铁律|Orthogonality Rule/);
+  assert.match(exported.prompt, /独立 DSH 会话/);
+  assert.doesNotMatch(exported.prompt, /^<system>/);
   assert.match(exported.reportPath, /^\.ai-review\/audits\/.+\.md$/);
   await assert.rejects(stat(path.join(root, '.ai-review')), /ENOENT/);
+
+  const headlessPrompt = await getJson(`${server.base}/audit/prompt?targetPath=src&mode=headless`);
+  assert.equal(headlessPrompt.mode, 'headless');
+  assert.match(headlessPrompt.prompt, /^<system>/);
 
   const started = await getJson(`${server.base}/audit`, {
     method: 'POST',

@@ -247,6 +247,8 @@ export interface BuildAuditPromptInput {
   note: string;
   baseRevision: string;
   reportPath: string;
+  /** `session` lets the agent commit `.ai-review` itself; `headless` forbids commits. */
+  mode?: 'headless' | 'session';
   now?: Date;
 }
 
@@ -259,9 +261,19 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
   const existing = await existingCandidateLines(new ReviewStore(input.repoRoot), input.baseRevision);
   const month = `${String(now.getFullYear())}-${pad(now.getMonth() + 1)}`;
   const scope = target.targetPath ? `\`${target.targetPath}\`` : '全仓库';
+  const sessionMode = input.mode === 'session';
+  const auditCommit = input.vcsType === 'svn'
+    ? '`svn add --force --parents .ai-review` + `svn commit -m "audit(<scope>): 仓库审查生成 N 个候选 [skip ci]" .ai-review`'
+    : '`git add -A -- .ai-review` + `git commit -m "audit(<scope>): 仓库审查生成 N 个候选 [skip ci]"`';
+  const commitRule = sessionMode
+    ? `5. 本会话由用户直接驱动：完成全部候选后，只提交 \`.ai-review\`（${auditCommit}），绝不能提交业务代码；提交前用 \`${input.vcsType === 'svn' ? 'svn status' : 'git status'}\` 确认业务工作区干净。`
+    : '5. 严禁执行 `git commit` / `svn commit`。结束前 `git status` / `svn status` 除 `.ai-review/` 外必须干净，不得在业务工作区留下未导出的改动或临时文件。';
+  const completionRule = sessionMode
+    ? '10. 完成时用简体中文输出最终摘要：新增候选、B/Deferred、报告路径、`.ai-review` 提交号（如有）。'
+    : '10. 完成时输出一行 `DONE` 和本次新增候选/报告的简短摘要。';
   const lines: string[] = [
     '# 任务',
-    '请你作为本轮仓库审查的执行者，先按 system prompt 的审查准则扫描目标范围，再把「A 类：无疑问的本质缺陷 / 低风险明显精简重构」直接转化为 `.ai-review` 候选修复包；B 类只写入审查报告，不修改代码。',
+    '请你作为本轮仓库审查的执行者，先按审查准则扫描目标范围，再把「A 类：无疑问的本质缺陷 / 低风险明显精简重构」直接转化为 `.ai-review` 候选修复包；B 类只写入审查报告，不修改代码。',
     '',
     '## 环境与范围',
     `- 仓库根目录（同时是工作目录）：${path.resolve(input.repoRoot)}`,
@@ -291,17 +303,25 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
     '## 用户关注点（可选）',
     input.note.trim() || '无特别关注点，按审查准则自主选择收益最高的问题。',
     '',
+    ...(sessionMode ? [
+      '## 会话执行方式（本次由用户直接从 DSH 发起）',
+      '你正在一个独立的 DSH 会话中执行本任务，用户可以在侧边栏看到完整过程，也可以随时切换到其他会话。',
+      '- 在关键节点输出简短进度：建立地图、候选 N 已生成、验证结果、收尾提交；不要只埋头执行。',
+      '- 不要中途等待用户确认；遇到 B 类或需要人工拍板的事项，写入审查报告后继续。',
+      '- 完成全部候选后，按下方规则只提交 `.ai-review`，不要提交业务代码。',
+      '',
+    ] : []),
     '## 硬性执行规则',
     '1. 所有候选必须**完全独立地基于当前基线**，严禁生成需要按顺序打补丁的依赖链。每导出一个候选的 `001.patch` 后，必须立即把业务工作区还原到基线，再处理下一个问题。',
     '2. 一个问题一个候选目录，目录名为 `YYYYMMDD-<module>-<short-slug>`，放在 `.ai-review/' + month + '/` 下；`<module>` 与 `<short-slug>` 只能使用 ASCII 字母、数字、`.`、`_`、`-`（禁止中文、空格、斜杠），中文语义写入 review.md 的 title。同一函数/结构体内强耦合的清理可合并进同一个本质修复。',
     '3. A 类必须：真正修改代码 → 实际运行 `gate_checks` 中的全部命令 → 导出 UTF-8/LF 全量 unified diff 到 `001.patch`（不得包含 `.ai-review/` 自身）→ 生成 review.md → 还原业务工作区。验证无法收敛时回滚，并降级为 B 类。',
     '4. B 类：不修改代码，只写入审查报告；不要为 B 类创建候选目录。若改动 B 强依赖某个大改动 A 先合入主干，把 B 写入“待前置合入后处理（Deferred）”。',
-    '5. 严禁执行 `git commit` / `svn commit`。结束前 `git status` / `svn status` 除 `.ai-review/` 外必须干净，不得在业务工作区留下未导出的改动或临时文件。',
+    commitRule,
     '6. 审查报告必须最后写入上述报告文件，结构见下节。报告是插件解析 B 类与 Deferred 清单的唯一来源，请严格使用指定标题和列表格式。',
     '7. 如果没有 A 类问题，报告 A 类写“无”，不要为了凑数生成候选；如果所有候选都验证失败，也不要留下半成品目录。',
     '8. review.md 的 `gate_checks` 每条都必须实际运行并通过；`# 需人工判断项` 即使无风险也要写一条“无：...”说明。',
     '9. 补丁生成方式：Git 使用 `git diff <base_revision> --binary`（新增业务文件先 `git add -N <文件>`，绝不能把 `.ai-review/` 加入索引）；SVN 在工作区为对应 revision 时使用 `svn diff`。',
-    '10. 完成时输出一行 `DONE` 和本次新增候选/报告的简短摘要。',
+    completionRule,
     '',
     '## review.md 最小字段（必须严格满足）',
     '```markdown',
@@ -326,7 +346,7 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
     'approval: null',
     '---',
     '```',
-    '正文按 system prompt 的章节结构生成：`# 问题与影响`、`# 根因`、`# 当前修复方案`、`# 需人工判断项`、`# 验证证据`、`# 审核记录`。',
+    '正文按审查准则的章节结构生成：`# 问题与影响`、`# 根因`、`# 当前修复方案`、`# 需人工判断项`、`# 验证证据`、`# 审核记录`。',
     '',
     '## 审查报告模板',
     '```markdown',
@@ -513,6 +533,7 @@ export class Auditor {
       note: this.deps.note,
       baseRevision: base,
       reportPath,
+      mode: 'headless',
       now,
     });
     const warnings: string[] = [];

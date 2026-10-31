@@ -64,7 +64,7 @@ interface QueueItem {
 }
 interface Queue {
   configured: boolean; items: QueueItem[]; errors: string[]; currentBase: string | null;
-  counts: Record<string, number>; owner: string; me: string;
+  counts: Record<string, number>; owner: string; me: string; repoRoot?: string;
 }
 interface CandidateMeta {
   schemaVersion: number; title: string; createdAt: string; owner: string; tags: string[]; status: string;
@@ -94,15 +94,27 @@ interface Job {
 }
 interface DiffLine { kind: 'context' | 'add' | 'del' | 'meta'; oldNo: number | null; newNo: number | null; text: string }
 interface DiffFile { path: string; lines: DiffLine[]; binary: boolean }
-interface AuditCreatedCandidate {
-  id: string; title: string; owner: string; status: string; patch: string; baseRevision: string;
-  patchStats: Stats; gateChecks: number; errors: string[];
+interface SessionPromptResult {
+  ok: boolean;
+  value?: { accepted: true };
+  error?: { message?: string; code?: string };
 }
-interface AuditDeferredItem { label: string; text: string; category: 'confirm' | 'deferred' }
-interface AuditResult {
-  manual: boolean; prompt?: string; created: AuditCreatedCandidate[]; deferred: AuditDeferredItem[];
-  report: { path: string; text: string } | null; commitRevision: string | null;
-  baseRevision: string; targetPath: string; warnings: string[]; message: string;
+interface SessionFaceLike {
+  prompt(content: Array<{ type: 'text'; text: string }>, mode: 'queue' | 'steer'): Promise<SessionPromptResult>;
+  rename(title: string): Promise<unknown>;
+}
+interface SessionsSnapshot { ids: string[]; current?: string }
+interface SessionsService {
+  list: { getSnapshot(): SessionsSnapshot };
+  binding(id: string): { session: SessionFaceLike } | undefined;
+  open(id: string): void;
+}
+interface WorkspaceItem { workspaceId: string; path: string; sessionIds: string[] }
+interface WorkspacesSnapshot { items: WorkspaceItem[]; recentWorkspaceId?: string }
+interface WorkspacesService {
+  startSession(workspaceId?: string): void;
+  connectWorkspace?(workspaceId: string): Promise<string>;
+  list: { getSnapshot(): WorkspacesSnapshot };
 }
 
 const EMPTY_STATS: Stats = { files: 0, additions: 0, deletions: 0, entries: [] };
@@ -149,9 +161,6 @@ function statsText(stats: Stats | null | undefined): string {
 }
 function commentText(status: string): string {
   return status === 'resolved' ? '已处理' : status === 'partial' ? '部分处理' : '未处理';
-}
-function runnerText(kind: string | undefined): string {
-  return kind === 'manual' ? '手动提示词' : kind === 'external' ? '外部命令' : 'DSH headless';
 }
 
 function parseDiff(text: string): DiffFile[] {
@@ -289,7 +298,12 @@ function createPlugin(requireModule: (id: string) => any) {
       ));
   }
 
-  function App(props: { t: (key: string) => string; sessionId: string }) {
+  function App(props: {
+    t: (key: string) => string;
+    sessionId: string;
+    sessions?: SessionsService;
+    workspaces?: WorkspacesService;
+  }) {
     activeSessionId = props.sessionId || '';
     const [health, setHealth] = useState<Health | null>(null);
     const [settingsResponse, setSettingsResponse] = useState<SettingsResponse | null>(null);
@@ -307,16 +321,19 @@ function createPlugin(requireModule: (id: string) => any) {
     const [busy, setBusy] = useState(false);
     const [stale, setStale] = useState(false);
     const [job, setJob] = useState<Job | null>(null);
-    const [modal, setModal] = useState<'' | 'approve' | 'reject' | 'audit'>('');
+    const [modal, setModal] = useState<'' | 'approve' | 'reject'>('');
     const [ack, setAck] = useState<Record<number, boolean>>({});
     const [general, setGeneral] = useState('');
     const [rejectReason, setRejectReason] = useState('');
     const [draft, setDraft] = useState<{ file: string; line: number; text: string } | null>(null);
+    const [auditOpen, setAuditOpen] = useState(false);
     const [auditTarget, setAuditTarget] = useState('');
     const [auditNote, setAuditNote] = useState('');
     const [auditPrompt, setAuditPrompt] = useState('');
     const [auditPromptLoading, setAuditPromptLoading] = useState(false);
+    const [auditLaunching, setAuditLaunching] = useState(false);
     const [auditCopied, setAuditCopied] = useState(false);
+    const [auditSessionId, setAuditSessionId] = useState('');
     const [filter, setFilter] = useState({ owner: '', statuses: '', text: '', tag: '' });
     const guardRef = useRef<{ revision: number; owner: string } | null>(null);
     const diffFiles = useMemo(() => parseDiff(diff?.unifiedDiff ?? ''), [diff]);
@@ -520,22 +537,31 @@ function createPlugin(requireModule: (id: string) => any) {
       void startJob('/ai-fix', { id: detail.candidate.id, ...guard() });
     };
 
-    const openAudit = (): void => {
-      setAuditTarget('');
-      setAuditNote('');
+    const toggleAudit = (): void => {
+      setAuditOpen((prev) => !prev);
       setAuditPrompt('');
       setAuditCopied(false);
       setError('');
-      setModal('audit');
+    };
+
+    const openAudit = (): void => {
+      setAuditOpen(true);
+      setAuditPrompt('');
+      setAuditCopied(false);
+      setError('');
+    };
+
+    const fetchAuditPrompt = async (): Promise<string> => {
+      const query = new URLSearchParams({ targetPath: auditTarget, note: auditNote, mode: 'session' });
+      const value = await api<{ prompt: string }>(`/audit/prompt?${query.toString()}`);
+      return value.prompt;
     };
 
     const exportAuditPrompt = async (): Promise<void> => {
       setAuditPromptLoading(true);
       setError('');
       try {
-        const query = new URLSearchParams({ targetPath: auditTarget, note: auditNote });
-        const value = await api<{ prompt: string }>(`/audit/prompt?${query.toString()}`);
-        setAuditPrompt(value.prompt);
+        setAuditPrompt(await fetchAuditPrompt());
         setAuditCopied(false);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -554,13 +580,82 @@ function createPlugin(requireModule: (id: string) => any) {
       }
     };
 
-    const startAudit = (): void => {
-      if (settings?.runner === 'manual') {
-        void exportAuditPrompt();
-        return;
+    const waitForNewSession = async (prompt: string): Promise<string> => {
+      const sessions = props.sessions;
+      const workspaces = props.workspaces;
+      if (!sessions) throw new Error('当前页面没有会话服务，无法创建新会话');
+      if (!workspaces) throw new Error('当前页面没有工作区服务，无法创建新会话');
+      const workspaceSnapshot = workspaces.list.getSnapshot();
+      const current = sessions.list.getSnapshot().current;
+      const repoRoot = (queue?.repoRoot ?? health?.repoRoot ?? '').replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase();
+      const currentWorkspace = workspaceSnapshot.items.find((item) => current !== undefined && item.sessionIds.includes(current));
+      const repoWorkspace = repoRoot
+        ? workspaceSnapshot.items.find((item) => item.path.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase() === repoRoot)
+        : undefined;
+      const recentWorkspace = workspaceSnapshot.items.find((item) => item.workspaceId === workspaceSnapshot.recentWorkspaceId);
+      const target = repoWorkspace ?? currentWorkspace ?? recentWorkspace;
+      if (!target) {
+        throw new Error('当前会话不属于任何工作区，无法确定新会话的仓库目录；请先打开一个仓库会话。');
       }
-      setModal('');
-      void startJob('/audit', { targetPath: auditTarget, note: auditNote });
+
+      let sessionId: string;
+      if (typeof workspaces.connectWorkspace === 'function') {
+        sessionId = await workspaces.connectWorkspace(target.workspaceId);
+      } else {
+        const previous = sessions.list.getSnapshot().current;
+        workspaces.startSession(target.workspaceId);
+        const deadline = Date.now() + 20_000;
+        let found: string | undefined;
+        while (Date.now() < deadline && found === undefined) {
+          const snapshot = sessions.list.getSnapshot();
+          if (snapshot.current && snapshot.current !== previous) found = snapshot.current;
+          else await new Promise((resolve) => setTimeout(resolve, 120));
+        }
+        if (!found) throw new Error('创建审查会话超时，请手动在侧边栏新建会话后重试');
+        sessionId = found;
+      }
+
+      sessions.open(sessionId);
+      let binding = sessions.binding(sessionId);
+      for (let attempt = 0; attempt < 60 && !binding; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        binding = sessions.binding(sessionId);
+      }
+      if (!binding) throw new Error('新会话已创建，但会话绑定未就绪');
+      try {
+        await binding.session.rename(`仓库审查 · ${auditTarget.trim() || '全仓库'}`.slice(0, 60));
+      } catch {
+        // A title is cosmetic; keep going even if the host refuses it.
+      }
+      let result: SessionPromptResult | null = null;
+      let lastError: unknown = null;
+      for (let sendAttempt = 0; sendAttempt < 3; sendAttempt += 1) {
+        try {
+          result = await binding.session.prompt([{ type: 'text', text: prompt }], 'queue');
+          if (result.ok) return sessionId;
+        } catch (error) {
+          lastError = error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      throw new Error(result?.error?.message ?? (lastError instanceof Error ? lastError.message : '审查任务发送失败'));
+    };
+
+    const launchAuditSession = async (): Promise<void> => {
+      setAuditLaunching(true);
+      setError('');
+      try {
+        const prompt = await fetchAuditPrompt();
+        const sessionId = await waitForNewSession(prompt);
+        setAuditSessionId(sessionId);
+        setAuditOpen(false);
+        setAuditPrompt('');
+        setAuditCopied(false);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setAuditLaunching(false);
+      }
     };
 
     const openCandidate = (id: string): void => {
@@ -650,10 +745,41 @@ function createPlugin(requireModule: (id: string) => any) {
             h('input', { className: 'dcr-input', style: { flex: 1, minWidth: 170 }, placeholder: '搜索标题 / ticket / 目录', value: filter.text, onChange: (e: any) => setFilter({ ...filter, text: e.target.value }) }),
             h('input', { className: 'dcr-input', style: { width: 110 }, placeholder: 'tag', value: filter.tag, onChange: (e: any) => setFilter({ ...filter, tag: e.target.value }) }),
             h('button', { className: 'dcr-btn', disabled: loading, onClick: () => { void loadQueue(); } }, loading ? '加载中…' : '刷新'),
-            h('button', { className: 'dcr-btn p', disabled: busy, onClick: openAudit }, '审查仓库'),
+            h('button', { className: 'dcr-btn p', disabled: busy, onClick: toggleAudit }, auditOpen ? '收起审查' : '审查仓库'),
           ),
           h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 8 } }, `当前基线 ${short(queue?.currentBase)} · 共 ${String(filteredItems.length)} 项`),
         ),
+        auditOpen ? h('div', { className: 'dcr-card' },
+          h('h3', null, '在新会话中审查当前仓库'),
+          h('div', { className: 'dcr-small dcr-muted', style: { marginBottom: 10 } },
+            '点击“启动审查会话”会新建一个 DSH 会话并在侧边栏显示；审查过程以对话形式流式展示，你可以随时切到其他会话，不会用弹窗遮挡当前页面。'),
+          !auditReady ? h('div', { className: 'dcr-banner warn', style: { marginBottom: 10 } }, '当前仓库还没有基线提交（Git HEAD / SVN revision）。请先完成一次提交，再启动审查会话。') : null,
+          h('div', { className: 'dcr-field' },
+            h('label', null, '审查范围（留空 = 全仓库）'),
+            h('input', { className: 'dcr-input', value: auditTarget, placeholder: '例如 src/ 或 packages/core/', onChange: (e: any) => setAuditTarget(e.target.value) }),
+          ),
+          h('div', { className: 'dcr-field' },
+            h('label', null, '补充关注点（可选）'),
+            h('textarea', { className: 'dcr-textarea', value: auditNote, placeholder: '例如：重点关注并发关闭竞态与资源泄漏；不要修改公开 API。', onChange: (e: any) => setAuditNote(e.target.value) }),
+          ),
+          h('div', { className: 'dcr-row' },
+            h('button', { className: 'dcr-btn p', disabled: busy || auditLaunching || auditPromptLoading || !auditReady, onClick: () => { void launchAuditSession(); } }, auditLaunching ? '正在创建会话…' : '启动审查会话'),
+            h('button', { className: 'dcr-btn', disabled: auditPromptLoading || !auditReady, onClick: () => { void exportAuditPrompt(); } }, auditPromptLoading ? '生成中…' : '导出提示词'),
+            h('button', { className: 'dcr-btn g', onClick: () => setAuditOpen(false) }, '取消'),
+            h('span', { className: 'dcr-grow' }),
+            h('span', { className: 'dcr-small dcr-muted' }, `基线 ${short(queue?.currentBase ?? health?.currentBase)} · 使用当前 DSH 会话模型`),
+          ),
+          auditSessionId ? h('div', { className: 'dcr-banner info', style: { marginTop: 10 } }, '审查会话已启动；如果当前不在该会话，可在侧边栏打开。',
+            h('button', { className: 'dcr-btn', style: { marginLeft: 8 }, onClick: () => { props.sessions?.open(auditSessionId); } }, '打开审查会话'),
+          ) : null,
+          auditPrompt ? h('div', { className: 'dcr-field', style: { marginTop: 10 } },
+            h('div', { className: 'dcr-row' },
+              h('label', { className: 'dcr-grow' }, '审查提示词（可复制到任意外部 Agent）'),
+              h('button', { className: 'dcr-btn', onClick: () => { void copyAuditPrompt(); } }, auditCopied ? '已复制' : '复制'),
+            ),
+            h('textarea', { className: 'dcr-textarea', style: { minHeight: 220 }, readOnly: true, value: auditPrompt }),
+          ) : null,
+        ) : null,
         error ? h('div', { className: 'dcr-banner err' }, error) : null,
         filteredItems.length === 0 ? h('div', { className: 'dcr-empty' },
           h('div', null, queue?.items.length === 0 ? '队列为空：仓库 .ai-review 中还没有候选修复。' : '没有符合筛选条件的候选。'),
@@ -846,15 +972,10 @@ function createPlugin(requireModule: (id: string) => any) {
     const renderJob = (): any => {
       if (!job) return null;
       const result = job.result;
-      const audit = job.type === 'audit' ? (job.result as AuditResult | undefined) : undefined;
-      const title = job.type === 'approve' ? '批准与验证' : job.type === 'audit' ? '仓库审查' : 'AI 修复';
       return h(Modal, {
-        title,
+        title: job.type === 'approve' ? '批准与验证' : 'AI 修复',
         onClose: () => { if (job.status !== 'running') setJob(null); },
-        footer: job.status === 'running' ? null : [
-          job.type === 'audit' ? h('button', { key: 'q', className: 'dcr-btn', onClick: () => { setJob(null); setScreen('queue'); void loadQueue(); } }, '返回队列') : null,
-          h('button', { key: 'c', className: 'dcr-btn p', onClick: () => setJob(null) }, '关闭'),
-        ],
+        footer: job.status === 'running' ? null : h('button', { className: 'dcr-btn p', onClick: () => setJob(null) }, '关闭'),
       },
         h('div', { className: 'dcr-row' },
           h('span', { className: `dcr-chip ${job.status === 'succeeded' ? 'approved' : job.status === 'failed' ? 'rejected' : 'pending'}` }, job.status === 'running' ? '执行中' : job.status === 'succeeded' ? '完成' : '失败'),
@@ -864,46 +985,6 @@ function createPlugin(requireModule: (id: string) => any) {
         job.error ? h('div', { className: 'dcr-banner err' }, job.error) : null,
         result?.message ? h('div', { className: 'dcr-banner info' }, result.message) : null,
         result?.prompt ? h('textarea', { className: 'dcr-textarea', style: { minHeight: 200 }, readOnly: true, value: result.prompt }) : null,
-        audit ? h('div', { className: 'dcr-card' },
-          h('h3', null, `审查结果 · ${String(audit.created.length)} 个 A 类候选`),
-          audit.created.length === 0
-            ? h('div', { className: 'dcr-muted dcr-small' }, '未生成 A 类候选；B 类 / Deferred 清单见审查报告。')
-            : h('div', { className: 'dcr-list' },
-              ...audit.created.map((item) => h('div', { key: item.id, className: 'dcr-item', style: { cursor: 'default' } },
-                h('div', { className: 'dcr-row' },
-                  h('strong', { className: 'dcr-grow' }, item.title),
-                  h('span', { className: `dcr-chip ${item.status}` }, statusText(item.status)),
-                ),
-                h('div', { className: 'dcr-meta' },
-                  h('span', { className: 'dcr-mono' }, item.id),
-                  h('span', null, statsText(item.patchStats)),
-                  h('span', null, `${String(item.gateChecks)} 项门禁`),
-                  h('span', null, `owner ${item.owner || '—'}`),
-                ),
-                item.errors.length > 0
-                  ? h('div', { className: 'dcr-small', style: { color: 'var(--dsw-alias-state-error-primary)', marginTop: 6 } }, item.errors.join('；'))
-                  : null,
-                h('div', { className: 'dcr-row', style: { marginTop: 8 } },
-                  h('button', { className: 'dcr-btn', onClick: () => { setJob(null); openCandidate(item.id); } }, '打开候选'),
-                ),
-              )),
-            ),
-          audit.deferred.length > 0 ? h('div', { style: { marginTop: 12 } },
-            h('h3', null, '需人工确认 / 待前置合入（未改代码）'),
-            ...audit.deferred.map((item, index) => h('div', { key: index, className: 'dcr-small', style: { borderTop: '1px solid var(--dsw-alias-border-l1)', paddingTop: 6, marginTop: 6 } },
-              h('div', null,
-                h('strong', null, item.label),
-                h('span', { className: 'dcr-muted' }, item.category === 'deferred' ? ' · 待前置合入' : ' · 需人工确认'),
-              ),
-              item.text ? h('div', { className: 'dcr-pre dcr-muted', style: { marginTop: 2 } }, item.text) : null,
-            )),
-          ) : null,
-          audit.warnings.length > 0 ? h('div', { className: 'dcr-banner warn', style: { marginTop: 10 } }, audit.warnings.join('；')) : null,
-          audit.report ? h('details', { style: { marginTop: 10 } },
-            h('summary', null, `审查报告：${audit.report.path}`),
-            h('pre', { className: 'dcr-raw', style: { marginTop: 6 } }, audit.report.text),
-          ) : null,
-        ) : null,
       );
     };
 
@@ -931,38 +1012,6 @@ function createPlugin(requireModule: (id: string) => any) {
         h('button', { className: 'dcr-btn', onClick: () => { void (async () => { try { await loadSettings(); } finally { setScreen('settings'); } })(); } }, '设置'),
       ),
       content,
-      modal === 'audit' ? h(Modal, {
-        title: '审查当前仓库',
-        onClose: () => setModal(''),
-        footer: settings?.runner === 'manual' ? [
-          h('button', { key: 'c', className: 'dcr-btn', onClick: () => setModal('') }, '取消'),
-          h('button', { key: 'e', className: 'dcr-btn p', disabled: auditPromptLoading || !auditReady, onClick: () => { void exportAuditPrompt(); } }, auditPromptLoading ? '生成中…' : '生成提示词'),
-        ] : [
-          h('button', { key: 'c', className: 'dcr-btn', onClick: () => setModal('') }, '取消'),
-          h('button', { key: 'e', className: 'dcr-btn', disabled: auditPromptLoading || !auditReady, onClick: () => { void exportAuditPrompt(); } }, auditPromptLoading ? '生成中…' : '导出提示词'),
-          h('button', { key: 's', className: 'dcr-btn p', disabled: busy || auditPromptLoading || !auditReady, onClick: startAudit }, '开始审查'),
-        ],
-      },
-        !auditReady ? h('div', { className: 'dcr-banner warn' }, '当前仓库还没有基线提交（Git HEAD / SVN revision）。请先完成一次提交，再开始仓库审查。') : null,
-        h('div', { className: 'dcr-banner info' }, 'AI 会先扫描仓库建立地图，再把“A 类：无疑问的本质修复 / 明显精简”直接生成为 .ai-review 候选（review.md + 补丁 + 门禁），把“B 类：存疑 / 跨模块重大变动”只写入审查报告。审查要求业务工作区干净且仓库已有基线提交，并会在本机运行构建/测试命令，请只对可信仓库使用。'),
-        h('div', { className: 'dcr-field' },
-          h('label', null, '审查范围（留空 = 全仓库）'),
-          h('input', { className: 'dcr-input', value: auditTarget, placeholder: '例如 src/ 或 packages/core/', onChange: (e: any) => setAuditTarget(e.target.value) }),
-        ),
-        h('div', { className: 'dcr-field' },
-          h('label', null, '补充关注点（可选）'),
-          h('textarea', { className: 'dcr-textarea', value: auditNote, placeholder: '例如：重点关注并发关闭竞态与资源泄漏；不要修改公开 API。', onChange: (e: any) => setAuditNote(e.target.value) }),
-        ),
-        h('div', { className: 'dcr-small dcr-muted' }, `执行器：${runnerText(settings?.runner)} · 当前基线 ${short(queue?.currentBase ?? health?.currentBase)} · 审查结果会写入 .ai-review 并提交（不 push）`),
-        auditPrompt ? h('div', { className: 'dcr-field' },
-          h('div', { className: 'dcr-row' },
-            h('label', { className: 'dcr-grow' }, '审查提示词（可复制到任意外部 Agent）'),
-            h('button', { className: 'dcr-btn', onClick: () => { void copyAuditPrompt(); } }, auditCopied ? '已复制' : '复制'),
-          ),
-          h('textarea', { className: 'dcr-textarea', style: { minHeight: 260 }, readOnly: true, value: auditPrompt }),
-        ) : null,
-        error ? h('div', { className: 'dcr-banner err' }, error) : null,
-      ) : null,
       modal === 'approve' && detail ? h(Modal, {
         title: '确认批准并提交',
         onClose: () => setModal(''),
@@ -994,7 +1043,7 @@ function createPlugin(requireModule: (id: string) => any) {
   }
 
   return {
-    inject: ['slots', 'locale'],
+    inject: ['slots', 'locale', 'sessions', 'workspaces'],
     apply(ctx: ClientCtx) {
       ctx.effect(() => ctx.locale.register(NS, {
         zh: { nav: '评审' },
@@ -1009,10 +1058,17 @@ function createPlugin(requireModule: (id: string) => any) {
         return () => style.remove();
       }, 'dsh-code-review: styles');
       const t = ctx.locale.bind(NS);
+      const sessionsService = ctx.get('sessions') as SessionsService | undefined;
+      const workspacesService = ctx.get('workspaces') as WorkspacesService | undefined;
       ctx.slots.inject('conversation.view', () => {
         const off = ctx.slots.register(
           { name: 'conversation.view', id: 'code-review', order: 40, label: () => t('nav'), locale: NS, inject: () => ({ t }) },
-          (props: any) => h(App, { t, sessionId: typeof props?.sessionId === 'string' ? props.sessionId : '' }),
+          (props: any) => h(App, {
+            t,
+            sessionId: typeof props?.sessionId === 'string' ? props.sessionId : '',
+            sessions: sessionsService,
+            workspaces: workspacesService,
+          }),
         );
         return typeof off === 'function' ? off : undefined;
       });

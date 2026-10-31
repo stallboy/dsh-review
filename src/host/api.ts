@@ -30,7 +30,7 @@ import { ApiError } from './types.js';
 import { createVcs, type VcsAdapter } from './vcs.js';
 
 export const API_PREFIX = '/dsh-code-review/api';
-const APP_VERSION = '0.2.0';
+const APP_VERSION = '0.3.0';
 const BODY_LIMIT = 2 * 1024 * 1024;
 const STATUSES: ReviewStatus[] = ['pending', 'changes_requested', 'approved', 'rejected'];
 
@@ -510,8 +510,13 @@ export class ReviewApi {
     if (!baseRevision) {
       throw new ApiError(412, 'not_configured', '当前仓库没有可用的基线提交（Git HEAD / SVN revision），无法生成仓库审查提示词。');
     }
+    const clean = await runtime.vcs.ensureCleanWorkspace();
+    if (!clean.clean) {
+      throw new ApiError(409, 'conflict', `仓库审查要求业务工作区干净。\n${clean.message}`);
+    }
     const target = await resolveAuditTarget(runtime.root, url.searchParams.get('targetPath') ?? '');
     const note = url.searchParams.get('note') ?? '';
+    const mode = url.searchParams.get('mode') === 'headless' ? 'headless' : 'session';
     const now = new Date();
     const reportPath = auditReportPath(target.targetPath, now);
     const userPrompt = await buildAuditPrompt({
@@ -522,10 +527,28 @@ export class ReviewApi {
       note,
       baseRevision,
       reportPath,
+      mode,
       now,
     });
+    const systemPrompt = await loadAuditSystemPrompt();
+    const prompt = mode === 'session'
+      ? [
+          '# 仓库审查任务（独立 DSH 会话）',
+          '',
+          '下面是本次仓库审查的完整准则与任务上下文。请完整遵守，并在当前仓库中直接执行；不要只输出计划。',
+          '',
+          '---',
+          '',
+          systemPrompt,
+          '',
+          '---',
+          '',
+          userPrompt,
+        ].join('\n')
+      : wrapAgentPrompt(systemPrompt, userPrompt);
     sendJson(res, 200, {
-      prompt: wrapAgentPrompt(await loadAuditSystemPrompt(), userPrompt),
+      prompt,
+      mode,
       targetPath: target.targetPath,
       baseRevision,
       owner,

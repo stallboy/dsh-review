@@ -144,6 +144,28 @@ approval: null
   assert.match(prompt, /A 类/);
   assert.match(prompt, /B 类/);
   assert.match(prompt, /正交|独立地基于/);
+  assert.match(prompt, /严禁执行 `git commit`/);
+});
+
+test('buildAuditPrompt session mode tells the agent to commit only .ai-review', async () => {
+  const root = await createGitFixture();
+  const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const prompt = await buildAuditPrompt({
+    repoRoot: root,
+    vcsType: 'git',
+    owner: 'tester',
+    targetPath: '',
+    note: '',
+    baseRevision: base,
+    reportPath: '.ai-review/audits/20261031-220000-repo.md',
+    mode: 'session',
+    now: new Date('2026-10-31T22:00:00+08:00'),
+  });
+
+  assert.match(prompt, /会话执行方式/);
+  assert.match(prompt, /侧边栏/);
+  assert.match(prompt, /只提交 `\.ai-review`/);
+  assert.doesNotMatch(prompt, /严禁执行 `git commit`/);
 });
 
 function auditorFor(root, overrides = {}) {
