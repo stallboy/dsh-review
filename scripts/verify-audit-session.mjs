@@ -256,7 +256,9 @@ function summarizeSession(events) {
   const assistantMessages = events.filter((event) => event.type === 'assistant/message').length;
   const toolCalls = events.filter((event) => event.type === 'tool/call').length;
   const hasAuditPrompt = userMessages.some((event) => promptText(event).includes(PROMPT_MARKER));
-  return { userMessages: userMessages.length, turnStarts, assistantMessages, toolCalls, hasAuditPrompt };
+  const preset = events.find((event) => event.type === 'permission/preset')?.data?.preset;
+  const approvalPolicy = events.find((event) => event.type === 'approval/policy')?.data?.policy;
+  return { userMessages: userMessages.length, turnStarts, assistantMessages, toolCalls, hasAuditPrompt, preset, approvalPolicy };
 }
 
 async function main() {
@@ -316,6 +318,7 @@ async function main() {
     options.wait * 1000,
   );
   log(`· 提示词已受理：user=${accepted.userMessages} turns=${accepted.turnStarts} assistant=${accepted.assistantMessages} tools=${accepted.toolCalls}`);
+  log(`· 权限 preset=${accepted.preset ?? '未记录'} approval=${accepted.approvalPolicy ?? '未记录'}`);
 
   const result = {
     ok: true,
