@@ -1,23 +1,32 @@
 ---
 schema_version: 1
-title: "patch: 修复 unified diff 解析，避免重命名漏提交、引号路径错乱与 hunk 回退空白"
-module: patch
-audit_type: bugfix
-created_at: "2026-10-31T23:16:00+08:00"
-owner: "cxs"
-tags: [git, svn, diff, patch, approval, bug]
-status: pending
+title: 'patch: 修复 unified diff 解析，避免重命名漏提交、引号路径错乱与 hunk 回退空白'
+created_at: '2026-10-31T23:16:00+08:00'
+owner: cxs
+tags:
+  - git
+  - svn
+  - diff
+  - patch
+  - approval
+  - bug
+status: approved
 ticket: null
 current_revision: 1
 revisions:
   - id: 1
-    base_revision: "402012744bcdd89fba50bb60cbf6fed84785ad67"
-    patch: "001.patch"
+    base_revision: 402012744bcdd89fba50bb60cbf6fed84785ad67
+    patch: 001.patch
 gate_checks:
-  - "npm run typecheck"
-  - "npm test"
+  - npm run typecheck
+  - npm test
 comments: []
-approval: null
+approval:
+  approved_by: cxs
+  approved_at: '2026-10-31T17:11:33.231Z'
+  commit_revision: null
+module: patch
+audit_type: bugfix
 ---
 
 # 问题与影响
@@ -73,3 +82,22 @@ approval: null
 待审核
 ### 意见处理结果
 无
+
+## 版本 1 (base: 402012744bcdd89fba50bb60cbf6fed84785ad67)
+
+### 验证结果
+
+<!-- ai-review:validation -->
+### 门禁执行结果
+
+- 工作目录: D:\work\mygithub\dsh-review · 基线: 316b0a207b2702df909dcba8de6363283e911562 · 平台: win32 / node v24.21.0 · 执行时间: 2026-10-31T17:11:33.230Z
+
+| 结果 | 命令 | 退出码 | 耗时 |
+| --- | --- | --- | --- |
+| 通过 | `npm run typecheck` | 0 | 2.2s |
+| 通过 | `npm test` | 0 | 9.6s |
+<!-- /ai-review:validation -->
+
+### 人类总体意见
+
+批准（cxs）

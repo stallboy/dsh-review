@@ -2,49 +2,147 @@ import type { InterRevisionDiff, PatchFileStat, PatchStats } from './types.js';
 
 export interface ParsedPatch {
   stats: PatchStats;
+  /** Every path the patch touches, including the old side of a rename or deletion. */
   paths: string[];
   text: string;
   binary: boolean;
 }
 
+/**
+ * Decode a git-quoted path (`core.quotepath` defaults to true for non-ASCII
+ * names): C escapes plus octal byte escapes that must be decoded as UTF-8.
+ */
 function unquoteGitPath(value: string): string {
   const trimmed = value.trim();
-  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
-    return trimmed.slice(1, -1).replace(/\\(.)/g, '$1');
+  if (trimmed.length < 2 || !trimmed.startsWith('"') || !trimmed.endsWith('"')) return trimmed;
+  const inner = trimmed.slice(1, -1);
+  const bytes: number[] = [];
+  const escapes: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92 };
+  for (let index = 0; index < inner.length; index += 1) {
+    const char = inner[index] ?? '';
+    if (char !== '\\') {
+      bytes.push(char.charCodeAt(0));
+      continue;
+    }
+    const next = inner[index + 1];
+    if (next === undefined) break;
+    const octal = /^[0-7]{3}/.exec(inner.slice(index + 1));
+    if (octal) {
+      bytes.push(Number.parseInt(octal[0], 8));
+      index += 3;
+      continue;
+    }
+    bytes.push(escapes[next] ?? next.charCodeAt(0));
+    index += 1;
   }
-  return trimmed;
+  return Buffer.from(bytes).toString('utf8');
 }
 
+function stripDiffPrefix(value: string): string {
+  return value.startsWith('a/') || value.startsWith('b/') ? value.slice(2) : value;
+}
+
+/** Path from a `---`/`+++`/`Index:` line; the prefix must be stripped after unquoting. */
 function headerPath(value: string): string {
   const withoutTab = value.split('\t')[0] ?? '';
-  const trimmed = withoutTab.trim();
-  const withoutPrefix = trimmed.startsWith('a/') || trimmed.startsWith('b/') ? trimmed.slice(2) : trimmed;
-  return unquoteGitPath(withoutPrefix);
+  return stripDiffPrefix(unquoteGitPath(withoutTab));
+}
+
+function readQuotedToken(text: string, start: number): { token: string; end: number } | null {
+  if (text[start] !== '"') return null;
+  let index = start + 1;
+  while (index < text.length) {
+    if (text[index] === '\\') {
+      index += 2;
+      continue;
+    }
+    if (text[index] === '"') return { token: text.slice(start, index + 1), end: index + 1 };
+    index += 1;
+  }
+  return null;
+}
+
+/** `a/<same path> b/<same path>`; the only unambiguous split for bare paths with spaces. */
+function splitSamePath(value: string): string | null {
+  const pathLength = (value.length - 5) / 2;
+  if (!Number.isInteger(pathLength) || pathLength < 0) return null;
+  const boundary = 2 + pathLength;
+  if (value[boundary] !== ' ' || value.slice(boundary + 1, boundary + 3) !== 'b/') return null;
+  const oldPath = value.slice(2, boundary);
+  return value.slice(boundary + 3) === oldPath ? oldPath : null;
+}
+
+/** Both sides of a `diff --git` header; git quotes each side that needs quoting. */
+function diffHeaderPaths(value: string): { oldPath: string; newPath: string } | null {
+  const rest = value.trim();
+  if (rest.startsWith('"')) {
+    const first = readQuotedToken(rest, 0);
+    if (!first) return null;
+    let index = first.end;
+    while (rest[index] === ' ') index += 1;
+    const second = readQuotedToken(rest, index);
+    return { oldPath: headerPath(first.token), newPath: headerPath(second ? second.token : rest.slice(index)) };
+  }
+  if (!rest.startsWith('a/')) return null;
+  const same = splitSamePath(rest);
+  if (same !== null) return { oldPath: same, newPath: same };
+  const boundary = rest.indexOf(' b/');
+  if (boundary <= 0) return null;
+  return { oldPath: headerPath(rest.slice(0, boundary)), newPath: headerPath(rest.slice(boundary + 1)) };
 }
 
 /** Parse a unified diff (git or svn flavor) enough for queue stats and path validation. */
 export function parsePatch(text: string): ParsedPatch {
   const entries = new Map<string, PatchFileStat>();
+  const touched = new Set<string>();
   let current: PatchFileStat | null = null;
   let binary = false;
+  let inHunk = false;
+  let inBinaryPayload = false;
+  const noteTouched = (path: string | null): void => {
+    if (path !== null && path.length > 0 && path !== '/dev/null') touched.add(path);
+  };
   for (const line of text.replace(/\r\n/g, '\n').split('\n')) {
-    const diffHeader = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+    const diffHeader = /^diff --git (.+)$/.exec(line);
     if (diffHeader) {
-      const path = unquoteGitPath(diffHeader[2] ?? diffHeader[1] ?? '');
+      inHunk = false;
+      inBinaryPayload = false;
+      const paths = diffHeaderPaths(diffHeader[1] ?? '');
+      if (!paths) continue;
+      noteTouched(paths.oldPath);
+      noteTouched(paths.newPath);
+      current = entries.get(paths.newPath) ?? { path: paths.newPath, additions: 0, deletions: 0, binary: false };
+      entries.set(paths.newPath, current);
+      continue;
+    }
+    if (inBinaryPayload) continue;
+    const indexHeader = /^Index: (.+)$/.exec(line);
+    if (indexHeader) {
+      inHunk = false;
+      const path = headerPath(indexHeader[1] ?? '');
+      noteTouched(path);
       current = entries.get(path) ?? { path, additions: 0, deletions: 0, binary: false };
       entries.set(path, current);
       continue;
     }
-    const indexHeader = /^Index: (.+)$/.exec(line);
-    if (indexHeader) {
-      const path = headerPath(indexHeader[1] ?? '');
-      current = entries.get(path) ?? { path, additions: 0, deletions: 0, binary: false };
-      entries.set(path, current);
+    if (line.startsWith('@@')) {
+      inHunk = true;
+      continue;
+    }
+    // Inside a hunk every '---'/'+++' line is content (a removed line may start
+    // with '-- ', an added line with '++ '), never a file header.
+    if (inHunk) {
+      if (line.startsWith('+')) {
+        if (current) current.additions += 1;
+      } else if (line.startsWith('-')) {
+        if (current) current.deletions += 1;
+      }
       continue;
     }
     const plusHeader = /^\+\+\+ (.+)$/.exec(line);
     if (plusHeader) {
       const path = headerPath(plusHeader[1] ?? '');
+      noteTouched(path);
       if (path !== '/dev/null') {
         current = entries.get(path) ?? { path, additions: 0, deletions: 0, binary: false };
         entries.set(path, current);
@@ -54,25 +152,22 @@ export function parsePatch(text: string): ParsedPatch {
     const minusHeader = /^--- (.+)$/.exec(line);
     if (minusHeader) {
       const path = headerPath(minusHeader[1] ?? '');
+      noteTouched(path);
       if (path !== '/dev/null' && current === null) {
         current = entries.get(path) ?? { path, additions: 0, deletions: 0, binary: false };
         entries.set(path, current);
       }
       continue;
     }
-    if (line.startsWith('GIT binary patch') || line.startsWith('Binary files ') || line.startsWith('Cannot display: file marked as a binary type')) {
+    if (line.startsWith('GIT binary patch')) {
       binary = true;
+      inBinaryPayload = true;
       if (current) current.binary = true;
       continue;
     }
-    if (line.startsWith('@@')) continue;
-    if (line.startsWith('+') && !line.startsWith('+++')) {
-      if (current) current.additions += 1;
-      continue;
-    }
-    if (line.startsWith('-') && !line.startsWith('---')) {
-      if (current) current.deletions += 1;
-      continue;
+    if (line.startsWith('Binary files ') || line.startsWith('Cannot display: file marked as a binary type')) {
+      binary = true;
+      if (current) current.binary = true;
     }
   }
   const list = [...entries.values()].filter((entry) => entry.path.length > 0);
@@ -82,7 +177,7 @@ export function parsePatch(text: string): ParsedPatch {
     deletions: list.reduce((total, entry) => total + entry.deletions, 0),
     entries: list,
   };
-  return { stats, paths: list.map((entry) => entry.path), text, binary };
+  return { stats, paths: [...touched], text, binary };
 }
 
 export function isAiReviewPath(path: string): boolean {
@@ -106,7 +201,7 @@ export function buildHunkFallbackDiff(
 ): InterRevisionDiff {
   const from = parsePatch(fromPatch);
   const to = parsePatch(toPatch);
-  const allPaths = [...new Set([...from.paths, ...to.paths])].sort();
+  const allPaths = [...new Set([...from.stats.entries, ...to.stats.entries].map((entry) => entry.path))].sort();
   const chunks: string[] = [
     `# 跨基线 Hunk 对比（rev ${String(fromRevision)} → rev ${String(toRevision)}）`,
     `# 旧基线: ${fromBase}`,
@@ -139,10 +234,17 @@ function extractFileSection(patchText: string, path: string): string {
   const collected: string[] = [];
   let active = false;
   for (const line of lines) {
-    const diffHeader = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+    const diffHeader = /^diff --git (.+)$/.exec(line);
     if (diffHeader) {
-      const candidate = unquoteGitPath(diffHeader[2] ?? diffHeader[1] ?? '');
-      active = candidate === path;
+      const paths = diffHeaderPaths(diffHeader[1] ?? '');
+      active = paths !== null && paths.newPath === path;
+      if (active) collected.push(line);
+      continue;
+    }
+    // `svn diff` uses `Index:` sections instead of git's `diff --git` headers.
+    const indexHeader = /^Index: (.+)$/.exec(line);
+    if (indexHeader) {
+      active = headerPath(indexHeader[1] ?? '') === path;
       if (active) collected.push(line);
       continue;
     }
