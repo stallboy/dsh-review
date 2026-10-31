@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Review",
+    "description": "Session-scoped code review tab: repository audit, review queue, versioned patches, gate checks and approval for the current repository."
+  }
+}

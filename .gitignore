@@ -1,0 +1,8 @@
+node_modules/
+# tsc 构建产物：由 `npm run build` 从 src/ 生成（含 src/host/vendor 的 js-yaml）
+dist/
+*.tsbuildinfo
+.tmp/
+.npm-cache/
+.pnpm-store/
+*.log
