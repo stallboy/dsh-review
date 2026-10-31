@@ -264,6 +264,18 @@ export function parseSections(body: string): ReviewSections {
   return sections;
 }
 
+const PLACEHOLDER_JUDGMENT = /^(?:无|暂无|没有|不适用|无需|none|n\/a|na)(?:[。.；;，,：:]|$|[（(])/i;
+
+/**
+ * Placeholder text such as “无”, “无。” or “无：...详情...” carries no decision
+ * for a human. Treat it as empty so the UI does not render a fake review item.
+ */
+export function isEmptyHumanJudgmentText(value: string): boolean {
+  const normalized = value.replace(/[*_`]/g, '').trim();
+  if (normalized.length === 0) return true;
+  return PLACEHOLDER_JUDGMENT.test(normalized);
+}
+
 export function extractHumanJudgment(text: string): HumanJudgmentItem[] {
   const items: HumanJudgmentItem[] = [];
   for (const line of text.split('\n')) {
@@ -273,12 +285,13 @@ export function extractHumanJudgment(text: string): HumanJudgmentItem[] {
     if (!raw) continue;
     const separator = raw.search(/[：:]/);
     if (separator === -1) {
-      items.push({ label: raw, text: '' });
+      if (!isEmptyHumanJudgmentText(raw)) items.push({ label: '需人工确认', text: raw });
       continue;
     }
-    const label = raw.slice(0, separator).trim();
+    const label = raw.slice(0, separator).replace(/\*\*|__/g, '').trim();
     const value = raw.slice(separator + 1).trim();
-    items.push({ label: label || raw, text: value });
+    if (isEmptyHumanJudgmentText(value)) continue;
+    items.push({ label: label || '需人工确认', text: value });
   }
   return items;
 }

@@ -80,6 +80,8 @@ export interface ReviewCandidate {
   meta: ReviewFrontmatter;
   sections: ReviewSections;
   humanJudgment: HumanJudgmentItem[];
+  /** True when the AI actually wrote the `# 需人工判断项` section (even if it only says “无”). */
+  humanJudgmentDeclared: boolean;
   /** Present when the file is readable but not valid; the UI shows it as broken. */
   parseError?: string;
 }
@@ -111,6 +113,8 @@ export interface CandidateSummary {
   patchStats: PatchStats;
   unresolvedComments: number;
   humanJudgmentCount: number;
+  /** True when the candidate declares the human-judgment section; false means it was never filled. */
+  humanJudgmentDeclared: boolean;
   isBaseBehind: boolean;
   baseRevision: string;
   lastFeedback: string;

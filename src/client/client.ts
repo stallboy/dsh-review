@@ -60,7 +60,7 @@ interface Comment {
 interface QueueItem {
   id: string; title: string; owner: string; status: string; tags: string[]; ticket: string | null;
   currentRevision: number; createdAt: string; patchStats: Stats; unresolvedComments: number;
-  humanJudgmentCount: number; isBaseBehind: boolean; baseRevision: string; lastFeedback: string; parseError?: string;
+  humanJudgmentCount: number; humanJudgmentDeclared: boolean; isBaseBehind: boolean; baseRevision: string; lastFeedback: string; parseError?: string;
 }
 interface Queue {
   configured: boolean; items: QueueItem[]; errors: string[]; currentBase: string | null;
@@ -78,6 +78,7 @@ interface Detail {
     id: string; month: string; slug: string; dirPath: string; reviewPath: string; meta: CandidateMeta;
     sections: { problem: string; rootCause: string; solution: string; humanJudgment: string; evidence: string; history: string };
     humanJudgment: { label: string; text: string }[];
+    humanJudgmentDeclared: boolean;
   };
   currentBase: string | null; isBaseBehind: boolean; patchText: string; patchStats: Stats; patchPaths: string[];
   comments: Comment[]; validation: string[];
@@ -253,11 +254,43 @@ function createPlugin(requireModule: (id: string) => any) {
 .dcr-thread{margin:2px 10px 6px 106px;padding:7px 10px;border-left:2px solid var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-2);border-radius:0 6px 6px 0}
 .dcr-thread-head{display:flex;gap:8px;align-items:center;font-size:11px;color:var(--dsw-alias-label-secondary);margin-bottom:3px}
 .dcr-st-unresolved{color:var(--dsw-alias-state-error-primary)}.dcr-st-partial{color:var(--dsw-alias-state-warn-primary)}.dcr-st-resolved{color:var(--dsw-alias-state-success-primary)}
-.dcr-modal-mask{position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.38);display:flex;align-items:flex-start;justify-content:center;padding:6vh 16px}
-.dcr-modal{width:min(760px,100%);max-height:88vh;overflow:auto;border-radius:12px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);box-shadow:0 18px 50px rgba(0,0,0,.28)}
-.dcr-modal-head{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--dsw-alias-border-l1);position:sticky;top:0;background:var(--dsw-alias-bg-layer-1);z-index:2}
-.dcr-modal-body{padding:16px;display:flex;flex-direction:column;gap:10px}
-.dcr-modal-foot{display:flex;gap:8px;justify-content:flex-end;padding:12px 16px;border-top:1px solid var(--dsw-alias-border-l1);position:sticky;bottom:0;background:var(--dsw-alias-bg-layer-1)}
+.dcr-approve{border-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 45%,transparent);background:color-mix(in srgb,var(--dsw-alias-brand-primary) 4%,var(--dsw-alias-bg-layer-1))}
+.dcr-approve-acks{display:flex;flex-direction:column;gap:4px;margin:8px 0 4px;border:1px dashed color-mix(in srgb,var(--dsw-alias-brand-primary) 35%,transparent);border-radius:8px;padding:8px 10px;background:var(--dsw-alias-bg-base)}
+.dcr-approve-acks .dcr-small{margin-bottom:2px}
+.dcr-approve-steps{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}
+.dcr-step{display:flex;gap:8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:8px 10px;background:var(--dsw-alias-bg-base)}
+.dcr-step-no{flex:none;width:18px;height:18px;border-radius:50%;background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base);font-size:11px;display:flex;align-items:center;justify-content:center;font-weight:700}
+.dcr-step-title{font-weight:600;font-size:12px}
+.dcr-step-desc{font-size:11.5px;color:var(--dsw-alias-label-secondary);line-height:1.45;margin-top:2px}
+.dcr-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:12px}
+.dcr-kpi{border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:7px 9px;background:var(--dsw-alias-bg-base)}
+.dcr-kpi-label{font-size:10.5px;color:var(--dsw-alias-label-secondary);letter-spacing:.4px;text-transform:uppercase}
+.dcr-kpi-value{font-size:13px;font-weight:600;margin-top:2px}
+.dcr-kpi-value.warn{color:var(--dsw-alias-state-warn-primary)}
+.dcr-kpi-value.ok{color:var(--dsw-alias-state-success-primary)}
+.dcr-rt{max-width:78ch;line-height:1.68;font-size:13px}
+.dcr-rt p{margin:0 0 9px}
+.dcr-rt p:last-child{margin-bottom:0}
+.dcr-rt ul,.dcr-rt ol{margin:4px 0 10px;padding-left:20px}
+.dcr-rt li{margin:3px 0;padding-left:2px}
+.dcr-rt strong{font-weight:650}
+.dcr-rt a{color:var(--dsw-alias-brand-primary);text-decoration:none}
+.dcr-rt a:hover{text-decoration:underline}
+.dcr-rt-h{font-weight:650;margin:12px 0 6px;font-size:13px}
+.dcr-rt-h:first-child{margin-top:0}
+.dcr-rt-h1{font-size:14px}
+.dcr-rt-h2{font-size:13.5px}
+.dcr-rt-h3,.dcr-rt-h4{font-size:13px;color:var(--dsw-alias-label-secondary)}
+.dcr-rt code,.dcr-inline-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1);border-radius:4px;padding:0 3px}
+.dcr-codeblock{background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l1);border-radius:7px;padding:9px 10px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.5;white-space:pre-wrap;margin:6px 0 10px}
+.dcr-gate-item{border:1px solid var(--dsw-alias-border-l1);border-radius:6px;padding:5px 8px;margin-bottom:5px;background:var(--dsw-alias-bg-base);overflow-wrap:anywhere}
+.dcr-job{border-color:color-mix(in srgb,var(--dsw-alias-brand-primary) 40%,transparent)}
+.dcr-job.failed{border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 45%,transparent)}
+.dcr-joblog{margin-top:8px}
+.dcr-joblog summary{cursor:pointer;font-size:12px;color:var(--dsw-alias-label-secondary);user-select:none}
+.dcr-joblog[open] summary{margin-bottom:6px}
+.dcr-details summary{cursor:pointer;font-size:12px;color:var(--dsw-alias-label-secondary);user-select:none;margin-bottom:6px}
+.dcr-details[open] summary{margin-bottom:8px}
 .dcr-empty{color:var(--dsw-alias-label-secondary);text-align:center;padding:40px 20px}
 .dcr-log{background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:10px;max-height:330px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.5;white-space:pre-wrap}
 .dcr-small{font-size:11.5px}.dcr-muted{color:var(--dsw-alias-label-secondary)}
@@ -267,13 +300,110 @@ function createPlugin(requireModule: (id: string) => any) {
 @media(max-width:760px){.dcr-grid{grid-template-columns:1fr}.dcr-line{grid-template-columns:32px 32px 14px 1fr 18px}.dcr-thread{margin-left:80px}}
 `;
 
-  function Modal(props: { title: string; onClose: () => void; children: any; footer?: any }) {
-    return h('div', { className: 'dcr-modal-mask', onMouseDown: (e: any) => { if (e.target === e.currentTarget) props.onClose(); } },
-      h('div', { className: 'dcr-modal' },
-        h('div', { className: 'dcr-modal-head' }, h('strong', { className: 'dcr-grow' }, props.title), h('button', { className: 'dcr-btn g', onClick: props.onClose }, '关闭')),
-        h('div', { className: 'dcr-modal-body' }, props.children),
-        props.footer ? h('div', { className: 'dcr-modal-foot' }, props.footer) : null,
-      ));
+  /** Inline markdown-lite: bold, code spans and links; everything stays a React node. */
+  function inlineNodes(text: string, keyPrefix: string): any[] {
+    const nodes: any[] = [];
+    const pattern = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)\s]+\))/g;
+    let last = 0;
+    let index = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text)) !== null) {
+      if (match.index > last) nodes.push(text.slice(last, match.index));
+      const token = match[0];
+      if (token.startsWith('**')) {
+        nodes.push(h('strong', { key: `${keyPrefix}-b-${String(index)}` }, token.slice(2, -2)));
+      } else if (token.startsWith('`')) {
+        nodes.push(h('code', { key: `${keyPrefix}-c-${String(index)}` }, token.slice(1, -1)));
+      } else {
+        const link = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(token);
+        if (link) {
+          nodes.push(h('a', { key: `${keyPrefix}-a-${String(index)}`, href: link[2], target: '_blank', rel: 'noreferrer' }, link[1]));
+        } else {
+          nodes.push(token);
+        }
+      }
+      last = match.index + token.length;
+      index += 1;
+    }
+    if (last < text.length) nodes.push(text.slice(last));
+    return nodes;
+  }
+
+  /**
+   * Review bodies are Markdown-ish. Rendering headings, lists, bold and code as
+   * real blocks keeps long audit text scannable instead of one wall of `<pre>`.
+   */
+  function RichText(props: { text: string; className?: string }) {
+    const text = (props.text || '').replace(/\r\n/g, '\n').trim();
+    if (!text) return h('div', { className: 'dcr-muted dcr-small' }, '未填写');
+    const blocks: any[] = [];
+    const lines = text.split('\n');
+    let seq = 0;
+    const nextKey = (): string => `rt-${String(seq++)}`;
+    const isBlockStart = (line: string): boolean =>
+      /^#{1,4}\s+/.test(line) || /^[-*]\s+/.test(line) || /^\d+[.)]\s+/.test(line) || line.startsWith('```');
+    let index = 0;
+    while (index < lines.length) {
+      const line = (lines[index] ?? '').trim();
+      if (!line) { index += 1; continue; }
+      if (line.startsWith('```')) {
+        const code: string[] = [];
+        index += 1;
+        while (index < lines.length && !(lines[index] ?? '').trim().startsWith('```')) {
+          code.push(lines[index] ?? '');
+          index += 1;
+        }
+        index += 1;
+        blocks.push(h('pre', { key: nextKey(), className: 'dcr-codeblock' }, code.join('\n')));
+        continue;
+      }
+      const heading = /^(#{1,4})\s+(.+)$/.exec(line);
+      if (heading) {
+        const level = heading[1]?.length ?? 1;
+        blocks.push(h('div', { key: nextKey(), className: `dcr-rt-h dcr-rt-h${String(level)}` }, ...inlineNodes(heading[2] ?? '', nextKey())));
+        index += 1;
+        continue;
+      }
+      if (/^[-*]\s+/.test(line)) {
+        const items: string[] = [];
+        while (index < lines.length) {
+          const bullet = /^[-*]\s+(.+)$/.exec((lines[index] ?? '').trim());
+          if (!bullet) break;
+          let item = bullet[1] ?? '';
+          index += 1;
+          while (index < lines.length && /^\s{2,}\S/.test(lines[index] ?? '') && !isBlockStart((lines[index] ?? '').trim())) {
+            item += ` ${(lines[index] ?? '').trim()}`;
+            index += 1;
+          }
+          items.push(item);
+        }
+        blocks.push(h('ul', { key: nextKey() }, ...items.map((item, itemIndex) =>
+          h('li', { key: `${String(itemIndex)}` }, ...inlineNodes(item, nextKey())))));
+        continue;
+      }
+      if (/^\d+[.)]\s+/.test(line)) {
+        const items: string[] = [];
+        while (index < lines.length) {
+          const ordered = /^\d+[.)]\s+(.+)$/.exec((lines[index] ?? '').trim());
+          if (!ordered) break;
+          items.push(ordered[1] ?? '');
+          index += 1;
+        }
+        blocks.push(h('ol', { key: nextKey() }, ...items.map((item, itemIndex) =>
+          h('li', { key: `${String(itemIndex)}` }, ...inlineNodes(item, nextKey())))));
+        continue;
+      }
+      const paragraph: string[] = [line];
+      index += 1;
+      while (index < lines.length) {
+        const next = (lines[index] ?? '').trim();
+        if (!next || isBlockStart(next)) break;
+        paragraph.push(next);
+        index += 1;
+      }
+      blocks.push(h('p', { key: nextKey() }, ...inlineNodes(paragraph.join(' '), nextKey())));
+    }
+    return h('div', { className: `dcr-rt ${props.className ?? ''}`.trim() }, ...blocks);
   }
 
   function App(props: { t: (key: string) => string; sessionId: string }) {
@@ -294,7 +424,7 @@ function createPlugin(requireModule: (id: string) => any) {
     const [busy, setBusy] = useState(false);
     const [stale, setStale] = useState(false);
     const [job, setJob] = useState<Job | null>(null);
-    const [modal, setModal] = useState<'' | 'approve' | 'reject'>('');
+    const [panel, setPanel] = useState<'' | 'approve' | 'reject'>('');
     const [ack, setAck] = useState<Record<number, boolean>>({});
     const [general, setGeneral] = useState('');
     const [rejectReason, setRejectReason] = useState('');
@@ -399,7 +529,17 @@ function createPlugin(requireModule: (id: string) => any) {
       setAck({});
       setGeneral('');
       setDraft(null);
+      setPanel('');
     }, [detail?.candidate.id, detail?.candidate.meta.currentRevision]);
+
+    useEffect(() => {
+      if (!panel) return;
+      const onKey = (event: KeyboardEvent): void => {
+        if (event.key === 'Escape') setPanel('');
+      };
+      window.addEventListener('keydown', onKey);
+      return () => window.removeEventListener('keydown', onKey);
+    }, [panel]);
 
     useEffect(() => {
       if (!job || job.status !== 'running') return;
@@ -492,7 +632,7 @@ function createPlugin(requireModule: (id: string) => any) {
       setBusy(true);
       try {
         await api('/reject', { method: 'POST', body: { id: detail.candidate.id, ...guard(), reason: rejectReason } });
-        setModal(''); setRejectReason('');
+        setPanel(''); setRejectReason('');
         setScreen('queue'); setSelectedId(''); setDetail(null);
         await loadQueue();
       } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
@@ -501,7 +641,7 @@ function createPlugin(requireModule: (id: string) => any) {
 
     const approve = (): void => {
       if (!detail) return;
-      setModal('');
+      setPanel('');
       void startJob('/approve', { id: detail.candidate.id, ...guard() });
     };
 
@@ -650,6 +790,7 @@ function createPlugin(requireModule: (id: string) => any) {
 
     const renderQueue = (): any => h('div', { className: 'dcr-body' },
       h('div', { className: 'dcr-wrap' },
+        renderJob(),
         h('div', { className: 'dcr-card' },
           h('div', { className: 'dcr-row' },
             h('input', { className: 'dcr-input', style: { width: 140 }, placeholder: '负责人', value: filter.owner, onChange: (e: any) => setFilter({ ...filter, owner: e.target.value }) }),
@@ -710,7 +851,11 @@ function createPlugin(requireModule: (id: string) => any) {
                   h('span', null, `owner ${item.owner}`),
                   h('span', null, statsText(item.patchStats)),
                   item.isBaseBehind ? h('span', { className: 'dcr-chip warn' }, `基线落后 ${short(item.baseRevision)}`) : h('span', { className: 'dcr-chip approved' }, '基线最新'),
-                  h('span', { className: 'dcr-chip warn' }, item.humanJudgmentCount > 0 ? `${String(item.humanJudgmentCount)} 项需人工判断` : '人工判断项未填写'),
+                  item.humanJudgmentCount > 0
+                    ? h('span', { className: 'dcr-chip warn' }, `${String(item.humanJudgmentCount)} 项需人工判断`)
+                    : item.humanJudgmentDeclared
+                      ? h('span', { className: 'dcr-chip approved' }, '无需人工判断')
+                      : h('span', { className: 'dcr-chip warn' }, '人工判断项未填写'),
                   item.unresolvedComments > 0 ? h('span', { className: 'dcr-chip warn' }, `${String(item.unresolvedComments)} 条未处理意见`) : null,
                   ...item.tags.map((tag) => h('span', { key: tag, className: 'dcr-chip' }, tag)),
                 ),
@@ -728,17 +873,75 @@ function createPlugin(requireModule: (id: string) => any) {
       const candidate = detail.candidate;
       const canAct = detail.canAct && !stale && candidate.meta.status !== 'approved' && candidate.meta.status !== 'rejected';
       const items = candidate.humanJudgment;
-      const allAck = items.length === 0 || items.every((_, index) => ack[index]);
+      const ackCount = items.filter((_, index) => ack[index]).length;
+      const allAck = items.length === 0 || ackCount === items.length;
       const files = diffFiles;
+      const baseRevision = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision)?.baseRevision ?? '';
+      const steps = [
+        { title: '同步基线', desc: settings?.syncBeforeApprove ? '先 pull --ff-only / svn update；失败即中止。' : '按当前基线验证，不自动同步远端。' },
+        { title: '应用补丁', desc: `严格应用 rev ${String(candidate.meta.currentRevision)} 的 ${candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision)?.patch ?? '补丁'}。` },
+        { title: '执行门禁', desc: `${String(candidate.meta.gateChecks.length)} 条命令逐条执行，任一失败即回滚。` },
+        { title: '原子提交', desc: '业务代码、review.md 状态与补丁清理进入同一个提交。' },
+      ];
+      const approvalPanel = (): any => h('div', { className: 'dcr-card dcr-approve' },
+        h('div', { className: 'dcr-row' },
+          h('h3', { className: 'dcr-grow', style: { margin: 0 } }, '确认批准并提交'),
+          h('button', { className: 'dcr-btn g', onClick: () => setPanel('') }, '取消'),
+        ),
+        h('div', { className: 'dcr-approve-steps' },
+          ...steps.map((step, index) => h('div', { key: index, className: 'dcr-step' },
+            h('div', { className: 'dcr-step-no' }, String(index + 1)),
+            h('div', null,
+              h('div', { className: 'dcr-step-title' }, step.title),
+              h('div', { className: 'dcr-step-desc' }, step.desc),
+            ),
+          )),
+        ),
+        h('div', { className: `dcr-banner ${items.length === 0 || allAck ? 'info' : 'warn'}` },
+          items.length === 0
+            ? (candidate.humanJudgmentDeclared ? 'AI 已确认无需额外人工判断，可直接批准。' : 'AI 未填写需人工判断项，批准前请先补全。')
+            : allAck
+              ? `已确认全部 ${String(items.length)} 项需人工判断点。`
+              : `还有 ${String(items.length - ackCount)} 项需人工判断项未确认；请先在上方逐项勾选。`,
+        ),
+        items.length > 0 ? h('div', { className: 'dcr-approve-acks' },
+          h('div', { className: 'dcr-small dcr-muted' }, '逐项确认（与下方“需人工判断项”同步）：'),
+          ...items.map((item, index) => h('label', { key: index, className: 'dcr-check' },
+            h('input', { type: 'checkbox', checked: Boolean(ack[index]), onChange: (e: any) => setAck({ ...ack, [index]: Boolean(e.target.checked) }) }),
+            h('span', null, item.label),
+          )),
+        ) : null,
+        h('details', { className: 'dcr-details', open: true, style: { marginTop: 10 } },
+          h('summary', null, `合并门禁（${String(candidate.meta.gateChecks.length)} 条）`),
+          candidate.meta.gateChecks.length === 0
+            ? h('div', { className: 'dcr-banner warn' }, '门禁为空，无法批准；请让 AI 修复补全 gate_checks。')
+            : h('div', null, ...candidate.meta.gateChecks.map((command, index) => h('div', { key: index, className: 'dcr-gate-item dcr-mono dcr-small' }, command))),
+        ),
+        h('div', { className: 'dcr-row', style: { marginTop: 12 } },
+          h('button', { className: 'dcr-btn p', disabled: busy || !allAck || candidate.meta.gateChecks.length === 0, onClick: approve }, busy ? '执行中…' : '确认批准并提交'),
+          h('button', { className: 'dcr-btn', onClick: () => setPanel('') }, '再想想'),
+          h('span', { className: 'dcr-grow' }),
+          h('span', { className: 'dcr-small dcr-muted' }, settings?.syncBeforeApprove ? '批准前自动同步基线' : '不自动同步基线'),
+        ),
+        h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 8 } }, '批准过程在页内显示实时日志，不弹窗、不锁定其他页面。'),
+      );
+      const rejectPanel = (): any => h('div', { className: 'dcr-card' },
+        h('div', { className: 'dcr-row' },
+          h('h3', { className: 'dcr-grow', style: { margin: 0 } }, '放弃候选'),
+          h('button', { className: 'dcr-btn g', onClick: () => setPanel('') }, '取消'),
+        ),
+        h('div', { className: 'dcr-banner warn', style: { marginTop: 8 } }, '放弃会删除所有过程补丁并提交 .ai-review 变更，仅保留 review.md 归档。'),
+        h('textarea', { className: 'dcr-textarea', autoFocus: true, placeholder: '放弃原因（必填）', value: rejectReason, onChange: (e: any) => setRejectReason(e.target.value) }),
+        h('div', { className: 'dcr-row', style: { marginTop: 8 } },
+          h('button', { className: 'dcr-btn d', disabled: busy || !rejectReason.trim(), onClick: () => { void reject(); } }, busy ? '执行中…' : '确认放弃'),
+          h('button', { className: 'dcr-btn', onClick: () => setPanel('') }, '取消'),
+        ),
+      );
       return h('div', { className: 'dcr-body' },
         h('div', { className: 'dcr-wrap' },
-          h('div', { className: 'dcr-row' },
-            h('button', { className: 'dcr-btn', onClick: () => { setScreen('queue'); setSelectedId(''); setDetail(null); } }, '← 队列'),
-            h('span', { className: 'dcr-grow' }),
-            h('button', { className: 'dcr-btn', onClick: () => { guardRef.current = null; setStale(false); void loadDetail(selectedId); } }, '刷新'),
-          ),
+          renderJob(),
           stale ? h('div', { className: 'dcr-banner err' }, '该候选已在其他窗口更新（版本或 owner 变化），当前页面已锁定，请刷新后重新审核。') : null,
-          detail.isBaseBehind ? h('div', { className: 'dcr-banner warn' }, `仓库基线 ${short(detail.currentBase)} 已不同于候选基线 ${short(candidate.meta.revisions.find((r) => r.id === candidate.meta.currentRevision)?.baseRevision)}；批准时先同步再严格应用补丁。`) : null,
+          detail.isBaseBehind ? h('div', { className: 'dcr-banner warn' }, `仓库基线 ${short(detail.currentBase)} 已不同于候选基线 ${short(baseRevision)}；批准时会先同步再严格应用补丁。`) : null,
           h('div', { className: 'dcr-card' },
             h('div', { className: 'dcr-row', style: { alignItems: 'flex-start' } },
               h('div', { className: 'dcr-grow' },
@@ -749,7 +952,6 @@ function createPlugin(requireModule: (id: string) => any) {
                   h('span', null, candidate.meta.ticket ? `#${candidate.meta.ticket}` : '无 ticket'),
                   h('span', null, `owner ${candidate.meta.owner}`),
                   h('span', null, `创建 ${dateText(candidate.meta.createdAt)}`),
-                  h('span', null, statsText(detail.patchStats)),
                   ...candidate.meta.tags.map((tag) => h('span', { key: tag, className: 'dcr-chip' }, tag)),
                 ),
                 h('div', { className: 'dcr-small dcr-muted dcr-mono', style: { marginTop: 6 } }, candidate.id),
@@ -758,32 +960,68 @@ function createPlugin(requireModule: (id: string) => any) {
               h('div', { className: 'dcr-row' },
                 !detail.canAct ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void takeover(); } }, '接管审核') : null,
                 canAct ? h('button', { className: 'dcr-btn', disabled: busy, onClick: aiFix }, '让 AI 修复') : null,
-                canAct ? h('button', { className: 'dcr-btn d', disabled: busy, onClick: () => setModal('reject') }, '放弃') : null,
-                canAct ? h('button', { className: 'dcr-btn p', disabled: busy || !allAck || detail.validation.length > 0, onClick: () => setModal('approve') }, '批准并提交') : null,
+                canAct ? h('button', { className: 'dcr-btn d', disabled: busy, onClick: () => setPanel(panel === 'reject' ? '' : 'reject') }, panel === 'reject' ? '收起放弃' : '放弃') : null,
+                canAct ? h('button', {
+                  className: 'dcr-btn p',
+                  disabled: busy || detail.validation.length > 0,
+                  title: detail.validation.length > 0 ? detail.validation.join('；') : !allAck ? '打开审批面板，逐项确认人工判断项' : '确认批准并提交',
+                  onClick: () => setPanel(panel === 'approve' ? '' : 'approve'),
+                }, panel === 'approve' ? '收起审批' : '批准并提交') : null,
+              ),
+            ),
+            h('div', { className: 'dcr-kpis' },
+              h('div', { className: 'dcr-kpi' },
+                h('div', { className: 'dcr-kpi-label' }, '基线'),
+                h('div', { className: `dcr-kpi-value ${detail.isBaseBehind ? 'warn' : 'ok'}` }, detail.isBaseBehind ? `落后 ${short(baseRevision)}` : '最新'),
+              ),
+              h('div', { className: 'dcr-kpi' },
+                h('div', { className: 'dcr-kpi-label' }, '人工确认'),
+                h('div', { className: `dcr-kpi-value ${items.length > 0 && !allAck ? 'warn' : !candidate.humanJudgmentDeclared ? 'warn' : 'ok'}` },
+                  items.length > 0 ? `${String(ackCount)}/${String(items.length)}` : candidate.humanJudgmentDeclared ? '无需' : '未填写'),
+              ),
+              h('div', { className: 'dcr-kpi' },
+                h('div', { className: 'dcr-kpi-label' }, '门禁'),
+                h('div', { className: `dcr-kpi-value ${candidate.meta.gateChecks.length > 0 ? 'ok' : 'warn'}` }, `${String(candidate.meta.gateChecks.length)} 条`),
+              ),
+              h('div', { className: 'dcr-kpi' },
+                h('div', { className: 'dcr-kpi-label' }, '补丁'),
+                h('div', { className: 'dcr-kpi-value' }, statsText(detail.patchStats)),
               ),
             ),
             !detail.canAct ? h('div', { className: 'dcr-banner info', style: { marginTop: 10 } }, `当前负责人为 ${candidate.meta.owner}，您处于只读模式；需要操作请先“接管审核”。`) : null,
             detail.validation.length > 0 ? h('div', { className: 'dcr-banner err', style: { marginTop: 10 } }, `评审数据不完整：${detail.validation.join('；')}`) : null,
           ),
-          h('div', { className: 'dcr-card' }, h('h3', null, '问题与影响'), h('pre', { className: 'dcr-pre' }, candidate.sections.problem || '未填写')),
-          h('div', { className: 'dcr-card' }, h('h3', null, '根因'), h('pre', { className: 'dcr-pre' }, candidate.sections.rootCause || '未填写')),
-          h('div', { className: 'dcr-card' }, h('h3', null, '当前修复方案'), h('pre', { className: 'dcr-pre' }, candidate.sections.solution || '未填写')),
-          h('div', { className: 'dcr-judge' },
-            h('h3', null, '需人工判断项'),
-            items.length === 0 ? h('div', { className: 'dcr-muted' }, 'AI 未填写需人工判断项。') : null,
-            ...items.map((item, index) => h('div', { key: index, className: 'dcr-judge-item' },
-              h('div', { className: 'dcr-grow' },
-                h('div', { className: 'dcr-judge-label' }, item.label),
-                h('div', { className: 'dcr-pre' }, item.text || '（未填写）'),
+          panel === 'approve' ? approvalPanel() : null,
+          panel === 'reject' ? rejectPanel() : null,
+          items.length === 0
+            ? (candidate.humanJudgmentDeclared
+                ? null
+                : h('div', { className: 'dcr-banner warn' }, 'AI 未填写需人工判断项；批准前请让 AI 修复或在 review.md 中补全该章节。'))
+            : h('div', { className: 'dcr-judge' },
+                h('h3', null, `需人工判断项 · ${String(ackCount)}/${String(items.length)} 已确认`),
+                ...items.map((item, index) => h('div', { key: index, className: 'dcr-judge-item' },
+                  h('div', { className: 'dcr-grow' },
+                    h('div', { className: 'dcr-judge-label' }, item.label),
+                    h(RichText, { text: item.text, className: 'dcr-small' }),
+                  ),
+                  h('label', { className: 'dcr-check' }, h('input', { type: 'checkbox', checked: Boolean(ack[index]), disabled: !canAct, onChange: (e: any) => setAck({ ...ack, [index]: Boolean(e.target.checked) }) }), h('span', null, '已审阅')),
+                )),
               ),
-              h('label', { className: 'dcr-check' }, h('input', { type: 'checkbox', checked: Boolean(ack[index]), disabled: !canAct, onChange: (e: any) => setAck({ ...ack, [index]: Boolean(e.target.checked) }) }), h('span', null, '已审阅')),
-            )),
-          ),
+          h('div', { className: 'dcr-card' }, h('h3', null, '问题与影响'), h(RichText, { text: candidate.sections.problem })),
+          h('div', { className: 'dcr-card' }, h('h3', null, '根因'), h(RichText, { text: candidate.sections.rootCause })),
+          h('div', { className: 'dcr-card' }, h('h3', null, '当前修复方案'), h(RichText, { text: candidate.sections.solution })),
           h('div', { className: 'dcr-card' },
             h('h3', null, '合并门禁与验证证据'),
-            ...candidate.meta.gateChecks.map((command, index) => h('div', { key: index, className: 'dcr-mono dcr-small', style: { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 6, padding: '5px 8px', marginBottom: 5, background: 'var(--dsw-alias-bg-base)' } }, command)),
+            candidate.meta.gateChecks.length === 0
+              ? h('div', { className: 'dcr-banner warn' }, '尚未定义 gate_checks。')
+              : h('div', null, ...candidate.meta.gateChecks.map((command, index) => h('div', { key: index, className: 'dcr-gate-item dcr-mono dcr-small' }, command))),
             h('div', { className: 'dcr-small dcr-muted' }, '点击批准即代表确认并在本机执行以上命令；任一失败会阻止合并。'),
-            candidate.sections.evidence ? h('pre', { className: 'dcr-raw', style: { marginTop: 8 } }, candidate.sections.evidence) : null,
+            candidate.sections.evidence
+              ? h('details', { className: 'dcr-details', style: { marginTop: 8 } },
+                  h('summary', null, '验证证据'),
+                  h(RichText, { text: candidate.sections.evidence }),
+                )
+              : null,
           ),
           h('div', { className: 'dcr-card' },
             h('h3', null, '总体意见'),
@@ -833,7 +1071,7 @@ function createPlugin(requireModule: (id: string) => any) {
                         canAct ? h('select', { className: 'dcr-select', style: { padding: '0 3px', fontSize: 11 }, value: comment.status, onChange: (e: any) => { void setCommentStatus(comment.id, e.target.value); } },
                           h('option', { value: 'unresolved' }, '未处理'), h('option', { value: 'partial' }, '部分处理'), h('option', { value: 'resolved' }, '已处理')) : null,
                       ),
-                      h('div', { className: 'dcr-pre' }, comment.content),
+                      h(RichText, { text: comment.content }),
                     )),
                   );
                 }),
@@ -861,7 +1099,7 @@ function createPlugin(requireModule: (id: string) => any) {
                   canAct ? h('select', { className: 'dcr-select', style: { padding: '0 3px', fontSize: 11 }, value: comment.status, onChange: (e: any) => { void setCommentStatus(comment.id, e.target.value); } },
                     h('option', { value: 'unresolved' }, '未处理'), h('option', { value: 'partial' }, '部分处理'), h('option', { value: 'resolved' }, '已处理')) : null,
                 ),
-                h('div', { className: 'dcr-pre', style: { marginTop: 3 } }, comment.content),
+                h(RichText, { text: comment.content, className: 'dcr-small' }),
               ))),
             h('div', { className: 'dcr-sep' }),
             ...candidate.meta.revisions.map((revision) => h('div', { key: revision.id, className: 'dcr-hist' },
@@ -874,7 +1112,12 @@ function createPlugin(requireModule: (id: string) => any) {
               ),
               h('div', { className: 'dcr-small dcr-mono dcr-muted' }, revision.patch),
             )),
-            candidate.sections.history ? h('pre', { className: 'dcr-raw', style: { marginTop: 8 } }, candidate.sections.history) : null,
+            candidate.sections.history
+              ? h('details', { className: 'dcr-details', style: { marginTop: 8 } },
+                  h('summary', null, '版本审核记录'),
+                  h(RichText, { text: candidate.sections.history }),
+                )
+              : null,
           ),
           h('div', { style: { height: 8 } }),
         ),
@@ -884,25 +1127,33 @@ function createPlugin(requireModule: (id: string) => any) {
     const renderJob = (): any => {
       if (!job) return null;
       const result = job.result;
-      return h(Modal, {
-        title: job.type === 'approve' ? '批准与验证' : 'AI 修复',
-        onClose: () => { if (job.status !== 'running') setJob(null); },
-        footer: job.status === 'running' ? null : h('button', { className: 'dcr-btn p', onClick: () => setJob(null) }, '关闭'),
-      },
+      const running = job.status === 'running';
+      const failed = job.status === 'failed';
+      const lastLine = job.log.length > 0 ? job.log[job.log.length - 1] : '等待输出…';
+      return h('div', { className: `dcr-card dcr-job ${failed ? 'failed' : ''}` },
         h('div', { className: 'dcr-row' },
-          h('span', { className: `dcr-chip ${job.status === 'succeeded' ? 'approved' : job.status === 'failed' ? 'rejected' : 'pending'}` }, job.status === 'running' ? '执行中' : job.status === 'succeeded' ? '完成' : '失败'),
+          h('strong', null, job.type === 'approve' ? '批准与验证' : 'AI 修复'),
+          h('span', { className: `dcr-chip ${job.status === 'succeeded' ? 'approved' : failed ? 'rejected' : 'pending'}` }, running ? '执行中' : job.status === 'succeeded' ? '完成' : '失败'),
           h('span', { className: 'dcr-small dcr-muted' }, dateText(job.startedAt)),
+          h('span', { className: 'dcr-grow' }),
+          !running ? h('button', { className: 'dcr-btn g', onClick: () => setJob(null) }, '关闭') : null,
         ),
-        h('div', { className: 'dcr-log' }, job.log.length ? job.log.join('\n') : '等待输出…'),
-        job.error ? h('div', { className: 'dcr-banner err' }, job.error) : null,
-        result?.message ? h('div', { className: 'dcr-banner info' }, result.message) : null,
-        result?.prompt ? h('textarea', { className: 'dcr-textarea', style: { minHeight: 200 }, readOnly: true, value: result.prompt }) : null,
+        running ? h('div', { className: 'dcr-small dcr-muted dcr-mono', style: { marginTop: 6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, lastLine) : null,
+        job.error ? h('div', { className: 'dcr-banner err', style: { marginTop: 8 } }, job.error) : null,
+        result?.message ? h('div', { className: `dcr-banner ${result?.success === false ? 'err' : 'info'}`, style: { marginTop: 8 } }, result.message) : null,
+        result?.commitRevision ? h('div', { className: 'dcr-small dcr-mono dcr-muted', style: { marginTop: 6 } }, `commit ${short(result.commitRevision)}`) : null,
+        h('details', { className: 'dcr-joblog', open: running ? true : undefined },
+          h('summary', null, `${running ? '实时日志' : '运行日志'}（${String(job.log.length)} 行）`),
+          h('div', { className: 'dcr-log' }, job.log.length ? job.log.join('\n') : '等待输出…'),
+        ),
+        result?.prompt ? h('details', { className: 'dcr-joblog' },
+          h('summary', null, '修复提示词'),
+          h('textarea', { className: 'dcr-textarea', style: { minHeight: 180, marginTop: 6 }, readOnly: true, value: result.prompt }),
+        ) : null,
       );
     };
 
     let content: any;
-    const approveItems = detail?.candidate.humanJudgment ?? [];
-    const approveAckReady = approveItems.length === 0 || approveItems.every((_, index) => ack[index]);
     if (screen === 'loading') content = h('div', { className: 'dcr-empty' }, '加载评审…');
     else if (screen === 'setup' || screen === 'settings') content = renderSettings();
     else if (screen === 'queue') content = renderQueue();
@@ -919,38 +1170,11 @@ function createPlugin(requireModule: (id: string) => any) {
           ),
           h('div', { className: 'dcr-sub' }, `${health?.repoRoot || '会话没有工作目录'} · 审核者 ${health?.owner || settings?.owner || '未设置'}`),
         ),
-        screen === 'detail' ? h('button', { className: 'dcr-btn g', onClick: () => setScreen('queue') }, '← 列表') : null,
+        screen === 'detail' ? h('button', { className: 'dcr-btn g', onClick: () => setScreen('queue') }, '← 队列') : null,
         h('button', { className: 'dcr-btn', onClick: () => { void refreshHealth(); if (screen === 'queue') void loadQueue(); if (screen === 'detail' && selectedId) void loadDetail(selectedId); } }, '刷新'),
         h('button', { className: 'dcr-btn', onClick: () => { void (async () => { try { await loadSettings(); } finally { setScreen('settings'); } })(); } }, '设置'),
       ),
       content,
-      modal === 'approve' && detail ? h(Modal, {
-        title: '确认批准并提交',
-        onClose: () => setModal(''),
-        footer: [
-          h('button', { key: 'c', className: 'dcr-btn', onClick: () => setModal('') }, '取消'),
-          h('button', { key: 'o', className: 'dcr-btn p', disabled: busy || !approveAckReady, onClick: approve }, busy ? '执行中…' : '批准并提交'),
-        ],
-      },
-        h('div', { className: 'dcr-banner warn' }, '批准将在本机执行门禁命令，并把业务代码、review.md 状态与补丁清理放入同一个原子提交。'),
-        ...detail.candidate.meta.gateChecks.map((command, index) => h('div', { key: index, className: 'dcr-mono dcr-small dcr-raw' }, command)),
-        ...detail.candidate.humanJudgment.map((item, index) => h('label', { key: index, className: 'dcr-check' },
-          h('input', { type: 'checkbox', checked: Boolean(ack[index]), onChange: (e: any) => setAck({ ...ack, [index]: Boolean(e.target.checked) }) }),
-          h('span', null, `${item.label}：${item.text}`),
-        )),
-      ) : null,
-      modal === 'reject' ? h(Modal, {
-        title: '放弃候选',
-        onClose: () => setModal(''),
-        footer: [
-          h('button', { key: 'c', className: 'dcr-btn', onClick: () => setModal('') }, '取消'),
-          h('button', { key: 'o', className: 'dcr-btn d', disabled: busy || !rejectReason.trim(), onClick: () => { void reject(); } }, '确认放弃'),
-        ],
-      },
-        h('div', { className: 'dcr-banner warn' }, '放弃会删除所有过程补丁并提交 .ai-review 变更，仅保留 review.md 归档。'),
-        h('textarea', { className: 'dcr-textarea', placeholder: '放弃原因（必填）', value: rejectReason, onChange: (e: any) => setRejectReason(e.target.value) }),
-      ) : null,
-      renderJob(),
     );
   }
 

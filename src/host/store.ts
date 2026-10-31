@@ -95,6 +95,7 @@ export class ReviewStore {
     const text = await readFile(reviewPath, 'utf8');
     try {
       const parsed = parseReviewMarkdown(text);
+      const sections = parseSections(parsed.body);
       return {
         id: candidateId(month, slug),
         month,
@@ -102,8 +103,9 @@ export class ReviewStore {
         dirPath: dir,
         reviewPath,
         meta: parsed.meta,
-        sections: parseSections(parsed.body),
-        humanJudgment: extractHumanJudgment(parseSections(parsed.body).humanJudgment),
+        sections,
+        humanJudgment: extractHumanJudgment(sections.humanJudgment),
+        humanJudgmentDeclared: sections.humanJudgment.trim().length > 0,
       };
     } catch (error) {
       if (!(error instanceof ReviewFormatError)) throw error;
@@ -150,6 +152,7 @@ export class ReviewStore {
         rawBody: '',
       },
       humanJudgment: [],
+      humanJudgmentDeclared: false,
       parseError: message,
     };
   }
@@ -211,6 +214,7 @@ export class ReviewStore {
             patchStats: EMPTY_STATS,
             unresolvedComments: 0,
             humanJudgmentCount: 0,
+            humanJudgmentDeclared: false,
             isBaseBehind: false,
             baseRevision: '',
             lastFeedback: '',
@@ -244,7 +248,8 @@ export class ReviewStore {
       dirPath: candidate.dirPath,
       patchStats: stats,
       unresolvedComments: unresolved,
-      humanJudgmentCount: candidate.humanJudgment.filter((item) => item.text.trim().length > 0).length,
+      humanJudgmentCount: candidate.humanJudgment.length,
+      humanJudgmentDeclared: candidate.humanJudgmentDeclared,
       isBaseBehind: !archived && currentBase !== null && baseRevision !== '' && baseRevision !== currentBase,
       baseRevision,
       lastFeedback: findLastFeedback(candidate.meta),
@@ -297,6 +302,7 @@ export class ReviewStore {
     await rename(temp, candidate.reviewPath);
     candidate.sections = parseSections(candidate.sections.rawBody);
     candidate.humanJudgment = extractHumanJudgment(candidate.sections.humanJudgment);
+    candidate.humanJudgmentDeclared = candidate.sections.humanJudgment.trim().length > 0;
   }
 
   async ensureWriteAllowed(candidate: ReviewCandidate, guard: ConcurrencyGuard): Promise<void> {
@@ -429,7 +435,7 @@ export class ReviewStore {
     if (!current) errors.push('current_revision 不在 revisions 中');
     if (!archived && candidate.meta.gateChecks.length === 0) errors.push('gate_checks 为空：批准前必须定义合并门禁命令');
     if (!candidate.meta.owner) errors.push('owner 为空');
-    if (!archived && candidate.humanJudgment.every((item) => item.text.trim().length === 0)) {
+    if (!archived && !candidate.humanJudgmentDeclared) {
       errors.push('需人工判断项未填写');
     }
     return errors;
