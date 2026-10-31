@@ -23,7 +23,7 @@ comments: []
 approval:
   approved_by: cxs
   approved_at: '2026-10-31T15:31:21.082Z'
-  commit_revision: null
+  commit_revision: 5e1d4bbebb665f0a0b21c2526c5c1d000d55e18a
 module: store
 audit_type: shrink
 ---
