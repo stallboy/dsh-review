@@ -38,25 +38,34 @@ export interface HostContext {
   logger?: HostLogger;
 }
 
-interface RpcResultLike {
-  ok: boolean;
-  value?: unknown;
-  error?: { message?: string };
+/** The live `ctx.sessionController` contract this plugin uses (generated `ctx.remote.session` host side). */
+interface DshSessionController {
+  create(request: { workspaceId?: string; cwd?: string }): Promise<{ sessionId?: unknown }>;
+  rename?(request: { sessionId: string; title: string }): Promise<unknown>;
+  prompt(
+    request: {
+      requestId: string;
+      sessionId: string;
+      mode: 'queue' | 'steer';
+      content: Array<{ type: 'text'; text: string }>;
+    },
+    signal: AbortSignal,
+  ): Promise<{ accepted?: unknown }>;
 }
 
-interface ApiProxyLike {
-  sessions: {
-    create(request: { rpcId: string; payload: { workspaceId?: string; cwd?: string } }): Promise<RpcResultLike>;
-    rename?(request: { rpcId: string; payload: { sessionId: string; title: string } }): Promise<RpcResultLike>;
-    prompt(request: {
-      rpcId: string;
-      payload: { sessionId: string; mode: 'queue'; content: Array<{ type: 'text'; text: string }> };
-    }): Promise<RpcResultLike>;
-  };
+interface WorkspaceLike {
+  id: string;
+  path: string;
 }
 
 interface WorkspaceRegistryLike {
-  list(): Array<{ id: string; path: string }>;
+  resolveByPath?(path: string): Promise<WorkspaceLike | undefined>;
+  list?(): WorkspaceLike[];
+}
+
+export interface AuditSessionHost {
+  get(name: string): unknown;
+  logger?: HostLogger;
 }
 
 /** Hard dependency: without the web server this plugin cannot serve its panel API. */
@@ -72,6 +81,83 @@ function writeJson(res: ServerResponse, status: number, body: unknown): void {
 
 function errorBody(message: string): unknown {
   return { error: { code: 'internal', message } };
+}
+
+function samePath(left: string, right: string): boolean {
+  const normalize = (value: string): string => path.resolve(value).replaceAll('\\', '/').toLowerCase();
+  return normalize(left) === normalize(right);
+}
+
+function describeSessionError(error: unknown): string {
+  if (error instanceof Error) {
+    const code = (error as { code?: unknown }).code;
+    return typeof code === 'string' && code.length > 0 ? `${error.message}（${code}）` : error.message;
+  }
+  return String(error);
+}
+
+/**
+ * Create a real DSH conversation for the repository audit and submit the audit prompt.
+ *
+ * DSH exposes session creation only through the host `sessionController`
+ * (`ctx.remote.session` on the client). The former `apiProxy.sessions` transport
+ * does not exist in current DSH builds, so this helper drives the supported
+ * create → rename → prompt sequence directly and attaches the session to the
+ * workspace that owns `cwd`, which makes it show up in the sidebar.
+ */
+export async function createDshAuditSession(
+  host: AuditSessionHost,
+  input: { cwd: string; title: string; prompt: string },
+): Promise<{ sessionId: string }> {
+  const controller = host.get('sessionController') as DshSessionController | undefined;
+  if (!controller || typeof controller.create !== 'function' || typeof controller.prompt !== 'function') {
+    throw new Error('当前 DSH Host 未挂载 sessionController，无法创建审查会话（请确认 DSH 版本包含 API Session 控制服务）');
+  }
+  const registry = host.get('workspaceRegistry') as WorkspaceRegistryLike | undefined;
+  let workspace: WorkspaceLike | undefined;
+  try {
+    workspace = await registry?.resolveByPath?.(input.cwd);
+  } catch (error) {
+    host.logger?.warn(`dsh-code-review: 按路径解析工作区失败：${describeSessionError(error)}`);
+  }
+  if (!workspace) {
+    workspace = registry?.list?.().find((item) => samePath(item.path, input.cwd));
+  }
+  let created: { sessionId?: unknown };
+  try {
+    created = workspace
+      ? await controller.create({ workspaceId: workspace.id })
+      : await controller.create({ cwd: input.cwd });
+  } catch (error) {
+    throw new Error(`创建 DSH 审查会话失败：${describeSessionError(error)}`);
+  }
+  const sessionId = typeof created?.sessionId === 'string' ? created.sessionId : '';
+  if (!sessionId) throw new Error('创建 DSH 审查会话未返回 sessionId');
+  if (controller.rename) {
+    try {
+      await controller.rename({ sessionId, title: input.title });
+    } catch (error) {
+      host.logger?.warn(`dsh-code-review: 审查会话改名失败：${describeSessionError(error)}`);
+    }
+  }
+  try {
+    const prompted = await controller.prompt(
+      {
+        requestId: `dsh-code-review-${randomUUID()}`,
+        sessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text: input.prompt }],
+      },
+      AbortSignal.timeout(60_000),
+    );
+    if (prompted?.accepted !== true) throw new Error('DSH 未接受审查提示词');
+  } catch (error) {
+    throw new Error(`发送审查任务失败：${describeSessionError(error)}`);
+  }
+  host.logger?.info(
+    `dsh-code-review: 已创建审查会话 ${sessionId}（workspace=${workspace?.id ?? 'cwd'}，title=${input.title}）`,
+  );
+  return { sessionId };
 }
 
 export function apply(ctx: HostContext): void {
@@ -108,41 +194,7 @@ export function apply(ctx: HostContext): void {
         return saved;
       },
       resolveCredential,
-      createAuditSession: async ({ cwd, title, prompt }) => {
-        const apiProxy = ctx.get('apiProxy') as ApiProxyLike | undefined;
-        if (!apiProxy?.sessions) {
-          throw new Error('DSH apiProxy 服务不可用，无法创建审查会话');
-        }
-        const registry = ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined;
-        const normalized = path.resolve(cwd).replaceAll('\\', '/').toLowerCase();
-        const workspace = registry?.list?.().find((item) =>
-          path.resolve(item.path).replaceAll('\\', '/').toLowerCase() === normalized,
-        );
-        const rpcId = `dsh-code-review-${randomUUID()}`;
-        const created = await apiProxy.sessions.create({
-          rpcId,
-          payload: {
-            ...(workspace ? { workspaceId: workspace.id } : {}),
-            cwd,
-          },
-        });
-        if (!created.ok) throw new Error(created.error?.message ?? '创建 DSH 会话失败');
-        const value = created.value as { sessionId?: unknown } | null | undefined;
-        const sessionId = typeof value?.sessionId === 'string' ? value.sessionId : '';
-        if (!sessionId) throw new Error('创建 DSH 会话未返回 sessionId');
-        try {
-          await apiProxy.sessions.rename?.({ rpcId, payload: { sessionId, title } });
-        } catch (error) {
-          logger?.warn(`dsh-code-review: 审查会话改名失败：${error instanceof Error ? error.message : String(error)}`);
-        }
-        const prompted = await apiProxy.sessions.prompt({
-          rpcId,
-          payload: { sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }] },
-        });
-        if (!prompted.ok) throw new Error(prompted.error?.message ?? '发送审查任务失败');
-        logger?.info(`dsh-code-review: 已创建审查会话 ${sessionId}`);
-        return { sessionId };
-      },
+      createAuditSession: (input) => createDshAuditSession(ctx, input),
       resolveSessionCwd: (sessionId) => {
         const sessions = ctx.get('sessions') as {
           get?: (id: string) => { header?: { cwd?: string } } | undefined;

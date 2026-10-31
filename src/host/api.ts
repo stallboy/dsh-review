@@ -40,7 +40,7 @@ export interface ApiDeps {
   resolveCredential?: (reference: string) => Promise<string | undefined>;
   /** Resolve the working directory of the Session that owns the review tab. */
   resolveSessionCwd?: (sessionId: string) => string | undefined;
-  /** Create a real DSH session (via the host apiProxy) and send the audit prompt into it. */
+  /** Create a real DSH session (through the host `sessionController`) and send the audit prompt into it. */
   createAuditSession?: (input: { cwd: string; title: string; prompt: string }) => Promise<{ sessionId: string }>;
   /** Diagnostic: the live client-module graph entry for this package, if any. */
   clientEntry?: () => unknown;
@@ -582,7 +582,7 @@ export class ReviewApi {
       throw new ApiError(409, 'conflict', `仓库审查要求业务工作区干净。\n${clean.message}`);
     }
     if (!this.deps.createAuditSession) {
-      throw new ApiError(500, 'internal', '当前 Host 不支持创建 DSH 审查会话（apiProxy 未挂载）。');
+      throw new ApiError(500, 'internal', '当前 Host 不支持创建 DSH 审查会话（sessionController 未挂载）。');
     }
     const owner = await this.ownerFor(runtime.root);
     const now = new Date();

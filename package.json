@@ -36,7 +36,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.host.json && tsc -p tsconfig.client.json",
     "typecheck": "tsc -p tsconfig.host.json --noEmit && tsc -p tsconfig.client.json --noEmit",
-    "test": "npm run build && node --test \"tests/**/*.test.mjs\""
+    "test": "npm run build && node --test \"tests/**/*.test.mjs\"",
+    "verify:audit": "node scripts/verify-audit-session.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",
