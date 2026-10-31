@@ -583,14 +583,30 @@ function createPlugin(requireModule: (id: string) => any) {
       await loadQueue();
     };
 
-    const addComment = async (file: string, line: number, text: string): Promise<void> => {
+    const addComment = async (file: string, line: number, text: string, autoFix = false): Promise<void> => {
       if (!detail || !text.trim()) return;
       setBusy(true); setError('');
       try {
-        await api('/comments', { method: 'POST', body: { id: detail.candidate.id, ...guard(), file, line, content: text } });
+        const response = await api<{ job?: Job; autoFixError?: string }>('/comments', {
+          method: 'POST',
+          body: { id: detail.candidate.id, ...guard(), file, line, content: text, autoFix },
+        });
         await afterWrite();
-      } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-      finally { setBusy(false); }
+        if (response.autoFixError) {
+          setError(`意见已保存，但 AI 修复未能启动：${response.autoFixError}`);
+          setBusy(false);
+          return;
+        }
+        if (response.job) {
+          setJob(response.job);
+          setBusy(response.job.status === 'running');
+          return;
+        }
+        setBusy(false);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+        setBusy(false);
+      }
     };
 
     const setCommentStatus = async (commentId: string, status: Comment['status']): Promise<void> => {
@@ -959,7 +975,7 @@ function createPlugin(requireModule: (id: string) => any) {
               ),
               h('div', { className: 'dcr-row' },
                 !detail.canAct ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void takeover(); } }, '接管审核') : null,
-                canAct ? h('button', { className: 'dcr-btn', disabled: busy, onClick: aiFix }, '让 AI 修复') : null,
+                canAct ? h('button', { className: 'dcr-btn', disabled: busy, title: '读取所有未解决意见，生成下一版修复', onClick: aiFix }, '让 AI 修复') : null,
                 canAct ? h('button', { className: 'dcr-btn d', disabled: busy, onClick: () => setPanel(panel === 'reject' ? '' : 'reject') }, panel === 'reject' ? '收起放弃' : '放弃') : null,
                 canAct ? h('button', {
                   className: 'dcr-btn p',
@@ -1025,10 +1041,22 @@ function createPlugin(requireModule: (id: string) => any) {
           ),
           h('div', { className: 'dcr-card' },
             h('h3', null, '总体意见'),
+            h('div', { className: 'dcr-small dcr-muted', style: { marginBottom: 6 } },
+              '提交后默认立即让 AI 读取这条意见和所有未解决的行内意见，生成下一版；也可以只提交意见，稍后再点顶部「让 AI 修复」。'),
             h('textarea', { className: 'dcr-textarea', value: general, disabled: !canAct, placeholder: canAct ? '写给 AI/作者的整体意见…' : '仅 owner 可提交意见', onChange: (e: any) => setGeneral(e.target.value) }),
             h('div', { className: 'dcr-row', style: { marginTop: 8 } },
-              h('button', { className: 'dcr-btn', disabled: !canAct || busy || !general.trim(), onClick: () => { const value = general; setGeneral(''); void addComment('', 0, value); } }, '提交总体意见'),
-              h('span', { className: 'dcr-small dcr-muted' }, '提交后状态变为“待修改”，写入仓库 review.md。'),
+              h('button', {
+                className: 'dcr-btn p',
+                disabled: !canAct || busy || !general.trim(),
+                onClick: () => { const value = general; setGeneral(''); void addComment('', 0, value, true); },
+              }, busy ? '执行中…' : '提交意见并让 AI 修复'),
+              h('button', {
+                className: 'dcr-btn',
+                disabled: !canAct || busy || !general.trim(),
+                onClick: () => { const value = general; setGeneral(''); void addComment('', 0, value, false); },
+              }, '仅提交意见'),
+              h('span', { className: 'dcr-grow' }),
+              h('span', { className: 'dcr-small dcr-muted' }, '提交后状态变为“待修改”，并写入仓库 review.md。'),
             ),
           ),
           h('div', { className: 'dcr-diff' },

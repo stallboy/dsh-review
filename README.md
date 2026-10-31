@@ -20,12 +20,13 @@ DeepSeek Harness（DSH）桌面端的代码评审插件。它把产品仓库里�
   - 批准或 AI 修复的运行状态与日志在页顶**内联卡片**展示，运行中可以继续浏览页面；队列页也保留该卡片；
   - 完整补丁 + 版本增量差异（Git 用临时 worktree 真实重建；跨基线先 3-way，失败退 hunk 级并显著提示）；
   - 按行内联评论、总体意见、评论状态（未处理/部分处理/已处理）；
+  - **总体意见默认自动接 AI 修复**：「提交意见并让 AI 修复」会先保存意见（含所有未解决行内意见）再自动启动修复生成下一版；「仅提交意见」只记录不跑 AI；顶部「让 AI 修复」用于不新增意见时重跑；
   - 版本历史与审核记录（可折叠）。
 - 操作隔离：只有 `owner` 能操作；其他人只读，可「接管审核」。
 - 乐观锁：每次提交带 `expectedRevision + expectedOwner`，旧页面操作会被拒绝并要求刷新。
 - 批准：内联审批面板确认 → 检查工作区干净 → 同步基线 → 严格应用补丁 → 依次执行 `gate_checks` → 业务代码 + `review.md` 状态/证据 + 删除过程补丁放入同一个原子提交；成功后追加一个仅 `.ai-review` 的提交回填 `commit_revision`（CI 忽略这类提交）。
 - 失败回退：补丁冲突或门禁失败时还原工作区，按设置尝试 AI 修复；AI 生成下一版后候选回到 `pending`，旧批准失效。
-- AI 修复执行器三选一：
+- AI 修复：读取候选下所有未解决意见（总体 + 行内），把当前版本补丁应用到工作区后生成下一版 review.md/patch；成功后只提交 `.ai-review`，失败会自动还原业务工作区。执行器三选一：
   - `dsh`（默认）：spawn 本机 `dsh --profile headless --json -`，prompt 走 stdin，模型凭据通过 DSH `credentials` 服务解析 `DEEPSEEK_API_KEY`；
   - `manual`：只生成可复制的修复提示；
   - `external`：任意命令，prompt 从 stdin 传入。
@@ -125,8 +126,8 @@ Host 端在 `/dsh-code-review/api` 下注册：
 
 - `GET /health`、`GET/PUT /settings`
 - `GET /queue`、`GET /candidate?id=`、`GET /patch`、`GET /diff?id=&from=&to=`
-- `POST /comments`、`POST /comment-status`、`POST /takeover`、`POST /reject`
-- `POST /approve`（返回 jobId）、`POST /ai-fix`（返回 jobId）、`GET /jobs/:id`、`POST /sync`
+- `POST /comments`（保存意见；body 带 `autoFix: true` 时保存后自动启动 AI 修复并返回 `job`）、`POST /comment-status`、`POST /takeover`、`POST /reject`
+- `POST /approve`（返回 jobId）、`POST /ai-fix`（显式启动同一 AI 修复 job，返回 jobId）、`GET /jobs/:id`、`POST /sync`
 - `GET /audit/prompt?mode=session|headless&targetPath=&note=`（导出审查提示词；session 为独立会话模式，headless 为旧的无交互模式）
 - `POST /audit/session`（通过 Host `sessionController` 创建真实 DSH 审查会话并发送提示词，返回 sessionId；UI 使用）
 - `POST /audit`（可选 headless 审查，返回 jobId；插件负责复核与提交，UI 不使用）
@@ -155,7 +156,7 @@ Host 端在 `/dsh-code-review/api` 下注册：
 - Git 增量 diff：两个版本在同一基线上真实重建并 `git diff`（`same_base_direct`）。
 - 同基线/多版本候选完整走通：评论 → AI 修复（真实 `dsh headless`）→ 新版本 3 → 门禁 4/4 → 批准。
 - SVN：本地 `file://` 仓库，`svn patch`、门禁、原子提交 r2、回填提交 r3、补丁删除。
-- 仓库审查（自动化夹具）：临时 Git 仓库 + 假执行器/假 `dsh` 命令完整走通「审查 → 生成 A 类候选 → 解析 B/Deferred → 复核补丁 → 还原工作区 → 提交 `.ai-review`」；仅 B 类时只提交报告；无效候选会回传校验错误；失败且无候选时不产生提交。`/audit/session` 使用假的 `createAuditSession` 验证了 sessionId、标题、owner 会话与 session 提示词；Host 侧 `createDshAuditSession` 用假 `sessionController` 覆盖了工作区挂载、cwd 回退、改名失败、错误码、提示词受理，以及权限预设/审批策略继承（含 `custom` 回退）。`npm test` 34 项通过。
+- 仓库审查（自动化夹具）：临时 Git 仓库 + 假执行器/假 `dsh` 命令完整走通「审查 → 生成 A 类候选 → 解析 B/Deferred → 复核补丁 → 还原工作区 → 提交 `.ai-review`」；仅 B 类时只提交报告；无效候选会回传校验错误；失败且无候选时不产生提交。`/audit/session` 使用假的 `createAuditSession` 验证了 sessionId、标题、owner 会话与 session 提示词；Host 侧 `createDshAuditSession` 用假 `sessionController` 覆盖了工作区挂载、cwd 回退、改名失败、错误码、提示词受理，以及权限预设/审批策略继承（含 `custom` 回退）；`/comments` 的 `autoFix` 链用 manual 执行器验证「保存意见 → 返回 ai_fix job → job 成功且 prompt 含该意见」。`npm test` 40 项通过。
 - 仓库审查（真实 DSH 会话，`scripts/verify-audit-session.mjs` 实跑）：`POST /audit/session` 创建会话 → 写入 `workspace.json` 挂到 `dsh-review` 工作区（侧边栏可见，标题「仓库审查 · src/host」）→ 继承 `danger-full-access` + `never` → 审查代理完成 132 次工具调用 / 104 步、基线 `npm test` 29/29 通过 → 在 `src/host` 生成 4 个独立候选与 `.ai-review/audits/20261031-230629-src-host.md` → 只提交 `.ai-review`（`audit(src/host): 仓库审查生成 4 个候选 [skip ci]`，commit `2bfbb86`），业务工作区保持干净。
 - 审批 UI：批准 / AI 修复 / 放弃改为页内面板与页内运行日志，不再使用全屏 modal 遮罩；人工判断项过滤“无 / 暂无 / 无：…”占位；正文按 Markdown-lite 渲染并限宽。用真实 `dist/client.js` + React 18 + 真实 `/queue`、`/candidate` 数据在无头 Chrome 中渲染详情、勾选人工项、打开内联审批面板并点击“确认批准并提交”（approve 用假 job 响应），确认 `.dcr-modal-mask` 数量为 0、页内 job 卡片出现，控制台 0 error。
 - `npm run typecheck`（host + client 双 program）通过；`node --check dist/client.js` 通过。

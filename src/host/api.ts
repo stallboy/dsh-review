@@ -21,6 +21,7 @@ import type {
   AppSettings,
   ConcurrencyGuard,
   HealthInfo,
+  JobRecord,
   ReviewCandidate,
   ReviewFilter,
   ReviewStatus,
@@ -687,7 +688,26 @@ export class ReviewApi {
       ...(typeof body['revision'] === 'number' ? { revision: body['revision'] } : {}),
     }, guard);
     const commit = await this.commitReviewOnly(`review(${id}): 审核意见 (rev ${String(candidate.meta.currentRevision)})`, candidate, runtime);
-    sendJson(res, 200, { candidate, commit });
+    let job: JobRecord | undefined;
+    let autoFixError: string | undefined;
+    if (body['autoFix'] === true) {
+      try {
+        // Chain from the just-committed opinion: the fixer reads every unresolved
+        // comment from review.md, including this one.
+        job = await this.startAiFixJob(runtime, id, {
+          expectedRevision: candidate.meta.currentRevision,
+          expectedOwner: candidate.meta.owner,
+        });
+      } catch (error) {
+        autoFixError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    sendJson(res, 200, {
+      candidate,
+      commit,
+      ...(job ? { job } : {}),
+      ...(autoFixError ? { autoFixError } : {}),
+    });
   }
 
   private async commentStatus(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
@@ -770,11 +790,22 @@ export class ReviewApi {
   }
 
   private async aiFix(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
-    const { store, vcs } = await this.runtimeFor(url);
-    this.ensureNoAuditRunning();
+    const runtime = await this.runtimeFor(url);
     const body = await readJson(req);
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
+    const job = await this.startAiFixJob(runtime, id, guard);
+    sendJson(res, 202, { jobId: job.id, job });
+  }
+
+  /**
+   * Start one AI-fix job from the candidate's unresolved feedback. Shared by
+   * the explicit `/ai-fix` action and the auto-fix chain that follows an
+   * overall opinion, so both paths validate and run identically.
+   */
+  private async startAiFixJob(runtime: Runtime, id: string, guard: ConcurrencyGuard): Promise<JobRecord> {
+    this.ensureNoAuditRunning();
+    const { store, vcs } = runtime;
     const detail = await store.get(id, null);
     if (detail.candidate.meta.currentRevision !== guard.expectedRevision || detail.candidate.meta.owner !== guard.expectedOwner) {
       throw new ApiError(409, 'stale', '候选已被更新，请重新加载');
@@ -784,7 +815,7 @@ export class ReviewApi {
     }
     const clean = await vcs.ensureCleanWorkspace();
     if (!clean.clean) throw new ApiError(409, 'conflict', clean.message);
-    const job = this.jobs.start('ai_fix', async (log) => {
+    return this.jobs.start('ai_fix', async (log) => {
       const comments = detail.candidate.meta.comments.filter((comment) => comment.status !== 'resolved');
       const patch = await store.currentPatch(detail.candidate);
       let workingTree: 'clean_base' | 'current_patch_applied' = 'clean_base';
@@ -821,7 +852,6 @@ export class ReviewApi {
       if (!commit.success) throw new Error(`AI 已生成新版本，但提交 .ai-review 失败：${commit.errorOutput}`);
       return { manual: false, result, commitRevision: commit.commitRevision };
     });
-    sendJson(res, 202, { jobId: job.id, job });
   }
 
   private async sync(res: ServerResponse, url: URL): Promise<void> {

@@ -12,7 +12,7 @@ after(async () => {
   await Promise.all(servers.map((server) => server.close()));
 });
 
-async function startApi(root, extraDeps = {}) {
+async function startApi(root, extraDeps = {}, settingsPatch = {}) {
   let settings = {
     ...DEFAULT_SETTINGS,
     repoRoot: root,
@@ -21,6 +21,7 @@ async function startApi(root, extraDeps = {}) {
     runner: 'external',
     externalCommand: `"${process.execPath}" "${fakeAuditAgentPath()}"`,
     syncBeforeApprove: false,
+    ...settingsPatch,
   };
   const api = new ReviewApi({
     settings,
@@ -211,5 +212,50 @@ test('API queue filters items but keeps owner-wide status counts', async () => {
   const all = await getJson(`${server.base}/queue`);
   assert.equal(all.items.length, 2);
   assert.deepEqual(all.errors, []);
+});
+
+test('API chains an overall comment into an AI fix job', async () => {
+  const root = await createGitFixture();
+  const baseRevision = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  await writeQueueCandidate(root, 'pending-one', 'pending', baseRevision);
+  const server = await startApi(root, {}, { runner: 'manual' });
+  servers.push(server);
+
+  const response = await getJson(`${server.base}/comments`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      id: '2026-10/pending-one',
+      expectedRevision: 1,
+      expectedOwner: 'tester',
+      content: '请补充边界测试',
+      autoFix: true,
+    }),
+  });
+  assert.ok(response.job, response.autoFixError ?? '没有启动 AI 修复 job');
+  assert.equal(response.job.type, 'ai_fix');
+
+  const job = await waitForJob(server.base, response.job.id);
+  assert.equal(job.status, 'succeeded', job.error ?? '');
+  assert.equal(job.result.manual, true);
+  assert.match(job.result.prompt, /请补充边界测试/);
+
+  const detail = await getJson(`${server.base}/candidate?id=${encodeURIComponent('2026-10/pending-one')}`);
+  assert.equal(detail.candidate.meta.status, 'changes_requested');
+  assert.equal(detail.candidate.meta.comments.length, 1);
+
+  const plain = await getJson(`${server.base}/comments`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      id: '2026-10/pending-one',
+      expectedRevision: 1,
+      expectedOwner: 'tester',
+      content: '只记一条意见',
+      autoFix: false,
+    }),
+  });
+  assert.equal(plain.job, undefined);
+  assert.equal(plain.autoFixError, undefined);
 });
 
