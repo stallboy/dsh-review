@@ -233,7 +233,7 @@ function auditSnapshot(repo) {
         .flatMap((entry) => {
           const monthDir = path.join(candidateDir, entry.name);
           return readdirSync(monthDir, { withFileTypes: true })
-            .filter((child) => child.isDirectory())
+            .filter((child) => child.isDirectory() && existsSync(path.join(monthDir, child.name, 'review.md')))
             .map((child) => `${entry.name}/${child.name}`);
         })
         .sort()
@@ -256,8 +256,8 @@ function summarizeSession(events) {
   const assistantMessages = events.filter((event) => event.type === 'assistant/message').length;
   const toolCalls = events.filter((event) => event.type === 'tool/call').length;
   const hasAuditPrompt = userMessages.some((event) => promptText(event).includes(PROMPT_MARKER));
-  const preset = events.find((event) => event.type === 'permission/preset')?.data?.preset;
-  const approvalPolicy = events.find((event) => event.type === 'approval/policy')?.data?.policy;
+  const preset = events.filter((event) => event.type === 'permission/preset').at(-1)?.data?.preset;
+  const approvalPolicy = events.filter((event) => event.type === 'approval/policy').at(-1)?.data?.policy;
   return { userMessages: userMessages.length, turnStarts, assistantMessages, toolCalls, hasAuditPrompt, preset, approvalPolicy };
 }
 
@@ -331,23 +331,27 @@ async function main() {
   };
 
   if (options.waitAudit > 0) {
-    log(`· 等待审查产出（最多 ${options.waitAudit}s）…`);
+    log(`· 等待审查会话结束（最多 ${options.waitAudit}s）…`);
     const started = Date.now();
-    const produced = await waitFor(
-      '审查报告或候选出现',
+    const finished = await waitFor(
+      '审查会话结束（turn/end）',
       () => {
-        const after = auditSnapshot(options.repo);
-        const newReports = after.reports.filter((name) => !before.reports.includes(name));
-        const newCandidates = after.candidates.filter((name) => !before.candidates.includes(name));
-        return newReports.length > 0 || newCandidates.length > 0 ? { newReports, newCandidates } : undefined;
+        const end = decodeSessionEvents(findSessionLog(created.sessionId)).find((event) => event.type === 'turn/end');
+        return end ? { end } : undefined;
       },
       options.waitAudit * 1000,
-      2000,
+      3000,
     );
-    result.audit = { ...produced, waitedMs: Date.now() - started };
-    log(`· 新增报告 ${produced.newReports.length} 个，新增候选 ${produced.newCandidates.length} 个`);
-    if (produced.newReports.length > 0) log(`  report: ${produced.newReports.join(', ')}`);
-    if (produced.newCandidates.length > 0) log(`  candidate: ${produced.newCandidates.join(', ')}`);
+    const after = auditSnapshot(options.repo);
+    const newReports = after.reports.filter((name) => !before.reports.includes(name));
+    const newCandidates = after.candidates.filter((name) => !before.candidates.includes(name));
+    const reason = finished.end?.data?.reason ?? {};
+    result.audit = { reason, newReports, newCandidates, waitedMs: Date.now() - started };
+    log(`· 审查会话结束：${reason.kind ?? 'unknown'}`);
+    log(`· 新增报告 ${newReports.length} 个，新增候选 ${newCandidates.length} 个`);
+    if (newReports.length > 0) log(`  report: ${newReports.join(', ')}`);
+    if (newCandidates.length > 0) for (const name of newCandidates) log(`  candidate: ${name}`);
+    if (reason.kind !== 'completed') throw new Error(`审查会话未正常完成：${JSON.stringify(reason)}`);
   }
 
   if (options.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);

@@ -64,7 +64,7 @@ node scripts/verify-audit-session.mjs --commit --target src/host --wait-audit 30
 2. 校验 `/health` 已按当前 `sessionId` 把评审仓库解析为当前目录，且有基线提交；
 3. `POST /audit/session` 创建审查会话并提交审查提示词；
 4. 轮询 `$DSH_HOME/sessions/**` 确认会话日志出现，`$DSH_HOME/storages/workspace.json` 确认会话已挂到当前工作区（侧边栏可见），会话日志中出现审查提示词与 `turn/start`；
-5. 可选等待 `.ai-review/audits/` 新报告或 `.ai-review/YYYY-MM/` 新候选（`--wait-audit`）。
+5. 可选等待审查会话真正结束（会话日志 `turn/end`），并列出 `.ai-review/audits/` 新报告或 `.ai-review/YYYY-MM/` 下带 `review.md` 的新候选（`--wait-audit`）。
 
 host 代码更新后仍需在插件管理中禁用再启用一次 `dsh-code-review` 才会重新加载；只改 client 时刷新页面即可。
 
@@ -153,9 +153,10 @@ Host 端在 `/dsh-code-review/api` 下注册：
 - 同基线/多版本候选完整走通：评论 → AI 修复（真实 `dsh headless`）→ 新版本 3 → 门禁 4/4 → 批准。
 - SVN：本地 `file://` 仓库，`svn patch`、门禁、原子提交 r2、回填提交 r3、补丁删除。
 - 仓库审查（自动化夹具）：临时 Git 仓库 + 假执行器/假 `dsh` 命令完整走通「审查 → 生成 A 类候选 → 解析 B/Deferred → 复核补丁 → 还原工作区 → 提交 `.ai-review`」；仅 B 类时只提交报告；无效候选会回传校验错误；失败且无候选时不产生提交。`/audit/session` 使用假的 `createAuditSession` 验证了 sessionId、标题、owner 会话与 session 提示词；Host 侧 `createDshAuditSession` 用假 `sessionController` 覆盖了工作区挂载、cwd 回退、改名失败、错误码、提示词受理，以及权限预设/审批策略继承（含 `custom` 回退）。`npm test` 29 项通过。
+- 仓库审查（真实 DSH 会话，`scripts/verify-audit-session.mjs` 实跑）：`POST /audit/session` 创建会话 → 写入 `workspace.json` 挂到 `dsh-review` 工作区（侧边栏可见，标题「仓库审查 · src/host」）→ 继承 `danger-full-access` + `never` → 审查代理完成 127 次工具调用、基线 `npm test` 29/29 通过 → 在 `src/host` 生成 4 个独立候选与 `.ai-review/audits/20261031-230629-src-host.md` → 只提交 `.ai-review`（`audit(src/host): 仓库审查生成 4 个候选 [skip ci]`），业务工作区保持干净。
 - `npm run typecheck`（host + client 双 program）通过；`node --check dist/client.js` 通过。
 
-未自动验证：浏览器中的视觉/交互；`scripts/verify-audit-session.mjs` 用 API 调用等价触发了「审查仓库」点击链路，并直接校验 DSH 会话日志与 `workspace.json` 挂载，不依赖浏览器自动化。
+未自动验证：浏览器中的视觉/交互（本机没有可用浏览器自动化工具）；点击链路用 API 调用等价触发，并直接校验 DSH 会话日志、`workspace.json` 挂载与 `turn/end` 完成信号。
 
 ## 目录
 
