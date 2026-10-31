@@ -57,9 +57,9 @@ approval: null
 - **执行环境**：Windows 11 (NT 10.0.26300) · Node.js v24.1.0 · TypeScript 5.9.3 · git 2.28.0 · svn 1.14.1
 - **执行结果摘要**：
   - `npm run typecheck`：exit 0，3.7s。
-  - `npm test`：exit 0，19.0s，34/34 通过（基线 29 + `tests/vcs.test.mjs` 5），skip 0。在基线 `4020127` 的临时 worktree 应用 `002.patch` 后执行。
+  - `npm test`：exit 0，19.0s，34/34 通过（基线 29 + `tests/vcs.test.mjs` 5），skip 0。在基线 `4020127` 的临时 worktree 应用 `002.patch` 后执行；直接运行会因沙箱禁用命名管道在测试启动前报 `spawn EPERM`，故通过仅供本地的 stdio shim 运行（不在补丁内）。
   - `tests/vcs.test.mjs` 单跑：5/5 通过，4.4s，含 SVN 用例（svn 1.14.1 实跑）。
-  - `git apply --check 002.patch`：在基线 `4020127` exit 0；在当前 HEAD `5d29573` exit 0。
+  - `git apply --check 002.patch`：在基线 `4020127` exit 0；在当前 HEAD exit 0（HEAD 已含其他已批准改动）。
 - **未覆盖风险**：gpg 签名失败、SVN 属性/树冲突未构造；非 Windows 平台未实机运行；`npm test` 的沙箱 shim 与普通环境存在执行差异。
 
 # 审核记录
@@ -76,7 +76,7 @@ approval: null
 
 ## 版本 2 (base: 402012744bcdd89fba50bb60cbf6fed84785ad67)
 ### 相对上一版的变化
-- **基线变化**：`402012744bcdd89fba50bb60cbf6fed84785ad67` 保持不变；当前仓库 HEAD `5d29573` 只包含已批准的其他候选，`002.patch` 在其上同样 `git apply --check` 通过。
+- **基线变化**：`402012744bcdd89fba50bb60cbf6fed84785ad67` 保持不变；当前仓库 HEAD 已包含其他已批准改动，`002.patch` 在基线与当前 HEAD 上均 `git apply --check` 通过。
 - **代码与方案调整**：`git reset` 去掉 `:(exclude).ai-review`，改为重置整个索引；新增失败 `atomicCommit` 的恢复用例；加强 `.ai-review` 用例，断言暂存区为空且文件仍在。
 - **意见处理**：本轮 `comments` 为空，没有人类评论可逐条回应；据 v1「需人工判断项」中的 `.ai-review` 索引状态一项主动收敛。
 ### 方案说明
