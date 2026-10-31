@@ -40,6 +40,8 @@ export interface ApiDeps {
   resolveCredential?: (reference: string) => Promise<string | undefined>;
   /** Resolve the working directory of the Session that owns the review tab. */
   resolveSessionCwd?: (sessionId: string) => string | undefined;
+  /** Create a real DSH session (via the host apiProxy) and send the audit prompt into it. */
+  createAuditSession?: (input: { cwd: string; title: string; prompt: string }) => Promise<{ sessionId: string }>;
   /** Diagnostic: the live client-module graph entry for this package, if any. */
   clientEntry?: () => unknown;
 }
@@ -117,6 +119,22 @@ function idFrom(url: URL): string {
 
 function relative(root: string, absolute: string): string {
   return path.relative(root, absolute).replaceAll('\\', '/');
+}
+
+function composeSessionPrompt(systemPrompt: string, userPrompt: string): string {
+  return [
+    '# 仓库审查任务（独立 DSH 会话）',
+    '',
+    '下面是本次仓库审查的完整准则与任务上下文。请完整遵守，并在当前仓库中直接执行；不要只输出计划。',
+    '',
+    '---',
+    '',
+    systemPrompt,
+    '',
+    '---',
+    '',
+    userPrompt,
+  ].join('\n');
 }
 
 function filterFrom(url: URL, owner: string): ReviewFilter {
@@ -242,6 +260,7 @@ export class ReviewApi {
     if (method === 'GET' && route === '/diff') return this.diff(res, url);
     if (method === 'GET' && route === '/fix-prompt') return this.fixPrompt(res, url);
     if (method === 'GET' && route === '/audit/prompt') return this.auditPrompt(res, url);
+    if (method === 'POST' && route === '/audit/session') return this.auditSession(req, res, url);
     if (method === 'POST' && route === '/audit') return this.audit(req, res, url);
     if (method === 'POST' && route === '/comments') return this.addComment(req, res, url);
     if (method === 'POST' && route === '/comment-status') return this.commentStatus(req, res, url);
@@ -532,19 +551,7 @@ export class ReviewApi {
     });
     const systemPrompt = await loadAuditSystemPrompt();
     const prompt = mode === 'session'
-      ? [
-          '# 仓库审查任务（独立 DSH 会话）',
-          '',
-          '下面是本次仓库审查的完整准则与任务上下文。请完整遵守，并在当前仓库中直接执行；不要只输出计划。',
-          '',
-          '---',
-          '',
-          systemPrompt,
-          '',
-          '---',
-          '',
-          userPrompt,
-        ].join('\n')
+      ? composeSessionPrompt(systemPrompt, userPrompt)
       : wrapAgentPrompt(systemPrompt, userPrompt);
     sendJson(res, 200, {
       prompt,
@@ -553,6 +560,53 @@ export class ReviewApi {
       baseRevision,
       owner,
       reportPath,
+    });
+  }
+
+  private async auditSession(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    const runtime = await this.runtimeFor(url);
+    const body = await readJson(req);
+    const targetPath = stringField(body, 'targetPath');
+    const note = stringField(body, 'note');
+    const target = await resolveAuditTarget(runtime.root, targetPath);
+    const running = this.jobs.list().find((job) => job.status === 'running');
+    if (running) {
+      throw new ApiError(409, 'conflict', `已有任务在运行（${running.type}），请等待完成后再开始仓库审查。`);
+    }
+    const baseRevision = await runtime.vcs.getCurrentBase();
+    if (!baseRevision) {
+      throw new ApiError(412, 'not_configured', '当前仓库没有可用的基线提交（Git HEAD / SVN revision），无法开始仓库审查。');
+    }
+    const clean = await runtime.vcs.ensureCleanWorkspace();
+    if (!clean.clean) {
+      throw new ApiError(409, 'conflict', `仓库审查要求业务工作区干净。\n${clean.message}`);
+    }
+    if (!this.deps.createAuditSession) {
+      throw new ApiError(500, 'internal', '当前 Host 不支持创建 DSH 审查会话（apiProxy 未挂载）。');
+    }
+    const owner = await this.ownerFor(runtime.root);
+    const now = new Date();
+    const reportPath = auditReportPath(target.targetPath, now);
+    const userPrompt = await buildAuditPrompt({
+      repoRoot: runtime.root,
+      vcsType: runtime.vcsType,
+      owner,
+      targetPath: target.targetPath,
+      note,
+      baseRevision,
+      reportPath,
+      mode: 'session',
+      now,
+    });
+    const prompt = composeSessionPrompt(await loadAuditSystemPrompt(), userPrompt);
+    const title = `仓库审查 · ${target.targetPath || '全仓库'}`.slice(0, 60);
+    const created = await this.deps.createAuditSession({ cwd: runtime.root, title, prompt });
+    sendJson(res, 202, {
+      sessionId: created.sessionId,
+      targetPath: target.targetPath,
+      reportPath,
+      baseRevision,
+      owner,
     });
   }
 

@@ -94,28 +94,6 @@ interface Job {
 }
 interface DiffLine { kind: 'context' | 'add' | 'del' | 'meta'; oldNo: number | null; newNo: number | null; text: string }
 interface DiffFile { path: string; lines: DiffLine[]; binary: boolean }
-interface SessionPromptResult {
-  ok: boolean;
-  value?: { accepted: true };
-  error?: { message?: string; code?: string };
-}
-interface SessionFaceLike {
-  prompt(content: Array<{ type: 'text'; text: string }>, mode: 'queue' | 'steer'): Promise<SessionPromptResult>;
-  rename(title: string): Promise<unknown>;
-}
-interface SessionsSnapshot { ids: string[]; current?: string }
-interface SessionsService {
-  list: { getSnapshot(): SessionsSnapshot };
-  binding(id: string): { session: SessionFaceLike } | undefined;
-  open(id: string): void;
-}
-interface WorkspaceItem { workspaceId: string; path: string; sessionIds: string[] }
-interface WorkspacesSnapshot { items: WorkspaceItem[]; recentWorkspaceId?: string }
-interface WorkspacesService {
-  startSession(workspaceId?: string): void;
-  connectWorkspace?(workspaceId: string): Promise<string>;
-  list: { getSnapshot(): WorkspacesSnapshot };
-}
 
 const EMPTY_STATS: Stats = { files: 0, additions: 0, deletions: 0, entries: [] };
 let activeSessionId = '';
@@ -298,12 +276,7 @@ function createPlugin(requireModule: (id: string) => any) {
       ));
   }
 
-  function App(props: {
-    t: (key: string) => string;
-    sessionId: string;
-    sessions?: SessionsService;
-    workspaces?: WorkspacesService;
-  }) {
+  function App(props: { t: (key: string) => string; sessionId: string }) {
     activeSessionId = props.sessionId || '';
     const [health, setHealth] = useState<Health | null>(null);
     const [settingsResponse, setSettingsResponse] = useState<SettingsResponse | null>(null);
@@ -580,74 +553,15 @@ function createPlugin(requireModule: (id: string) => any) {
       }
     };
 
-    const waitForNewSession = async (prompt: string): Promise<string> => {
-      const sessions = props.sessions;
-      const workspaces = props.workspaces;
-      if (!sessions) throw new Error('当前页面没有会话服务，无法创建新会话');
-      if (!workspaces) throw new Error('当前页面没有工作区服务，无法创建新会话');
-      const workspaceSnapshot = workspaces.list.getSnapshot();
-      const current = sessions.list.getSnapshot().current;
-      const repoRoot = (queue?.repoRoot ?? health?.repoRoot ?? '').replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase();
-      const currentWorkspace = workspaceSnapshot.items.find((item) => current !== undefined && item.sessionIds.includes(current));
-      const repoWorkspace = repoRoot
-        ? workspaceSnapshot.items.find((item) => item.path.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase() === repoRoot)
-        : undefined;
-      const recentWorkspace = workspaceSnapshot.items.find((item) => item.workspaceId === workspaceSnapshot.recentWorkspaceId);
-      const target = repoWorkspace ?? currentWorkspace ?? recentWorkspace;
-      if (!target) {
-        throw new Error('当前会话不属于任何工作区，无法确定新会话的仓库目录；请先打开一个仓库会话。');
-      }
-
-      let sessionId: string;
-      if (typeof workspaces.connectWorkspace === 'function') {
-        sessionId = await workspaces.connectWorkspace(target.workspaceId);
-      } else {
-        const previous = sessions.list.getSnapshot().current;
-        workspaces.startSession(target.workspaceId);
-        const deadline = Date.now() + 20_000;
-        let found: string | undefined;
-        while (Date.now() < deadline && found === undefined) {
-          const snapshot = sessions.list.getSnapshot();
-          if (snapshot.current && snapshot.current !== previous) found = snapshot.current;
-          else await new Promise((resolve) => setTimeout(resolve, 120));
-        }
-        if (!found) throw new Error('创建审查会话超时，请手动在侧边栏新建会话后重试');
-        sessionId = found;
-      }
-
-      sessions.open(sessionId);
-      let binding = sessions.binding(sessionId);
-      for (let attempt = 0; attempt < 60 && !binding; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        binding = sessions.binding(sessionId);
-      }
-      if (!binding) throw new Error('新会话已创建，但会话绑定未就绪');
-      try {
-        await binding.session.rename(`仓库审查 · ${auditTarget.trim() || '全仓库'}`.slice(0, 60));
-      } catch {
-        // A title is cosmetic; keep going even if the host refuses it.
-      }
-      let result: SessionPromptResult | null = null;
-      let lastError: unknown = null;
-      for (let sendAttempt = 0; sendAttempt < 3; sendAttempt += 1) {
-        try {
-          result = await binding.session.prompt([{ type: 'text', text: prompt }], 'queue');
-          if (result.ok) return sessionId;
-        } catch (error) {
-          lastError = error;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 300));
-      }
-      throw new Error(result?.error?.message ?? (lastError instanceof Error ? lastError.message : '审查任务发送失败'));
-    };
-
     const launchAuditSession = async (): Promise<void> => {
       setAuditLaunching(true);
       setError('');
       try {
-        const prompt = await fetchAuditPrompt();
-        const sessionId = await waitForNewSession(prompt);
-        setAuditSessionId(sessionId);
+        const value = await api<{ sessionId: string }>('/audit/session', {
+          method: 'POST',
+          body: { targetPath: auditTarget, note: auditNote },
+        });
+        setAuditSessionId(value.sessionId);
         setAuditOpen(false);
         setAuditPrompt('');
         setAuditCopied(false);
@@ -769,9 +683,7 @@ function createPlugin(requireModule: (id: string) => any) {
             h('span', { className: 'dcr-grow' }),
             h('span', { className: 'dcr-small dcr-muted' }, `基线 ${short(queue?.currentBase ?? health?.currentBase)} · 使用当前 DSH 会话模型`),
           ),
-          auditSessionId ? h('div', { className: 'dcr-banner info', style: { marginTop: 10 } }, '审查会话已启动；如果当前不在该会话，可在侧边栏打开。',
-            h('button', { className: 'dcr-btn', style: { marginLeft: 8 }, onClick: () => { props.sessions?.open(auditSessionId); } }, '打开审查会话'),
-          ) : null,
+          auditSessionId ? h('div', { className: 'dcr-banner info', style: { marginTop: 10 } }, `审查会话已创建（${short(auditSessionId)}）。请在侧边栏打开「仓库审查 · ${auditTarget.trim() || '全仓库'}」查看实时过程；当前页面不会被遮挡。`) : null,
           auditPrompt ? h('div', { className: 'dcr-field', style: { marginTop: 10 } },
             h('div', { className: 'dcr-row' },
               h('label', { className: 'dcr-grow' }, '审查提示词（可复制到任意外部 Agent）'),
@@ -1043,7 +955,7 @@ function createPlugin(requireModule: (id: string) => any) {
   }
 
   return {
-    inject: ['slots', 'locale', 'sessions', 'workspaces'],
+    inject: ['slots', 'locale'],
     apply(ctx: ClientCtx) {
       ctx.effect(() => ctx.locale.register(NS, {
         zh: { nav: '评审' },
@@ -1058,16 +970,12 @@ function createPlugin(requireModule: (id: string) => any) {
         return () => style.remove();
       }, 'dsh-code-review: styles');
       const t = ctx.locale.bind(NS);
-      const sessionsService = ctx.get('sessions') as SessionsService | undefined;
-      const workspacesService = ctx.get('workspaces') as WorkspacesService | undefined;
       ctx.slots.inject('conversation.view', () => {
         const off = ctx.slots.register(
           { name: 'conversation.view', id: 'code-review', order: 40, label: () => t('nav'), locale: NS, inject: () => ({ t }) },
           (props: any) => h(App, {
             t,
             sessionId: typeof props?.sessionId === 'string' ? props.sessionId : '',
-            sessions: sessionsService,
-            workspaces: workspacesService,
           }),
         );
         return typeof off === 'function' ? off : undefined;

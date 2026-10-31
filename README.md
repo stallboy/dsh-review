@@ -9,7 +9,7 @@ DeepSeek Harness（DSH）桌面端的代码评审插件。它把产品仓库里�
 ## 功能
 
 - 与「对话」同级的「评审」标签页（`conversation.view`），自动使用当前会话的工作目录作为评审仓库，无需单独配置项目目录。
-- **仓库审查（Audit Repo）**：在审核队列点击「审查仓库」会在 DSH 中**新建一个审查会话**（侧边栏可见），审查过程以对话流式展示，不弹窗、不遮挡其他工作；AI 生成 A 类候选与 B 类/Deferred 审查报告，候选自动进入评审队列。
+- **仓库审查（Audit Repo）**：在审核队列点击「审查仓库」会通过 Host 的 `apiProxy` 在 DSH 中**新建一个审查会话**（侧边栏可见），审查过程以对话流式展示，不弹窗、不遮挡其他工作；AI 生成 A 类候选与 B 类/Deferred 审查报告，候选自动进入评审队列。
 - 审核队列：按 owner/状态/tag/目录/标题筛选，显示变更规模、基线落后、需人工判断项数量、最近意见。
 - 审核详情：
   - 问题与影响、根因、当前修复方案；
@@ -34,7 +34,7 @@ DeepSeek Harness（DSH）桌面端的代码评审插件。它把产品仓库里�
 
 1. **审查范围**：留空审查全仓库，或填 `src/`、`packages/core/` 等仓库内相对路径；
 2. **补充关注点**（可选）：例如“重点关注并发关闭竞态与资源泄漏”；
-3. **启动审查会话**：在 DSH 中新建一个会话（侧边栏可见，标题为「仓库审查 · <范围>」），把完整审查准则作为第一条消息发送，并自动切到该会话。你可以立刻切到其他会话继续工作，审查过程在自己的会话里流式展示，不会遮挡当前页面；原会话仍保留在侧边栏；
+3. **启动审查会话**：Host 通过 DSH `apiProxy` 新建一个会话（侧边栏可见，标题为「仓库审查 · <范围>」），把完整审查准则作为第一条消息发送。当前页面**不会自动切换或遮挡**；你可以继续工作，需要查看过程时从侧边栏打开该会话。审查会话自己会流式展示工具调用与输出；
 4. **导出提示词**：不启动会话，把完整审查提示词复制到任意外部 Agent 执行。
 
 AI 按 A/B 类自动分流：
@@ -106,6 +106,7 @@ Host 端在 `/dsh-code-review/api` 下注册：
 - `POST /comments`、`POST /comment-status`、`POST /takeover`、`POST /reject`
 - `POST /approve`（返回 jobId）、`POST /ai-fix`（返回 jobId）、`GET /jobs/:id`、`POST /sync`
 - `GET /audit/prompt?mode=session|headless&targetPath=&note=`（导出审查提示词；session 为独立会话模式，headless 为旧的无交互模式）
+- `POST /audit/session`（通过 Host `apiProxy` 创建真实 DSH 审查会话并发送提示词，返回 sessionId；UI 使用）
 - `POST /audit`（可选 headless 审查，返回 jobId；插件负责复核与提交，UI 不使用）
 - `GET /fix-prompt?id=`、`GET /reviewers`、`GET /client-entry`
 
@@ -115,7 +116,7 @@ Host 端在 `/dsh-code-review/api` 下注册：
 2. **`commit_revision` 回填需要第二个提交**：提交哈希无法写入自身；第二个提交只改 `.ai-review`，CI 规则已忽略这类提交。
 3. **SVN 增量 diff 为 hunk 级**：SVN 无三方合并能力，跨版本增量直接退化为 hunk 对比并显示警告。
 4. **仓库审查只处理仓库自闭环**：A 类自动生成候选，B 类只写报告；Jira 等外部 Ticket 自动抓取尚未接入（远期方向）。
-5. **审查的运行前提**：业务工作区必须干净且仓库已有基线提交。UI 会新建一个 DSH 审查会话（侧边栏可见），AI 在会话中直接修改工作区；会话模式下由 AI 按提示词只提交 `.ai-review`，不做 headless 插件复核。批准候选时插件会重新验证补丁并执行门禁。
+5. **审查的运行前提**：业务工作区必须干净且仓库已有基线提交。UI 通过 Host `apiProxy` 新建一个 DSH 审查会话（侧边栏可见，不自动切换当前页面），AI 在会话中直接修改工作区；会话模式下由 AI 按提示词只提交 `.ai-review`，不做 headless 插件复核。批准候选时插件会重新验证补丁并执行门禁。
 6. **审查报告位于 `.ai-review/audits/`**：headless 模式由插件解析报告中的 B 类/Deferred 并生成回退报告；会话模式由 AI 写入报告并在最终回复中给出摘要。
 7. **无批量批准、无真实鉴权**：owner 是本地约定，适合小团队试点；真正的权限需要仓库/服务端能力。
 8. **UI 使用中文文案**（locale 命名空间已注册，便于后续补英文/日文）。
@@ -132,10 +133,10 @@ Host 端在 `/dsh-code-review/api` 下注册：
 - Git 增量 diff：两个版本在同一基线上真实重建并 `git diff`（`same_base_direct`）。
 - 同基线/多版本候选完整走通：评论 → AI 修复（真实 `dsh headless`）→ 新版本 3 → 门禁 4/4 → 批准。
 - SVN：本地 `file://` 仓库，`svn patch`、门禁、原子提交 r2、回填提交 r3、补丁删除。
-- 仓库审查（自动化夹具）：临时 Git 仓库 + 假执行器/假 `dsh` 命令完整走通「审查 → 生成 A 类候选 → 解析 B/Deferred → 复核补丁 → 还原工作区 → 提交 `.ai-review`」；仅 B 类时只提交报告；无效候选会回传校验错误；失败且无候选时不产生提交。session/headless 两种提示词模式均有测试。`npm test` 18 项通过。
+- 仓库审查（自动化夹具）：临时 Git 仓库 + 假执行器/假 `dsh` 命令完整走通「审查 → 生成 A 类候选 → 解析 B/Deferred → 复核补丁 → 还原工作区 → 提交 `.ai-review`」；仅 B 类时只提交报告；无效候选会回传校验错误；失败且无候选时不产生提交。`/audit/session` 使用假的 `createAuditSession` 验证了 sessionId、标题与 session 提示词。`npm test` 19 项通过。
 - `npm run typecheck`（host + client 双 program）通过；`node --check dist/client.js` 通过。
 
-未自动验证：浏览器中的视觉/交互，以及“从评审页新建 DSH 会话并自动发送审查提示词”的真实点击链路（当前会话无法绕过 DSH 页面的连接鉴权，也没有可用的浏览器自动化工具）；这部分只做了 TypeScript 检查和 DSH 客户端服务契约对照。请刷新 DSH 页面后实际点击验证；host 代码更新后需在插件管理中先禁用再启用插件。
+未自动验证：浏览器中的视觉/交互，以及真实 `apiProxy` 创建 DSH 会话并出现在侧边栏的点击链路（当前会话无法绕过 DSH 页面的连接鉴权，也没有可用的浏览器自动化工具）；`/audit/session` 已用 stub 覆盖，真实 Host 回调需要你重载插件后点一次验证。请刷新 DSH 页面后实际点击；host 代码更新后需在插件管理中先禁用再启用插件。
 
 ## 目录
 
