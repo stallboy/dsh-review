@@ -22,7 +22,7 @@ comments: []
 approval:
   approved_by: cxs
   approved_at: '2026-10-31T15:35:43.746Z'
-  commit_revision: null
+  commit_revision: e95100d6b100f685c483cc9271aadd5074f62e2a
 module: store
 audit_type: delete
 ---
