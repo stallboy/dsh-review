@@ -63,6 +63,34 @@ interface WorkspaceRegistryLike {
   list?(): WorkspaceLike[];
 }
 
+interface SessionLike {
+  readonly header?: { cwd?: string };
+}
+
+interface SessionsLike {
+  get?(id: string): SessionLike | undefined;
+}
+
+interface AgentLike {
+  readonly id: string;
+}
+
+interface AgentsLike {
+  get?(id: string): AgentLike | undefined;
+}
+
+type ApprovalPolicy = 'ask' | 'never';
+
+interface PermissionPresetsLike {
+  current(session: SessionLike): string;
+  set(session: SessionLike, name: string): void;
+}
+
+interface ApprovalLike {
+  setPolicy(agent: AgentLike, policy: ApprovalPolicy): void;
+  overrideOf(session: SessionLike): ApprovalPolicy | undefined;
+}
+
 export interface AuditSessionHost {
   get(name: string): unknown;
   logger?: HostLogger;
@@ -97,6 +125,57 @@ function describeSessionError(error: unknown): string {
 }
 
 /**
+ * Give the audit conversation the same permission preset / approval policy as
+ * the session that opened the review tab. Without this the new session starts
+ * at the deployment default (`workspace-write` + `ask`), so an audit that runs
+ * `gate_checks` through a piped subprocess stalls on an approval prompt nobody
+ * is watching. Inheritance keeps the audit inside the trust level the user
+ * already chose for this repository.
+ */
+function inheritOwnerPolicy(
+  host: AuditSessionHost,
+  ownerSessionId: string,
+  auditSessionId: string,
+): { preset?: string; approval?: ApprovalPolicy } {
+  if (!ownerSessionId || ownerSessionId === auditSessionId) return {};
+  const sessions = host.get('sessions') as SessionsLike | undefined;
+  const owner = sessions?.get?.(ownerSessionId);
+  const audit = sessions?.get?.(auditSessionId);
+  if (!owner || !audit) return {};
+  const inherited: { preset?: string; approval?: ApprovalPolicy } = {};
+
+  const presets = host.get('permissionPresets') as PermissionPresetsLike | undefined;
+  if (presets?.current && presets.set) {
+    try {
+      const name = presets.current(owner);
+      if (name && name !== 'custom') {
+        presets.set(audit, name);
+        inherited.preset = name;
+      }
+    } catch (error) {
+      host.logger?.warn(`dsh-code-review: 继承权限预设失败：${describeSessionError(error)}`);
+    }
+  }
+
+  const approval = host.get('approval') as ApprovalLike | undefined;
+  const policy = approval?.overrideOf?.(owner);
+  if (!inherited.preset && policy && approval?.setPolicy) {
+    const agent = (host.get('agents') as AgentsLike | undefined)?.get?.(auditSessionId);
+    if (agent) {
+      try {
+        approval.setPolicy(agent, policy);
+        inherited.approval = policy;
+      } catch (error) {
+        host.logger?.warn(`dsh-code-review: 继承审批策略失败：${describeSessionError(error)}`);
+      }
+    }
+  } else if (policy) {
+    inherited.approval = policy;
+  }
+  return inherited;
+}
+
+/**
  * Create a real DSH conversation for the repository audit and submit the audit prompt.
  *
  * DSH exposes session creation only through the host `sessionController`
@@ -107,7 +186,7 @@ function describeSessionError(error: unknown): string {
  */
 export async function createDshAuditSession(
   host: AuditSessionHost,
-  input: { cwd: string; title: string; prompt: string },
+  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string },
 ): Promise<{ sessionId: string }> {
   const controller = host.get('sessionController') as DshSessionController | undefined;
   if (!controller || typeof controller.create !== 'function' || typeof controller.prompt !== 'function') {
@@ -140,6 +219,7 @@ export async function createDshAuditSession(
       host.logger?.warn(`dsh-code-review: 审查会话改名失败：${describeSessionError(error)}`);
     }
   }
+  const inherited = inheritOwnerPolicy(host, input.ownerSessionId ?? '', sessionId);
   try {
     const prompted = await controller.prompt(
       {
@@ -155,7 +235,8 @@ export async function createDshAuditSession(
     throw new Error(`发送审查任务失败：${describeSessionError(error)}`);
   }
   host.logger?.info(
-    `dsh-code-review: 已创建审查会话 ${sessionId}（workspace=${workspace?.id ?? 'cwd'}，title=${input.title}）`,
+    `dsh-code-review: 已创建审查会话 ${sessionId}（workspace=${workspace?.id ?? 'cwd'}，title=${input.title}，` +
+      `preset=${inherited.preset ?? 'default'}，approval=${inherited.approval ?? 'default'}）`,
   );
   return { sessionId };
 }

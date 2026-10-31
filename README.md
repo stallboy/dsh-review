@@ -34,7 +34,7 @@ DeepSeek Harness（DSH）桌面端的代码评审插件。它把产品仓库里�
 
 1. **审查范围**：留空审查全仓库，或填 `src/`、`packages/core/` 等仓库内相对路径；
 2. **补充关注点**（可选）：例如“重点关注并发关闭竞态与资源泄漏”；
-3. **启动审查会话**：Host 通过 `ctx.sessionController` 新建一个会话并挂到当前仓库所属工作区（侧边栏可见，标题为「仓库审查 · <范围>」），把完整审查准则作为第一条消息发送。当前页面**不会自动切换或遮挡**；你可以继续工作，需要查看过程时从侧边栏打开该会话。审查会话自己会流式展示工具调用与输出；
+3. **启动审查会话**：Host 通过 `ctx.sessionController` 新建一个会话并挂到当前仓库所属工作区（侧边栏可见，标题为「仓库审查 · <范围>」），把完整审查准则作为第一条消息发送。新会话会**继承评审页所在会话的权限预设/审批策略**（例如 `danger-full-access` + `never`），因此审查里的 `gate_checks` 不会卡在无人应答的批准弹窗上。当前页面**不会自动切换或遮挡**；你可以继续工作，需要查看过程时从侧边栏打开该会话。审查会话自己会流式展示工具调用与输出；
 4. **导出提示词**：不启动会话，把完整审查提示词复制到任意外部 Agent 执行。
 
 AI 按 A/B 类自动分流：
@@ -152,7 +152,7 @@ Host 端在 `/dsh-code-review/api` 下注册：
 - Git 增量 diff：两个版本在同一基线上真实重建并 `git diff`（`same_base_direct`）。
 - 同基线/多版本候选完整走通：评论 → AI 修复（真实 `dsh headless`）→ 新版本 3 → 门禁 4/4 → 批准。
 - SVN：本地 `file://` 仓库，`svn patch`、门禁、原子提交 r2、回填提交 r3、补丁删除。
-- 仓库审查（自动化夹具）：临时 Git 仓库 + 假执行器/假 `dsh` 命令完整走通「审查 → 生成 A 类候选 → 解析 B/Deferred → 复核补丁 → 还原工作区 → 提交 `.ai-review`」；仅 B 类时只提交报告；无效候选会回传校验错误；失败且无候选时不产生提交。`/audit/session` 使用假的 `createAuditSession` 验证了 sessionId、标题与 session 提示词；Host 侧 `createDshAuditSession` 用假 `sessionController` 覆盖了工作区挂载、cwd 回退、改名失败、错误码与提示词受理。`npm test` 26 项通过。
+- 仓库审查（自动化夹具）：临时 Git 仓库 + 假执行器/假 `dsh` 命令完整走通「审查 → 生成 A 类候选 → 解析 B/Deferred → 复核补丁 → 还原工作区 → 提交 `.ai-review`」；仅 B 类时只提交报告；无效候选会回传校验错误；失败且无候选时不产生提交。`/audit/session` 使用假的 `createAuditSession` 验证了 sessionId、标题、owner 会话与 session 提示词；Host 侧 `createDshAuditSession` 用假 `sessionController` 覆盖了工作区挂载、cwd 回退、改名失败、错误码、提示词受理，以及权限预设/审批策略继承（含 `custom` 回退）。`npm test` 29 项通过。
 - `npm run typecheck`（host + client 双 program）通过；`node --check dist/client.js` 通过。
 
 未自动验证：浏览器中的视觉/交互；`scripts/verify-audit-session.mjs` 用 API 调用等价触发了「审查仓库」点击链路，并直接校验 DSH 会话日志与 `workspace.json` 挂载，不依赖浏览器自动化。

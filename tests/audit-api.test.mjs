@@ -120,7 +120,7 @@ test('API creates a DSH audit session with the session prompt', async () => {
   });
   servers.push(server);
 
-  const response = await getJson(`${server.base}/audit/session`, {
+  const response = await getJson(`${server.base}/audit/session?sessionId=session-owner`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ targetPath: 'src', note: '重点看边界条件' }),
@@ -129,6 +129,7 @@ test('API creates a DSH audit session with the session prompt', async () => {
   assert.equal(response.sessionId, 'session-test');
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cwd, root);
+  assert.equal(calls[0].ownerSessionId, 'session-owner');
   assert.match(calls[0].title, /仓库审查/);
   assert.match(calls[0].title, /src/);
   assert.match(calls[0].prompt, /独立 DSH 会话/);

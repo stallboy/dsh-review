@@ -41,7 +41,13 @@ export interface ApiDeps {
   /** Resolve the working directory of the Session that owns the review tab. */
   resolveSessionCwd?: (sessionId: string) => string | undefined;
   /** Create a real DSH session (through the host `sessionController`) and send the audit prompt into it. */
-  createAuditSession?: (input: { cwd: string; title: string; prompt: string }) => Promise<{ sessionId: string }>;
+  createAuditSession?: (input: {
+    cwd: string;
+    title: string;
+    prompt: string;
+    /** Session that owns the review tab; its permission/approval policy is inherited. */
+    ownerSessionId?: string;
+  }) => Promise<{ sessionId: string }>;
   /** Diagnostic: the live client-module graph entry for this package, if any. */
   clientEntry?: () => unknown;
 }
@@ -565,6 +571,7 @@ export class ReviewApi {
 
   private async auditSession(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const runtime = await this.runtimeFor(url);
+    const ownerSessionId = url.searchParams.get('sessionId') ?? '';
     const body = await readJson(req);
     const targetPath = stringField(body, 'targetPath');
     const note = stringField(body, 'note');
@@ -600,7 +607,7 @@ export class ReviewApi {
     });
     const prompt = composeSessionPrompt(await loadAuditSystemPrompt(), userPrompt);
     const title = `仓库审查 · ${target.targetPath || '全仓库'}`.slice(0, 60);
-    const created = await this.deps.createAuditSession({ cwd: runtime.root, title, prompt });
+    const created = await this.deps.createAuditSession({ cwd: runtime.root, title, prompt, ownerSessionId });
     sendJson(res, 202, {
       sessionId: created.sessionId,
       targetPath: target.targetPath,

@@ -6,6 +6,7 @@ const CWD = process.cwd();
 
 function createHost(options = {}) {
   const calls = { create: [], rename: [], prompt: [] };
+  const order = [];
   const controller = {
     async create(request) {
       calls.create.push(request);
@@ -17,6 +18,7 @@ function createHost(options = {}) {
       if (options.renameError) throw options.renameError;
     },
     async prompt(request, signal) {
+      order.push('prompt');
       calls.prompt.push({ request, signal });
       if (options.promptError) throw options.promptError;
       return options.promptResult ?? { accepted: true };
@@ -25,6 +27,7 @@ function createHost(options = {}) {
   const services = {
     sessionController: Object.hasOwn(options, 'controller') ? options.controller : controller,
     workspaceRegistry: options.registry,
+    ...options.services,
   };
   const warnings = [];
   const host = {
@@ -39,7 +42,7 @@ function createHost(options = {}) {
       },
     },
   };
-  return { host, calls, warnings };
+  return { host, calls, warnings, order };
 }
 
 const registryWith = (workspace) => ({
@@ -128,4 +131,109 @@ test('audit session keeps the created session when renaming fails', async () => 
   assert.equal(result.sessionId, 'session-audit');
   assert.equal(calls.prompt.length, 1);
   assert.match(warnings.join('\n'), /审查会话改名失败：title service down/);
+});
+
+test('audit session inherits the owner permission preset before the prompt starts', async () => {
+  const ownerSession = { header: {} };
+  const auditSession = { header: {} };
+  const inherited = [];
+  const { host, calls, order } = createHost({
+    registry: registryWith(undefined),
+    services: {
+      sessions: {
+        get(id) {
+          if (id === 'owner-session') return ownerSession;
+          if (id === 'session-audit') return auditSession;
+          return undefined;
+        },
+      },
+      permissionPresets: {
+        current(session) {
+          inherited.push('current');
+          return session === ownerSession ? 'danger-full-access' : 'workspace-write';
+        },
+        set(session, name) {
+          inherited.push(`set:${name}`);
+        },
+      },
+      approval: {
+        overrideOf() {
+          return 'never';
+        },
+        setPolicy() {
+          throw new Error('the preset already carries the approval policy');
+        },
+      },
+      agents: { get: () => ({ id: 'session-audit' }) },
+    },
+  });
+
+  await createDshAuditSession(host, {
+    cwd: CWD,
+    title: '仓库审查',
+    prompt: '任务',
+    ownerSessionId: 'owner-session',
+  });
+
+  assert.deepEqual(inherited, ['current', 'set:danger-full-access']);
+  assert.deepEqual(order, ['prompt']);
+  assert.equal(calls.prompt.length, 1);
+});
+
+test('audit session falls back to the owner approval policy for a custom preset', async () => {
+  const ownerSession = { header: {} };
+  const auditSession = { header: {} };
+  const { host, order } = createHost({
+    registry: registryWith(undefined),
+    services: {
+      sessions: {
+        get(id) {
+          if (id === 'owner-session') return ownerSession;
+          if (id === 'session-audit') return auditSession;
+          return undefined;
+        },
+      },
+      permissionPresets: {
+        current() {
+          order.push('current');
+          return 'custom';
+        },
+        set() {
+          order.push('preset-set');
+        },
+      },
+      approval: {
+        overrideOf() {
+          return 'never';
+        },
+        setPolicy(agent, policy) {
+          order.push(`policy:${agent.id}:${policy}`);
+        },
+      },
+      agents: { get: () => ({ id: 'session-audit' }) },
+    },
+  });
+
+  await createDshAuditSession(host, {
+    cwd: CWD,
+    title: '仓库审查',
+    prompt: '任务',
+    ownerSessionId: 'owner-session',
+  });
+
+  assert.deepEqual(order, ['current', 'policy:session-audit:never', 'prompt']);
+});
+
+test('audit session still starts when permission inheritance is unavailable', async () => {
+  const { host, calls } = createHost({ registry: registryWith(undefined), services: { sessions: {} } });
+
+  const result = await createDshAuditSession(host, {
+    cwd: CWD,
+    title: '仓库审查',
+    prompt: '任务',
+    ownerSessionId: 'owner-session',
+  });
+
+  assert.equal(result.sessionId, 'session-audit');
+  assert.equal(calls.prompt.length, 1);
 });
