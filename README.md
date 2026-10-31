@@ -20,7 +20,7 @@ DeepSeek Harness（DSH）桌面端的代码评审插件。它把产品仓库里�
   - 批准或 AI 修复的运行状态与日志在页顶**内联卡片**展示，运行中可以继续浏览页面；队列页也保留该卡片；
   - 完整补丁 + 版本增量差异（Git 用临时 worktree 真实重建；跨基线先 3-way，失败退 hunk 级并显著提示）；
   - 按行内联评论、总体意见、评论状态（未处理/部分处理/已处理）；
-  - **总体意见默认自动接 AI 修复**：「提交意见并让 AI 修复」会先保存意见（含所有未解决行内意见）再自动启动修复生成下一版；「仅提交意见」只记录不跑 AI；顶部「让 AI 修复」用于不新增意见时重跑；
+  - **总体意见默认自动接 AI 修复**：「提交意见并让 AI 修复」会先保存意见（含所有未解决行内意见）再自动启动修复生成下一版；「仅提交意见」只记录不跑 AI。想再修一版时，直接在总体意见里写清要求后再次提交即可；
   - 版本历史与审核记录（可折叠）。
 - 操作隔离：只有 `owner` 能操作；其他人只读，可「接管审核」。
 - 乐观锁：每次提交带 `expectedRevision + expectedOwner`，旧页面操作会被拒绝并要求刷新。
@@ -127,7 +127,7 @@ Host 端在 `/dsh-code-review/api` 下注册：
 - `GET /health`、`GET/PUT /settings`
 - `GET /queue`、`GET /candidate?id=`、`GET /patch`、`GET /diff?id=&from=&to=`
 - `POST /comments`（保存意见；body 带 `autoFix: true` 时保存后自动启动 AI 修复并返回 `job`）、`POST /comment-status`、`POST /takeover`、`POST /reject`
-- `POST /approve`（返回 jobId）、`POST /ai-fix`（显式启动同一 AI 修复 job，返回 jobId）、`GET /jobs/:id`、`POST /sync`
+- `POST /approve`（返回 jobId）、`POST /ai-fix`（显式启动同一 AI 修复 job，返回 jobId；UI 不再单独暴露按钮，保留给自动化）、`GET /jobs/:id`、`POST /sync`
 - `GET /audit/prompt?mode=session|headless&targetPath=&note=`（导出审查提示词；session 为独立会话模式，headless 为旧的无交互模式）
 - `POST /audit/session`（通过 Host `sessionController` 创建真实 DSH 审查会话并发送提示词，返回 sessionId；UI 使用）
 - `POST /audit`（可选 headless 审查，返回 jobId；插件负责复核与提交，UI 不使用）

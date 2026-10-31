@@ -661,11 +661,6 @@ function createPlugin(requireModule: (id: string) => any) {
       void startJob('/approve', { id: detail.candidate.id, ...guard() });
     };
 
-    const aiFix = (): void => {
-      if (!detail) return;
-      void startJob('/ai-fix', { id: detail.candidate.id, ...guard() });
-    };
-
     const toggleAudit = (): void => {
       setAuditOpen((prev) => !prev);
       setAuditPrompt('');
@@ -930,7 +925,7 @@ function createPlugin(requireModule: (id: string) => any) {
         h('details', { className: 'dcr-details', open: true, style: { marginTop: 10 } },
           h('summary', null, `合并门禁（${String(candidate.meta.gateChecks.length)} 条）`),
           candidate.meta.gateChecks.length === 0
-            ? h('div', { className: 'dcr-banner warn' }, '门禁为空，无法批准；请让 AI 修复补全 gate_checks。')
+            ? h('div', { className: 'dcr-banner warn' }, '门禁为空，无法批准；请在总体意见中要求 AI 补全 gate_checks 后再提交。')
             : h('div', null, ...candidate.meta.gateChecks.map((command, index) => h('div', { key: index, className: 'dcr-gate-item dcr-mono dcr-small' }, command))),
         ),
         h('div', { className: 'dcr-row', style: { marginTop: 12 } },
@@ -975,7 +970,6 @@ function createPlugin(requireModule: (id: string) => any) {
               ),
               h('div', { className: 'dcr-row' },
                 !detail.canAct ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void takeover(); } }, '接管审核') : null,
-                canAct ? h('button', { className: 'dcr-btn', disabled: busy, title: '不新增意见，直接读取未解决意见并生成下一版', onClick: aiFix }, 'AI 再修一版') : null,
                 canAct ? h('button', { className: 'dcr-btn d', disabled: busy, onClick: () => setPanel(panel === 'reject' ? '' : 'reject') }, panel === 'reject' ? '收起放弃' : '放弃') : null,
                 canAct ? h('button', {
                   className: 'dcr-btn p',
@@ -1012,7 +1006,7 @@ function createPlugin(requireModule: (id: string) => any) {
           items.length === 0
             ? (candidate.humanJudgmentDeclared
                 ? null
-                : h('div', { className: 'dcr-banner warn' }, 'AI 未填写需人工判断项；批准前请让 AI 修复或在 review.md 中补全该章节。'))
+                : h('div', { className: 'dcr-banner warn' }, 'AI 未填写需人工判断项；批准前请在总体意见中要求 AI 补全该章节。'))
             : h('div', { className: 'dcr-judge' },
                 h('h3', null, `需人工判断项 · ${String(ackCount)}/${String(items.length)} 已确认`),
                 ...items.map((item, index) => h('div', { key: index, className: 'dcr-judge-item' },
@@ -1042,7 +1036,7 @@ function createPlugin(requireModule: (id: string) => any) {
           h('div', { className: 'dcr-card' },
             h('h3', null, '总体意见'),
             h('div', { className: 'dcr-small dcr-muted', style: { marginBottom: 6 } },
-              '提交后默认立即让 AI 读取这条意见和所有未解决的行内意见，生成下一版；也可以只提交意见，稍后再点顶部「让 AI 修复」。'),
+              '提交后默认立即让 AI 读取这条意见和所有未解决的行内意见，生成下一版；只想记录意见时点「仅提交意见」。想再修一版，直接在意见里写清要求再提交即可。'),
             h('textarea', { className: 'dcr-textarea', value: general, disabled: !canAct, placeholder: canAct ? '写给 AI/作者的整体意见…' : '仅 owner 可提交意见', onChange: (e: any) => setGeneral(e.target.value) }),
             h('div', { className: 'dcr-row', style: { marginTop: 8 } },
               h('button', {
