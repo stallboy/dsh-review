@@ -28,38 +28,56 @@
 
 ## 一、整体架构与闭环工作流
 
-```text
-┌─────────────────────────────────────────────────────────────────────────┐
-│                候选修复生产层（内置审查器 / 定时任务 / 修复器）          │
-│                                                                         │
-│   主动触发仓库审查 (Audit Repo) 或导出审查提示词                        │
-│   （自动扫描近期 rejected 的 review.md 摘要，注入 Few-shot 负向约束）◄─┐ │
-│         │                                                             │ │
-│         ├─► [A 类：无疑问的本质修复 / 低侵入明显改进]                 │ │
-│         │     （自动改代码 → 跑门禁验证 → 保持补丁正交独立）          │ │
-│         │                                                             │ │
-│         └─► [B 类：存疑/跨模块重大变动 / 需前置合入的延迟项]          │ │
-│               （仅输出待确认清单，人工勾选或前置合入后再转化为候选）  │ │
-└─────────┼─────────────────────────────────────────────────────────────┼─┘
-          │ 生成正交候选修复与验证材料                                  │
-          ▼                                                             │
-产品仓库 .ai-review/YYYY-MM/候选目录 (review.md + NNN.patch)            │
-          │                                                             │
-  各程序员本地 DSH 同步                                                 │
-  （后台静默执行 patch --dry-run / git apply --check 预检基线冲突）     │
-          ▼                                                             │
- DSH 审核队列与审核详情页                                               │
- （仅当前 Owner 可操作；若预检冲突则高亮标记 [点击让 AI 重新 Rebase]）  │
-    │          │             │                  │                       │
-  批准     人工微调      改进意见 /           放弃                      │
-    │          │        一键 Rebase             │                       │
-    │          ▼             ▼                  └──► 清理过程补丁，     │
-    │    生成新版本补丁  AI 生成下一版本             记录拒绝原因并 ────┘
-    │          │             │                       标记 rejected
-    ◄──────────┴─────────────┘                       （沉淀负向反馈记忆）
-    ▼
-隔离工作区同步最新基线并应用补丁 → 无冲突且通过必过测试与检验 → 清理过程补丁 → 代码与批准记录原子提交
+```mermaid
+flowchart TD
+    subgraph PROD["候选修复生产层（内置审查器 / 定时任务 / 修复器）"]
+        MEM["负向反馈记忆<br/>扫描近期 rejected 的 review.md 摘要，注入 Few-shot 负向约束"]
+        AUDIT["主动触发仓库审查（Audit Repo）<br/>或导出标准审查提示词"]
+        CLA["A 类：无疑问的本质修复 / 低侵入明显改进<br/>自动改代码 → 跑门禁验证 → 保持补丁正交独立"]
+        CLB["B 类：存疑 / 跨模块重大变动 / 需前置合入的延迟项<br/>仅输出待确认清单"]
+        CLB2["人工勾选或前置合入后<br/>再转化为候选修复"]
+        MEM -.->|负向约束反哺| AUDIT
+        AUDIT --> CLA
+        AUDIT --> CLB
+        CLB --> CLB2
+    end
 
+    CLA --> GEN["生成正交候选修复与验证材料"]
+    CLB2 --> GEN
+    GEN --> DIR["产品仓库 .ai-review/YYYY-MM/候选目录<br/>review.md + NNN.patch"]
+
+    DIR --> SYNC["各程序员本地 DSH 同步<br/>后台静默执行 patch --dry-run / git apply --check 预检基线冲突"]
+    SYNC --> QUEUE["DSH 审核队列与审核详情页<br/>仅当前 Owner 可操作<br/>预检冲突时高亮「点击让 AI 重新 Rebase」"]
+
+    WORK["隔离工作区同步最新基线并应用补丁"]
+    TUNE["人工微调补丁"]
+    REBASE["AI 生成下一版本补丁"]
+    NEWVER["生成新版本补丁"]
+    REJ["清理过程补丁<br/>记录拒绝原因并标记 rejected"]
+
+    QUEUE -->|批准| WORK
+    QUEUE -->|人工微调| TUNE
+    QUEUE -->|改进意见 / 一键 Rebase| REBASE
+    QUEUE -->|放弃| REJ
+
+    TUNE --> NEWVER
+    REBASE --> NEWVER
+    NEWVER -->|重新进入队列复审| QUEUE
+
+    WORK --> PASS["无冲突且通过必过测试与检验"]
+    PASS --> CLEAN["清理过程补丁"]
+    CLEAN --> COMMIT["代码与批准记录原子提交"]
+
+    REJ ==>|沉淀负向反馈记忆| MEM
+
+    classDef prod fill:#eef6ff,stroke:#4a90d9,color:#10233a
+    classDef review fill:#fff8e6,stroke:#d9a400,color:#3d2c00
+    classDef reject fill:#fdeaea,stroke:#d9534f,color:#4a1512
+    classDef done fill:#eaf6ea,stroke:#3f9142,color:#12351a
+    class MEM,AUDIT,CLA,CLB,CLB2 prod
+    class QUEUE,TUNE,REBASE,NEWVER review
+    class REJ reject
+    class WORK,PASS,CLEAN,COMMIT done
 ```
 
 DSH 适合作为宿主：
