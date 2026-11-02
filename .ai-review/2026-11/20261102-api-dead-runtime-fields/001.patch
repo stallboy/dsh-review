@@ -1,0 +1,33 @@
+diff --git a/src/host/api.ts b/src/host/api.ts
+index 39998d8..626eaa1 100644
+--- a/src/host/api.ts
++++ b/src/host/api.ts
+@@ -167,8 +167,6 @@ function filterFrom(url: URL, owner: string): ReviewFilter {
+ 
+ export class ReviewApi {
+   private settings: AppSettings;
+-  private store: ReviewStore | null = null;
+-  private vcs: VcsAdapter | null = null;
+   private vcsType: VcsType | null = null;
+   private configErrors: string[] = [];
+   private readonly runtimeCache = new Map<string, Runtime>();
+@@ -188,8 +186,6 @@ export class ReviewApi {
+ 
+   private async reconfigure(settings: AppSettings): Promise<void> {
+     this.settings = settings;
+-    this.store = null;
+-    this.vcs = null;
+     this.vcsType = null;
+     this.configErrors = [];
+     this.runtimeCache.clear();
+@@ -205,10 +201,6 @@ export class ReviewApi {
+     }
+     this.configErrors = validation.errors;
+     this.vcsType = validation.vcsType;
+-    if (!validation.vcsType) return;
+-    const root = path.resolve(settings.repoRoot);
+-    this.store = new ReviewStore(root);
+-    this.vcs = createVcs(validation.vcsType, root);
+   }
+ 
+   private async runtimeFor(url: URL): Promise<Runtime> {

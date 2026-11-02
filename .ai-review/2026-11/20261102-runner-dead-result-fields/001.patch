@@ -1,0 +1,34 @@
+diff --git a/src/host/runner.ts b/src/host/runner.ts
+index 65ad6f1..044ef13 100644
+--- a/src/host/runner.ts
++++ b/src/host/runner.ts
+@@ -293,7 +293,6 @@ export class Runner {
+   private async verifyOutcome(outputTail: string): Promise<RunnerExecutionResult> {
+     const { store } = this.request;
+     const previous = this.request.candidate.meta.currentRevision;
+-    const previousSolution = this.request.candidate.sections.solution;
+     let candidate: ReviewCandidate;
+     try {
+       const detail = await store.get(this.request.candidate.id, null);
+@@ -337,8 +336,6 @@ export class Runner {
+     return {
+       success: true,
+       newRevisionId: candidate.meta.currentRevision,
+-      newPatchPath: patchPath,
+-      schemeChanged: candidate.sections.solution.trim() !== previousSolution.trim(),
+       outputTail,
+     };
+   }
+diff --git a/src/host/types.ts b/src/host/types.ts
+index 4de4abf..e50459c 100644
+--- a/src/host/types.ts
++++ b/src/host/types.ts
+@@ -163,8 +163,6 @@ export interface ValidationReport {
+ export interface RunnerExecutionResult {
+   success: boolean;
+   newRevisionId?: number;
+-  newPatchPath?: string;
+-  schemeChanged?: boolean;
+   errorMessage?: string;
+   /** Manual runner: the ready-to-copy fix prompt. */
+   prompt?: string;

@@ -1,0 +1,66 @@
+diff --git a/src/client/client.ts b/src/client/client.ts
+index d45b8ff..389c3bd 100644
+--- a/src/client/client.ts
++++ b/src/client/client.ts
+@@ -38,7 +38,7 @@
+   }
+ 
+   interface Settings {
+-    repoRoot: string; owner: string; vcsType: 'auto' | 'git' | 'svn'; baseBranch: string;
++    repoRoot: string; owner: string; vcsType: 'auto' | 'git' | 'svn';
+     runner: 'dsh' | 'manual' | 'external'; dshCommand: string; externalCommand: string;
+     autoFixOnFailure: boolean; gateTimeoutMs: number; syncBeforeApprove: boolean;
+   }
+diff --git a/src/host/api.ts b/src/host/api.ts
+index 39998d8..e4b3fdb 100644
+--- a/src/host/api.ts
++++ b/src/host/api.ts
+@@ -370,7 +370,6 @@ export class ReviewApi {
+       ...(typeof body['repoRoot'] === 'string' ? { repoRoot: body['repoRoot'] } : {}),
+       ...(typeof body['owner'] === 'string' ? { owner: body['owner'] } : {}),
+       ...(body['vcsType'] === 'git' || body['vcsType'] === 'svn' || body['vcsType'] === 'auto' ? { vcsType: body['vcsType'] } : {}),
+-      ...(typeof body['baseBranch'] === 'string' ? { baseBranch: body['baseBranch'] } : {}),
+       ...(body['runner'] === 'dsh' || body['runner'] === 'manual' || body['runner'] === 'external' ? { runner: body['runner'] } : {}),
+       ...(typeof body['dshCommand'] === 'string' ? { dshCommand: body['dshCommand'] } : {}),
+       ...(typeof body['externalCommand'] === 'string' ? { externalCommand: body['externalCommand'] } : {}),
+diff --git a/src/host/settings.ts b/src/host/settings.ts
+index 71dc3b9..58be02d 100644
+--- a/src/host/settings.ts
++++ b/src/host/settings.ts
+@@ -10,7 +10,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
+   repoRoot: '',
+   owner: '',
+   vcsType: 'auto',
+-  baseBranch: '',
+   runner: 'dsh',
+   dshCommand: '',
+   externalCommand: '',
+@@ -37,7 +36,6 @@ function normalizeSettings(raw: unknown): AppSettings {
+     repoRoot: asString(input['repoRoot'], '').trim(),
+     owner: asString(input['owner'], '').trim(),
+     vcsType: vcsType === 'git' || vcsType === 'svn' ? vcsType : 'auto',
+-    baseBranch: asString(input['baseBranch'], '').trim(),
+     runner: runner === 'manual' || runner === 'external' ? runner : 'dsh',
+     dshCommand: asString(input['dshCommand'], '').trim(),
+     externalCommand: asString(input['externalCommand'], '').trim(),
+@@ -130,8 +128,3 @@ export async function suggestOwner(repoRoot: string): Promise<string> {
+     return '';
+   }
+ }
+-
+-export async function resolveRepoRoot(settings: AppSettings): Promise<string> {
+-  if (!settings.repoRoot.trim()) return '';
+-  return path.resolve(settings.repoRoot);
+-}
+diff --git a/src/host/types.ts b/src/host/types.ts
+index 4de4abf..24c7a09 100644
+--- a/src/host/types.ts
++++ b/src/host/types.ts
+@@ -198,7 +198,6 @@ export interface AppSettings {
+   repoRoot: string;
+   owner: string;
+   vcsType: 'auto' | VcsType;
+-  baseBranch: string;
+   runner: RunnerKind;
+   dshCommand: string;
+   externalCommand: string;
