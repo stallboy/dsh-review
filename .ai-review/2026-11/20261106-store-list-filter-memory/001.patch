@@ -1,0 +1,118 @@
+diff --git a/src/host/store.ts b/src/host/store.ts
+index 3e923d6..f470b32 100644
+--- a/src/host/store.ts
++++ b/src/host/store.ts
+@@ -185,6 +185,7 @@ export class ReviewStore {
+     rejectionMemoryWindow?: number | null,
+   ): Promise<{ items: CandidateSummary[]; errors: string[] }> {
+     const items: CandidateSummary[] = [];
++    const summaries: CandidateSummary[] = [];
+     const errors: string[] = [];
+     const memoryEntries: import('./memory.js').RejectionMemoryEntry[] = [];
+     let months: string[] = [];
+@@ -230,8 +231,7 @@ export class ReviewStore {
+               currentPatchPaths: stats === EMPTY_STATS ? null : stats.entries.map((entry) => entry.path),
+             });
+             if (invariantErrors.length > 0) {
+-              const summary = this.toSummary(this.brokenCandidate(month, slug, path.join(monthDir, slug), reviewPath, invariantErrors.join('；')), stats, currentBase, staleDays);
+-              if (matchesReviewFilter(summary, filter)) items.push(summary);
++              summaries.push(this.toSummary(this.brokenCandidate(month, slug, path.join(monthDir, slug), reviewPath, invariantErrors.join('；')), stats, currentBase, staleDays));
+               continue;
+             }
+           }
+@@ -240,8 +240,7 @@ export class ReviewStore {
+             const entry = entryFromCandidate({ candidateId: candidate.id, meta: candidate.meta });
+             if (entry) memoryEntries.push(entry);
+           }
+-          if (!matchesReviewFilter(summary, filter)) continue;
+-          items.push(summary);
++          summaries.push(summary);
+         } catch (error) {
+           const message = `${month}/${slug}: ${error instanceof Error ? error.message : String(error)}`;
+           errors.push(message);
+@@ -264,10 +263,13 @@ export class ReviewStore {
+             lastFeedback: '',
+             parseError: message,
+           };
+-          if (matchesReviewFilter(summary, filter)) items.push(summary);
++          summaries.push(summary);
+         }
+       }
+     }
++    for (const summary of summaries) {
++      if (matchesReviewFilter(summary, filter)) items.push(summary);
++    }
+     items.sort((left, right) => {
+       // §2.2：按时间点而非字符串；同一时间点以候选 id 为次序键。
+       const byDate = timePoint(right.createdAt) - timePoint(left.createdAt);
+diff --git a/tests/store-list-filter.test.mjs b/tests/store-list-filter.test.mjs
+new file mode 100644
+index 0000000..2e93103
+--- /dev/null
++++ b/tests/store-list-filter.test.mjs
+@@ -0,0 +1,65 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { mkdir, writeFile } from 'node:fs/promises';
++import path from 'node:path';
++import { ReviewStore } from '../dist/store.js';
++import { createGitFixture } from './helpers.mjs';
++
++const FM = (status) => [
++  '---',
++  'schema_version: 1',
++  'title: "net: 修复加法符号"',
++  'module: net',
++  'audit_type: bugfix',
++  'created_at: "2026-11-01T10:00:00+08:00"',
++  'updated_at: "2026-11-01T10:00:00+08:00"',
++  'owner: tester',
++  'tags: []',
++  `status: ${status}`,
++  'ticket: null',
++  'current_revision: 1',
++  'revisions:',
++  '  - id: 1',
++  '    base_revision: "1"',
++  '    patch: 001.patch',
++  'gate_checks: ["node --version"]',
++  'comments: []',
++  'human_decisions: []',
++  'approval: null',
++  status === 'rejected'
++    ? [
++        'rejection:',
++        '  rejected_by: tester',
++        '  rejected_at: "2026-11-02T10:00:00+08:00"',
++        '  reason: "方案有回归风险"',
++      ].join('\n')
++    : 'rejection: null',
++  'commit_message: "net: x"',
++  '---',
++  '',
++  '# 问题与影响',
++  '',
++  '- 测试候选。',
++  '',
++].join('\n');
++
++async function writeCandidate(root, slug, status) {
++  const dir = path.join(root, '.ai-review', '2026-11', slug);
++  await mkdir(dir, { recursive: true });
++  await writeFile(path.join(dir, 'review.md'), FM(status), 'utf8');
++  if (status !== 'rejected') {
++    await writeFile(path.join(dir, '001.patch'), 'diff --git a/src/math.js b/src/math.js\n', 'utf8');
++  }
++}
++
++test('store.list：被拒候选被过滤器排除后，其负向记忆指纹仍须生效', async () => {
++  const root = await createGitFixture();
++  await writeCandidate(root, '1104-net-old', 'rejected');
++  await writeCandidate(root, '1104-net-new', 'pending');
++  const store = new ReviewStore(root);
++
++  // `statuses` 过滤在合并前就把 rejected 候选排除掉；重复判定只能依赖仍保留的负向记忆。
++  const { items } = await store.list({ statuses: ['pending'] }, null, null, 30);
++  assert.deepEqual(items.map((item) => item.id), ['2026-11/1104-net-new']);
++  assert.equal(items[0].duplicateOf, '2026-11/1104-net-old');
++});

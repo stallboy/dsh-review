@@ -1,0 +1,123 @@
+diff --git a/src/host/store.ts b/src/host/store.ts
+index 3e923d6..c06de21 100644
+--- a/src/host/store.ts
++++ b/src/host/store.ts
+@@ -77,6 +77,17 @@ function timePoint(value: string): number {
+   return Number.isNaN(parsed) ? Number.POSITIVE_INFINITY : parsed;
+ }
+ 
++/**
++ * §18.1：超过 stale_days 的活跃候选。队列（isStale 提示）与显式归档（requireStaleDays）
++ * 共用同一判定，避免两处各写一遍时间比较而口径漂移。updated_at 无法解析时视为未过期。
++ */
++function isStaleCandidate(meta: ReviewFrontmatter, staleDays?: number | null): boolean {
++  if (staleDays === undefined || staleDays === null || staleDays <= 0) return false;
++  if (meta.status === 'approved' || meta.status === 'rejected') return false;
++  const anchor = new Date(meta.updatedAt || meta.createdAt).getTime();
++  return !Number.isNaN(anchor) && (Date.now() - anchor) / 86_400_000 >= staleDays;
++}
++
+ export class ReviewStore {
+   constructor(readonly repoRoot: string) {}
+ 
+@@ -292,9 +303,7 @@ export class ReviewStore {
+     const unresolved = candidate.meta.comments.filter((comment) => comment.status !== 'resolved').length;
+     const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
+     // §18.1：队列加载只提示过期（本地派生状态），不做读时写。
+-    const anchor = new Date(candidate.meta.updatedAt || candidate.meta.createdAt).getTime();
+-    const isStale = staleDays !== undefined && staleDays !== null && staleDays > 0 && !archived
+-      && !Number.isNaN(anchor) && (Date.now() - anchor) / 86_400_000 >= staleDays;
++    const isStale = isStaleCandidate(candidate.meta, staleDays);
+     return {
+       id: candidate.id,
+       title: candidate.meta.title,
+@@ -479,11 +488,8 @@ export class ReviewStore {
+     if (!trimmed) throw new ApiError(400, 'bad_request', '放弃原因不能为空');
+     if (options?.requireStaleDays !== undefined) {
+       // §18.1：显式归档过期候选——只有确实超过 stale_days 的候选可归档（乐观锁保证只写一次）。
+-      const anchor = new Date(candidate.meta.updatedAt || candidate.meta.createdAt).getTime();
+-      const ageDays = (Date.now() - anchor) / 86_400_000;
+-      if (Number.isNaN(anchor)) throw new ApiError(422, 'bad_request', 'updated_at 无法解析，不能判定超时');
+-      if (ageDays < options.requireStaleDays) {
+-        throw new ApiError(409, 'conflict', `未超过 stale_days（${String(options.requireStaleDays)} 天，当前 ${ageDays.toFixed(1)} 天），不能按超时归档`);
++      if (!isStaleCandidate(candidate.meta, options.requireStaleDays)) {
++        throw new ApiError(409, 'conflict', `未超过 stale_days（${String(options.requireStaleDays)} 天），不能按超时归档`);
+       }
+     }
+     candidate.meta.status = 'rejected';
+diff --git a/tests/store-stale-threshold.test.mjs b/tests/store-stale-threshold.test.mjs
+new file mode 100644
+index 0000000..a90a444
+--- /dev/null
++++ b/tests/store-stale-threshold.test.mjs
+@@ -0,0 +1,70 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { mkdir, writeFile } from 'node:fs/promises';
++import path from 'node:path';
++import { ReviewStore } from '../dist/store.js';
++import { createGitFixture } from './helpers.mjs';
++
++async function writeCandidate(root, slug, updatedAt) {
++  const dir = path.join(root, '.ai-review', '2026-11', slug);
++  await mkdir(dir, { recursive: true });
++  const review = [
++    '---',
++    'schema_version: 1',
++    `title: "store: 测试候选 ${slug}"`,
++    'module: store',
++    'audit_type: shrink',
++    'created_at: "2026-11-01T10:00:00+08:00"',
++    `updated_at: "${updatedAt}"`,
++    'owner: tester',
++    'tags: []',
++    'status: pending',
++    'ticket: null',
++    'current_revision: 1',
++    'revisions:',
++    '  - id: 1',
++    '    base_revision: "1"',
++    '    patch: "001.patch"',
++    'gate_checks:',
++    '  - "node --version"',
++    'comments: []',
++    'approval: null',
++    '---',
++    '',
++    '# 问题与影响',
++    '- 测试候选。',
++    '',
++    '# 需人工判断项',
++    '- 无',
++    '',
++  ].join('\n');
++  await writeFile(path.join(dir, 'review.md'), review, 'utf8');
++  await writeFile(path.join(dir, '001.patch'), '', 'utf8');
++  return `2026-11/${slug}`;
++}
++
++const daysAgo = (days) => new Date(Date.now() - days * 86_400_000).toISOString();
++
++test('超时判定：队列体感过期与显式超时归档口径一致', async () => {
++  const root = await createGitFixture();
++  const staleId = await writeCandidate(root, 'stale-candidate', daysAgo(40));
++  const freshId = await writeCandidate(root, 'fresh-candidate', daysAgo(1));
++  const store = new ReviewStore(root);
++
++  const { items } = await store.list({}, null, 30);
++  const stale = items.find((item) => item.id === staleId);
++  const fresh = items.find((item) => item.id === freshId);
++  assert.equal(stale?.isStale, true);
++  assert.equal(fresh?.isStale, undefined);
++
++  // 队列提示过期与显式归档必须给出同一个结论：过期的可归档，未过期的拒绝。
++  const rejected = await store.reject(staleId, '超过 stale_days', { expectedRevision: 1, expectedOwner: 'tester' }, {
++    rejectedBy: 'system:stale',
++    requireStaleDays: 30,
++  });
++  assert.equal(rejected.meta.rejection?.rejectedBy, 'system:stale');
++  await assert.rejects(
++    store.reject(freshId, '超过 stale_days', { expectedRevision: 1, expectedOwner: 'tester' }, { requireStaleDays: 30 }),
++    /未超过 stale_days/,
++  );
++});
