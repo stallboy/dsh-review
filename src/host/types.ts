@@ -6,11 +6,22 @@ export type VcsType = 'git' | 'svn';
 export type RunnerKind = 'dsh' | 'manual' | 'external';
 export type DiffResolutionMode = 'same_base_direct' | 'cross_base_3way_clean' | 'cross_base_hunk_fallback';
 export type RunnerMode = 'ADDRESS_FEEDBACK' | 'RESOLVE_CONFLICT';
+/** §4.2：审查分类枚举（9 值，2026-11-04 §18.4 扩展）。 */
+export type AuditType =
+  | 'bugfix' | 'delete' | 'shrink' | 'reuse' | 'merge' | 'split'
+  | 'stdlib' | 'native' | 'yagni';
+export const AUDIT_TYPES: readonly AuditType[] = [
+  'bugfix', 'delete', 'shrink', 'reuse', 'merge', 'split', 'stdlib', 'native', 'yagni',
+];
 
 export interface RevisionEntry {
   id: number;
   baseRevision: string;
   patch: string;
+  /** §4.3：ai = AI 修复 / AI Rebase；human = 人工微调。 */
+  author?: 'ai' | 'human';
+  /** I14：本版本对象中未建模的键原样保留。 */
+  extra?: Record<string, unknown>;
 }
 
 export interface ReviewComment {
@@ -18,16 +29,53 @@ export interface ReviewComment {
   revision: number;
   file: string;
   line: number;
+  /** §4.6：行内评论必填 LEFT（基线旧代码）/ RIGHT（补丁新代码）；总体评论省略。 */
+  side?: 'LEFT' | 'RIGHT';
   author: string;
   content: string;
   status: CommentStatus;
   createdAt?: string;
+  /** I14：本评论对象中未建模的键原样保留。 */
+  extra?: Record<string, unknown>;
+}
+
+/** §4.5：AI 无法自证、必须由人拍板的决策点。 */
+export interface HumanDecision {
+  id: string;
+  question: string;
+  note?: string;
+  /** I14：未建模键保留。 */
+  extra?: Record<string, unknown>;
+}
+
+/** §4.8：拒绝留痕；超时归档时 rejectedBy 为 `system:stale`。 */
+export interface RejectionMeta {
+  rejectedBy: string;
+  rejectedAt: string;
+  reason: string;
+  /** I14：未建模键保留。 */
+  extra?: Record<string, unknown>;
+}
+
+export interface WaivedDecision {
+  id: string;
+  reason: string;
 }
 
 export interface ApprovalMeta {
   approvedBy: string;
   approvedAt: string;
   commitRevision: string | null;
+  /** §4.7：批准时生效的门禁快照（必须与当时顶层 gate_checks 一致）。P5 起写入。 */
+  gateChecks?: string[];
+  /** §4.7：逐条执行结果（command/exit_code/duration_ms）。P5 起写入。 */
+  gateResults?: Array<{ command: string; exit_code: number; duration_ms: number }>;
+  /** §4.7：已确认的 human_decisions[].id。P5 起写入。 */
+  confirmedDecisions?: string[];
+  /** §4.7：知悉但接受风险的判断项（id + 非空 reason）。P5 起写入。 */
+  waivedDecisions?: WaivedDecision[];
+  /** I14：approval 对象中未建模的键原样保留。 */
+  extra?: Record<string, unknown>;
 }
 
 export interface GateCheckResult {
@@ -42,16 +90,31 @@ export interface GateCheckResult {
 export interface ReviewFrontmatter {
   schemaVersion: number;
   title: string;
+  /** §4.2：小写模块标志，用于路由、筛选与负向记忆。开发期旧数据可能缺失。 */
+  module: string;
+  /** §4.2：9 值审查分类。开发期旧数据可能缺失。 */
+  auditType: AuditType | '';
   createdAt: string;
+  /** §2.3：最后一次共享写入时间；每次 write 自动维护。 */
+  updatedAt: string;
   owner: string;
   tags: string[];
   status: ReviewStatus;
   ticket: string | null;
+  /** §4.2：当前补丁实际触及的业务文件（长期事实）。 */
+  targetFiles: string[];
   currentRevision: number;
   revisions: RevisionEntry[];
   gateChecks: string[];
   comments: ReviewComment[];
+  humanDecisions: HumanDecision[];
   approval: ApprovalMeta | null;
+  rejection: RejectionMeta | null;
+  /** §4.9：多行提交信息；首行必须与 title 一致。 */
+  commitMessage: string;
+  /** §4.8/§18.6：人工重开字段，可选；二者必须同时出现或同时缺省。 */
+  reopenedFrom?: string | null;
+  reopenedReason?: string | null;
   /** Unknown frontmatter keys are preserved so an AI-authored file is never truncated. */
   extra: Record<string, unknown>;
 }
@@ -118,6 +181,16 @@ export interface CandidateSummary {
   isBaseBehind: boolean;
   baseRevision: string;
   lastFeedback: string;
+  /** §18.1：超过 stale_days 的活跃候选——队列只提示，不做读时写。 */
+  isStale?: boolean;
+  /** §7：负向记忆指纹（module+排序 target_files+audit_type+规范化 title）。 */
+  fingerprint?: string;
+  /** §4.8：人工重开指向的被拒候选；null 表示非重开。 */
+  reopenedFrom?: string | null;
+  /** §7.4：窗口内完全重复的被拒候选 id——该候选被阻止进入审核。 */
+  duplicateOf?: string;
+  /** §18.8：approved 但 commit_revision 未回填——队列提示幂等补填。 */
+  needsBackfill?: boolean;
   parseError?: string;
 }
 
@@ -182,8 +255,16 @@ export type ApprovalAbortReason =
   | 'RUNNER_FAILED'
   | 'PATCH_CONFLICT'
   | 'GATE_CHECK_FAILED'
+  | 'DECISIONS_UNCONFIRMED'
+  | 'COMMIT_MESSAGE_MISMATCH'
   | 'NOT_CONFIGURED'
   | 'INTERNAL_ERROR';
+
+/** §4.7：批准时人工判断项的处理记录。 */
+export interface ApprovalDecisions {
+  confirmed: string[];
+  waived: WaivedDecision[];
+}
 
 export interface ApprovalOutcome {
   status: ApprovalOutcomeStatus;
@@ -205,6 +286,8 @@ export interface AppSettings {
   autoFixOnFailure: boolean;
   gateTimeoutMs: number;
   syncBeforeApprove: boolean;
+  /** §6.1 定时审查间隔（分钟）；0 = 关闭。 */
+  scheduleIntervalMinutes: number;
 }
 
 /** One A-class candidate that the repo auditor actually produced on disk. */

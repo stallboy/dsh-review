@@ -15,6 +15,8 @@ import { JobManager } from './jobs.js';
 import { parsePatch, isAiReviewPath } from './patch.js';
 import { Runner, wrapAgentPrompt } from './runner.js';
 import { loadReviewers } from './reviewers.js';
+import { AuditArchive, projectFindings } from './audit-archive.js';
+import { runGateChecks } from './validator.js';
 import { matchesReviewFilter, ReviewStore } from './store.js';
 import { detectVcs, suggestOwner, validateSettings } from './settings.js';
 import type {
@@ -180,6 +182,91 @@ export class ReviewApi {
 
   async init(): Promise<void> {
     await this.reconfigure(this.deps.settings);
+    this.startScheduler();
+  }
+
+  // ---------- §6.1 定时审查（scheduled trigger） ----------
+
+  private scheduleTimer: ReturnType<typeof setInterval> | null = null;
+
+  private startScheduler(): void {
+    this.stopScheduler();
+    const minutes = this.settings.scheduleIntervalMinutes;
+    if (!(minutes > 0) || !this.deps.createAuditSession) return;
+    this.scheduleTimer = setInterval(() => {
+      void this.runScheduledAudit().catch((error) => {
+        console.error('[dsh-code-review] 定时审查失败：', error instanceof Error ? error.message : String(error));
+      });
+    }, minutes * 60_000);
+    this.scheduleTimer.unref?.();
+  }
+
+  /** 停止定时审查调度（插件卸载 / 测试收尾时调用）。 */
+  stopScheduler(): void {
+    if (this.scheduleTimer) {
+      clearInterval(this.scheduleTimer);
+      this.scheduleTimer = null;
+    }
+  }
+
+  private async runScheduledAudit(): Promise<void> {
+    const runtime = await this.runtimeFor(new URL('http://local/')).catch(() => null);
+    if (!runtime || !this.deps.createAuditSession) return;
+    const running = this.jobs.list().find((job) => job.status === 'running');
+    if (running) return;
+    const baseRevision = await runtime.vcs.getCurrentBase().catch(() => null);
+    if (!baseRevision) return;
+    const clean = await runtime.vcs.ensureCleanWorkspace().catch(() => ({ clean: false, message: 'unknown' }));
+    if (!clean.clean) return;
+    const owner = await this.ownerFor(runtime.root);
+    const now = new Date();
+    const reportPath = auditReportPath('', now);
+    const userPrompt = await buildAuditPrompt({
+      repoRoot: runtime.root,
+      vcsType: runtime.vcsType,
+      owner,
+      targetPath: '',
+      note: '定时审查（trigger: scheduled）',
+      baseRevision,
+      reportPath,
+      mode: 'session',
+      now,
+    });
+    const prompt = composeSessionPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root)}`);
+    await this.deps.createAuditSession({ cwd: runtime.root, title: '定时仓库审查', prompt, ownerSessionId: '' });
+  }
+
+  /** §18.2：把 reviewers.yml 解析结果作为提示词参数传入审查会话。 */
+  private async ownerRoutingBlock(repoRoot: string): Promise<string> {
+    const config = await loadReviewers(repoRoot);
+    const lines = [
+      '## Owner 路由（reviewers.yml 解析结果，创建候选时按此写 owner）',
+      `- default_owner: ${config.defaultOwner || '(未配置，由当前操作者兜底)'}`,
+    ];
+    for (const rule of config.rules) {
+      lines.push(`- owner ${rule.owner}：paths ${JSON.stringify(rule.paths)} tags ${JSON.stringify(rule.tags)}`);
+    }
+    lines.push('- 匹配顺序：路径命中数 > tag 命中数 > 配置顺序；无命中用 default_owner。');
+    return lines.join('\n');
+  }
+
+  // ---------- §8/§18.8 检出级写互斥（进程内串行化共享写操作） ----------
+
+  private writeLocks = new Map<string, Promise<unknown>>();
+
+  private withWriteLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.writeLocks.get(repoRoot) ?? Promise.resolve();
+    const next = previous.then(fn, fn);
+    this.writeLocks.set(repoRoot, next.catch(() => undefined));
+    return next;
+  }
+
+  /** 共享写路由统一加锁（§8/§18.8：同一检出的写操作串行化）。 */
+  private withRepoLock<T>(url: URL, fn: () => Promise<T>): Promise<T> {
+    return this.runtimeFor(url).then(
+      (runtime) => this.withWriteLock(runtime.root, fn),
+      () => fn(),
+    );
   }
 
   getSettings(): AppSettings {
@@ -269,16 +356,24 @@ export class ReviewApi {
     if (method === 'GET' && route === '/audit/prompt') return this.auditPrompt(res, url);
     if (method === 'POST' && route === '/audit/session') return this.auditSession(req, res, url);
     if (method === 'POST' && route === '/audit') return this.audit(req, res, url);
-    if (method === 'POST' && route === '/comments') return this.addComment(req, res, url);
-    if (method === 'POST' && route === '/comment-status') return this.commentStatus(req, res, url);
-    if (method === 'POST' && route === '/takeover') return this.takeover(req, res, url);
-    if (method === 'POST' && route === '/reject') return this.reject(req, res, url);
+    if (method === 'POST' && route === '/comments') return this.withRepoLock(url, () => this.addComment(req, res, url));
+    if (method === 'POST' && route === '/comment-status') return this.withRepoLock(url, () => this.commentStatus(req, res, url));
+    if (method === 'POST' && route === '/takeover') return this.withRepoLock(url, () => this.takeover(req, res, url));
+    if (method === 'POST' && route === '/reject') return this.withRepoLock(url, () => this.reject(req, res, url));
+    if (method === 'POST' && route === '/archive-stale') return this.withRepoLock(url, () => this.reject(req, res, url, 'stale'));
+    if (method === 'POST' && route === '/reopen') return this.withRepoLock(url, () => this.reopen(req, res, url));
+    if (method === 'POST' && route === '/convert') return this.withRepoLock(url, () => this.convert(req, res, url));
+    if (method === 'POST' && route === '/rebase') return this.withRepoLock(url, () => this.rebase(req, res, url));
+    if (method === 'POST' && route === '/manual-revision') return this.withRepoLock(url, () => this.manualRevision(req, res, url));
+    if (method === 'POST' && route === '/backfill') return this.withRepoLock(url, () => this.backfill(req, res, url));
     if (method === 'POST' && route === '/approve') return this.approve(req, res, url);
     if (method === 'POST' && route === '/ai-fix') return this.aiFix(req, res, url);
     if (method === 'POST' && route === '/sync') return this.sync(res, url);
     if (method === 'GET' && route === '/jobs') return this.jobsList(res);
     if (method === 'GET' && route.startsWith('/jobs/')) return this.jobGet(res, route.slice('/jobs/'.length), url);
     if (method === 'GET' && route === '/reviewers') return this.reviewers(res, url);
+    if (method === 'GET' && route === '/audits') return this.auditsList(res, url);
+    if (method === 'GET' && route === '/findings') return this.findings(res, url);
     if (method === 'GET' && route === '/client-entry') {
       let entry: unknown = null;
       try {
@@ -377,9 +472,11 @@ export class ReviewApi {
       ...(typeof body['autoFixOnFailure'] === 'boolean' ? { autoFixOnFailure: body['autoFixOnFailure'] } : {}),
       ...(typeof body['syncBeforeApprove'] === 'boolean' ? { syncBeforeApprove: body['syncBeforeApprove'] } : {}),
       ...(typeof body['gateTimeoutMs'] === 'number' ? { gateTimeoutMs: body['gateTimeoutMs'] } : {}),
+      ...(typeof body['scheduleIntervalMinutes'] === 'number' ? { scheduleIntervalMinutes: body['scheduleIntervalMinutes'] } : {}),
     };
     const saved = await this.deps.saveSettings(merged);
     await this.reconfigure(saved);
+    this.startScheduler(); // 调度间隔运行期可改，立即生效
     const validation = await validateSettings(saved).catch(() => ({ ok: false, errors: this.configErrors, vcsType: this.vcsType }));
     sendJson(res, 200, { settings: saved, validation });
   }
@@ -403,9 +500,11 @@ export class ReviewApi {
     const owner = ownerParam !== null ? ownerParam.trim() : await this.ownerFor(runtime.root);
     const filter = filterFrom(url, owner);
     const base = await runtime.vcs.getCurrentBase().catch(() => null);
+    // §18.1：stale_days 决定队列的过期提示（只读，不产生共享写入）。
+    const reviewers = await loadReviewers(runtime.root);
     // One scan for both the filtered page and the owner-wide status counts: the
     // filtered items are always a subset of the owner's candidates.
-    const all = await runtime.store.list({ owner }, base);
+    const all = await runtime.store.list({ owner }, base, reviewers.staleDays, reviewers.rejectionMemoryDays);
     const items = all.items.filter((item) => matchesReviewFilter(item, filter));
     const counts: Record<ReviewStatus, number> = { pending: 0, changes_requested: 0, approved: 0, rejected: 0 };
     for (const item of all.items) counts[item.status] += 1;
@@ -513,6 +612,40 @@ export class ReviewApi {
     sendJson(res, 200, { config });
   }
 
+  /** §3：目录式审查档案列表（旧扁平报告不参与）。 */
+  private async auditsList(res: ServerResponse, url: URL): Promise<void> {
+    const runtime = await this.runtimeFor(url);
+    const archive = new AuditArchive(runtime.root);
+    const records = await archive.list();
+    sendJson(res, 200, {
+      audits: records
+        .filter((record) => !record.parseError)
+        .sort((left, right) => new Date(right.meta.createdAt).getTime() - new Date(left.meta.createdAt).getTime())
+        .map((record) => ({
+          auditId: record.meta.auditId,
+          createdAt: record.meta.createdAt,
+          scope: record.meta.scope,
+          trigger: record.meta.trigger,
+          previousAudit: record.meta.previousAudit,
+          candidates: record.meta.candidates,
+          itemCount: record.meta.items.length,
+          path: `.ai-review/audits/${record.dirName}/audit.md`,
+        })),
+      errors: records.filter((record) => record.parseError).map((record) => `${record.dirName}: ${record.parseError}`),
+    });
+  }
+
+  /** §3.4：finding 投影（覆盖判定 → 最新观察 → 当前状态 → 可见性）。 */
+  private async findings(res: ServerResponse, url: URL): Promise<void> {
+    const runtime = await this.runtimeFor(url);
+    const archive = new AuditArchive(runtime.root);
+    const records = await archive.list();
+    const queue = await runtime.store.list({}, null);
+    const statusById = new Map(queue.items.map((item) => [item.id, item.status]));
+    const projections = projectFindings(records, (candidateId) => statusById.get(candidateId) ?? null);
+    sendJson(res, 200, { findings: projections, errors: records.filter((r) => r.parseError).map((r) => `${r.dirName}: ${r.parseError}`) });
+  }
+
   private async fixPrompt(res: ServerResponse, url: URL): Promise<void> {
     const { store } = await this.runtimeFor(url);
     const id = idFrom(url);
@@ -559,9 +692,10 @@ export class ReviewApi {
       now,
     });
     const systemPrompt = await loadAuditSystemPrompt();
+    const promptWithRouting = `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root)}`;
     const prompt = mode === 'session'
-      ? composeSessionPrompt(systemPrompt, userPrompt)
-      : wrapAgentPrompt(systemPrompt, userPrompt);
+      ? composeSessionPrompt(systemPrompt, promptWithRouting)
+      : wrapAgentPrompt(systemPrompt, promptWithRouting);
     sendJson(res, 200, {
       prompt,
       mode,
@@ -608,7 +742,7 @@ export class ReviewApi {
       mode: 'session',
       now,
     });
-    const prompt = composeSessionPrompt(await loadAuditSystemPrompt(), userPrompt);
+    const prompt = composeSessionPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root)}`);
     const title = `仓库审查 · ${target.targetPath || '全仓库'}`.slice(0, 60);
     const created = await this.deps.createAuditSession({ cwd: runtime.root, title, prompt, ownerSessionId });
     sendJson(res, 202, {
@@ -686,6 +820,8 @@ export class ReviewApi {
       ...(typeof body['file'] === 'string' ? { file: body['file'] } : {}),
       ...(typeof body['line'] === 'number' ? { line: body['line'] } : {}),
       ...(typeof body['revision'] === 'number' ? { revision: body['revision'] } : {}),
+      // §4.6/I11：行内评论必须带 LEFT/RIGHT；UI 侧按行类型传 RIGHT（补丁新代码）。
+      ...(body['side'] === 'LEFT' || body['side'] === 'RIGHT' ? { side: body['side'] } : {}),
     }, guard);
     const commit = await this.commitReviewOnly(`review(${id}): 审核意见 (rev ${String(candidate.meta.currentRevision)})`, candidate, runtime);
     let job: JobRecord | undefined;
@@ -738,23 +874,31 @@ export class ReviewApi {
     sendJson(res, 200, { candidate, commit });
   }
 
-  private async reject(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  private async reject(req: IncomingMessage, res: ServerResponse, url: URL, mode: 'manual' | 'stale' = 'manual'): Promise<void> {
     const { store, vcs } = await this.runtimeFor(url);
     const body = await readJson(req);
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
-    const reason = stringField(body, 'reason');
+    const reason = mode === 'stale'
+      ? '超过 stale_days 未审核，按超时废弃处理'
+      : stringField(body, 'reason');
     const detail = await store.get(id, null);
     await store.ensureWriteAllowed(detail.candidate, guard);
+    const reviewers = await loadReviewers(store.repoRoot);
+    if (mode === 'stale' && reviewers.staleDays === null) {
+      throw new ApiError(409, 'conflict', 'reviewers.yml 未配置 stale_days，不能按超时归档');
+    }
     const reviewBackup = await readFile(detail.candidate.reviewPath, 'utf8');
     const patchBackups: { name: string; text: string }[] = [];
     for (const revision of detail.candidate.meta.revisions) {
       const file = path.join(detail.candidate.dirPath, revision.patch);
       if (existsSync(file)) patchBackups.push({ name: revision.patch, text: await readFile(file, 'utf8') });
     }
-    const candidate = await store.reject(id, reason, guard);
+    const candidate = await store.reject(id, reason, guard, mode === 'stale'
+      ? { rejectedBy: 'system:stale', requireStaleDays: reviewers.staleDays ?? undefined }
+      : {});
     const commit = await vcs.atomicCommit({
-      message: `review(${id}): reject rev ${String(candidate.meta.currentRevision)}`,
+      message: `review(${id}): ${mode === 'stale' ? 'archive stale' : 'reject'} rev ${String(candidate.meta.currentRevision)}`,
       paths: [relative(store.repoRoot, candidate.dirPath)],
       deletePaths: candidate.meta.revisions.map((revision) => relative(store.repoRoot, path.join(candidate.dirPath, revision.patch))),
     });
@@ -767,13 +911,237 @@ export class ReviewApi {
     sendJson(res, 200, { candidate, commitRevision: commit.commitRevision });
   }
 
+  /**
+   * §6.5 Rebase：在最新基线上重建当前补丁——干净工作区 → 应用补丁（失败即冲突）
+   * → 重跑门禁 → 追加新版本（author: ai，基线=最新）→ 回 pending → 只提交候选目录。
+   */
+  private async rebase(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    const runtime = await this.runtimeFor(url);
+    const { store, vcs } = runtime;
+    this.ensureNoAuditRunning();
+    const body = await readJson(req);
+    const id = stringField(body, 'id');
+    const guard = guardFrom(body);
+    const detail = await store.get(id, null);
+    await store.ensureWriteAllowed(detail.candidate, guard);
+    const job = this.jobs.start('ai_fix', (log, jobId) => this.withWriteLock(store.repoRoot, async () => {
+      const candidate = detail.candidate;
+      const base = await vcs.getCurrentBase().catch(() => null);
+      if (!base) return { status: 'ABORTED', message: '无法读取最新基线', jobId };
+      const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
+      if (!current) return { status: 'ABORTED', message: '当前版本缺失', jobId };
+      if (current.baseRevision === base) {
+        return { status: 'ABORTED', message: '基线已是最新，无需 Rebase', jobId };
+      }
+      const clean = await vcs.ensureCleanWorkspace();
+      if (!clean.clean) return { status: 'ABORTED', message: `工作区不干净：${clean.message}`, jobId };
+      log(`在最新基线 ${base.slice(0, 12)} 上应用补丁`);
+      const patchPath = path.join(store.repoRoot, '.ai-review', id, current.patch);
+      const applied = await vcs.applyPatch(patchPath, true);
+      if (!applied.ok) {
+        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        return { status: 'ABORTED', message: `Rebase 冲突：${applied.message}`, jobId };
+      }
+      log('重跑门禁');
+      const report = await runGateChecks(candidate.meta.gateChecks, {
+        cwd: store.repoRoot, baseRevision: base, timeoutMs: this.settings.gateTimeoutMs,
+        onLine: (line) => { if (line.trim()) log(`  ${line.slice(0, 300)}`); },
+      });
+      await vcs.revertBusinessWorkspace().catch(() => undefined);
+      if (!report.allPassed) {
+        return { status: 'ABORTED', message: `门禁未通过，Rebase 未产生新版本：\n${report.formattedEvidenceMarkdown}`, jobId };
+      }
+      const updated = await store.appendRevision(id, {
+        author: 'ai', baseRevision: base, patchText: await (await import('node:fs/promises')).readFile(patchPath, 'utf8'),
+      }, guard);
+      const commit = await this.commitReviewOnly(`review(${id}): rebase to ${base.slice(0, 12)} (rev ${String(updated.meta.currentRevision)})`, updated, runtime);
+      if (!commit.success) return { status: 'ABORTED', message: `提交失败：${commit.message}`, jobId };
+      return { status: 'COMMITTED', newRevision: updated.meta.currentRevision, commitRevision: commit.commitRevision, message: `已 Rebase 到基线 ${base.slice(0, 12)}，新版本 ${String(updated.meta.currentRevision)}`, jobId };
+    }));
+    sendJson(res, 202, { jobId: job.id, job });
+  }
+
+  /**
+   * §6.4 人工微调（收尾）：外部提供的全量补丁文本在当前基线上验证 + 重跑门禁后
+   * 追加新版本（author: human）→ 回 pending → 只提交候选目录。
+   */
+  private async manualRevision(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    const runtime = await this.runtimeFor(url);
+    const { store, vcs } = runtime;
+    this.ensureNoAuditRunning();
+    const body = await readJson(req);
+    const id = stringField(body, 'id');
+    const guard = guardFrom(body);
+    const patchText = stringField(body, 'patchText');
+    if (!patchText.trim()) throw new ApiError(400, 'bad_request', 'patchText 不能为空');
+    const detail = await store.get(id, null);
+    await store.ensureWriteAllowed(detail.candidate, guard);
+    const job = this.jobs.start('ai_fix', (log, jobId) => this.withWriteLock(store.repoRoot, async () => {
+      const candidate = detail.candidate;
+      const clean = await vcs.ensureCleanWorkspace();
+      if (!clean.clean) return { status: 'ABORTED', message: `工作区不干净：${clean.message}`, jobId };
+      const base = await vcs.getCurrentBase().catch(() => null);
+      if (!base) return { status: 'ABORTED', message: '无法读取当前基线', jobId };
+      const { writeFile: writeTmp, rm: rmTmp } = await import('node:fs/promises');
+      const os = await import('node:os');
+      const tmpPath = path.join(os.tmpdir(), `dcr-tweak-${String(process.pid)}.patch`);
+      await writeTmp(tmpPath, patchText, 'utf8');
+      try {
+        const applied = await vcs.applyPatch(tmpPath, true);
+        if (!applied.ok) {
+          await vcs.revertBusinessWorkspace().catch(() => undefined);
+          return { status: 'ABORTED', message: `补丁无法应用：${applied.message}`, jobId };
+        }
+        log('重跑门禁');
+        const report = await runGateChecks(candidate.meta.gateChecks, {
+          cwd: store.repoRoot, baseRevision: base, timeoutMs: this.settings.gateTimeoutMs,
+          onLine: (line) => { if (line.trim()) log(`  ${line.slice(0, 300)}`); },
+        });
+        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        if (!report.allPassed) {
+          return { status: 'ABORTED', message: `门禁未通过，未产生新版本：\n${report.formattedEvidenceMarkdown}`, jobId };
+        }
+        const updated = await store.appendRevision(id, { author: 'human', baseRevision: base, patchText }, guard);
+        const commit = await this.commitReviewOnly(`review(${id}): manual tweak (rev ${String(updated.meta.currentRevision)})`, updated, runtime);
+        if (!commit.success) return { status: 'ABORTED', message: `提交失败：${commit.message}`, jobId };
+        return { status: 'COMMITTED', newRevision: updated.meta.currentRevision, commitRevision: commit.commitRevision, message: `人工微调完成，新版本 ${String(updated.meta.currentRevision)}`, jobId };
+      } finally {
+        await rmTmp(tmpPath, { force: true }).catch(() => undefined);
+      }
+    }));
+    sendJson(res, 202, { jobId: job.id, job });
+  }
+
+  /**
+   * §4.7/§18.8：commit_revision 回填的幂等恢复入口——只改 approval.commit_revision，
+   * 不改 updated_at、不动业务代码；可安全重试直至成功。
+   */
+  private async backfill(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    const runtime = await this.runtimeFor(url);
+    const { store, vcs } = runtime;
+    const body = await readJson(req);
+    const id = stringField(body, 'id');
+    const commitRevision = stringField(body, 'commitRevision');
+    if (!commitRevision.trim()) throw new ApiError(400, 'bad_request', 'commitRevision 不能为空');
+    const detail = await store.get(id, null);
+    if (detail.candidate.parseError) throw new ApiError(422, 'bad_request', detail.candidate.parseError);
+    if (detail.candidate.meta.status !== 'approved' || !detail.candidate.meta.approval) {
+      throw new ApiError(409, 'conflict', '只有 approved 候选可以回填 commit_revision');
+    }
+    if (detail.candidate.meta.approval.commitRevision === commitRevision) {
+      sendJson(res, 200, { candidate: detail.candidate, message: '已是最新，无需回填' });
+      return;
+    }
+    const candidate = detail.candidate;
+    const approval = candidate.meta.approval;
+    if (!approval) throw new ApiError(409, 'conflict', 'approval 缺失，无法回填');
+    approval.commitRevision = commitRevision;
+    await store.write(candidate, { touchUpdatedAt: false });
+    const commit = await this.commitReviewOnly(`review(${id}): record commit_revision ${commitRevision}`, candidate, runtime);
+    if (!commit.success) throw new ApiError(500, 'internal', `回填提交失败：${commit.message}`);
+    sendJson(res, 200, { candidate, commitRevision: commit.commitRevision });
+  }
+
+  /**
+   * §6.2 B/Deferred 转候选：把一个已存在的候选与审查项绑定。
+   * Deferred 必须先确认 depends_on 满足（前置 finding resolved，或其 converted 候选 approved）；
+   * 审查档案与候选目录两侧必须在同一个共享提交中完成，失败恢复档案文件。
+   */
+  private async convert(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    const runtime = await this.runtimeFor(url);
+    const { store, vcs } = runtime;
+    const body = await readJson(req);
+    const auditId = stringField(body, 'auditId');
+    const findingId = stringField(body, 'findingId');
+    const candidateId = stringField(body, 'candidateId');
+    const archive = new AuditArchive(runtime.root);
+    const record = await archive.read(auditId);
+    if (record.parseError) throw new ApiError(422, 'bad_request', `审查档案无效：${record.parseError}`);
+    const item = record.meta.items.find((entry) => entry.findingId === findingId);
+    if (!item) throw new ApiError(404, 'not_found', `finding 不存在：${findingId}`);
+    if (item.status !== 'pending') {
+      throw new ApiError(409, 'conflict', `审查项状态为 ${item.status}，只有 pending 可转换`);
+    }
+    if (item.kind === 'deferred') {
+      const records = await archive.list();
+      const queue = await store.list({}, null);
+      const statusById = new Map(queue.items.map((entry) => [entry.id, entry.status]));
+      const projections = projectFindings(records, (id) => statusById.get(id) ?? null);
+      const prerequisite = projections.find((projection) => projection.findingId === item.dependsOn);
+      const satisfied = prerequisite !== undefined
+        && (prerequisite.lastStatus === 'resolved'
+          || (prerequisite.lastStatus === 'converted' && prerequisite.candidateStatus === 'approved'));
+      if (!satisfied) {
+        const blocker = prerequisite
+          ? `前置 finding 状态：${prerequisite.lastStatus}${prerequisite.candidateStatus ? `（候选 ${prerequisite.candidateStatus}）` : ''}`
+          : `前置 finding 无有效观察：${item.dependsOn ?? '(空)'}`;
+        throw new ApiError(409, 'conflict', `depends_on 未满足，阻塞转换——${blocker}`);
+      }
+    }
+    const detail = await store.get(candidateId, null);
+    if (detail.candidate.parseError) throw new ApiError(422, 'bad_request', `候选数据无效：${detail.candidate.parseError}`);
+    if (detail.candidate.meta.status === 'approved' || detail.candidate.meta.status === 'rejected') {
+      throw new ApiError(409, 'conflict', `候选 ${candidateId} 已归档，不能作为转换目标`);
+    }
+    // 两侧同一提交：先备份档案，更新 item，再连同候选目录一起原子提交；失败恢复档案。
+    const { readFile, writeFile } = await import('node:fs/promises');
+    const auditBackup = await readFile(record.reviewPath, 'utf8');
+    await archive.updateItem(auditId, findingId, 'converted', candidateId);
+    const commit = await vcs.atomicCommit({
+      message: `audit(${auditId}): convert ${findingId} -> ${candidateId}`,
+      paths: [`.ai-review/audits/${auditId}`, `.ai-review/${candidateId}`],
+    });
+    if (!commit.success) {
+      await writeFile(record.reviewPath, auditBackup, 'utf8');
+      throw new ApiError(500, 'internal', `转换提交失败，已恢复审查档案：${commit.errorOutput}`);
+    }
+    const updated = await archive.read(auditId);
+    sendJson(res, 200, { audit: updated.meta, candidateId, commitRevision: commit.commitRevision });
+  }
+
+  private async reopen(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+    const runtime = await this.runtimeFor(url);
+    const { store } = runtime;
+    const body = await readJson(req);
+    const id = stringField(body, 'id');
+    const guard = guardFrom(body);
+    const from = stringField(body, 'from');
+    const reason = stringField(body, 'reason');
+    const candidate = await store.reopen(id, from, reason, guard);
+    const commit = await this.commitReviewOnly(`review(${id}): 人工重开（来自 ${from}）`, candidate, runtime);
+    sendJson(res, 200, { candidate, commit });
+  }
+
   private async approve(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const { store, vcs } = await this.runtimeFor(url);
     this.ensureNoAuditRunning();
     const body = await readJson(req);
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
+    // §4.7：人工判断项的确认/知悉记录随批准提交。
+    const confirmed = Array.isArray(body['confirmedDecisions'])
+      ? body['confirmedDecisions'].map((item) => String(item)).filter(Boolean)
+      : [];
+    const waivedRaw = Array.isArray(body['waivedDecisions']) ? body['waivedDecisions'] : [];
+    const waived = waivedRaw
+      .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
+      .map((item) => ({ id: String(item['id'] ?? ''), reason: String(item['reason'] ?? '') }))
+      .filter((item) => item.id);
+    for (const item of waived) {
+      if (!item.reason.trim()) throw new ApiError(400, 'bad_request', `知悉项 ${item.id} 必须填写理由`);
+    }
     await store.get(id, null);
+    // §7.4：窗口内与被拒候选完全重复的候选被阻止批准；人工重开（/reopen）可豁免。
+    {
+      const reviewersCfg = await loadReviewers(store.repoRoot);
+      if (reviewersCfg.rejectionMemoryDays > 0) {
+        const queue = await store.list({}, null, null, reviewersCfg.rejectionMemoryDays);
+        const duplicate = queue.items.find((item) => item.id === id);
+        if (duplicate?.duplicateOf) {
+          throw new ApiError(409, 'conflict', `该候选与窗口内的被拒候选完全重复（${duplicate.duplicateOf}），不能批准；如确为误判请先人工重开（POST /reopen）`);
+        }
+      }
+    }
     const job = this.jobs.start('approve', async (log, jobId) => {
       const orchestrator = new ApprovalOrchestrator({
         store,
@@ -782,7 +1150,7 @@ export class ReviewApi {
         makeRunner: (request) => new Runner(request),
         ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
       });
-      const outcome = await orchestrator.approve(id, guard, jobId, log);
+      const outcome = await this.withWriteLock(store.repoRoot, () => orchestrator.approve(id, guard, jobId, log, { confirmed, waived }));
       log(`结果：${outcome.status}${outcome.reason ? ` (${outcome.reason})` : ''} — ${outcome.message}`);
       return outcome;
     });

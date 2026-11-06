@@ -322,6 +322,8 @@ export function apply(ctx: HostContext): void {
   });
   ctx.effect(
     () => () => {
+      // 插件卸载/重载时停止定时审查调度，避免回调泄漏。
+      api?.stopScheduler();
       off();
     },
     'dsh-code-review: http routes',

@@ -127,8 +127,13 @@ Host 端在 `/dsh-code-review/api` 下注册：
 - `GET /health`、`GET/PUT /settings`
 - `GET /queue`、`GET /candidate?id=`、`GET /patch`、`GET /diff?id=&from=&to=`
 - `POST /comments`（保存意见；body 带 `autoFix: true` 时保存后自动启动 AI 修复并返回 `job`）、`POST /comment-status`、`POST /takeover`、`POST /reject`
-- `POST /approve`（返回 jobId）、`POST /ai-fix`（显式启动同一 AI 修复 job，返回 jobId；UI 不再单独暴露按钮，保留给自动化）、`GET /jobs/:id`、`POST /sync`
-- `GET /audit/prompt?mode=session|headless&targetPath=&note=`（导出审查提示词；session 为独立会话模式，headless 为旧的无交互模式）
+- `POST /archive-stale`（§18.1 显式归档过期候选：`system:stale` + 乐观锁只写一次；队列 `isStale` 只提示不写）
+- `POST /reopen`（§4.8 人工重开：`from` 指向 rejected 候选，理由必填，豁免负向记忆窗口）
+- `POST /convert`（§6.2 B/Deferred 转候选：depends_on 满足判定 + 档案/候选两侧同一提交）
+- `POST /rebase` / `POST /manual-revision`（§6.5/§6.4：新版本 + 门禁重跑，返回 job）
+- `GET /audits`、`GET /findings`（§3 目录式审查档案与 §3.4 finding 投影；旧扁平报告不参与）
+- `POST /approve`（返回 jobId；body 支持 `confirmedDecisions`/`waivedDecisions`，§4.7 判断项全覆盖校验）、`POST /ai-fix`（显式启动同一 AI 修复 job，返回 jobId；UI 不再单独暴露按钮，保留给自动化）、`GET /jobs/:id`、`POST /sync`
+- `GET /audit/prompt?mode=session|headless&targetPath=&note=`（导出审查提示词，含 reviewers.yml 路由注入；session 为独立会话模式，headless 为旧的无交互模式）
 - `POST /audit/session`（通过 Host `sessionController` 创建真实 DSH 审查会话并发送提示词，返回 sessionId；UI 使用）
 - `POST /audit`（可选 headless 审查，返回 jobId；插件负责复核与提交，UI 不使用）
 - `GET /fix-prompt?id=`、`GET /reviewers`、`GET /client-entry`
@@ -136,15 +141,16 @@ Host 端在 `/dsh-code-review/api` 下注册：
 ## 已知边界 / 与设计文档的差异
 
 1. **只 commit 不 push**：按当前会话选择；如需自动推送，可扩展 `GitAdapter.atomicCommit`。
-2. **`commit_revision` 回填需要第二个提交**：提交哈希无法写入自身；第二个提交只改 `.ai-review`，CI 规则已忽略这类提交。
+2. **`commit_revision` 回填需要第二个提交**：提交哈希无法写入自身；第二个提交只改 `.ai-review`，CI 规则已忽略这类提交。队列对 `approved` 且 `commit_revision: null` 的候选举报 `needsBackfill` 提示（§18.8 幂等补填）。
 3. **SVN 增量 diff 为 hunk 级**：SVN 无三方合并能力，跨版本增量直接退化为 hunk 对比并显示警告。
-4. **仓库审查只处理仓库自闭环**：A 类自动生成候选，B 类只写报告；Jira 等外部 Ticket 自动抓取尚未接入（远期方向）。
-5. **审查的运行前提**：业务工作区必须干净且仓库已有基线提交。UI 通过 Host `sessionController` 新建一个 DSH 审查会话（侧边栏可见，不自动切换当前页面），AI 在会话中直接修改工作区；会话模式下由 AI 按提示词只提交 `.ai-review`，不做 headless 插件复核。批准候选时插件会重新验证补丁并执行门禁。
-6. **审查报告位于 `.ai-review/audits/`**：headless 模式由插件解析报告中的 B 类/Deferred 并生成回退报告；会话模式由 AI 写入报告并在最终回复中给出摘要。
-7. **无批量批准、无真实鉴权**：owner 是本地约定，适合小团队试点；真正的权限需要仓库/服务端能力。
+4. **契约数据模型已落地（schema_version 1）**：`review.md` 全字段（module/audit_type 9 值/updated_at/target_files/human_decisions/rejection/commit_message/reopened_*）、§2.3 固定键序、§13 不变量校验（队列 broken 隔离）、负向记忆指纹与窗口阻止、批准留痕（门禁快照/逐条结果/判断项确认）、检出级写互斥均已实现并有测试（`tests/contract-*.test.mjs`，94 项全绿）。
+5. **仓库审查写入端仍为旧扁平报告**：`audits/<时间戳>-<范围>.md`；新目录式档案（`audits/<audit_id>/audit.md` + items/finding）的读取、投影、转换（`/convert`）已就绪，审查会话提示词改写为新格式属下一步。审查提示词已注入负向记忆摘要（§7.5/7.6）。
+6. **UI 未覆盖新端点**：`/archive-stale`、`/reopen`、`/convert`、`/rebase`、`/manual-revision`、`/backfill`、`/audits`、`/findings` 目前仅 API + 测试，客户端面板待补。
+7. **无批量批准、无真实鉴权**：owner 是本地约定，适合小团队试点；真正的权限需要仓库/服务端能力。检出级互斥为进程内实现，多克隆并发与"批准后跨实例重复 approved 检测"（§18.8 后半）不在保证范围。Jira 等外部 Ticket 自动抓取尚未接入（远期方向）。
+7a. **§14 共享事实过滤未实现**：队列/投影/负向记忆当前直接读工作区文件，未按 `git status` 排除未提交改动（本地视图）；提交失败回滚机制为主要缓解，完整实现待做。
 8. **UI 使用中文文案**（locale 命名空间已注册，便于后续补英文/日文）。
 9. 门禁命令由 AI 写入 `review.md`，批准时会以当前用户权限在本机执行；确认框会完整展示命令，请只批准可信候选。
-10. **审查会话使用当前 DSH 模型**：长时间审查会持续占用该会话；可以在聊天界面取消或追加意见，不影响其他会话。
+10. **审查会话使用当前 DSH 模型**：长时间审查会持续占用该会话；可以在聊天界面取消或追加意见，不影响其他会话。定时审查（`scheduleIntervalMinutes` 设置，分钟间隔）会按期自动创建「定时仓库审查」会话，提示词含 scheduled 标记与 owner 路由注入。
 11. **UI 与 headless 双路径**：UI 的「审查仓库」走新 DSH 会话（侧边栏可见、可交互），不再使用后台 headless 模态；`POST /audit` 的 headless 审查仍保留给自动化/测试，由插件负责复核与提交。
 
 ## 验证记录

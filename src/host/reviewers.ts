@@ -11,9 +11,24 @@ export interface ReviewerRule {
 export interface ReviewersConfig {
   defaultOwner: string;
   rules: ReviewerRule[];
+  /** §5：门禁白名单（trim 后精确匹配；未命中不是禁止，而是 UI 必须二次确认）。 */
+  allowedGateCommands: string[];
+  /** §5：updated_at 超过该天数进入超时废弃流程；未配置时仅提示。 */
+  staleDays: number | null;
+  /** §5：rejected 参与重复阻止的时间窗（天），默认 30。 */
+  rejectionMemoryDays: number;
+  /** §5：每模块最多注入的负向摘要数量，默认 20。 */
+  maxAntiPatterns: number;
 }
 
-export const EMPTY_REVIEWERS: ReviewersConfig = { defaultOwner: '', rules: [] };
+export const EMPTY_REVIEWERS: ReviewersConfig = {
+  defaultOwner: '',
+  rules: [],
+  allowedGateCommands: [],
+  staleDays: null,
+  rejectionMemoryDays: 30,
+  maxAntiPatterns: 20,
+};
 
 export function reviewersPath(repoRoot: string): string {
   return path.join(repoRoot, '.ai-review', 'reviewers.yml');
@@ -43,9 +58,17 @@ export async function loadReviewers(repoRoot: string): Promise<ReviewersConfig> 
         tags: asStringArray(rule['tags']),
       });
     }
+    const asPositiveInt = (value: unknown): number | null => {
+      const num = typeof value === 'number' && Number.isFinite(value) ? value : Number(value);
+      return Number.isInteger(num) && num > 0 ? num : null;
+    };
     return {
       defaultOwner: typeof record['default_owner'] === 'string' ? record['default_owner'].trim() : '',
       rules,
+      allowedGateCommands: asStringArray(record['allowed_gate_commands']),
+      staleDays: asPositiveInt(record['stale_days']),
+      rejectionMemoryDays: asPositiveInt(record['rejection_memory_days']) ?? EMPTY_REVIEWERS.rejectionMemoryDays,
+      maxAntiPatterns: asPositiveInt(record['max_anti_patterns']) ?? EMPTY_REVIEWERS.maxAntiPatterns,
     };
   } catch {
     return { ...EMPTY_REVIEWERS };

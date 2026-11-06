@@ -7,6 +7,7 @@ import type { ReviewStore } from './store.js';
 import type {
   AppSettings,
   ApprovalAbortReason,
+  ApprovalDecisions,
   ApprovalOutcome,
   ConcurrencyGuard,
   ReviewCandidate,
@@ -15,6 +16,34 @@ import type {
 import type { VcsAdapter } from './vcs.js';
 
 export const MAX_COMMIT_RETRIES = 2;
+
+/** §4.7/I8：human_decisions 全覆盖校验——每个 id 被确认或知悉，waived 必须有非空理由。 */
+export function checkDecisionCoverage(
+  decisions: { id: string; question: string }[],
+  confirmed: string[],
+  waived: { id: string; reason: string }[],
+): string[] {
+  const errors: string[] = [];
+  for (const item of waived) {
+    if (!item.reason.trim()) errors.push(`知悉项 ${item.id} 缺少理由`);
+  }
+  const confirmedSet = new Set(confirmed);
+  const waivedSet = new Set(waived.map((item) => item.id));
+  for (const item of decisions) {
+    if (!confirmedSet.has(item.id) && !waivedSet.has(item.id)) {
+      errors.push(`人工判断项 ${item.id} 未确认也未标记知悉：${item.question}`);
+    }
+  }
+  return errors;
+}
+
+/** §4.9：commit_message 首行必须与 title 完全一致。 */
+export function checkCommitMessage(title: string, commitMessage: string): string | null {
+  const firstLine = commitMessage.split('\n')[0]?.trim() ?? '';
+  if (!firstLine) return 'commit_message 为空：批准前必须填写提交信息';
+  if (firstLine !== title.trim()) return `commit_message 首行必须与 title 一致：${JSON.stringify(firstLine)} vs ${JSON.stringify(title)}`;
+  return null;
+}
 
 export interface RunnerLike {
   run(): Promise<RunnerExecutionResult>;
@@ -41,7 +70,13 @@ function relative(root: string, absolute: string): string {
 export class ApprovalOrchestrator {
   constructor(private readonly deps: ApprovalDeps) {}
 
-  async approve(id: string, guard: ConcurrencyGuard, jobId: string, log: (line: string) => void): Promise<ApprovalOutcome> {
+  async approve(
+    id: string,
+    guard: ConcurrencyGuard,
+    jobId: string,
+    log: (line: string) => void,
+    decisions: ApprovalDecisions = { confirmed: [], waived: [] },
+  ): Promise<ApprovalOutcome> {
     const { store, vcs, settings } = this.deps;
     const maxAttempts = MAX_COMMIT_RETRIES + 1;
     let lastCommitError = '';
@@ -55,6 +90,21 @@ export class ApprovalOrchestrator {
           message: '候选已被其他人更新（版本或负责人变化），请重新加载后再批准。',
           jobId,
         };
+      }
+      // §4.7/I8：人工判断项必须逐项确认或知悉（waived 带理由）。
+      const decisionErrors = checkDecisionCoverage(candidate.meta.humanDecisions, decisions.confirmed, decisions.waived);
+      if (decisionErrors.length > 0) {
+        return {
+          status: 'ABORTED',
+          reason: 'DECISIONS_UNCONFIRMED',
+          message: `人工判断项未全部处理，无法批准：\n${decisionErrors.join('\n')}`,
+          jobId,
+        };
+      }
+      // §4.9：commit_message 首行 == title。
+      const messageError = checkCommitMessage(candidate.meta.title, candidate.meta.commitMessage);
+      if (messageError) {
+        return { status: 'ABORTED', reason: 'COMMIT_MESSAGE_MISMATCH', message: messageError, jobId };
       }
       const validation = await store.validateCandidate(candidate);
       if (validation.length > 0) {
@@ -124,13 +174,16 @@ export class ApprovalOrchestrator {
         };
       }
       const backup = await this.backup(fresh);
-      await store.applyApproval(fresh, guard.expectedOwner, report, null);
+      await store.applyApproval(fresh, guard.expectedOwner, report, null, decisions);
       const patchPaths = fresh.meta.revisions.map((revision) =>
         relative(store.repoRoot, path.join(fresh.dirPath, revision.patch)),
       );
       const businessPaths = parsePatch(patch.text).paths.filter((file) => !isAiReviewPath(file));
+      // §4.9：业务提交使用 review.md 中的最新 commit_message（首行 == title），不用插件拼接的固定标题。
+      const businessMessage = fresh.meta.commitMessage.trim()
+        || `review(${id}): approve rev ${String(fresh.meta.currentRevision)}`;
       const commit = await vcs.atomicCommit({
-        message: `review(${id}): approve rev ${String(fresh.meta.currentRevision)}`,
+        message: businessMessage,
         paths: [...businessPaths, relative(store.repoRoot, fresh.dirPath)],
         deletePaths: patchPaths,
       });
@@ -155,7 +208,8 @@ export class ApprovalOrchestrator {
       if (fresh.meta.approval) {
         fresh.meta.approval.commitRevision = commit.commitRevision;
         try {
-          await store.write(fresh);
+          // §8 规则 6：回填只写 commit_revision，不改变 updated_at（幂等可重试）。
+          await store.write(fresh, { touchUpdatedAt: false });
           const backfill = await vcs.atomicCommit({
             message: `review(${id}): record commit_revision ${commit.commitRevision ?? ''}`.trim(),
             paths: [relative(store.repoRoot, fresh.dirPath)],
@@ -184,6 +238,10 @@ export class ApprovalOrchestrator {
     try {
       const detail = await this.deps.store.get(id, null);
       const candidate = detail.candidate;
+      if (candidate.parseError) {
+        log(`候选数据无效：${candidate.parseError}`);
+        return null;
+      }
       if (candidate.meta.currentRevision !== guard.expectedRevision) {
         log(`版本已从 ${String(guard.expectedRevision)} 变为 ${String(candidate.meta.currentRevision)}`);
         return null;

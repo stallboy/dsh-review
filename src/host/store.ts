@@ -12,6 +12,8 @@ import {
   serializeReviewMarkdown,
 } from './frontmatter.js';
 import { parsePatch } from './patch.js';
+import { quickReviewInvariants, fullReviewInvariants } from './invariants.js';
+import { entryFromCandidate, fingerprintOf, withinWindow } from './memory.js';
 import type {
   CandidateSummary,
   ConcurrencyGuard,
@@ -64,9 +66,15 @@ export function matchesReviewFilter(summary: CandidateSummary, filter: ReviewFil
     const haystack = `${summary.title} ${summary.id} ${summary.ticket ?? ''} ${summary.tags.join(' ')}`.toLowerCase();
     if (!haystack.includes(needle)) return false;
   }
-  if (filter.createdAfter && summary.createdAt < filter.createdAfter) return false;
-  if (filter.createdBefore && summary.createdAt > filter.createdBefore) return false;
+  if (filter.createdAfter && timePoint(summary.createdAt) < timePoint(filter.createdAfter)) return false;
+  if (filter.createdBefore && timePoint(summary.createdAt) > timePoint(filter.createdBefore)) return false;
   return true;
+}
+
+/** §2.2：时间比较一律按解析后的时间点；无效时间排最后。 */
+function timePoint(value: string): number {
+  const parsed = new Date(value).getTime();
+  return Number.isNaN(parsed) ? Number.POSITIVE_INFINITY : parsed;
 }
 
 export class ReviewStore {
@@ -96,7 +104,7 @@ export class ReviewStore {
     try {
       const parsed = parseReviewMarkdown(text);
       const sections = parseSections(parsed.body);
-      return {
+      const candidate: ReviewCandidate = {
         id: candidateId(month, slug),
         month,
         slug,
@@ -107,6 +115,12 @@ export class ReviewStore {
         humanJudgment: extractHumanJudgment(sections.humanJudgment),
         humanJudgmentDeclared: sections.humanJudgment.trim().length > 0,
       };
+      // §13.2：读取候选时执行只读不变量校验，违反者标记 broken，不参与批准/投影。
+      const invariantErrors = quickReviewInvariants(candidate);
+      if (invariantErrors.length > 0) {
+        return this.brokenCandidate(month, slug, dir, reviewPath, invariantErrors.join('；'));
+      }
+      return candidate;
     } catch (error) {
       if (!(error instanceof ReviewFormatError)) throw error;
       return this.brokenCandidate(month, slug, dir, reviewPath, error.message);
@@ -123,16 +137,23 @@ export class ReviewStore {
     const meta: ReviewFrontmatter = {
       schemaVersion: 1,
       title: slug,
+      module: '',
+      auditType: '',
       createdAt: '',
+      updatedAt: '',
       owner: '',
       tags: [],
       status: 'pending',
       ticket: null,
+      targetFiles: [],
       currentRevision: 0,
       revisions: [],
       gateChecks: [],
       comments: [],
+      humanDecisions: [],
       approval: null,
+      rejection: null,
+      commitMessage: '',
       extra: {},
     };
     return {
@@ -157,9 +178,15 @@ export class ReviewStore {
     };
   }
 
-  async list(filter: ReviewFilter, currentBase: string | null): Promise<{ items: CandidateSummary[]; errors: string[] }> {
+  async list(
+    filter: ReviewFilter,
+    currentBase: string | null,
+    staleDays?: number | null,
+    rejectionMemoryWindow?: number | null,
+  ): Promise<{ items: CandidateSummary[]; errors: string[] }> {
     const items: CandidateSummary[] = [];
     const errors: string[] = [];
+    const memoryEntries: import('./memory.js').RejectionMemoryEntry[] = [];
     let months: string[] = [];
     try {
       months = (await readdir(this.aiReviewRoot, { withFileTypes: true }))
@@ -195,7 +222,24 @@ export class ReviewStore {
             }
             if (existsSync(patchPath)) stats = parsePatch(await readFile(patchPath, 'utf8')).stats;
           }
-          const summary = this.toSummary(candidate, stats, currentBase);
+          // I5/I4 的补丁上下文校验（声明非空时强制路径一致）。
+          if (candidate.parseError === undefined) {
+            const invariantErrors = fullReviewInvariants({
+              candidate,
+              patchExists: (revision) => archived || existsSync(this.patchPathFor(candidate, revision.patch)),
+              currentPatchPaths: stats === EMPTY_STATS ? null : stats.entries.map((entry) => entry.path),
+            });
+            if (invariantErrors.length > 0) {
+              const summary = this.toSummary(this.brokenCandidate(month, slug, path.join(monthDir, slug), reviewPath, invariantErrors.join('；')), stats, currentBase, staleDays);
+              if (matchesReviewFilter(summary, filter)) items.push(summary);
+              continue;
+            }
+          }
+          const summary = this.toSummary(candidate, stats, currentBase, staleDays);
+          if (candidate.meta.status === 'rejected') {
+            const entry = entryFromCandidate({ candidateId: candidate.id, meta: candidate.meta });
+            if (entry) memoryEntries.push(entry);
+          }
           if (!matchesReviewFilter(summary, filter)) continue;
           items.push(summary);
         } catch (error) {
@@ -225,17 +269,32 @@ export class ReviewStore {
       }
     }
     items.sort((left, right) => {
-      const byDate = right.createdAt.localeCompare(left.createdAt);
+      // §2.2：按时间点而非字符串；同一时间点以候选 id 为次序键。
+      const byDate = timePoint(right.createdAt) - timePoint(left.createdAt);
       return byDate !== 0 ? byDate : right.id.localeCompare(left.id);
     });
+    // §7：负向记忆实时计算——窗口内完全相同指纹的活跃候选被标记阻止（重开豁免）。
+    if (rejectionMemoryWindow !== undefined && rejectionMemoryWindow !== null && rejectionMemoryWindow > 0) {
+      const memory = memoryEntries.filter((entry) => withinWindow(entry, rejectionMemoryWindow));
+      for (const item of items) {
+        if (item.parseError || item.status === 'rejected' || item.status === 'approved') continue;
+        if (item.reopenedFrom) continue;
+        const match = memory.find((entry) => entry.fingerprint === item.fingerprint);
+        if (match) item.duplicateOf = match.candidateId;
+      }
+    }
     return { items, errors };
   }
 
-  private toSummary(candidate: ReviewCandidate, stats: PatchStats, currentBase: string | null): CandidateSummary {
+  private toSummary(candidate: ReviewCandidate, stats: PatchStats, currentBase: string | null, staleDays?: number | null): CandidateSummary {
     const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
     const baseRevision = current?.baseRevision ?? '';
     const unresolved = candidate.meta.comments.filter((comment) => comment.status !== 'resolved').length;
     const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
+    // §18.1：队列加载只提示过期（本地派生状态），不做读时写。
+    const anchor = new Date(candidate.meta.updatedAt || candidate.meta.createdAt).getTime();
+    const isStale = staleDays !== undefined && staleDays !== null && staleDays > 0 && !archived
+      && !Number.isNaN(anchor) && (Date.now() - anchor) / 86_400_000 >= staleDays;
     return {
       id: candidate.id,
       title: candidate.meta.title,
@@ -253,6 +312,13 @@ export class ReviewStore {
       isBaseBehind: !archived && currentBase !== null && baseRevision !== '' && baseRevision !== currentBase,
       baseRevision,
       lastFeedback: findLastFeedback(candidate.meta),
+      reopenedFrom: candidate.meta.reopenedFrom ?? null,
+      fingerprint: fingerprintOf(candidate.meta),
+      // §18.8：approved 但 commit_revision 未回填——只读提示，等待幂等补填。
+      ...(candidate.meta.status === 'approved' && candidate.meta.approval && !candidate.meta.approval.commitRevision
+        ? { needsBackfill: true }
+        : {}),
+      ...(isStale ? { isStale: true } : {}),
       ...(candidate.parseError ? { parseError: candidate.parseError } : {}),
     };
   }
@@ -271,7 +337,17 @@ export class ReviewStore {
       throw new ApiError(404, 'not_found', `候选不存在：${id}`);
     }
     const candidate = await this.readCandidate(month, slug);
-    if (candidate.parseError) throw new ApiError(422, 'bad_request', `review.md 格式错误：${candidate.parseError}`);
+    // §18.8：broken 候选只读展示（详情页可见 parseError），不在此抛错造成死胡同；
+    // 写路径各自经 readCategory/校验拦截。
+    if (candidate.parseError) {
+      return {
+        candidate,
+        currentBase,
+        isBaseBehind: false,
+        patchText: '',
+        patchStats: EMPTY_STATS,
+      };
+    }
     const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
     if (!current) throw new ApiError(500, 'internal', '当前版本元数据缺失');
     const patchPath = this.patchPathFor(candidate, current.patch);
@@ -295,7 +371,11 @@ export class ReviewStore {
     return readFile(this.patchPathFor(candidate, patchName), 'utf8');
   }
 
-  async write(candidate: ReviewCandidate): Promise<void> {
+  async write(candidate: ReviewCandidate, options?: { touchUpdatedAt?: boolean }): Promise<void> {
+    if (options?.touchUpdatedAt !== false) {
+      // §8 通用规则 6：每次共享写入更新 updated_at。
+      candidate.meta.updatedAt = new Date().toISOString();
+    }
     const text = serializeReviewMarkdown(candidate.meta, candidate.sections.rawBody);
     const temp = `${candidate.reviewPath}.tmp-${String(process.pid)}`;
     await writeFile(temp, text, 'utf8');
@@ -320,7 +400,7 @@ export class ReviewStore {
   async addComment(
     id: string,
     author: string,
-    input: { content: string; file?: string; line?: number; revision?: number },
+    input: { content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT' },
     guard: ConcurrencyGuard,
   ): Promise<ReviewCandidate> {
     const { month, slug } = this.resolveCandidateDir(id);
@@ -332,11 +412,19 @@ export class ReviewStore {
     const revision = input.revision ?? candidate.meta.currentRevision;
     const file = (input.file ?? '').replaceAll('\\', '/');
     const line = input.line ?? 0;
+    // §4.6：行内评论必须带 LEFT/RIGHT；总体评论不带。
+    let side = input.side;
+    if (file !== '' || line !== 0) {
+      if (side !== 'LEFT' && side !== 'RIGHT') throw new ApiError(400, 'bad_request', '行内评论必须指明 LEFT 或 RIGHT');
+    } else {
+      side = undefined;
+    }
     const comment: ReviewComment = {
       id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
       revision,
       file,
       line,
+      ...(side ? { side } : {}),
       author,
       content,
       status: 'unresolved',
@@ -377,15 +465,35 @@ export class ReviewStore {
     return candidate;
   }
 
-  async reject(id: string, reason: string, guard: ConcurrencyGuard): Promise<ReviewCandidate> {
+  async reject(
+    id: string,
+    reason: string,
+    guard: ConcurrencyGuard,
+    options?: { rejectedBy?: string; requireStaleDays?: number },
+  ): Promise<ReviewCandidate> {
     const { month, slug } = this.resolveCandidateDir(id);
     const candidate = await this.readCandidate(month, slug);
     if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
     await this.ensureWriteAllowed(candidate, guard);
     const trimmed = reason.trim();
     if (!trimmed) throw new ApiError(400, 'bad_request', '放弃原因不能为空');
+    if (options?.requireStaleDays !== undefined) {
+      // §18.1：显式归档过期候选——只有确实超过 stale_days 的候选可归档（乐观锁保证只写一次）。
+      const anchor = new Date(candidate.meta.updatedAt || candidate.meta.createdAt).getTime();
+      const ageDays = (Date.now() - anchor) / 86_400_000;
+      if (Number.isNaN(anchor)) throw new ApiError(422, 'bad_request', 'updated_at 无法解析，不能判定超时');
+      if (ageDays < options.requireStaleDays) {
+        throw new ApiError(409, 'conflict', `未超过 stale_days（${String(options.requireStaleDays)} 天，当前 ${ageDays.toFixed(1)} 天），不能按超时归档`);
+      }
+    }
     candidate.meta.status = 'rejected';
     candidate.meta.approval = null;
+    // §4.8：拒绝必须在同一写入中留痕 rejection。
+    candidate.meta.rejection = {
+      rejectedBy: options?.rejectedBy ?? guard.expectedOwner,
+      rejectedAt: new Date().toISOString(),
+      reason: trimmed,
+    };
     candidate.sections.rawBody = appendVersionSection(
       candidate.sections.rawBody,
       candidate.meta.currentRevision,
@@ -396,17 +504,77 @@ export class ReviewStore {
     return candidate;
   }
 
+  /**
+   * §4.8/§18.6：人工重开被拒方案——在活跃候选上标记 reopened_from/reopen_reason。
+   * 仅 Owner 人工操作（API 层保证不由 AI 路径触发）；目标必须是真实存在的 rejected 候选。
+   */
+  async reopen(id: string, fromId: string, reason: string, guard: ConcurrencyGuard): Promise<ReviewCandidate> {
+    const { month, slug } = this.resolveCandidateDir(id);
+    const candidate = await this.readCandidate(month, slug);
+    if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
+    await this.ensureWriteAllowed(candidate, guard);
+    const trimmedReason = reason.trim();
+    if (!trimmedReason) throw new ApiError(400, 'bad_request', '重开理由不能为空');
+    const { month: fromMonth, slug: fromSlug } = this.resolveCandidateDir(fromId);
+    const fromPath = path.join(this.aiReviewRoot, fromMonth, fromSlug, 'review.md');
+    if (!existsSync(fromPath)) throw new ApiError(404, 'not_found', `被拒候选不存在：${fromId}`);
+    const fromCandidate = await this.readCandidate(fromMonth, fromSlug);
+    if (fromCandidate.parseError) throw new ApiError(422, 'bad_request', `被拒候选无法解析：${fromCandidate.parseError}`);
+    if (fromCandidate.meta.status !== 'rejected' || !fromCandidate.meta.rejection) {
+      throw new ApiError(409, 'conflict', `reopened_from 必须指向 rejected 候选：${fromId}`);
+    }
+    candidate.meta.reopenedFrom = fromId;
+    candidate.meta.reopenedReason = trimmedReason;
+    await this.write(candidate);
+    return candidate;
+  }
+
+  /**
+   * §6.4/§6.5：追加新版本（人工微调 author=human / Rebase author=ai）。
+   * 调用方负责隔离工作区与门禁；本方法只落盘新补丁、推进版本、回到 pending 并清空批准。
+   */
+  async appendRevision(
+    id: string,
+    input: { author: 'ai' | 'human'; baseRevision: string; patchText: string },
+    guard: ConcurrencyGuard,
+  ): Promise<ReviewCandidate> {
+    const { month, slug } = this.resolveCandidateDir(id);
+    const candidate = await this.readCandidate(month, slug);
+    if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
+    await this.ensureWriteAllowed(candidate, guard);
+    const nextId = candidate.meta.currentRevision + 1;
+    const patchName = `${String(nextId).padStart(3, '0')}.patch`;
+    const { writeFile: writePatchFile } = await import('node:fs/promises');
+    await writePatchFile(path.join(candidate.dirPath, patchName), input.patchText, 'utf8');
+    candidate.meta.revisions.push({ id: nextId, baseRevision: input.baseRevision, patch: patchName, author: input.author });
+    candidate.meta.currentRevision = nextId;
+    candidate.meta.status = 'pending';
+    candidate.meta.approval = null;
+    await this.write(candidate);
+    return candidate;
+  }
+
   async applyApproval(
     candidate: ReviewCandidate,
     approvedBy: string,
     report: ValidationReport,
     commitRevision: string | null,
+    decisions?: { confirmed: string[]; waived: { id: string; reason: string }[] },
   ): Promise<void> {
     candidate.meta.status = 'approved';
     candidate.meta.approval = {
       approvedBy,
       approvedAt: new Date().toISOString(),
       commitRevision,
+      // §4.7：批准留痕——门禁快照、逐条执行结果、判断项确认/知悉记录。
+      gateChecks: [...candidate.meta.gateChecks],
+      gateResults: report.results.map((result) => ({
+        command: result.command,
+        exit_code: result.exitCode ?? -1,
+        duration_ms: result.durationMs,
+      })),
+      confirmedDecisions: decisions ? [...decisions.confirmed] : [],
+      waivedDecisions: decisions ? decisions.waived.map((item) => ({ ...item })) : [],
     };
     const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
     candidate.sections.rawBody = appendVersionSection(

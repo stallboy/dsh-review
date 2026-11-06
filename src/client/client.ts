@@ -627,6 +627,7 @@
         try {
           const response = await api.post<{ job?: Job; autoFixError?: string }>('/comments', {
             id: detail.candidate.id, ...guard(), file, line, content: text, autoFix,
+            side: 'RIGHT', // 行内评论入口位于补丁新代码行（newNo），按 §4.6 定 side
           });
           await afterWrite();
           if (response.autoFixError) {

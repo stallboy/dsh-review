@@ -239,6 +239,32 @@ async function existingCandidateLines(store: ReviewStore, baseRevision: string):
   }
 }
 
+/** §7.5/§7.6：负向记忆注入——窗口内 rejected 摘要（每模块上限 max_anti_patterns，按 rejected_at 倒序）。 */
+async function negativeMemoryLines(repoRoot: string): Promise<string> {
+  try {
+    const store = new ReviewStore(repoRoot);
+    const { loadReviewers } = await import('./reviewers.js');
+    const { entryFromCandidate, topPerModule, formatMemorySummary, withinWindow } = await import('./memory.js');
+    const config = await loadReviewers(repoRoot);
+    const { items } = await store.list({}, null);
+    const full = [];
+    for (const item of items) {
+      if (item.status !== 'rejected') continue;
+      try {
+        const record = await store.get(item.id, null);
+        const entry = entryFromCandidate({ candidateId: item.id, meta: record.candidate.meta });
+        if (entry && withinWindow(entry, config.rejectionMemoryDays, Date.now())) full.push(entry);
+      } catch {
+        // 跳过无法读取的 rejected 候选
+      }
+    }
+    if (full.length === 0) return '- 无（近期没有被拒绝的方案）。';
+    return formatMemorySummary(topPerModule(full, config.maxAntiPatterns));
+  } catch {
+    return '- （无法读取负向记忆；请自行检查 .ai-review/ 下已拒绝候选。）';
+  }
+}
+
 export interface BuildAuditPromptInput {
   repoRoot: string;
   vcsType: VcsType;
@@ -259,6 +285,7 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
   const reviewersText = await readReviewersText(input.repoRoot, input.owner);
   const outline = await collectOutline(input.repoRoot, target.absolutePath);
   const existing = await existingCandidateLines(new ReviewStore(input.repoRoot), input.baseRevision);
+  const negativeMemory = await negativeMemoryLines(input.repoRoot);
   const month = `${String(now.getFullYear())}-${pad(now.getMonth() + 1)}`;
   const scope = target.targetPath ? `\`${target.targetPath}\`` : '全仓库';
   const sessionMode = input.mode === 'session';
@@ -294,6 +321,9 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
     '',
     '## 已存在的候选（不要重复生成同一问题）',
     existing,
+    '',
+    '## 负向记忆：近期被拒绝的方案（禁止重复；标题/文件/原因见下）',
+    negativeMemory,
     '',
     '## 仓库结构摘要（仅用于建立地图，完整内容请自行读取）',
     '```text',

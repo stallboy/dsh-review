@@ -17,6 +17,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   autoFixOnFailure: true,
   gateTimeoutMs: 600_000,
   syncBeforeApprove: true,
+  scheduleIntervalMinutes: 0,
 };
 
 export function dshHome(): string {
@@ -46,6 +47,9 @@ function normalizeSettings(raw: unknown): AppSettings {
       ? Math.min(input['gateTimeoutMs'], 3_600_000)
       : DEFAULT_SETTINGS.gateTimeoutMs,
     syncBeforeApprove: input['syncBeforeApprove'] !== false,
+    scheduleIntervalMinutes: typeof input['scheduleIntervalMinutes'] === 'number' && input['scheduleIntervalMinutes'] > 0
+      ? input['scheduleIntervalMinutes']
+      : 0,
   };
 }
 

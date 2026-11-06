@@ -175,6 +175,15 @@ async function writeQueueCandidate(root, slug, status, baseRevision) {
     '  - "node --version"',
     'comments: []',
     'approval: null',
+    ...(status === 'approved'
+      ? [
+          'rejection: null',
+          'approval:',
+          '  approved_by: tester',
+          '  approved_at: "2026-10-31T21:00:00+08:00"',
+          '  commit_revision: null',
+        ]
+      : []),
     '---',
     '',
     '# 问题与影响',
