@@ -243,7 +243,7 @@ audit_smoke_commands: []
 | `author` / `content` | 均为非空 string；人类原文不得被 AI 改写。 |
 | `status` | `unresolved / partial / resolved`。 |
 | `created_at` | 可选 ISO-8601 string。 |
-| `anchor` | 可选对象：`{snippet: 非空 string, before?: string, after?: string}`。保存评论创建时被评论行的原文摘要，并可选保存前后各一行，用于跨版本重定位；仅行内评论可带，总体评论必须省略。原 `revision/file/line/side` 仍是权威锚点，任何读取端不得改写。Client 未上传 anchor 时，Host 应根据目标 revision 的基线或补丁内容自动提取对应行填充（无法可靠解析时省略）。 |
+| `anchor` | 可选对象：`{snippet: 非空 string, before?: string, after?: string}`。保存评论创建时被评论行的原文摘要，并可选保存前后各一行，用于跨版本重定位；仅行内评论可带，总体评论必须省略。原 `revision/file/line/side` 仍是权威锚点，任何读取端不得改写。Client 未上传 anchor 时，Host 应自动提取对应行填充：优先从该 revision 的补丁 Hunk 中内存解析（无需访问 VCS）；目标行不在 Hunk 覆盖范围内时，再从该 revision 的 base_revision 文件快照提取；失败或超时时静默省略，不阻塞评论提交。 |
 
 批准对象字段：
 
@@ -766,7 +766,7 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 
 收尾时 Host 必须验证每个 A 类候选：Frontmatter 合法、status=pending、rev1、approval=null、基线与本轮一致、补丁可在基线干净应用且不越界，并通过全部适用不变量。owner 必须等于 Host 按同一共享快照中的 reviewers.yml、target_files 和 tags 计算的路由结果，否则不得提交。B/Deferred 解析为档案 items，并写入插件复核块。校验失败的候选不得提交，其错误必须写入本轮复核结果；合法候选与本轮 audit 目录仍可继续。
 
-若 `reviewers.yml` 的 `verify_gate_on_audit_finalize` 为 `smoke` 或 `declared`，Host 还必须对每个通过前述校验的新候选，在其补丁应用后的工作区执行对应命令（`smoke` 执行 `audit_smoke_commands`，`declared` 执行候选 `gate_checks`）；执行后无论成功失败都必须还原业务工作区（保留 `.ai-review/`），失败则该候选不提交，错误写入复核块。默认 `none`：审计期门禁是 AI 报告，批准时 Host 仍会重新执行全部门禁。复核块必须明确区分“补丁可应用/Frontmatter 与不变量通过”和“门禁是否由 Host 复算”；未复算时不得写成“通过全部适用检查”。
+若 `reviewers.yml` 的 `verify_gate_on_audit_finalize` 为 `smoke` 或 `declared`，Host 还必须对每个通过前述校验的新候选，在其补丁应用后的工作区执行对应命令（`smoke` 执行 `audit_smoke_commands`，`declared` 执行候选 `gate_checks`）；执行后无论成功失败都必须还原业务工作区（保留 `.ai-review/`），失败则该候选不提交，错误写入复核块。收尾重跑必须串行逐候选执行，并在 audit / finalize Job 日志中实时输出当前复核的候选 ID 与门禁命令进度；单条命令同样受 §9 的 `gateTimeoutMs` 约束，超时按失败处理。默认 `none`：审计期门禁是 AI 报告，批准时 Host 仍会重新执行全部门禁。复核块必须明确区分“补丁可应用/Frontmatter 与不变量通过”和“门禁是否由 Host 复算”；未复算时不得写成“通过全部适用检查”。
 
 提交前 `candidates[]` 必须只包含实际通过校验并纳入本次共享提交的候选 id，A 类正文列表也必须同步过滤；不得保留仅本地或非法候选引用。收尾提交必须是一次仅包含本轮 audit 目录、合法新候选目录和复核块的共享提交；即使无合法候选也可提交审查档案。提交失败或结果不明必须按 §5.6 的三分支处理，不得无条件恢复或返回成功。业务工作区必须已还原。
 
@@ -933,7 +933,7 @@ stale、duplicate、local 和基线冲突必须使用不同徽标；local 不计
 - 底部提供总体意见、批准、提出改进意见和必填原因的放弃；changes_requested 提供“转回待审核”。
 - 行内评论模型必须保存 side；删除侧行创建 LEFT，新增/上下文新侧创建 RIGHT，展示和线程匹配同时比较 file + line + side。
 - 行内评论可携带 `anchor`；跨版本展示时先按 `file + line + side` 匹配，内容不匹配再用 `anchor.snippet` 重定位；无 anchor 或重定位失败时回退到原版本视图并以原评论位置展示，任何情况下都不得改写原评论。
-- 多条评论可以本地草稿批量提交；提交时一次发送，候选状态只在批次内转换一次。
+- 多条评论可以本地草稿批量提交；提交时一次发送，候选状态只在批次内转换一次。存在未提交本地草稿且用户触发 AI 修复时，必须通过 `/comments/batch` 携带 `autoFix: true` 一次性完成评论提交与修复触发；无本地草稿时才直接调用 `/ai-fix`，不得拆成串行的两个请求徒增锁竞争。
 - 评论草稿与批准前勾选只保存在前端内存。
 - 详情页显示 `patchCheck` 派生诊断；`conflicted` 时提供 Rebase 入口，但预检不是批准证据，不得单独禁用批准。
 - 已批准候选显示派生业务提交版本与 `approvalCommitLookup` 诊断；`ambiguous/unknown` 只显示提示，不得显示为失败。
@@ -1172,7 +1172,7 @@ Agent 结束任务前必须逐项确认：
 
 ## 附录 A. 当前实现差距
 
-本附录只描述当前实现与目标契约的差距，不修改正文契约。优先级表示修复顺序：P0 = 共享事实/安全语义受损或主流程不可用；P1 = 主流程或数据契约不完整；P2 = 一致性或体验缺口。修复后删除对应行。
+本附录只描述当前实现与目标契约的差距，不修改正文契约。优先级表示修复顺序：P0 = 共享事实/安全语义受损或主流程不可用；P1 = 主流程或数据契约不完整；P2 = 一致性或体验缺口。修复后删除对应行（编号不复用，允许跳号）。排期注记：G41 的投影缓存底座与 G10（同快照共享读取）、G18（批准提交派生）在代码层高度耦合，应合并在同一里程碑实现，避免队列读端对每个 approved 候选反复执行 `git log` / `git show`。
 
 | # | 优先级 | 当前差距 | 影响 | 修复方向 |
 | --- | --- | --- | --- | --- |
