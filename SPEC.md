@@ -243,7 +243,7 @@ audit_smoke_commands: []
 | `author` / `content` | 均为非空 string；人类原文不得被 AI 改写。 |
 | `status` | `unresolved / partial / resolved`。 |
 | `created_at` | 可选 ISO-8601 string。 |
-| `anchor` | 可选对象：`{snippet: 非空 string, before?: string, after?: string}`。保存评论创建时被评论行的原文摘要，并可选保存前后各一行，用于跨版本重定位；仅行内评论可带，总体评论必须省略。原 `revision/file/line/side` 仍是权威锚点，任何读取端不得改写。 |
+| `anchor` | 可选对象：`{snippet: 非空 string, before?: string, after?: string}`。保存评论创建时被评论行的原文摘要，并可选保存前后各一行，用于跨版本重定位；仅行内评论可带，总体评论必须省略。原 `revision/file/line/side` 仍是权威锚点，任何读取端不得改写。Client 未上传 anchor 时，Host 应根据目标 revision 的基线或补丁内容自动提取对应行填充（无法可靠解析时省略）。 |
 
 批准对象字段：
 
@@ -263,7 +263,7 @@ audit_smoke_commands: []
 | --- | --- |
 | `rejected_by` / `rejected_at` / `reason` | 必填；含义同上。 |
 | `category` | 可选 enum：`false_positive / intentional_design / high_risk / out_of_scope / stale`；未知值必须原样保留并按 `unspecified` 处理，不得使候选 broken。`stale` 仅由 Host 在超时归档时写入，人工拒绝不得选择。不参与 §6.1 确定性指纹。 |
-| `related_symbols` | 可选 string[]；Host 在拒绝时从当前补丁 hunk header 提取的函数/结构体名，仅用于提示词与 UI 相似性提示，不参与确定性指纹。 |
+| `related_symbols` | 可选 string[]；Host 在拒绝时从当前补丁 hunk header 提取的函数/结构体名，仅用于提示词与 UI 相似性提示，不参与确定性指纹。提取时必须逐项 trim、丢弃空串并去重，单条超过 120 字符截断或丢弃，最多保留前 16 个唯一条目；无法提取有效符号时写 `[]` 或省略。 |
 
 所有时间戳必须包含 `Z` 或 `±HH:MM` 时区偏移。解析器必须接受 YAML 裸时间对象并规范化为 UTC `Z` 字符串；比较、过滤与排序按解析后的时间点，不得按字符串字典序。audit_id 只使用规范化后的 UTC 时刻，因此不受该转换影响（§4.7）。
 
@@ -600,7 +600,7 @@ AI 必须把无法自证的业务语义、架构/性能折中、兼容性和未�
 3. 该提交删除了候选当前 `revisions[]` 的全部补丁；
 4. 该提交包含 `target_files` 中至少一个业务路径的改动。
 
-Git 在候选目录的 first-parent 历史中查找删除补丁的提交，再用 `git show <c>:<path>` 与 `git show <c>^:<path>` 验证状态迁移；SVN 在对应路径历史中查找同一 revision 的 `M review.md` 与 `D` 补丁，再用 `svn cat -r <c>` 与 `-r <c-1>` 验证。Host 必须把结果归为三态：
+Git 在触及该候选目录 `review.md` 的提交历史中（如 `git log -- <candidate_dir>`）查找满足上述 4 个条件的提交，再用 `git show <c>:<path>` 与各父提交的 `git show <p>:<path>` 验证状态迁移；不限定 first-parent，因为条件 1–4 加 `ambiguous` 兜底已具备足够的唯一性过滤。验证 Merge 提交时必须显式展开其改动列表（如 `git diff-tree -m -r <c>`）：默认 diff 输出对 Merge 提交不列文件，直接沿用会导致漏检；条件 2 的"父提交"在 Merge 场景下须对所有父提交均不满足 `approved` 才算状态迁移。SVN 在对应路径历史中查找同一 revision 的 `M review.md` 与 `D` 补丁，再用 `svn cat -r <c>` 与 `-r <c-1>` 验证。Host 必须把结果归为三态：
 
 - `found`：唯一命中，返回该 VCS 版本号；
 - `ambiguous`：多个提交同时满足，返回诊断并要求人工确认，不得任意选择；
@@ -838,7 +838,7 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 | --- | --- | --- |
 | GET | `/health` | 应用、版本、configured、repoRoot、owner、VCS、当前基线、诊断和状态计数。 |
 | GET | `/settings` | `{settings, validation, suggestedOwner, runners}`。 |
-| GET | `/queue?owner=&statuses=&tag=&dir=&text=&createdAfter=&createdBefore=` | `{configured, items, errors, currentBase, counts, owner, me, repoRoot}`；owner 缺省为当前操作者、显式空值表示全部；statuses 为逗号分隔合法状态，缺省/空值为全部；tag 小写比较，dir/text 为大小写不敏感包含匹配；createdAfter/Before 均为含边界的 ISO 时间点。approved 项可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup: found / ambiguous / unknown`；`ambiguous/unknown` 只作诊断，不得阻塞队列。可含缓存字段 `patchCheck`，但必须携带 `checkedBase` 与非空 ISO-8601 `checkedAt`，且不得作为共享事实或批准依据。 |
+| GET | `/queue?owner=&statuses=&tag=&dir=&text=&createdAfter=&createdBefore=` | `{configured, items, errors, currentBase, counts, owner, me, repoRoot}`；owner 缺省为当前操作者、显式空值表示全部；statuses 为逗号分隔合法状态，缺省/空值为全部；tag 小写比较，dir/text 为大小写不敏感包含匹配；createdAfter/Before 均为含边界的 ISO 时间点。approved 项可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup: found / ambiguous / unknown`；`ambiguous/unknown` 只作诊断，不得阻塞队列。可含缓存字段 `patchCheck`，但必须携带 `checkedBase` 与非空 ISO-8601 `checkedAt`，且不得作为共享事实或批准依据。`patchCheck` 的执行策略：预检内存缓存以 `(candidateId, revision, base)` 为键；`/queue` 只读已有缓存，未命中时该项返回 `state: "unknown"` 或省略，并由 Host 在后台以低优先级异步触发预检填充缓存，严禁在队列请求内同步批量执行补丁检查；`/candidate` 未命中缓存时可同步执行单候选预检并写回缓存。 |
 | GET | `/candidate?id=` | `{candidate, currentBase, isBaseBehind, patchCheck, approvalCommitRevision?, approvalCommitLookup?, patchText, patchStats, patchPaths, comments, validation, revisionStats, canAct, me, jobs}`。approved 候选可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup`，含义同 `/queue`。`patchCheck` 为派生诊断：`{state: clean / conflicted / unknown, checkedBase: string, checkedAt: ISO-8601 string}`；`clean/conflicted` 只表示补丁能否应用到 `checkedBase`，不构成批准证据，批准 Job 必须重新严格应用。 |
 | GET | `/patch?id=&name=` | `{name, text}`；name 必须是该候选已有 revision 的补丁文件名。 |
 | GET | `/diff?id=&from=&to=` | to 缺省当前版本；from 缺省或等于 to 返回 full，否则返回 incremental、resolutionMode 与 notes。 |
@@ -867,11 +867,11 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 | POST | `/audit/release` | `{auditId, confirmStopped: true}`；仅在租约已取消或超时后使用 | 200 `{released: true}`；Host 复核工作区后释放租约。未确认停止、租约仍活跃或状态不明返回 409。 |
 | POST | `/candidate/finalize` | `{id}`，指向本地独立 Mode A 候选 | 202 `{jobId, job}`；以 ai_fix Job 完整校验并仅提交该新候选目录。 |
 | POST | `/jobs/:id/cancel` | 空 object `{}` | 202 `{jobId, job}`；按 §7.7 幂等取消，停止进程/会话但不得自动释放手动租约。 |
-| POST | `/comments` | `{id, ...guard, content, revision?, file?, line?, side?, anchor?, autoFix?}`；content 非空，revision 缺省当前版本；行内评论同时提供 file、正整数 line 与 LEFT/RIGHT，总体评论不提供三者；anchor 若提供按 §4.3 校验 | 200 `{candidate, commit, job?, autoFixError?}`；先提交单条评论，再可选启动 ai_fix。 |
-| POST | `/comments/batch` | `{id, ...guard, comments: [{content, revision?, file?, line?, side?, anchor?}], autoFix?}`；comments 非空，每条按 `/comments` 校验 | 200 `{candidate, commit, job?, autoFixError?}`；全有或全无：一次共享写入、一次提交，任一条非法整批 422，不部分写入；`pending -> changes_requested` 只在批次内发生一次。 |
+| POST | `/comments` | `{id, ...guard, content, revision?, file?, line?, side?, anchor?, autoFix?}`；content 非空，revision 缺省当前版本；行内评论同时提供 file、正整数 line 与 LEFT/RIGHT，总体评论不提供三者；anchor 若提供按 §4.3 校验，未提供时 Host 按 §4.3 自动提取填充 | 200 `{candidate, commit, job?, autoFixError?}`；先提交单条评论，再可选启动 ai_fix。 |
+| POST | `/comments/batch` | `{id, ...guard, comments: [{content, revision?, file?, line?, side?, anchor?}], autoFix?}`；comments 非空，每条按 `/comments` 校验（含 anchor 的 Host 兜底提取） | 200 `{candidate, commit, job?, autoFixError?}`；全有或全无：一次共享写入、一次提交，任一条非法整批 422，不部分写入；`pending -> changes_requested` 只在批次内发生一次。 |
 | POST | `/comment-status` | `{id, ...guard, commentId, status}` | 200 `{candidate, commit}`；只改评论状态。 |
 | POST | `/takeover` | `{id, ...guard, owner?}`；owner 缺省当前操作者 | 200 `{candidate, commit}`；唯一允许非 Owner 的候选共享写。 |
-| POST | `/reject` | `{id, ...guard, reason, category?}`；reason 非空，category 为可选枚举且人工请求不得使用 `stale` | 200 `{candidate, commitRevision}`；同一提交写 rejection 并删除补丁；Host 在删除补丁前从补丁 hunk header 提取 `related_symbols`。 |
+| POST | `/reject` | `{id, ...guard, reason, category?}`；reason 非空，category 为可选枚举且人工请求不得使用 `stale` | 200 `{candidate, commitRevision}`；同一提交写 rejection 并删除补丁；Host 在删除补丁前从补丁 hunk header 提取 `related_symbols`，并按 §4.3 归一化与上限写入。 |
 | POST | `/archive-stale` | `{id, ...guard}` | 200 同 reject；Host 复核 updated_at 与 stale_days，并自动写 `rejection.category: stale`。 |
 | POST | `/resume` | `{id, ...guard}` | 200 `{candidate, commit}`；仅 Owner 将 changes_requested 转回 pending，不产生新 revision。 |
 | POST | `/reopen` | `{id, ...guard, from, reason}`；from 指向真实 rejected 候选，reason 非空 | 200 `{candidate, commit}`；只修改活跃候选；from 已有直接替代候选时返回 409。 |
