@@ -1,3 +1,5 @@
+> **状态：早期接口草案（superseded）**。契约以 `SPEC.md` 为准；以下 TypeScript 定义仅作历史参考。批准元数据不再包含 `commit_revision`，业务提交由 Host 从 VCS 历史派生。
+
 以下为 DSH Web 审核插件内部核心模块（数据模型、Review Store、Router、VCS 接口、Validator、Runner 及核心审批编排器）的完整 TypeScript 接口与数据结构定义。
 
 该设计遵循**强类型约束**、**无状态服务抽象**与**VCS 底层隔离**原则，可直接作为项目的 `src/core/types.ts` 基础契约。
@@ -56,8 +58,7 @@ export interface ApprovalMeta {
   approved_by: string | null;
   /** ISO-8601 时间戳 */
   approved_at: string | null;
-  /** 最终原子提交生成的 VCS 版本号 */
-  commit_revision: string | null;
+  // 业务提交版本不进 review.md；由 Host 从 VCS 历史派生（SPEC §5.5）。
 }
 
 /** review.md 的 YAML Frontmatter 强类型结构 */

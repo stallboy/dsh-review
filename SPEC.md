@@ -5,6 +5,7 @@
 **本文是自包含的唯一权威规格，不需要配合其他文档阅读。** `assets/ai-fixer-system.md`、`assets/repo-audit-system.md` 等提示词文件是本文 §11 的下游实现产物，必须服从本文；其他设计草案、实施计划和源码注释均不具有规范力。
 
 - **包名 / 版本**：`dsh-code-review` v0.3.0，包含 Host 与 Web Client 两端。
+- **契约修订（2026-11-09，开发期）**：批准改为单次原子提交，`approval.commit_revision` 字段已移除，业务提交由 Host 从 VCS 历史派生；新增拒绝分类、评论锚点、批量评论、派生预检与可选收尾门禁。`schema_version` 仍为 1；本版尚未正式发布，按 §4.1 不迁移开发期数据。
 - **规范用语**：“必须 / 不得”表示强制要求；“应”表示无正当理由不得偏离；“可”表示可选能力。
 - **命名约定**：仓库内 YAML 使用 `snake_case`，HTTP API 与 TypeScript 使用 `camelCase`。例如 `commit_message` 对应 `commitMessage`，`base_revision` 对应 `baseRevision`。
 - **目标与现状分离**：正文描述目标契约；当前实现尚未达到契约的地方集中列在附录 A，不在正文中混入实现差距。
@@ -33,7 +34,7 @@ flowchart TD
     DETAIL -->|"评论 / 微调 / Rebase"| FIX["生成新的完整补丁版本"]
     FIX --> QUEUE
     DETAIL -->|"批准"| GATE["在批准时基线上应用补丁<br/>重新执行全部门禁"]
-    GATE -->|"全部通过"| COMMIT["原子提交业务代码与批准记录<br/>再回填 commit_revision"]
+    GATE -->|"全部通过"| COMMIT["原子提交业务代码与批准记录<br/>业务提交由 VCS 历史派生"]
     DETAIL -->|"拒绝 / 超时"| REJECT["保留 review.md<br/>清理过程补丁"]
     REJECT -.->|"负向记忆"| AUDIT
 ```
@@ -50,7 +51,7 @@ flowchart TD
 
 - 不替代代码托管平台的 PR/MR，不在核心流程中引入 branch、PR 或 merge 语义。
 - 不提供批量批准；每个候选必须单独进入详情审核。
-- 当前不为门禁提供隔离工作区；门禁在仓库根目录原地执行。
+- 当前不为门禁提供隔离工作区；门禁在仓库根目录原地执行。这是 v1 的有意选择：门禁可能依赖 `node_modules`、构建缓存、`.env` 与子模块，worktree 不携带这些，SVN 也没有对等物。Git 专用的隔离工作区可作为未来可选能力，不进入 v1 契约。
 - 不代替人类作业务决策，不提供绕过人工判断项的静默批准入口。
 - 不提供真正的多用户认证授权；Owner 是本地操作隔离约定，不是安全身份。
 - 不建立共享索引、独立数据库或 Stacked Patches 依赖链。
@@ -130,10 +131,10 @@ flowchart TD
 2. 检查工作区，按设置同步并取得批准时生效基线。
 3. 严格应用当前补丁并记录业务内容快照，重新执行全部门禁。
 4. 再次检查 guard 和业务快照，防止候选或业务代码在门禁期间被更新。
-5. 第一次原子提交业务代码、`review.md` 批准记录和过程补丁删除。
-6. 第二次仅提交 `review.md`，回填第一次提交的 `commit_revision`。
+5. 原子提交业务代码、`review.md` 批准记录和过程补丁删除。
+6. 提交成功后，Host 记录本次提交版本用于响应；后续读取从 VCS 历史派生该候选的业务提交版本；不向 `review.md` 写入提交哈希。
 
-第一次提交成功即表示业务批准已经生效。第二次失败不得把结果描述为业务失败或尝试回滚；候选进入 `needsBackfill`，通过幂等补填恢复。提交结果无法确定时必须进入人工恢复，不得猜测回滚。
+该原子提交成功即表示业务批准已经生效。提交结果无法确定时必须按 §5.6 查询 VCS 并进入人工恢复，不得猜测回滚。
 
 ### 3.5 拒绝、超时与重开
 
@@ -182,6 +183,8 @@ allowed_gate_commands:
 stale_days: 14
 rejection_memory_days: 30
 max_anti_patterns: 20
+verify_gate_on_audit_finalize: none
+audit_smoke_commands: []
 ```
 
 | 键 | 规则 |
@@ -192,6 +195,8 @@ max_anti_patterns: 20
 | `stale_days` | 可选正整数；按 `updated_at` 判断活跃候选是否过期。未配置时不得执行超时归档。 |
 | `rejection_memory_days` | 可选正整数，默认 30；负向记忆阻止窗口。 |
 | `max_anti_patterns` | 可选正整数，默认 20；每模块注入提示词的最近被拒记录上限。 |
+| `verify_gate_on_audit_finalize` | 可选 enum `none / smoke / declared`，默认 `none`；`smoke` 执行 `audit_smoke_commands`，`declared` 执行候选 `gate_checks`。失败则该候选不进入收尾提交。 |
+| `audit_smoke_commands` | 可选 string[]；`smoke` 模式必须非空，按顺序在仓库根目录执行。 |
 
 路由先判断规则是否命中，再计算分数：
 
@@ -212,7 +217,7 @@ max_anti_patterns: 20
 | `module` | 是 | 非空 string | 小写模块标志，用于筛选、路由与负向记忆。 |
 | `audit_type` | 是 | enum | `bugfix / delete / shrink / reuse / merge / split / stdlib / native / yagni`。 |
 | `created_at` | 是 | ISO-8601 string | 创建时间，迭代不变。 |
-| `updated_at` | 是 | ISO-8601 string | 最后一次共享写入时间；仅 `commit_revision` 回填不更新。其余每次共享写入必须使其严格大于上一值：精度至少为毫秒；同一刻度或时钟回拨时使用“上一值 + 1ms”，再规范化为 UTC。 |
+| `updated_at` | 是 | ISO-8601 string | 最后一次共享写入时间。每次共享写入必须使其严格大于上一值：精度至少为毫秒；同一刻度或时钟回拨时使用“上一值 + 1ms”，再规范化为 UTC。 |
 | `owner` | 是 | 非空 string | 当前负责人。 |
 | `tags` | 是 | string[] | 可为 `[]`；每项 trim 后转 ASCII 小写，空项丢弃，再按规范化值去重，结果数组唯一。 |
 | `ticket` | 是 | string \| null | 无工单时为 `null`。 |
@@ -224,7 +229,7 @@ max_anti_patterns: 20
 | `comments[]` | 是 | 列表 | 可为 `[]`；精确形状见下表。 |
 | `human_decisions[]` | 是 | 列表 | 可为 `[]`；每项含候选内唯一稳定、非空 string `id`、非空 string `question`，以及可选 string `note`。 |
 | `approval` | 是 | object \| null | 未批准为 `null`；批准形状见下表。 |
-| `rejection` | 是 | object \| null | 未拒绝为 `null`；否则必含非空 string `rejected_by`、ISO-8601 `rejected_at`、非空 string `reason`。 |
+| `rejection` | 是 | object \| null | 未拒绝为 `null`；否则必含非空 string `rejected_by`、ISO-8601 `rejected_at`、非空 string `reason`，以及可选 `category` 与 `related_symbols`，形状见下表。 |
 | `commit_message` | 是 | 非空 string | 多行提交信息，首行必须与 title 完全一致。 |
 | `reopened_from` / `reopen_reason` | 可选 | 非空 string | 必须同时缺省或同时出现；from 必须指向真实 rejected 候选。 |
 
@@ -238,17 +243,27 @@ max_anti_patterns: 20
 | `author` / `content` | 均为非空 string；人类原文不得被 AI 改写。 |
 | `status` | `unresolved / partial / resolved`。 |
 | `created_at` | 可选 ISO-8601 string。 |
+| `anchor` | 可选对象：`{snippet: 非空 string, before?: string, after?: string}`。保存评论创建时被评论行的原文摘要，并可选保存前后各一行，用于跨版本重定位；仅行内评论可带，总体评论必须省略。原 `revision/file/line/side` 仍是权威锚点，任何读取端不得改写。 |
 
 批准对象字段：
 
 | 键 | 契约 |
 | --- | --- |
 | `approved_by` / `approved_at` | 实际批准 Owner 的非空 string 与共享批准时间的 ISO-8601 string。 |
-| `commit_revision` | 非空 string 或 `null`；第一次业务提交时必须为 `null`，第二次回填后保存第一次提交的 VCS 版本号。空字符串非法，必须使候选 broken。 |
 | `gate_checks` | 批准时门禁快照，必须与当时顶层 gate_checks 完全一致。 |
 | `gate_results[]` | 每项为 `{command: string, exit_code: 非负整数, duration_ms: 非负有限数}`；与快照按顺序一一对应，批准时每个 exit_code 必须为 0。 |
 | `confirmed_decisions[]` | 已确认判断项 id 字符串数组，无项时为 `[]`。 |
 | `waived_decisions[]` | `{id: string, reason: string}` 数组，reason 非空，无项时为 `[]`。 |
+
+`commit_revision` 不属于 `review.md`；业务提交版本由 Host 读模型 `approvalCommitRevision` 派生，规则见 §5.5。
+
+拒绝对象字段：
+
+| 键 | 契约 |
+| --- | --- |
+| `rejected_by` / `rejected_at` / `reason` | 必填；含义同上。 |
+| `category` | 可选 enum：`false_positive / intentional_design / high_risk / out_of_scope / stale`；未知值必须原样保留并按 `unspecified` 处理，不得使候选 broken。`stale` 仅由 Host 在超时归档时写入，人工拒绝不得选择。不参与 §6.1 确定性指纹。 |
+| `related_symbols` | 可选 string[]；Host 在拒绝时从当前补丁 hunk header 提取的函数/结构体名，仅用于提示词与 UI 相似性提示，不参与确定性指纹。 |
 
 所有时间戳必须包含 `Z` 或 `±HH:MM` 时区偏移。解析器必须接受 YAML 裸时间对象并规范化为 UTC `Z` 字符串；比较、过滤与排序按解析后的时间点，不得按字符串字典序。audit_id 只使用规范化后的 UTC 时刻，因此不受该转换影响（§4.7）。
 
@@ -303,6 +318,10 @@ comments:
     content: "并发请求时这里会触发多次关闭，需要收敛关闭入口"
     status: resolved
     created_at: "2026-11-03T15:00:00+08:00"
+    anchor:
+      snippet: "func (s *Session) Close() error {"
+      before: "// Close closes the session."
+      after: "    s.mu.Lock()"
 human_decisions:
   - id: h1
     question: "并发关闭时是否允许丢弃仍在发送的消息？"
@@ -517,6 +536,8 @@ finding 的当前状态由历史档案和候选共享事实实时计算，不建
 
 无效档案不参与投影。输出按 finding_id 排序，并保留最近观察的 audit_id 与时间供 UI 展示。
 
+Host 可以在内存中缓存同一 VCS 快照的投影结果，但缓存不是共享索引：不得持久化，不得跨快照复用，不得读取本地视图；缓存命中必须能证明快照未变化。Git 以 HEAD commit 为快照标识，SVN 以 revision 与工作副本标识为准。缓存只保存解析后的元数据与投影，不保存补丁全文。
+
 ---
 
 ## 5. 生命周期与审核记录
@@ -528,7 +549,7 @@ finding 的当前状态由历史档案和候选共享事实实时计算，不建
 pending ──新增未解决评论──> changes_requested
 pending / changes_requested ──AI 修复 / 人工微调 / Rebase──> pending
 changes_requested ──Owner 显式执行 /resume──> pending
-pending ──门禁全过且第一次原子提交成功──> approved
+pending ──门禁全过且原子提交成功──> approved
 pending / changes_requested ──拒绝 / 超时归档──> rejected
 rejected ──人工重开──> 另一活跃候选记录 reopened_from
 ```
@@ -537,7 +558,7 @@ rejected ──人工重开──> 另一活跃候选记录 reopened_from
 - 只有 `pending` 可以批准；`changes_requested` 必须先产生新版本或由 Owner 显式转回。
 - `/resume` 不产生新补丁版本，只改变状态并更新 `updated_at`。
 - AI 修复失败不写共享状态；候选保持原状态，可重试或人工转回。
-- `approved` 与 `rejected` 是终态，除幂等补填外不得再写入。
+- `approved` 与 `rejected` 是终态，除 Owner 人工修复 broken 候选外不得再写入。
 - 补丁冲突或门禁失败时按 §7.5 处理；产生新版本后，本次批准失效并回到 `pending`。
 
 ### 5.2 版本与作者
@@ -568,32 +589,32 @@ AI 必须把无法自证的业务语义、架构/性能折中、兼容性和未�
 - 各数组内部不得重复；每项 waive 必须有非空理由。
 - 未知 id、重复、交叉、遗漏或多余引用均拒绝批准，不得写入 approval。
 
-### 5.5 批准快照与回填恢复
+### 5.5 批准快照与提交定位
 
-批准快照必须保存门禁及逐条结果、精确校验后的判断项处理记录、批准人和批准时间。第一次提交中的 `commit_revision` 为 `null`；第二次提交只回填该字段，不更新 `updated_at`，不修改业务代码。
+批准快照必须保存门禁及逐条结果、精确校验后的判断项处理记录、批准人和批准时间。批准只产生一次原子提交；`review.md` 不保存提交哈希，业务提交由 Host 从 VCS 历史派生。
 
-`needsBackfill` 是从共享事实重建的派生徽标，不是第五个候选状态：
+派生规则必须同时满足：
 
-```text
-needsBackfill ⟺ status == approved && approval.commit_revision == null
-```
+1. 该提交中的 `review.md` 为 `approved` 且 `approval != null`；
+2. 该提交的父提交中同一文件不存在或不是 `approved`（即该提交是状态迁移提交）；
+3. 该提交删除了候选当前 `revisions[]` 的全部补丁；
+4. 该提交包含 `target_files` 中至少一个业务路径的改动。
 
-`commit_revision: ""` 不是未回填状态，而是数据错误；该候选必须 broken，不得显示 needsBackfill，也不得通过 /backfill 覆盖为合法值，必须由 Owner 显式修复提交。
+Git 在候选目录的 first-parent 历史中查找删除补丁的提交，再用 `git show <c>:<path>` 与 `git show <c>^:<path>` 验证状态迁移；SVN 在对应路径历史中查找同一 revision 的 `M review.md` 与 `D` 补丁，再用 `svn cat -r <c>` 与 `-r <c-1>` 验证。Host 必须把结果归为三态：
 
-Host 必须能从 VCS 历史中定位并验证第一次批准提交：该提交应包含此候选从活跃到 approved 的 review.md、对应业务路径和补丁删除。队列应提供验证后的建议版本号，不能因重启或后续其他提交而丢失恢复能力。
+- `found`：唯一命中，返回该 VCS 版本号；
+- `ambiguous`：多个提交同时满足，返回诊断并要求人工确认，不得任意选择；
+- `unknown`：历史不可读、浅克隆或未找到，返回诊断；候选仍可读、可展示，不得标记 broken，不得阻塞队列或批准。
 
-第二次提交失败时：
+历史开发数据若仍带 `approval.commit_revision`，Host 只能将其作为只读诊断提示，不得据此跳过派生，也不得在新写入中产生该字段；正式发布前按 §4.1 不迁移。
 
-- 批准结果仍为 `COMMITTED`，同时包含 `backfillPending: true`、第一次提交的 `commitRevision` 和失败详情。
-- 队列显示 `needsBackfill`。
-- `/backfill` 接收 `{id, commitRevision}`；Host 必须验证该值等于 VCS 历史中定位到的第一次批准提交，不得盲信请求。当前值为 `null` 时补填，已等于请求值时直接成功，已是不同值或请求值验证失败时返回 409，不得覆盖。
-- 补填提交信息固定为 `review(<id>): record commit_revision <rev>`。响应中的 `backfillCommitRevision` 表示本次补填元数据提交；第一次业务提交始终从 `candidate.approval.commitRevision` 读取。
+派生结果只在 Host 内存中缓存，键为 `(repoRoot, candidateId, VCS 快照)`，不写入 `review.md`，不建立持久化索引。批准 Job 立即返回的 `commitRevision` 来自本次提交的 VCS 结果；后续读取使用派生值。提交结果无法确定时，按 §5.6 的三分支处理，不得猜测回滚。
 
 ### 5.6 提交信息
 
 业务原子提交必须使用候选 `commit_message` 全文，首行与 title 完全一致；空白或不一致在批准前置检查中返回 `COMMIT_MESSAGE_MISMATCH`。
 
-其余评审元数据操作必须产生仅包含相关 `.ai-review/` 路径的独立提交，包括评论、评论状态、接管、人工转回、AI 修复、人工微调、Rebase、拒绝、重开、转换、忽略 finding 和补填。每次共享写操作只有在对应提交成功后才算完成。任何提交失败或结果不明都统一按以下顺序处理：
+其余评审元数据操作必须产生仅包含相关 `.ai-review/` 路径的独立提交，包括评论、评论状态、接管、人工转回、AI 修复、人工微调、Rebase、拒绝、重开、转换和忽略 finding。批量评论在一次共享写入与一次提交中完成。每次共享写操作只有在对应提交成功后才算完成。任何提交失败或结果不明都统一按以下顺序处理：
 
 1. 查询 VCS 并确认提交存在且内容匹配：按成功继续，不得恢复旧文件。
 2. 已证明提交不存在：恢复操作前文件并返回失败，不得保留本地写入或返回成功。
@@ -607,7 +628,7 @@ Host 必须能从 VCS 历史中定位并验证第一次批准提交：该提交�
 
 ### 6.1 指纹与窗口
 
-事实字段为 `module + target_files + audit_type + title + rejection.reason`。确定性重复指纹使用无分隔符碰撞的规范 JSON 数组：
+事实字段为 `module + target_files + audit_type + title + rejection.reason`，另可带 `rejection.category` 与 `rejection.related_symbols` 作为提示词/展示的辅助信息。确定性重复指纹只使用前四项，使用无分隔符碰撞的规范 JSON 数组：
 
 ```text
 JSON.stringify([
@@ -618,18 +639,19 @@ JSON.stringify([
 ])
 ```
 
-title 规范化仅包括去首尾空白、合并连续空白和 ASCII 小写化。JSON 字段转义与数组边界是指纹的一部分，不得改用逗号或 `|` 拼接。窗口由 `rejection_memory_days` 控制，默认 30 天，按解析后的 `rejected_at` 时间点计算。
+title 规范化仅包括去首尾空白、合并连续空白和 ASCII 小写化。JSON 字段转义与数组边界是指纹的一部分，不得改用逗号或 `|` 拼接。窗口由 `rejection_memory_days` 控制，默认 30 天，按解析后的 `rejected_at` 时间点计算。`category`、`related_symbols` 与 `rejection.reason` 的文本均不得进入确定性指纹；语义相近但指纹不同的方案仍按 §6.2 交给提示词和人工处理。
 
 ### 6.2 阻止与豁免
 
 - 窗口内指纹完全相同的活跃候选可浏览，但队列必须显示 `duplicateOf`。受理前发现重复时 Host 返回 409 `conflict`；批准 Job 受理后必须按 §7.5 在锁内、同步后和门禁后复检，发现时写入 `ABORTED / DUPLICATE_CANDIDATE`，detail 携带 duplicateOf。
+- `system:stale` 归档的 `category` 为 `stale`；它是超时归档而非实质拒绝。确定性阻止仍按指纹执行，但提示词必须标注为弱信号，不得把它描述为“方案被拒绝”。
 - 窗口外记录不得触发确定性阻止，只可作为提示词中的负向示例。
 - 对合法重开候选，豁免范围包括沿 `reopened_from` 向上追踪到的全部被拒祖先，且每条引用都必须通过 I16 校验。例如 A→B→C 中，C 豁免 A 与 B。链外或其他同指纹且未豁免的记录仍正常阻止；`duplicateOf` 指向按 rejected_at 倒序的第一条未豁免匹配记录。
 - 语义相近但指纹不同的方案不得由系统自动判定重复，必须通过提示词和人类审核处理。
 
 ### 6.3 提示词注入
 
-按 module 分组，按 `rejected_at` 倒序选取最近 `max_anti_patterns` 条记录，默认每模块 20 条。注入摘要包含标题、目标文件、审查类型和拒绝原因；不得注入大段历史正文。
+按 module 分组，按 `rejected_at` 倒序选取最近 `max_anti_patterns` 条记录，默认每模块 20 条。注入摘要包含标题、目标文件、审查类型、拒绝原因、可选分类与相关符号；按 `category` 分组呈现约束。`system:stale` 的 `stale` 记录是超时归档，不是实质拒绝，提示词必须标注为弱信号；确定性阻止仍按指纹执行。分类缺省或未知时归入 `unspecified` 分组。不得注入大段历史正文。
 
 ---
 
@@ -693,7 +715,7 @@ Runner 模式：
 
 ### 7.5 批准编排
 
-最多允许 3 次提交尝试，即 `MAX_COMMIT_RETRIES = 2`。每次尝试必须按序执行；若上一次尝试已证明第一次提交不存在，必须先恢复业务工作区和 review.md 到尝试前快照，再开始下一次：
+最多允许 3 次提交尝试，即 `MAX_COMMIT_RETRIES = 2`。每次尝试必须按序执行；若上一次尝试已证明业务提交不存在，必须先恢复业务工作区和 review.md 到尝试前快照，再开始下一次：
 
 1. **重读同一 VCS 快照中的共享事实与 guard**：候选必须为 pending；revision、owner、updated_at 任一不符，返回 `ABORTED / CONCURRENCY_MISMATCH`；非 pending 返回 `ABORTED / STATE_CONFLICT`。同时按 §6 检查重复候选；发现则返回 `ABORTED / DUPLICATE_CANDIDATE`，detail 携带 duplicateOf。
 2. **人工判断项**：按 §5.4 精确校验，失败返回 `ABORTED / DECISIONS_UNCONFIRMED`。
@@ -703,14 +725,14 @@ Runner 模式：
 6. **同步与基线**：默认先同步。已知且可安全恢复的失败返回 `ABORTED / SYNC_FAILED`；部分同步或基线状态无法确定时返回 `RECOVERY_REQUIRED / SYNC_STATE_UNKNOWN`，禁止自动重试。随后重新绑定同步后的共享快照，重跑步骤 1–4（包括负向记忆）；后续补丁、门禁与批准记录均使用该快照。
 7. **严格应用同一共享快照中的当前补丁**：失败则还原业务工作区并进入补丁冲突回退。成功后记录所有目标业务文件的内容、存在性与模式快照。
 8. **重新执行门禁**：失败则终止完整进程树、还原业务工作区并进入门禁失败回退。
-9. **再次校验共享事实、guard、工作区与提交内容**：确认 HEAD/相关事实未变化并重新执行 §6 重复检查；候选变化返回 `ABORTED / CONCURRENCY_MISMATCH`，新重复返回 `ABORTED / DUPLICATE_CANDIDATE`。重新计算业务工作区快照，必须与步骤 7 完全一致且没有额外业务文件变化。第一次提交还必须从已验证内容构造提交树，并逐路径核对暂存 blob、模式与删除集合；可使用临时 index，或强制重新暂存后核验。工作区、索引或提交树任一不一致均返回 `ABORTED / BUSINESS_CONTENT_CHANGED` 并恢复，防止门禁通过索引或 clean filter 夹带未审核代码。
-10. **第一次原子提交**：写入 approval 且 commit_revision 为 `null`，提交业务代码、review.md 和补丁删除：
+9. **再次校验共享事实、guard、工作区与提交内容**：确认 HEAD/相关事实未变化并重新执行 §6 重复检查；候选变化返回 `ABORTED / CONCURRENCY_MISMATCH`，新重复返回 `ABORTED / DUPLICATE_CANDIDATE`。重新计算业务工作区快照，必须与步骤 7 完全一致且没有额外业务文件变化。业务提交还必须从已验证内容构造提交树，并逐路径核对暂存 blob、模式与删除集合；可使用临时 index，或强制重新暂存后核验。工作区、索引或提交树任一不一致均返回 `ABORTED / BUSINESS_CONTENT_CHANGED` 并恢复，防止门禁通过索引或 clean filter 夹带未审核代码。
+10. **原子提交**：写入 approval（不含提交哈希），提交业务代码、review.md 和补丁删除：
     - 明确因撞车且提交不存在：恢复快照后重试；实际耗尽返回 `ABORTED / MAX_RETRIES_EXCEEDED`。
     - 明确的非撞车失败且提交不存在：返回 `ABORTED / COMMIT_FAILED`，不得误报重试耗尽。
     - 超时、断连或结果不明：先查询 HEAD/远端并核对候选批准内容。提交存在则按成功继续；证明不存在才可恢复并返回 COMMIT_FAILED；仍无法确定则返回 `RECOVERY_REQUIRED / COMMIT_OUTCOME_UNKNOWN`，禁止恢复备份或重试。
-11. **第二次回填提交**：按 §5.5 返回成功或待回填结果。
+11. **返回提交结果**：本次提交成功时返回其 VCS 版本号；后续读取按 §5.5 从历史派生。不得再产生仅用于记录哈希的第二次提交。
 
-Backup 只能用于已证明第一次业务提交不存在的路径和 AI 修复失败路径。第一次提交成功或结果无法确定时，不得恢复旧 review.md、撤销业务内容或返回普通 ABORTED。
+Backup 只能用于已证明业务提交不存在的路径和 AI 修复失败路径。业务提交成功或结果无法确定时，不得恢复旧 review.md、撤销业务内容或返回普通 ABORTED。
 
 冲突与门禁失败的回退规则：
 
@@ -725,7 +747,7 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 
 | status | 特有字段 |
 | --- | --- |
-| `COMMITTED` | 必含非空 `commitRevision` 与 boolean `backfillPending`；待回填时另含 `backfillError`。 |
+| `COMMITTED` | 必含非空 `commitRevision`（本次业务提交的 VCS 版本号）。 |
 | `FALLBACK_TO_PENDING` | 必含 `reason: PATCH_CONFLICT \| GATE_CHECK_FAILED`；可含正整数 `newRevision` 与 `manualPrompt`。 |
 | `ABORTED` | 必含 reason：`CONCURRENCY_MISMATCH / STATE_CONFLICT / DUPLICATE_CANDIDATE / DECISIONS_UNCONFIRMED / COMMIT_MESSAGE_MISMATCH / INVALID_CANDIDATE / DIRTY_WORKSPACE / SYNC_FAILED / BUSINESS_CONTENT_CHANGED / COMMIT_FAILED / MAX_RETRIES_EXCEEDED / RUNNER_FAILED`；可含 `detail`。 |
 | `RECOVERY_REQUIRED` | 必含 `reason: COMMIT_OUTCOME_UNKNOWN \| SYNC_STATE_UNKNOWN` 与非空 `detail`；必须由人工确认 VCS 与工作区状态。 |
@@ -744,6 +766,8 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 
 收尾时 Host 必须验证每个 A 类候选：Frontmatter 合法、status=pending、rev1、approval=null、基线与本轮一致、补丁可在基线干净应用且不越界，并通过全部适用不变量。owner 必须等于 Host 按同一共享快照中的 reviewers.yml、target_files 和 tags 计算的路由结果，否则不得提交。B/Deferred 解析为档案 items，并写入插件复核块。校验失败的候选不得提交，其错误必须写入本轮复核结果；合法候选与本轮 audit 目录仍可继续。
 
+若 `reviewers.yml` 的 `verify_gate_on_audit_finalize` 为 `smoke` 或 `declared`，Host 还必须对每个通过前述校验的新候选，在其补丁应用后的工作区执行对应命令（`smoke` 执行 `audit_smoke_commands`，`declared` 执行候选 `gate_checks`）；执行后无论成功失败都必须还原业务工作区（保留 `.ai-review/`），失败则该候选不提交，错误写入复核块。默认 `none`：审计期门禁是 AI 报告，批准时 Host 仍会重新执行全部门禁。复核块必须明确区分“补丁可应用/Frontmatter 与不变量通过”和“门禁是否由 Host 复算”；未复算时不得写成“通过全部适用检查”。
+
 提交前 `candidates[]` 必须只包含实际通过校验并纳入本次共享提交的候选 id，A 类正文列表也必须同步过滤；不得保留仅本地或非法候选引用。收尾提交必须是一次仅包含本轮 audit 目录、合法新候选目录和复核块的共享提交；即使无合法候选也可提交审查档案。提交失败或结果不明必须按 §5.6 的三分支处理，不得无条件恢复或返回成功。业务工作区必须已还原。
 
 独立 Fixer Mode A 没有 auditId 时，必须通过 `POST /candidate/finalize` 指定候选 id，由 Host 以 ai_fix Job 执行同一套完整校验，成功后仅提交该新候选目录；未收尾的独立候选不参与共享流程。
@@ -759,11 +783,11 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 - Job 类型：`approve / ai_fix / audit / reject / feedback`；外层状态：`running / succeeded / failed`。最小 JSON 形状为 `{id, type, status, startedAt, finishedAt?, log: string[], result?, error?}`。
 - 所有业务型 Job 的 result 必须含判别字段 `status`。除 §7.5 的批准取值外，通用取值为 `MANUAL_REQUIRED`、`VALIDATION_FAILED`、`ABORTED` 与 `RECOVERY_REQUIRED`；成功共享提交的 ai_fix/audit 使用 `COMMITTED`。RECOVERY_REQUIRED 必含 reason 和 detail。audit 若有任何候选校验失败，即使合法候选和档案已提交，也必须返回 VALIDATION_FAILED 并携带 commitRevision 与逐候选错误，不能伪装成全部成功。业务 outcome 正常返回时外层为 succeeded；只有未捕获内部异常使外层 failed。Client 必须读取 result.status。
 - 最多保留 40 个 Job，超出时优先淘汰最早开始的已完成 Job；单 Job 最多保留 4000 行日志。日志偏移和累计行数使用单调递增的绝对序号，截断不得让客户端丢失后续日志；协议见 §8.2。
-- Job 仅保存在内存。Host 重启后不得将中断 Job 当作成功；批准恢复以共享事实和 needsBackfill 为准。若崩溃后工作区状态或提交结果无法确定，必须阻止自动写操作并要求人工恢复，不得猜测回滚。
+- Job 仅保存在内存。Host 重启后不得将中断 Job 当作成功；批准恢复以共享事实和 §5.5 的提交派生结果为准。若崩溃后工作区状态或提交结果无法确定，必须阻止自动写操作并要求人工恢复，不得猜测回滚。
 - 所有共享写和工作区事务必须经同一 repo 级进程内锁串行；guard 校验、同步、应用补丁、门禁、Runner、还原和提交位于同一锁临界区。`/sync` 在其他工作区事务运行时必须排队，不得改变其基线。手动审查的执行租约同样参与互斥。
 - audit（包括会话与手动租约 Job）运行中禁止 approve、ai-fix、rebase、manual-revision 和其他 sync；新 audit 与 audit/session/manual 要求无任何运行中 Job。
 - 定时审查默认关闭；任一 Job 运行中、工作区脏或无基线时跳过本次，插件卸载时停止调度。
-- `POST /jobs/:id/cancel` 只请求停止后续执行，不强行把业务结果改为 ABORTED。Host 终止完整进程树或结束会话并等待清理后：已证明共享提交不存在才返回 ABORTED；普通共享提交已存在则返回对应 COMMITTED/VALIDATION_FAILED；批准第一次提交已存在则返回 COMMITTED，并按回填状态设置 backfillPending；结果不明返回 RECOVERY_REQUIRED 且禁止恢复。已结束 Job 直接返回原结果。手动租约不得随取消自动释放，必须按 §7.6 经人工确认停止后释放。不得靠 Host 重启释放锁。
+- `POST /jobs/:id/cancel` 只请求停止后续执行，不强行把业务结果改为 ABORTED。Host 终止完整进程树或结束会话并等待清理后：已证明共享提交不存在才返回 ABORTED；普通共享提交已存在则返回对应 COMMITTED/VALIDATION_FAILED；批准业务提交已存在则返回 COMMITTED，并返回该提交的 VCS 版本号；结果不明返回 RECOVERY_REQUIRED 且禁止恢复。已结束 Job 直接返回原结果。手动租约不得随取消自动释放，必须按 §7.6 经人工确认停止后释放。不得靠 Host 重启释放锁。
 
 Rebase 由插件自身以 ai_fix Job 执行：读取当前基线，基线未变则 ABORTED；工作区必须干净；在新基线 three-way 应用当前补丁并重跑门禁；门禁通过后必须基于新基线导出包含实际冲突解决结果的完整 `--binary` diff，并验证该新补丁能在新基线干净应用。只有该验证通过才追加 author=ai 的新 revision、回到 pending 并提交 `.ai-review/`。不得复用旧补丁文本。已证明未提交的明确失败不产生新版本并还原工作区；提交结果不明时返回 RECOVERY_REQUIRED，不得按普通失败还原。
 
@@ -780,7 +804,7 @@ API 优先根据请求 query 中的 sessionId 解析会话 cwd 作为仓库根�
 - 前缀为 `/dsh-code-review/api`，请求与响应均为 JSON；带 body 的请求使用 `Content-Type: application/json`。
 - 响应包含 `cache-control: no-store`；请求体上限 2 MiB，超限返回 413 `bad_request`。
 - 仓库级接口可通过 query `sessionId` 解析仓库。
-- 除 `/convert`、`/backfill` 与 `/candidate/finalize` 外，候选写操作必须在 body 顶层携带完整 guard。独立 finalize 处理尚未共享的本地候选，不使用共享 guard，而是通过 repo 锁、本地候选完整性和目标共享目录冲突检查串行收尾：
+- 除 `/convert` 与 `/candidate/finalize` 外，候选写操作必须在 body 顶层携带完整 guard。独立 finalize 处理尚未共享的本地候选，不使用共享 guard，而是通过 repo 锁、本地候选完整性和目标共享目录冲突检查串行收尾：
 
 ```json
 {
@@ -814,8 +838,8 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 | --- | --- | --- |
 | GET | `/health` | 应用、版本、configured、repoRoot、owner、VCS、当前基线、诊断和状态计数。 |
 | GET | `/settings` | `{settings, validation, suggestedOwner, runners}`。 |
-| GET | `/queue?owner=&statuses=&tag=&dir=&text=&createdAfter=&createdBefore=` | `{configured, items, errors, currentBase, counts, owner, me, repoRoot}`；owner 缺省为当前操作者、显式空值表示全部；statuses 为逗号分隔合法状态，缺省/空值为全部；tag 小写比较，dir/text 为大小写不敏感包含匹配；createdAfter/Before 均为含边界的 ISO 时间点。needsBackfill 项可含 `suggestedBackfillCommitRevision`，且只能在 Host 已从 VCS 定位并验证第一次批准提交时提供。 |
-| GET | `/candidate?id=` | `{candidate, currentBase, isBaseBehind, patchText, patchStats, patchPaths, comments, validation, revisionStats, canAct, me, jobs}`。 |
+| GET | `/queue?owner=&statuses=&tag=&dir=&text=&createdAfter=&createdBefore=` | `{configured, items, errors, currentBase, counts, owner, me, repoRoot}`；owner 缺省为当前操作者、显式空值表示全部；statuses 为逗号分隔合法状态，缺省/空值为全部；tag 小写比较，dir/text 为大小写不敏感包含匹配；createdAfter/Before 均为含边界的 ISO 时间点。approved 项可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup: found / ambiguous / unknown`；`ambiguous/unknown` 只作诊断，不得阻塞队列。可含缓存字段 `patchCheck`，但必须携带 `checkedBase` 与非空 ISO-8601 `checkedAt`，且不得作为共享事实或批准依据。 |
+| GET | `/candidate?id=` | `{candidate, currentBase, isBaseBehind, patchCheck, approvalCommitRevision?, approvalCommitLookup?, patchText, patchStats, patchPaths, comments, validation, revisionStats, canAct, me, jobs}`。approved 候选可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup`，含义同 `/queue`。`patchCheck` 为派生诊断：`{state: clean / conflicted / unknown, checkedBase: string, checkedAt: ISO-8601 string}`；`clean/conflicted` 只表示补丁能否应用到 `checkedBase`，不构成批准证据，批准 Job 必须重新严格应用。 |
 | GET | `/patch?id=&name=` | `{name, text}`；name 必须是该候选已有 revision 的补丁文件名。 |
 | GET | `/diff?id=&from=&to=` | to 缺省当前版本；from 缺省或等于 to 返回 full，否则返回 incremental、resolutionMode 与 notes。 |
 | GET | `/fix-prompt?id=` | `{prompt, comments}`，comments 为全部未 resolved 评论。 |
@@ -843,18 +867,18 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 | POST | `/audit/release` | `{auditId, confirmStopped: true}`；仅在租约已取消或超时后使用 | 200 `{released: true}`；Host 复核工作区后释放租约。未确认停止、租约仍活跃或状态不明返回 409。 |
 | POST | `/candidate/finalize` | `{id}`，指向本地独立 Mode A 候选 | 202 `{jobId, job}`；以 ai_fix Job 完整校验并仅提交该新候选目录。 |
 | POST | `/jobs/:id/cancel` | 空 object `{}` | 202 `{jobId, job}`；按 §7.7 幂等取消，停止进程/会话但不得自动释放手动租约。 |
-| POST | `/comments` | `{id, ...guard, content, revision?, file?, line?, side?, autoFix?}`；content 非空，revision 缺省当前版本；行内评论同时提供 file、正整数 line 与 LEFT/RIGHT，总体评论不提供三者 | 200 `{candidate, commit, job?, autoFixError?}`；先提交评论，再可选启动 ai_fix。 |
+| POST | `/comments` | `{id, ...guard, content, revision?, file?, line?, side?, anchor?, autoFix?}`；content 非空，revision 缺省当前版本；行内评论同时提供 file、正整数 line 与 LEFT/RIGHT，总体评论不提供三者；anchor 若提供按 §4.3 校验 | 200 `{candidate, commit, job?, autoFixError?}`；先提交单条评论，再可选启动 ai_fix。 |
+| POST | `/comments/batch` | `{id, ...guard, comments: [{content, revision?, file?, line?, side?, anchor?}], autoFix?}`；comments 非空，每条按 `/comments` 校验 | 200 `{candidate, commit, job?, autoFixError?}`；全有或全无：一次共享写入、一次提交，任一条非法整批 422，不部分写入；`pending -> changes_requested` 只在批次内发生一次。 |
 | POST | `/comment-status` | `{id, ...guard, commentId, status}` | 200 `{candidate, commit}`；只改评论状态。 |
 | POST | `/takeover` | `{id, ...guard, owner?}`；owner 缺省当前操作者 | 200 `{candidate, commit}`；唯一允许非 Owner 的候选共享写。 |
-| POST | `/reject` | `{id, ...guard, reason}`；reason 非空 | 200 `{candidate, commitRevision}`；同一提交写 rejection 并删除补丁。 |
-| POST | `/archive-stale` | `{id, ...guard}` | 200 同 reject；Host 复核 updated_at 与 stale_days。 |
+| POST | `/reject` | `{id, ...guard, reason, category?}`；reason 非空，category 为可选枚举且人工请求不得使用 `stale` | 200 `{candidate, commitRevision}`；同一提交写 rejection 并删除补丁；Host 在删除补丁前从补丁 hunk header 提取 `related_symbols`。 |
+| POST | `/archive-stale` | `{id, ...guard}` | 200 同 reject；Host 复核 updated_at 与 stale_days，并自动写 `rejection.category: stale`。 |
 | POST | `/resume` | `{id, ...guard}` | 200 `{candidate, commit}`；仅 Owner 将 changes_requested 转回 pending，不产生新 revision。 |
 | POST | `/reopen` | `{id, ...guard, from, reason}`；from 指向真实 rejected 候选，reason 非空 | 200 `{candidate, commit}`；只修改活跃候选；from 已有直接替代候选时返回 409。 |
 | POST | `/convert` | `{auditId, findingId, candidateId}`，均非空；不传候选 guard | 200 `{audit, candidateId, commitRevision}`；按 §7.6 校验并原子提交。 |
 | POST | `/dismiss-finding` | `{auditId, findingId, reason}`，均非空；不传候选 guard | 200 `{audit, commitRevision}`；按 §7.6 留痕并独立提交。 |
 | POST | `/rebase` | `{id, ...guard}` | 202 `{jobId, job}`，Job 类型 ai_fix。 |
 | POST | `/manual-revision` | `{id, ...guard, patchText}`；非空全量 Unified Diff | 202 `{jobId, job}`；验证与门禁通过后追加 human revision。 |
-| POST | `/backfill` | `{id, commitRevision}`，均非空；不传 guard | 200 `{candidate, backfillCommitRevision?, message?}`；按 §5.5 验证并幂等处理。 |
 | POST | `/approve` | `{id, ...guard, confirmedDecisions?: string[], waivedDecisions?: {id, reason}[]}`；缺省数组按 `[]` | 202 `{jobId, job}`；最终结果读取 job.result。 |
 | POST | `/ai-fix` | `{id, ...guard}`；必须有未 resolved 评论 | 202 `{jobId, job}`；无 unresolved/partial 评论时在创建 Job 前返回 409。 |
 | POST | `/sync` | 空 object `{}` | 200 VCS 同步结果；在 repo 工作区锁内串行，不创建候选写入。 |
@@ -888,7 +912,7 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 
 默认筛选当前操作者，状态默认全部。卡片显示 ticket、title、revision、变更规模、Owner、人工判断项、未解决评论、基线状态与本地瞬态进度。
 
-stale、duplicate、needsBackfill 和 local 必须使用不同徽标；local 不计入共享 KPI。基线落后时提示批准将在新基线重放。无批量批准，整卡点击进入详情。
+stale、duplicate、local 和基线冲突必须使用不同徽标；local 不计入共享 KPI。基线落后时提示批准将在新基线重放；`patchCheck.state == conflicted` 时提示可先 Rebase，但不得单独阻止查看或批准；批准 Job 仍须重新严格应用，冲突时按 §7.5 回退。无批量批准，整卡点击进入详情。
 
 ### 10.2 详情页
 
@@ -908,14 +932,18 @@ stale、duplicate、needsBackfill 和 local 必须使用不同徽标；local 不
 - 人工判断项只使用 Frontmatter `human_decisions` 作为数据源；逐项确认或填写理由 waive，精确覆盖后才解锁批准。正文不一致只显示告警，不得替代机器字段。
 - 底部提供总体意见、批准、提出改进意见和必填原因的放弃；changes_requested 提供“转回待审核”。
 - 行内评论模型必须保存 side；删除侧行创建 LEFT，新增/上下文新侧创建 RIGHT，展示和线程匹配同时比较 file + line + side。
+- 行内评论可携带 `anchor`；跨版本展示时先按 `file + line + side` 匹配，内容不匹配再用 `anchor.snippet` 重定位；无 anchor 或重定位失败时回退到原版本视图并以原评论位置展示，任何情况下都不得改写原评论。
+- 多条评论可以本地草稿批量提交；提交时一次发送，候选状态只在批次内转换一次。
 - 评论草稿与批准前勾选只保存在前端内存。
+- 详情页显示 `patchCheck` 派生诊断；`conflicted` 时提供 Rebase 入口，但预检不是批准证据，不得单独禁用批准。
+- 已批准候选显示派生业务提交版本与 `approvalCommitLookup` 诊断；`ambiguous/unknown` 只显示提示，不得显示为失败。
 - Job 日志轮询使用绝对偏移；收到 logResetRequired 时必须丢弃旧日志并按返回快照重建，不能继续使用旧 since 等待新行。
 
 ### 10.3 批准进度
 
-批准界面依次展示：工作区检查 → 同步 → 应用补丁与门禁 → 业务原子提交 → commit_revision 回填，并轮询 Job 增量日志。
+批准界面依次展示：工作区检查 → 同步 → 应用补丁与门禁 → 业务原子提交，并轮询 Job 增量日志。
 
-业务提交成功但回填失败时必须显示“已批准，待回填”，不得显示整体失败；必须提供幂等补填入口。Client 使用队列项的 `suggestedBackfillCommitRevision` 作为默认值；缺少该字段时提示人工核查 VCS，不得要求用户猜测版本号。
+业务提交成功后直接显示 `commitRevision`；不得再有“待回填”分支。后续读取 approved 候选时，Client 使用 `approvalCommitRevision` 与 `approvalCommitLookup` 展示派生结果；`ambiguous/unknown` 只显示诊断，不得要求用户猜测版本号，也不得把候选显示为失败。
 
 ---
 
@@ -1031,7 +1059,7 @@ Agent 结束任务前必须逐项确认：
 - 候选共享写操作使用完整 ConcurrencyGuard；expectedUpdatedAt 用于发现评论等不推进补丁版本的写入。§4.3 的严格单调规则保证即使冻结时钟或时钟回拨，连续写入也有不同 guard。
 - expectedOwner 只是并发期望状态，不是请求者身份。
 - 进程内 repo 锁负责串行化共享写和工作区事务；乐观锁负责拒绝旧页面操作，两者不能相互替代。
-- `/convert`、`/dismiss-finding` 使用 repo 锁与档案状态前置校验；`/backfill` 通过 VCS 验证和当前值规则保证幂等。
+- `/convert`、`/dismiss-finding` 使用 repo 锁与档案状态前置校验；批准提交的派生定位只读，不产生写操作。
 - 不提供分布式锁或跨工作区互斥。多主机同时写不在当前正确性保证范围内，尤其不得声称乐观锁能防止多主机 approve 污染工作区。
 
 ### 12.2 安全与操作隔离
@@ -1051,7 +1079,7 @@ Agent 结束任务前必须逐项确认：
 - YAML/Markdown 按 UTF-8 读取，BOM 与 CRLF 在解析层归一化；补丁载荷不得做内容规范化。
 - 空 gate_checks 在 Validator、完整性校验与 Client 三处一致拦截。
 - 同步 API 失败直接返回错误对象；异步 API 的 202 仅表示受理。
-- 已证明提交不存在时必须恢复操作前文件；第一次批准提交成功后的恢复只走 needsBackfill。批准 Job 中提交或同步结果不明时使用 `RECOVERY_REQUIRED`；`/sync` 等同步接口则返回 409 `conflict`，且 `details` 必含 `{status: "RECOVERY_REQUIRED", reason, detail}`。两者都禁止猜测回滚。
+- 已证明提交不存在时必须恢复操作前文件；批准提交成功后不得尝试回滚业务内容，后续读取按 §5.5 从 VCS 历史派生提交版本。批准 Job 中提交或同步结果不明时使用 `RECOVERY_REQUIRED`；`/sync` 等同步接口则返回 409 `conflict`，且 `details` 必含 `{status: "RECOVERY_REQUIRED", reason, detail}`。两者都禁止猜测回滚。
 - Host 崩溃不承诺自动还原未知工作区。后续写操作若发现脏工作区或不确定状态必须停止并请求人工确认，不得把崩溃中断当作失败或成功。
 
 ---
@@ -1069,12 +1097,12 @@ Agent 结束任务前必须逐项确认：
 | I3 | revision id 从 1 连续递增且唯一，current_revision 等于最大 id，revision id 与补丁编号一致。 |
 | I4 | 活跃候选每个 revision 的补丁文件存在；归档候选豁免。新候选还必须在生产收尾验证补丁可干净应用。 |
 | I5 | 活跃候选 target_files 非空、唯一并与当前补丁实际路径一致；重命名同时含旧、新路径。 |
-| I6 | `status == approved ⟺ approval != null`，`status == rejected ⟺ rejection != null`；approval 与 rejection 互斥，拒绝字段非空；approval.commit_revision 只能是 null 或非空 string，空字符串 broken。 |
+| I6 | `status == approved ⟺ approval != null`，`status == rejected ⟺ rejection != null`；approval 与 rejection 互斥，拒绝必填字段非空；`category` 若存在必须为非空 string，未知值原样保留且不使候选 broken。 |
 | I7 | approval.gate_checks 等于批准时顶层门禁；gate_results 按顺序一一对应，exit_code 均为非负整数且批准时全为 0，duration_ms 为非负有限数。 |
 | I8 | human_decisions id 唯一且非空；批准时 confirmed/waived 仅含有效 id、各自无重复、彼此互斥、并集完整覆盖，waive 理由非空。 |
 | I9 | audit item 为 converted 当且仅当 candidate 非空；其他状态 candidate=null。 |
 | I10 | deferred 的 depends_on 为非空 finding_id 且不得自依赖；confirm 的 depends_on=null；pending 环依赖不得转换并必须报告。 |
-| I11 | 评论 id 非空唯一并引用已有版本；行内评论 file 非空、line>0、side=LEFT/RIGHT；总体评论 file=""、line=0 且省略 side。 |
+| I11 | 评论 id 非空唯一并引用已有版本；行内评论 file 非空、line>0、side=LEFT/RIGHT，`anchor` 若存在则 `snippet` 非空；总体评论 file=""、line=0 且省略 side 与 `anchor`。 |
 | I12 | target_files、scope、patch 与**行内**评论 file 均为合法仓库相对路径；总体评论 file="" 是不参与路径校验的哨兵值；实际读写不得经符号链接逃逸。 |
 | I13 | 所有时间戳含时区偏移且可解析；audit_id 时间与 created_at 规范化后的 **UTC 日历时刻**精确到秒一致。 |
 | I14 | 未知 Frontmatter 键及嵌套键的键、值和结构在读写往返中保留。 |
@@ -1091,6 +1119,8 @@ Agent 结束任务前必须逐项确认：
 - 删除或重命名字段、改变字段语义、将可选改为必填、改变路径/id 规则也必须升至 v2。
 - 正式使用后，v2 必须提供迁移规范和至少一个版本的旧数据读兼容；开发期数据可按 §4.1 不迁移。
 
+本版（v0.3.0，2026-11-09 修订）仍处于开发期，`schema_version` 保持 1；删除 `approval.commit_revision`、新增可选 `rejection.category` / `rejection.related_symbols` / `comments[].anchor` 属于预发布契约修订，按 §4.1 不迁移开发期数据。正式使用后，删除或重命名字段必须升至 v2。
+
 ---
 
 ## 14. 测试与验收
@@ -1101,7 +1131,7 @@ Agent 结束任务前必须逐项确认：
 - `npm test`：build 后运行 `node --test`。
 - `npm run verify:audit`：执行真实审查会话端到端校验。
 
-测试应覆盖 Frontmatter、不变量、负向记忆、finding 投影、批准流、审查核心/API、会话、补丁、VCS、人工判断与 Client bundle。测试夹具至少包含合法候选、非法候选、失败 Agent 和仅报告 Agent。
+测试应覆盖 Frontmatter、不变量、负向记忆、finding 投影、批准流与提交派生、批量评论、评论锚点、预检诊断、收尾门禁、审查核心/API、会话、补丁、VCS、人工判断与 Client bundle。测试夹具至少包含合法候选、非法候选、失败 Agent 和仅报告 Agent。
 
 ### 14.2 契约—验收追踪
 
@@ -1109,24 +1139,24 @@ Agent 结束任务前必须逐项确认：
 
 | 验收 id | 必须证明的行为 |
 | --- | --- |
-| AC-DATA-01 | 必填/可选/nullable、标量类型、毫秒精度、固定键序、空数组/null、未知嵌套键读写不丢失；commit_revision 空串 broken；I1–I16 均有正反例；完整示例通过相同校验。 |
+| AC-DATA-01 | 必填/可选/nullable、标量类型、毫秒精度、固定键序、空数组/null、未知嵌套键读写不丢失；新增 `rejection.category` / `rejection.related_symbols` / `comments[].anchor` 往返与未知枚举值保留；I1–I16 均有正反例；完整示例通过相同校验。 |
 | AC-READ-01 | Git 与 SVN 的未提交/已修改内容只显示 local；候选文件来自同一 VCS 快照，不得拼凑工作区补丁；broken 只有显式修复提交后恢复。 |
-| AC-STATE-01 | 新建进入 pending；pending 可带未解决评论；评论进入 changes_requested；新版本和 /resume 回到 pending；只有 pending 可批准；终态只允许补填例外。 |
+| AC-STATE-01 | 新建进入 pending；pending 可带未解决评论；评论进入 changes_requested；新版本和 /resume 回到 pending；只有 pending 可批准；approved/rejected 为终态，除 Owner 人工修复 broken 外不得再写入。 |
 | AC-LOCK-01 | 冻结时钟并连续两次评论，第二个旧 guard 必须 stale；时钟回拨也严格推进；revision、owner、updated_at 任一变化均可检测。 |
 | AC-DECISION-01 | 完整确认/waive 可批准；遗漏、未知 id、重复、交叉和空理由均拒绝；approval 只保存精确集合。 |
-| AC-APPROVE-01 | 同步后重建快照并重跑前置检查；门禁后工作区、Git 索引和提交树均等于已验证快照；第二次失败仍 COMMITTED + backfillPending，业务不回滚。 |
-| AC-RECOVERY-01 | 提交超时模拟已提交/未提交/无法确定；取消已提交 Job 返回实际业务结果，结果不明取消返回 RECOVERY_REQUIRED；backfill 验证第一次提交。 |
-| AC-API-01 | 每个写端点覆盖 400/422 边界、非法状态和冲突；guard 例外仅限约定端点；Job 日志绝对偏移与截断重置；backfill 四种情况；手动释放租约。 |
+| AC-APPROVE-01 | 同步后重建快照并重跑前置检查；门禁后工作区、Git 索引和提交树均等于已验证快照；单次原子提交；业务提交成功后从历史派生提交版本；后续修复提交不改变派生结果；ambiguous/unknown 只诊断。 |
+| AC-RECOVERY-01 | 提交超时模拟已提交/未提交/无法确定；取消已提交 Job 返回实际业务结果，结果不明取消返回 RECOVERY_REQUIRED；派生定位在提交存在/不存在/不明三态下正确，浅克隆与 merge 歧义不阻塞。 |
+| AC-API-01 | 每个写端点覆盖 400/422 边界、非法状态和冲突；guard 例外仅限约定端点；Job 日志绝对偏移与截断重置；批量评论全有或全无；`patchCheck` 三态；手动释放租约。 |
 | AC-SECURITY-01 | 路径穿越、绝对路径、反斜杠、VCS 管理路径、二进制/重命名越界、禁止目录和符号链接逃逸均拒绝；非白名单门禁完整展示并二次确认。 |
-| AC-AUDIT-01 | 同秒档案不覆盖；audit_id 按 UTC 校验；完整示例恰含一个复核块；candidates 只含实际提交项；转换/忽略只改最新观察；重开链处理异常。 |
-| AC-UI-01 | 人工判断项使用 Frontmatter 并上行 decisions；显示 stale/duplicate/needsBackfill/local；按 result.status 区分业务结果；使用 suggestedBackfillCommitRevision 补填。 |
+| AC-AUDIT-01 | 同秒档案不覆盖；audit_id 按 UTC 校验；完整示例恰含一个复核块；candidates 只含实际提交项；转换/忽略只改最新观察；重开链处理异常；可选收尾门禁在 `none` 不跑、`smoke/declared` 重跑并按失败排除候选。 |
+| AC-UI-01 | 人工判断项使用 Frontmatter 并上行 decisions；显示 stale/duplicate/local/patchCheck；approved 项显示派生审批提交与 lookup 诊断；按 result.status 区分业务结果。 |
 | AC-PROMPT-01 | Fixer/Auditor 的实际提示词展开所有引用规则，覆盖字段契约、9 个 audit_type、正交性、提交限制、人工判断和不可信仓库内容，不含未展开章节引用。 |
 | AC-ROUTING-01 | 仅 paths、仅 tags、两者 AND、无效规则、规范化 tags 去重、并列顺序和 default_owner 均有用例；Agent 填错 Owner 时 Host 收尾拒绝。 |
 | AC-RUNNER-01 | dsh/manual/external 的命令与 stdin、提交前校验、有限超时和取消均有用例；主进程退出 0 后残留子进程也必须清理。 |
 | AC-RETRY-01 | 非撞车失败为 COMMIT_FAILED；仅真实耗尽为 MAX_RETRIES_EXCEEDED；重试前恢复；受理后新重复返回 DUPLICATE_CANDIDATE；sync 与事务互斥。 |
 | AC-SCHEDULE-01 | 会话/headless/手动/定时审查都有可追踪 Job 或租约；手动取消/超时不释放租约，只有确认停止后 release；finalize 正常释放。 |
 | AC-SETTINGS-01 | 所有默认值与归一化、baseBranch 的 Git 同步目标、dshCommand 覆盖与 externalCommand stdin 均有用例。 |
-| AC-MEMORY-01 | 指纹对逗号、竖线、Unicode 和不同数组分组无碰撞；A→B→C 链中 A/B 均豁免，链外同指纹仍阻止；批准前后均复检。 |
+| AC-MEMORY-01 | 指纹对逗号、竖线、Unicode 和不同数组分组无碰撞；A→B→C 链中 A/B 均豁免，链外同指纹仍阻止；批准前后均复检；`category` 分组与 `stale` 弱信号生效，`related_symbols` 不进入指纹。 |
 
 ---
 
@@ -1160,9 +1190,9 @@ Agent 结束任务前必须逐项确认：
 | G13 | P2 | audit_id 校验使用读取机器本地时区。 | UTC 规范化或跨时区读取可能误判。 | 统一按 created_at 的 UTC 时刻生成和校验。 |
 | G14 | P1 | 人工判断项只检查覆盖和 waive 理由。 | 快照可能包含未知、重复或交叉决策。 | 按 §5.4 实施精确集合校验。 |
 | G15 | P1 | 补丁禁止路径与符号链接校验未完整覆盖禁止目录、VCS 管理路径和写入竞态。 | 非业务或越界路径可能进入补丁流程。 | 按 §4.6、§12.2 统一应用前及写入时校验。 |
-| G16 | P1 | ApprovalOutcome 缺少 backfillPending、RECOVERY_REQUIRED 和完整判别原因。 | Client 无法稳定区分业务结果与恢复状态。 | 按 §7.5 实现判别联合及结构化失败详情。 |
-| G17 | P0 | 多个共享写路径提交失败仍返回成功或无恢复；未区分“提交存在/不存在/不明”三分支，backfill、AI fix、Rebase、人工微调也有不完整回滚。 | 本地写入可能被误当共享事实，或已成功提交被误回滚。 | 按 §5.6 统一查询 VCS 后三分支处理：成功继续、证明不存在才恢复、不明确保留现场并报告恢复状态。 |
-| G18 | P1 | backfill 可覆盖不同已有值，未验证第一次批准提交，队列也无建议版本字段，响应未区分两次提交。 | 可能写错审计链或无法安全恢复。 | 按 §5.5 从 VCS 定位验证，提供 suggestedBackfillCommitRevision，并使用 backfillCommitRevision 响应。 |
+| G16 | P1 | ApprovalOutcome 缺少 `RECOVERY_REQUIRED` 和完整判别原因，且仍把 `PATCH_CONFLICT/GATE_CHECK_FAILED` 混入 ABORTED 原因。 | Client 无法稳定区分业务结果与恢复状态。 | 按 §7.5 实现判别联合及结构化失败详情。 |
+| G17 | P0 | 多个共享写路径提交失败仍返回成功或无恢复；未区分“提交存在/不存在/不明”三分支，AI fix、Rebase、人工微调也有不完整回滚。 | 本地写入可能被误当共享事实，或已成功提交被误回滚。 | 按 §5.6 统一查询 VCS 后三分支处理：成功继续、证明不存在才恢复、不明确保留现场并报告恢复状态。 |
+| G18 | P1 | 批准仍执行第二次回填提交，未实现 §5.5 的历史派生；approved 候选没有 `approvalCommitRevision`/`approvalCommitLookup` 读模型。 | 多一次提交与一类失败分支，且无法验证派生规则。 | 改为单次原子提交，实现 Git/SVN 派生与三态诊断。 |
 | G19 | P1 | 当前批准允许 changes_requested，且缺少 202 前的完整 guard 预检。 | 非 pending 可进入审批；受理前后错误语义不一致。 | 仅接受 pending；受理前 409，受理后写 ABORTED outcome。 |
 | G20 | P0 | DSH 会话没有跟踪 Job/收尾/互斥；手动执行租约、finalize、release 和开始执行时的 auditId 响应未实现。 | 外部执行可并发改仓库，取消后也无法证明外部 Agent 已停止。 | 实现会话 Job、/audit/manual 租约、auditId、/audit/finalize 和确认停止后的 /audit/release。 |
 | G21 | P1 | Client 只按外层 Job 状态显示“完成”，未读取 result.status。 | ABORTED、FALLBACK 与 COMMITTED 可能同样显示完成。 | 所有业务 Job 按 result.status 展示。 |
@@ -1181,6 +1211,13 @@ Agent 结束任务前必须逐项确认：
 | G34 | P1 | Client 未保存/比较评论 side，新建评论固定 RIGHT，LEFT 评论可能错显且无法创建。 | 基线侧与补丁侧评论无法正确区分。 | 评论模型、创建入口和渲染过滤同时使用 file+line+side。 |
 | G35 | P1 | 批准只在创建 Job 前检查重复候选，受理后、同步后、门禁后不再复检。 | 新出现的同指纹拒绝记录可能不阻止批准。 | 按 §7.5 三处复检，受理后使用 DUPLICATE_CANDIDATE。 |
 | G36 | P1 | Job 日志直接删除最旧 4000 行，logOffset 仅回显 since，不是绝对偏移。 | 客户端在截断后永远读不到新日志。 | 使用累计绝对序号、earliestLogOffset 和 logResetRequired。 |
-| G37 | P2 | 当前解析把空 commit_revision 规范化为 null，未标记 broken；手工写入空串可能被误判为待回填。 | 无法区分合法未回填与坏数据。 | 空串判 broken；只有 null 触发 needsBackfill。 |
+| G37 | P2 | `/comments` 仍逐条提交，未实现 `/comments/batch`。 | 多条评论产生多次提交与 HEAD 变化，缓存命中率低。 | 按 §8.3 实现批量评论，全有或全无。 |
+| G38 | P2 | 未实现 `rejection.category` / `rejection.related_symbols` 与提示词分组。 | 负向记忆仍只有自由文本原因。 | 按 §4.3、§6.3 写入与注入。 |
+| G39 | P2 | 未实现 `comments[].anchor` 与跨版本重定位。 | 跨版本未解决评论可能错位。 | 按 §4.3、§10.2 增加可选锚点与重定位展示。 |
+| G40 | P2 | 未实现 `patchCheck` 派生预检。 | 批准前才发现冲突的体验问题仍在。 | 按 §8.2 在详情页返回派生诊断，批准仍严格重检。 |
+| G41 | P2 | 未实现投影内存缓存。 | 队列/投影随档案增长线性扫描。 | 按 §4.8 以 VCS 快照为键做内存缓存。 |
+| G42 | P2 | 未实现 `verify_gate_on_audit_finalize` / `audit_smoke_commands`。 | 审计期门禁仍只有 AI 自述。 | 按 §7.6 增加可选收尾复算与 UI 标注。 |
+
+G37–G42 为 2026-11-09 契约修订新增差距。
 
 多主机分布式互斥是 §12.1 的明确已知限制，不作为当前实现差距；只有正式将其纳入目标契约后才应新增差距项。

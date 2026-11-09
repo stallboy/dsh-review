@@ -1,6 +1,8 @@
 # DSH Review 工作流与数据契约 · 精读版
 
-> 提炼自 [2026-11-03-review-workflow-data-design.md](2026-11-03-review-workflow-data-design.md)（commit `bda37f6`），面向人类阅读；两文冲突时以原设计文档为准。
+> 提炼自 [2026-11-03-review-workflow-data-design.md](2026-11-03-review-workflow-data-design.md)（commit `bda37f6`），面向人类阅读；本文为历史精读，契约以 `SPEC.md` 为准。
+
+> **2026-11-09 契约修订**：批准已改为单次原子提交；`commit_revision` 不再写入 `review.md`，由 Host 从 VCS 历史派生（SPEC §5.5）。本文 §4 已按单次提交更新；旧稿中的“原子提交②：回填 commit_revision”已作废。评论批处理、锚点、拒绝分类与预检诊断见 SPEC。
 
 ## 0. 一句话
 
@@ -107,18 +109,18 @@ sequenceDiagram
     P->>W: 同步最新基线，应用当前补丁
     P->>W: 重新执行全部 gate_checks（不信 AI 叙述）
     alt 门禁全绿且无冲突
-        P->>G: 原子提交①：业务代码 + status:approved + approval（快照/结果/确认记录）+ 补丁删除
+        P->>G: 原子提交：业务代码 + status:approved + approval（快照/结果/确认记录）+ 补丁删除
         P->>G: 重同步，检测同候选重复 approved（互斥兜底）
-        P->>G: 原子提交②：仅 .ai-review，回填 commit_revision
+        P->>P: 从 VCS 历史派生业务提交版本（found/ambiguous/unknown）
     else 门禁失败 / 有冲突
         P->>U: 返回失败，回滚工作区
     end
-    Note over P,G: 回填②失败：显式报告，业务提交不伪装回滚；<br/>队列加载发现 approved 且 commit_revision 为 null 会提示幂等补填
+    Note over P,G: 派生只读；ambiguous/unknown 只显示诊断，不阻塞候选
 ```
 
 ## 5. 拒绝、超时与负向记忆
 
-拒绝在同一共享提交里完成：`rejection`（`rejected_by`/`rejected_at`/`reason` 非空）+ `status` + `updated_at` + 删除过程补丁。`review.md` 永久保留，作为负向记忆事实源。
+拒绝在同一共享提交里完成：`rejection`（`rejected_by`/`rejected_at`/`reason` 非空，可选 `category`/`related_symbols`）+ `status` + `updated_at` + 删除过程补丁。`review.md` 永久保留，作为负向记忆事实源。分类用于提示词分组，`stale` 只作弱信号，均不进入确定性指纹。
 
 超时不做「读时写」：队列加载只提示过期；实际归档由定时任务或显式「归档过期候选」操作执行，`rejected_by: system:stale`，乐观锁保证只写一次。
 
@@ -149,7 +151,7 @@ SVN 增量 diff 无 worktree 可切换：无法干净应用时按 hunk 级降级
 四条兜底，全部是流程级约定、无数据结构开销：
 
 1. **并发批准互斥**：共享写操作经同一共享检出的检出级互斥串行化；批准提交后重同步，发现同候选重复 `approved` 显式报告、人工裁决（多克隆分布式并发不在本期范围）。
-2. **乐观锁贯穿所有写**：`expectedRevision + expectedOwner`，失败即返回 409/400 并恢复文件，绝不以成功响应掩盖。
+2. **乐观锁贯穿所有写**：`expectedRevision + expectedOwner + expectedUpdatedAt`，失败即返回 409/400 并恢复文件，绝不以成功响应掩盖。
 3. **broken 候选出口**：不参与任何流转；唯一恢复路径是 Owner 人工修复 + 一次仅含该候选目录的显式修复提交；不可修复者只读展示或人工补合法 `rejection` 退出；禁止 AI 自动改写。
 4. **审查目录冲突**：审查完成提交前校验本轮 audit 目录及新候选目录不存在；同秒冲突即本轮失败重试。
 
@@ -163,8 +165,8 @@ SVN 增量 diff 无 worktree 可切换：无法干净应用时按 hunk 级降级
 | 4 | `audit_type` 映射 | 扩展为 9 值：+`stdlib`/`native`/`yagni`（additive，schema_version 保持 1） |
 | 5 | SVN 已提交判定 | `svn status --xml` 规则 + hunk 级降级（见 §6 表） |
 | 6 | 负向记忆误判覆盖 | 可选字段 `reopened_from`/`reopen_reason`，仅 Owner 人工填写 |
-| 7 | 批量操作与真实鉴权 | 一期不做（deferred）；owner 是本地约定不是鉴权 |
-| 8 | 流程保证补全 | 并发批准互斥、回填恢复、broken 出口、目录冲突校验（见 §7） |
+| 7 | 批量操作与真实鉴权 | 批量批准/决策不做；评论批处理已纳入契约；owner 是本地约定不是鉴权 |
+| 8 | 流程保证补全 | 并发批准互斥、提交派生、broken 出口、目录冲突校验（见 §7） |
 
 ## 9. 明确不做的事（边界）
 

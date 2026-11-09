@@ -9,6 +9,8 @@
 | 关联 | `dsh_web.md`（原始设计）、`docs/dsh-platform-notes.md`（平台核查）、`README.md`（as-built） |
 | 读者 | 实现者、评审者；验收按 §16 的验收标准执行 |
 
+> **术语注记（2026-11-09）**：本文的“两阶段”指审查的 Phase A / Phase B，不是批准的两次提交。批准已改为单次原子提交 + 历史派生（SPEC §5.5）；本文 §9 的 worktree 只适用于审查执行，不改变 SPEC §1.4 的批准门禁原地执行。
+
 **变更记录**
 
 | 版本 | 日期 | 变更 |
@@ -707,7 +709,7 @@ gate_evidence:             # 插件亲跑的门禁
 
 | 批次 | 内容 | 验收标准（DoD） | 预估 |
 |---|---|---|---|
-| **P0 ✅** | 合入 §2.1 三个候选，`main` 推进到含修复的基线 | 已完成：合并批准提交 `9fedff2` + 回填 `b4689e4`（三个候选：api 互斥 / hunk 边界 / 提交路径收敛；原"每候选一次批准 + 一次回填"的 6 个提交已按用户要求合并，旧 sha 仅 reflog 可找回）；测试 55→60；队列 pending 10→7 | 0.5 天 |
+| **P0 ✅** | 合入 §2.1 三个候选，`main` 推进到含修复的基线 | 已完成：合并批准提交 `9fedff2` + 回填 `b4689e4`（历史记录：当时使用两次提交；新契约为单次提交 + 历史派生；三个候选：api 互斥 / hunk 边界 / 提交路径收敛；原"每候选一次批准 + 一次回填"的 6 个提交已按用户要求合并，旧 sha 仅 reflog 可找回）；测试 55→60；队列 pending 10→7 | 0.5 天 |
 | **B0 ✅** | 落地自检：断言写成 `/health diagnostics.adversary` + 一次性 `POST /audit/probe` | 已完成，4 条断言全绿：①`startActivation` 存在且 `spawn` provider 可用；②`launchAgentResolved:true`；③探针 `ok:true`/2.35s/`disposed:true`，父会话 **0 条**结算消息；④预设服务可用但只收窄工具不收窄权限根（篡改检测保留）。顺带修出 6 条契约错误（§8.2） | 0.5 天 |
 | **B1 ✅** | `worktree.ts` 抽取 + `prune` + `fingerprint`（`applyPatch({worktree})` 按本轮指令未纳入，留待 B3/B4 真正需要时再加） | 已完成（提交 `6dc4968`）：既有 77 项断言未改 + 新增 3 个 worktree 用例（共 **80 项全绿**）；`pruneAll` 关闭 P2 脏引用；`fingerprint(dir)` 记录 HEAD + porcelain 状态 + 变更文件内容哈希（有界、输出截断时失败关闭） | 0.5 天 |
 | B2 | `plan.ts` + `overlap.ts` + `state.ts` + `report.ts`（纯函数） | `audit-plan` / `audit-overlap` / `audit-report` 绿 | 1 天 |

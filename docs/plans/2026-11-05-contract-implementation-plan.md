@@ -4,6 +4,8 @@
 回滚节点：git tag `pre-contract-impl-20261105`（`36aaa12`）。
 约束：`schema_version` 保持 1；未知字段保留；每阶段测试全绿后提交一次；只 commit 不 push。
 
+> **2026-11-09 修订**：P10 的 `commit_revision` 回填项作废。批准改为单次原子提交，业务提交由 Host 从 VCS 历史派生（SPEC §5.5）；新增 `rejection.category`/`related_symbols`、`comments[].anchor`、`/comments/batch`、`patchCheck`、可选收尾门禁，见 SPEC 与附录 A G18/G37–G42。
+
 ## 阶段与验收标准
 
 | 阶段 | 内容 | 验收标准（全部需有测试用例） |
@@ -17,7 +19,7 @@
 | P7 B/Deferred 转候选 | 转换 API：depends_on 满足判定、两侧同一提交、失败恢复 | 单边成功被阻止；未满足 depends_on 拒绝转换 |
 | P8 人工微调与 Rebase | 隔离工作区人工微调（author: human）；Rebase 新版本（author: ai，重跑门禁） | 新版本基线正确；半版本不留存 |
 | P9 定时审查 + 会话路由注入 | 定时触发入队；审查会话启动时把 reviewers 解析结果注入提示词 | trigger 字段正确；路由结果出现在提示词 |
-| P10 流程保证收口 | 检出级写互斥；审查提交前目录不存在校验；`commit_revision: null` 回填恢复提示；批准后重同步重复检测 | 并发写被串行化；同秒目录冲突失败重试；null 回填被提示 |
+| P10 流程保证收口 | 检出级写互斥；审查提交前目录不存在校验；批准单次提交与 VCS 历史派生；批准后重同步重复检测 | 并发写被串行化；同秒目录冲突失败重试；派生三态正确 |
 
 ## 总验收
 
@@ -37,7 +39,7 @@
 - [x] P7 B/Deferred 转候选（`c225bf6`，3 项验收：confirm 两侧同一提交、deferred depends_on 门控（resolved/approved 满足，pending/无观察/归档候选阻塞）、投影联动）
 - [x] P8 人工微调与 Rebase（`776a9c7`，2 项验收：Rebase 基线门控+新版本 author ai+工作区干净；manual-revision 坏补丁不留半版本+author human）
 - [x] P9 定时审查 + 会话路由注入（`5c4ae1a`：审查提示词注入 reviewers 解析结果；scheduleIntervalMinutes 定时创建 scheduled 会话）
-- [x] P10 流程保证收口（`5c4ae1a`：检出级写互斥——并发归档恰好一次成功；目录冲突校验见 P6；approved+commit_revision=null 队列 needsBackfill 提示）
+- [x] P10 流程保证收口（`5c4ae1a`：检出级写互斥——并发归档恰好一次成功；目录冲突校验见 P6）。2026-11-09 修订：原 `commit_revision` 回填提示作废，改为单次提交 + 历史派生（待实现）。
 
 ## 总验收
 

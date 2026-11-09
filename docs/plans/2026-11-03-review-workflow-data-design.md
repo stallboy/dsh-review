@@ -5,7 +5,13 @@
 | 状态 | 已按 2026-11-04 评审结论修订并规范化，§18 待决事项已全部落定，可进入实现 |
 | 日期 | 2026-11-03（2026-11-04 按评审结论修订） |
 | 适用范围 | 手动审查、定时审查、B/Deferred 转换、候选审核、批准、拒绝与归档 |
-| 关联文档 | `dsh_web.md`（原始设计）、`README.md`（当前实现） |
+| 关联文档 | `dsh_web.md`（原始设计）、`README.md`（当前实现）、`SPEC.md`（当前权威契约） |
+
+> **2026-11-09 契约修订（开发期）**：本文是历史设计记录，契约以 `SPEC.md` 为准。
+> - 批准改为单次原子提交；`approval.commit_revision` 字段移除，业务提交由 Host 从 VCS 历史派生（SPEC §5.5）。本文 §4.7、§6.6、§8、§12.3、§13.2 中关于第二次回填提交、`needsBackfill`、`/backfill` 的描述作废。
+> - 新增可选 `rejection.category` / `rejection.related_symbols`、`comments[].anchor`、`/comments/batch`、`candidate.patchCheck`、`queue.approvalCommitRevision` 与可选 `verify_gate_on_audit_finalize`；见 SPEC §4.3、§5.5、§6、§7.6、§8.2、§8.3。
+> - 负向记忆的确定性指纹仍只使用 module + target_files + audit_type + 规范化 title；分类与符号只用于提示词/展示。
+> - 批准门禁在仓库根目录原地执行；worktree 仅作为未来可选能力，不是 v1 默认（SPEC §1.4）。
 
 ## 文档结构
 
@@ -430,13 +436,15 @@ commit_message: |
 
 ### 4.7 `approval` 字段
 
+> **已废弃（2026-11-09）**：本节的 `commit_revision` 字段与第二次回填提交已移除；批准只产生一次原子提交，业务提交由 Host 从 VCS 历史派生（SPEC §5.5）。
+
 `approval` 在候选未批准时为 null；批准时为：
 
 | 字段 | 类型 | 功能与流程 |
 | --- | --- | --- |
 | `approved_by` | string | 实际执行批准的 Owner。 |
 | `approved_at` | ISO time | 共享批准提交的时间。 |
-| `commit_revision` | string \| null | 业务代码与批准记录所在提交；首个提交时尚未知，第二个仅 `.ai-review` 提交回填。 |
+| ~~`commit_revision`~~ | ~~string \| null~~ | 已废弃（2026-11-09）：不再写入 `review.md`；业务提交由 Host 从 VCS 历史派生（SPEC §5.5）。 |
 | `gate_checks` | string[] | 批准时生效的门禁快照，必须与当时的顶层 `gate_checks` 完全一致。 |
 | `gate_results` | object[] | 实际执行结果，每项含 `command`、`exit_code`、`duration_ms`；批准必须全部通过。 |
 | `confirmed_decisions` | string[] | 已确认的 `human_decisions[].id`；无判断项时为 `[]`。 |
@@ -448,7 +456,6 @@ commit_message: |
 approval:
   approved_by: zhangsan
   approved_at: "2026-11-04T10:00:00+08:00"
-  commit_revision: null
   gate_checks:
     - "go test ./internal/net/..."
   gate_results:
@@ -465,9 +472,8 @@ approval:
 
 - 只有业务代码、批准状态和过程补丁删除成功进入同一原子提交后，`approved` 才对外成立。
 - 任何实质方案变化都会清空批准并回到 `pending`。
-- 仅上下文偏移、方案与语义不变且门禁重新通过时，可以沿用本次批准。
-- `commit_revision` 回填失败必须显式报告，但不能把已经成功的业务提交伪装成失败回滚。
-- 回填中断的恢复：队列加载时发现 `approved` 且 `commit_revision == null` 的候选即提示 Owner 执行回填；回填幂等（只写 `approval.commit_revision`，不改 `updated_at`、不动业务代码），可安全重试直至成功。
+- ~~仅上下文偏移、方案与语义不变且门禁重新通过时，可以沿用本次批准。~~ 已废弃（2026-11-09）：任何新版本都必须人工复审。
+- ~~`commit_revision` 回填失败与回填中断恢复~~：已废弃（2026-11-09）；批准只有一次原子提交，业务提交由 Host 从 VCS 历史派生（SPEC §5.5）。
 - 批准时 `human_decisions` 中每个 `id` 必须被确认或标记知悉，否则拒绝批准；`waived` 必须写明原因。
 - `gate_results` 的命令集合与顺序必须与 `approval.gate_checks` 一致，且全部通过。
 - 批准后若文件顶层 `gate_checks` 与 `approval.gate_checks` 不一致，视为外部改写并标记。
@@ -621,12 +627,14 @@ max_anti_patterns: 20
 
 ### 6.6 批准
 
+> **已废弃（2026-11-09）**：本节第 2 步的隔离工作区、第 6 步的第二次回填提交均已废弃；批准在仓库根目录原地执行，只产生一次原子提交，业务提交由 Host 从 VCS 历史派生（SPEC §1.4、§5.5）。
+
 1. 重新同步并读取候选，校验 Revision、Owner、`human_decisions` 的确认/知悉覆盖和提交信息；存在未确认且未标记知悉的判断项，或批准人不是当时 owner 时拒绝批准。
-2. 在隔离工作区同步最新基线并应用当前补丁。
+2. ~~在隔离工作区同步最新基线并应用当前补丁。~~ SPEC v1 在仓库根目录原地执行（§1.4）。
 3. 校验并执行门禁，记录实际证据（命令、退出码、耗时）到本次批准。
 4. 无冲突且全绿则继续；实质变化则产生新版本并重新审核。
 5. 业务代码、`status: approved`、`approval`（含门禁快照、执行结果、确认/知悉记录）、验证证据、过程补丁删除和 `updated_at` 更新进入同一原子提交。
-6. 第二个仅 `.ai-review` 提交回填 `commit_revision`。
+6. ~~第二个仅 `.ai-review` 提交回填 `commit_revision`。~~ 已废弃（2026-11-09）。
 7. 基线竞争最多重试两次；超过上限则不产生共享 approved 状态。
 8. 批准互斥语义（见 §18.8）：所有共享写操作经由同一共享检出串行化执行（检出级互斥，同一时刻只允许一个共享提交流程）；批准提交后立即重新同步，若发现同一候选已存在另一条 approved 记录，显式报告冲突并交由人工裁决，不自动改写状态。多克隆分布式并发不在本期保证范围（§16：owner 非鉴权）。
 
@@ -639,6 +647,8 @@ max_anti_patterns: 20
 - 已拒绝候选不可继续评论、修复或批准。
 
 ## 7. 负向记忆与重复阻止
+
+> **2026-11-09 补充**：拒绝记录可带 `category` 与 `related_symbols`；分类用于提示词分组，`stale` 只作弱信号；两者都不进入确定性指纹。
 
 不建立独立负向记忆文件。事实来源为 rejected 候选的：
 
@@ -658,6 +668,8 @@ module + target_files + audit_type + title + rejection.reason
 
 ## 8. 共享写入与事务边界
 
+> **已废弃（2026-11-09）**：本节表格中的 `commit_revision` 回填行不再适用；批准只有一次业务提交，后续读取按 SPEC §5.5 派生。
+
 | 操作 | 同一共享提交必须包含 |
 | --- | --- |
 | 审查完成 | 本轮 audit 目录 + 本轮新候选目录 |
@@ -666,7 +678,7 @@ module + target_files + audit_type + title + rejection.reason
 | 状态修正（如 AI 修复失败后转回 `pending`） | 当前候选目录 |
 | AI 修复/人工微调/Rebase | 当前候选目录及新增补丁 |
 | 批准 | 业务代码 + 当前候选目录 + 补丁删除 |
-| commit_revision 回填 | 当前候选目录，独立第二次提交 |
+| ~~commit_revision 回填~~ | 已废弃（2026-11-09）：批准只有一次业务提交。 |
 | 拒绝/超时 | 当前候选目录 + 补丁删除 |
 
 通用规则：
@@ -676,7 +688,7 @@ module + target_files + audit_type + title + rejection.reason
 3. 本地写入后提交失败，恢复操作前文件并返回失败。
 4. Job 只有在共享提交成功后才能报告成功。
 5. 默认只 commit 不 push；其他实例通过既定仓库同步获得事实。
-6. 每次共享写入更新 `updated_at`；批准/拒绝后为终态时间；`commit_revision` 回填不改变 `updated_at`。
+6. 每次共享写入更新 `updated_at`；批准/拒绝后为终态时间。
 7. 只对已提交事实做流程裁决；未提交改动按 §14 视为本地视图。
 8. 共享写操作经由同一共享检出串行化执行（检出级互斥锁）；批准提交后重新同步，检测同候选重复 approved 记录，发现即显式报告、人工裁决（见 §6.6、§18.8）。
 
@@ -760,7 +772,7 @@ pending | converted | dismissed | resolved
 - 未提交的工作区改动被视为本地视图，不参与批准、负向记忆和提示词注入。
 - 超过 `stale_days` 的候选能按 `system:stale` 归档，且只产生一次 rejected 写入。
 - 共享写操作经检出级互斥串行化；批准提交后能发现同候选重复 approved 记录并显式报告，不自动改写。
-- `approved` 且 `commit_revision == null` 的候选在队列加载时被提示回填；回填幂等可重试。
+- ~~`approved` 且 `commit_revision == null` 的候选在队列加载时被提示回填；回填幂等可重试。~~ 已废弃（2026-11-09）：改为从 VCS 历史派生，见 SPEC §5.5。
 - broken 候选经 Owner 人工修复提交后能恢复流转；修复前不参与批准、投影与负向记忆，且不可被 AI 自动改写。
 - 带 `reopened_from` 的候选不被确定性重复阻止，但负向记忆注入仍生效；`reopened_from` 不指向 rejected 候选或 `reopen_reason` 为空时按 broken 处理。
 
@@ -808,7 +820,7 @@ pending | converted | dismissed | resolved
 | 批准 | §13.1 中适用于该候选的不变量、I7/I8、工作区干净、补丁可应用、门禁全绿、commit_message 首行 == title；更新 `updated_at` | 回滚工作区；候选回 pending 或返回失败；不产生 approved |
 | 拒绝/超时 | expectedRevision + expectedOwner、`rejection.reason` 非空、`rejected_by` 合法；只写一次 | 返回失败；不删除补丁 |
 | 重开被拒方案 | I16：`reopened_from` 指向真实 rejected 候选、`reopen_reason` 非空、操作者为 Owner 且非 AI 自动填写 | 拒绝写入；按普通新候选处理或返回失败 |
-| commit_revision 回填 | 只改 `approval.commit_revision`；候选已 approved；队列加载发现 approved 且 `commit_revision == null` 时提示执行回填（中断恢复触发，回填幂等可重试） | 显式报告回填失败，不回滚业务提交 |
+| ~~commit_revision 回填~~ | 已废弃（2026-11-09）：批准只有一次原子提交；业务提交由 Host 从 VCS 历史派生（SPEC §5.5） | — |
 | 读端容错 | 不自动修复；未知字段保留 | 标记 broken 或提示升级 |
 
 broken 候选的出口（决定见 §18.8）：
@@ -918,6 +930,6 @@ SVN 环境的判定规则（决定见 §18.5）：
 按“保证流程、不打磨细节”的口径复查端到端流程后补定的 4 项缺口，均无数据结构变更：
 
 - **并发批准互斥**：共享写操作经同一共享检出的检出级互斥串行化；批准提交后重新同步，发现同候选重复 approved 记录时显式报告、人工裁决，不自动改写。多克隆分布式并发不在本期范围（规范见 §6.6 第 8 步、§8 通用规则 8）。
-- **`commit_revision` 回填中断恢复**：队列加载发现 approved 且为 null 即提示回填；回填幂等可重试（规范见 §4.7、§13.2）。
+- ~~**`commit_revision` 回填中断恢复**~~：已废弃（2026-11-09）；批准单次提交，业务提交由 Host 从 VCS 历史派生（SPEC §5.5）。
 - **broken 候选出口**：Owner 人工修复 + 仅含该候选目录的显式修复提交是唯一恢复路径；不可修复者保持 broken 只读展示或人工补合法 `rejection` 退出；禁止 AI 自动改写（规范见 §13.2）。
 - **审查目录冲突校验**：审查完成提交前校验本轮 audit 目录及新候选目录不存在；同秒并发冲突时本轮失败重试，目录名随时间戳自然区分（规范见 §13.2）。

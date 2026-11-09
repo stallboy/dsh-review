@@ -79,10 +79,7 @@ comments:
     author: "<评论人>"
     content: "<评论原文>"
     status: resolved # 只能是 unresolved | partial | resolved
-approval:
-  approved_by: null
-  approved_at: null
-  commit_revision: null
+approval: null
 ---
 
 # 问题与影响
