@@ -14,7 +14,7 @@
 
 ## 2. 测试状态
 
-- 全量测试：**136 项，全部通过**（`node --test --test-timeout=90000 --test-concurrency=1 --test-reporter=tap tests/*.test.mjs`，输出落盘）。
+- 全量测试：**137 项，全部通过**（`node --test --test-timeout=90000 --test-concurrency=1 --test-reporter=tap tests/*.test.mjs`，输出落盘）。
 - 运行方式约束（重要）：必须 `--test-concurrency=1` 且输出重定向到文件；
   多文件并行或 TEMP 脏时会出现“假挂起”——根因是 `%TEMP%` 累积的 `dsh-*` 夹具目录造成文件系统压力。
   长跑前先清理：`Remove-Item $env:TEMP\dsh-* -Recurse -Force`。
@@ -86,7 +86,7 @@
 
 ## 6. 实现后审查结论（2026-11-10 终，第二轮对抗性审查后修补）
 
-- **验证基线**：`npm run typecheck` / `npm run build` 通过；全量 **136 项测试通过**；
+- **验证基线**：`npm run typecheck` / `npm run build` 通过；全量 **137 项测试通过**；
   本轮新增 4 个契约测试文件（三分支、租约互斥、投影共享源、VCS 派生/SVN 真机）
   与 2 个 `/approve commitMessage` 用例。
 - **上一轮审查确认的未修项：全部关闭**——H1 SVN 路径级三分支、租约互斥（含定时审查）、
