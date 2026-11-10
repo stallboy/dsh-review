@@ -49,6 +49,7 @@ async function writeCandidate(root, baseRevision, humanSection) {
     'tags: [test]',
     'status: pending',
     'ticket: null',
+    'target_files: [src/math.js]',
     'current_revision: 1',
     'revisions:',
     '  - id: 1',

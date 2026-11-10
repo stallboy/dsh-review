@@ -129,7 +129,7 @@ test('P3: 显式归档写 system:stale + 删补丁 + 只写一次；未过期候
   const tooFresh = await fetch(`${apiUrl}/archive-stale`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261104-net-fresh', expectedRevision: 1, expectedOwner: 'tester' }),
+    body: JSON.stringify({ id: '2026-11/20261104-net-fresh', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: freshIso }),
   });
   assert.equal(tooFresh.status, 409);
   assert.match((await tooFresh.json()).error.message, /未超过 stale_days/);
@@ -138,7 +138,7 @@ test('P3: 显式归档写 system:stale + 删补丁 + 只写一次；未过期候
   const ok = await fetch(`${apiUrl}/archive-stale`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261104-net-stale', expectedRevision: 1, expectedOwner: 'tester' }),
+    body: JSON.stringify({ id: '2026-11/20261104-net-stale', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: staleIso }),
   });
   assert.equal(ok.status, 200);
   const { candidate } = await ok.json();
@@ -151,7 +151,7 @@ test('P3: 显式归档写 system:stale + 删补丁 + 只写一次；未过期候
   const again = await fetch(`${apiUrl}/archive-stale`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261104-net-stale', expectedRevision: 1, expectedOwner: 'tester' }),
+    body: JSON.stringify({ id: '2026-11/20261104-net-stale', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: staleIso }),
   });
   assert.equal(again.status, 409);
 
@@ -171,7 +171,7 @@ test('P3: 未配置 stale_days 时归档被拒绝', async () => {
   const response = await fetch(`${apiUrl}/archive-stale`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261104-net-stale', expectedRevision: 1, expectedOwner: 'tester' }),
+    body: JSON.stringify({ id: '2026-11/20261104-net-stale', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: staleIso }),
   });
   assert.equal(response.status, 409);
   assert.match((await response.json()).error.message, /stale_days/);

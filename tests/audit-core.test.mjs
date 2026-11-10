@@ -103,6 +103,7 @@ owner: tester
 tags: [math]
 status: pending
 ticket: null
+target_files: [src/math.js]
 current_revision: 1
 revisions:
   - id: 1
@@ -147,7 +148,7 @@ approval: null
   assert.match(prompt, /严禁执行 `git commit`/);
 });
 
-test('buildAuditPrompt session mode tells the agent to commit only .ai-review', async () => {
+test('buildAuditPrompt 任何模式都严禁 Agent 自行提交（§11.4）——会话模式等待 Host 收尾', async () => {
   const root = await createGitFixture();
   const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   const prompt = await buildAuditPrompt({
@@ -157,15 +158,20 @@ test('buildAuditPrompt session mode tells the agent to commit only .ai-review', 
     targetPath: '',
     note: '',
     baseRevision: base,
-    reportPath: '.ai-review/audits/20261031-220000-repo.md',
+    reportPath: '.ai-review/audits/20261031-220000-repo/audit.md',
     mode: 'session',
     now: new Date('2026-10-31T22:00:00+08:00'),
   });
 
   assert.match(prompt, /会话执行方式/);
   assert.match(prompt, /侧边栏/);
-  assert.match(prompt, /只提交 `\.ai-review`/);
-  assert.doesNotMatch(prompt, /严禁执行 `git commit`/);
+  // §11.4（2026-11-10 修订）：会话模式同样禁止自行 commit/push，收尾由 Host 统一执行。
+  assert.match(prompt, /严禁执行 `git commit`/);
+  assert.match(prompt, /收尾/);
+  assert.doesNotMatch(prompt, /只提交 `\.ai-review`/);
+  // 报告正文路径为目录式档案 audit.md，且要求只写正文。
+  assert.match(prompt, /\.ai-review\/audits\/[\w.-]+\/audit\.md/);
+  assert.match(prompt, /不要写 YAML Frontmatter/);
 });
 
 function auditorFor(root, overrides = {}) {

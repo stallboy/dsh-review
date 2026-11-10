@@ -169,19 +169,24 @@ export function auditInvariantErrors(meta: AuditFrontmatter, dirName: string): s
     if (item.kind === 'deferred' && !item.dependsOn) errors.push(`I10: ${at} deferred 缺少 depends_on`);
     if (item.kind === 'confirm' && item.dependsOn) errors.push(`I10: ${at} confirm 不应有 depends_on`);
   }
-  // I13：audit_id 时间戳与 created_at 指向同一开始时刻（分钟粒度）。
+  // I13：audit_id 时间戳与 created_at 的 UTC 日历时刻一致（§4.7：与创建/读取机器时区无关）。
   const stamp = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/.exec(meta.auditId);
   if (stamp) {
     const created = new Date(meta.createdAt);
     if (Number.isNaN(created.getTime())) {
       errors.push('I13: created_at 无法解析');
     } else {
-      const local = new Date(created.getTime() - created.getTimezoneOffset() * 60_000);
-      const compact = local.toISOString().replace(/[-:T]/g, '').slice(0, 14);
+      const compact = created.toISOString().replace(/[-:T]/g, '').slice(0, 14);
       if (compact !== stamp.slice(1).join('')) errors.push(`I13: audit_id 时间戳与 created_at 不一致：${meta.auditId} vs ${meta.createdAt}`);
     }
   }
   return errors;
+}
+
+/** §7.1：共享快照读取源（Git HEAD / SVN BASE）——投影等读端只能使用共享事实。 */
+export interface AuditSnapshotSource {
+  listAuditDirs(): Promise<string[]>;
+  readAuditText(dirName: string): Promise<string | null>;
 }
 
 export class AuditArchive {
@@ -191,10 +196,27 @@ export class AuditArchive {
     return path.join(this.repoRoot, '.ai-review', 'audits');
   }
 
-  /** 列出目录式档案（目录名合法且含 audit.md）；旧扁平 *.md 不参与。 */
-  async list(): Promise<AuditRecord[]> {
+  /**
+   * 列出目录式档案（目录名合法且含 audit.md）；旧扁平 *.md 不参与。
+   * 传入共享快照源时只读该快照；否则读工作区（写路径使用）。
+   */
+  async list(source?: AuditSnapshotSource): Promise<AuditRecord[]> {
     const records: AuditRecord[] = [];
     let dirs: string[] = [];
+    if (source) {
+      try {
+        dirs = (await source.listAuditDirs()).filter((name) => AUDIT_DIR_PATTERN.test(name));
+      } catch {
+        return records;
+      }
+      dirs.sort();
+      for (const dirName of dirs) {
+        const text = await source.readAuditText(dirName).catch(() => null);
+        if (text === null) continue;
+        records.push(this.recordFromText(dirName, path.join(this.auditsRoot, dirName, 'audit.md'), text));
+      }
+      return records;
+    }
     try {
       dirs = (await readdir(this.auditsRoot, { withFileTypes: true }))
         .filter((entry) => entry.isDirectory() && AUDIT_DIR_PATTERN.test(entry.name))
@@ -212,9 +234,16 @@ export class AuditArchive {
     return records;
   }
 
-  async read(dirName: string): Promise<AuditRecord> {
+  async read(dirName: string, source?: AuditSnapshotSource): Promise<AuditRecord> {
     const reviewPath = path.join(this.auditsRoot, dirName, 'audit.md');
-    const text = await readFile(reviewPath, 'utf8');
+    const text = source
+      ? await source.readAuditText(dirName).catch(() => null)
+      : await readFile(reviewPath, 'utf8');
+    if (text === null) throw new Error(`审查档案不存在：${dirName}`);
+    return this.recordFromText(dirName, reviewPath, text);
+  }
+
+  private recordFromText(dirName: string, reviewPath: string, text: string): AuditRecord {
     try {
       const parsed = parseAuditMarkdown(text);
       const errors = auditInvariantErrors(parsed.meta, dirName);
@@ -237,12 +266,25 @@ export class AuditArchive {
     }
   }
 
-  /** 写入新档案（§6.1：创建前校验目录不存在，冲突即失败——同秒并发由时间戳自然区分）。 */
+  /** 写入新档案（§4.7：创建前校验目录不存在，冲突即失败）。 */
   async write(meta: AuditFrontmatter, body: string): Promise<AuditRecord> {
     const errors = auditInvariantErrors(meta, meta.auditId);
     if (errors.length > 0) throw new AuditFormatError(errors.join('；'));
     const dir = path.join(this.auditsRoot, meta.auditId);
     if (existsSync(dir)) throw new AuditFormatError(`审查目录已存在：${meta.auditId}`);
+    const { mkdir } = await import('node:fs/promises');
+    await mkdir(dir, { recursive: true });
+    return this.writeExisting(meta, body);
+  }
+
+  /**
+   * 收尾覆写：目录已由 Agent 创建（报告正文先写入 audit.md），
+   * Host 在原位写入完整档案（frontmatter + 正文 + 复核块）。仍执行全部不变量校验。
+   */
+  async writeExisting(meta: AuditFrontmatter, body: string): Promise<AuditRecord> {
+    const errors = auditInvariantErrors(meta, meta.auditId);
+    if (errors.length > 0) throw new AuditFormatError(errors.join('；'));
+    const dir = path.join(this.auditsRoot, meta.auditId);
     const { mkdir } = await import('node:fs/promises');
     await mkdir(dir, { recursive: true });
     const reviewPath = path.join(dir, 'audit.md');
@@ -252,8 +294,33 @@ export class AuditArchive {
     return { meta, body, dirName: meta.auditId, reviewPath };
   }
 
+  /** 生成下一个未占用的 audit_id（UTC 时间戳 + scope slug；同秒冲突追加 -2/-3）。 */
+  async nextAuditId(scope: string, now: Date): Promise<string> {
+    const stamp = now.toISOString().replace(/[-:T]/g, '').slice(0, 15).replace(/^(\d{14})(\d)$/, '$1');
+    const compact = `${stamp.slice(0, 8)}-${stamp.slice(8, 14)}`;
+    const slug = (scope || 'repo')
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 40) || 'repo';
+    let auditId = `${compact}-${slug}`;
+    let suffix = 2;
+    while (existsSync(path.join(this.auditsRoot, auditId))) {
+      auditId = `${compact}-${slug}-${String(suffix)}`;
+      suffix += 1;
+    }
+    return auditId;
+  }
+
   /** 人工转换审查项时更新 item（§3.4：只改 status/candidate，不重写其他历史）。 */
-  async updateItem(dirName: string, findingId: string, status: AuditItemStatus, candidate: string | null): Promise<AuditRecord> {
+  async updateItem(
+    dirName: string,
+    findingId: string,
+    status: AuditItemStatus,
+    candidate: string | null,
+    note?: string,
+  ): Promise<AuditRecord> {
     const record = await this.read(dirName);
     if (record.parseError) throw new AuditFormatError(record.parseError);
     const item = record.meta.items.find((entry) => entry.findingId === findingId);
@@ -262,18 +329,28 @@ export class AuditArchive {
     item.candidate = candidate;
     const errors = auditInvariantErrors(record.meta, dirName);
     if (errors.length > 0) throw new AuditFormatError(errors.join('；'));
-    // 与其他写路径一致的原子替换：temp + rename，避免崩溃留下半写档案。
+    // §7.6 /dismiss-finding：在正文 `# 审查项处理记录` 追加时间、操作者与理由。
+    const body = note
+      ? `${record.body.replace(/\s+$/, '')}\n\n# 审查项处理记录\n\n- ${note}\n`
+      : record.body;
     const temp = `${record.reviewPath}.tmp-${String(process.pid)}`;
     const { writeFile: writeAtomic, rename: renameAtomic } = await import('node:fs/promises');
-    await writeAtomic(temp, serializeAuditMarkdown(record.meta, record.body), 'utf8');
+    await writeAtomic(temp, serializeAuditMarkdown(record.meta, body), 'utf8');
     await renameAtomic(temp, record.reviewPath);
-    return record;
+    return { ...record, body };
   }
 }
 
-// ---------- §3.4 投影 ----------
+// ---------- §4.8 投影 ----------
 
 export type ProjectedState = 'open' | 'closed' | 'dismissed' | 'reopened';
+
+/** §4.8 投影所需的候选事实（由调用方从共享事实供给）。 */
+export interface CandidateChainInfo {
+  status: 'pending' | 'changes_requested' | 'approved' | 'rejected';
+  /** §4.8：该候选的 reopened_from 指向（null 表示非重开）。 */
+  reopenedFrom: string | null;
+}
 
 export interface FindingProjection {
   findingId: string;
@@ -286,7 +363,6 @@ export interface FindingProjection {
   lastStatus: AuditItemStatus;
   lastObservedAudit: string;
   lastObservedAt: string;
-  /** converted 时的关联候选当前状态（由调用方供给）。 */
   candidateStatus?: 'pending' | 'changes_requested' | 'approved' | 'rejected';
   candidate?: string;
 }
@@ -299,16 +375,18 @@ function scopeCovers(scope: string, targetFiles: string[]): boolean {
 }
 
 /**
- * §3.4 投影：覆盖判定（target_files 全部落在某轮 scope 内才算观察过）→
- * 最新观察（时间点最新，同刻以 audit_id 为次序键）→ 当前状态（converted 结合候选真实状态）→ 可见性。
+ * §4.8 投影（2026-11-10 对齐 SPEC）：覆盖判定 → 最新观察 → 基础状态映射 →
+ * 重开链判定（converted+rejected 时沿 reopened_from 查找唯一替代候选，
+ * candidate/candidateStatus 指向链上当前候选；多替代/缺失/broken/环 → errors 报告）。
  */
 export function projectFindings(
   audits: AuditRecord[],
-  candidateStatusById: (candidateId: string) => 'pending' | 'changes_requested' | 'approved' | 'rejected' | null,
-): FindingProjection[] {
-  // 只用有效档案；无效档案不参与投影（§13.2）。
+  candidateInfoById: (candidateId: string) => CandidateChainInfo | null,
+  candidateIds: string[] = [],
+): { findings: FindingProjection[]; errors: string[] } {
+  const errors: string[] = [];
   const valid = audits.filter((audit) => !audit.parseError);
-  // 覆盖判定 + 最新观察。
+  // 覆盖判定 + 最新观察（时间点最新，同刻以 audit_id 为次序键）。
   const latest = new Map<string, { audit: AuditRecord; item: AuditItem }>();
   for (const audit of valid) {
     for (const item of audit.meta.items) {
@@ -326,32 +404,54 @@ export function projectFindings(
     }
   }
   const projections: FindingProjection[] = [];
-  for (const [findingId, { audit, item }] of latest) {
-    let state: ProjectedState;
-    let candidateStatus: FindingProjection['candidateStatus'];
-    if (item.status === 'dismissed') state = 'dismissed';
-    else if (item.status === 'resolved') state = 'closed';
-    else if (item.status === 'converted') {
-      const status = item.candidate ? candidateStatusById(item.candidate) : null;
-      candidateStatus = status ?? undefined;
-      if (status === 'approved') state = 'closed';
-      else if (status === 'rejected') state = 'reopened';
-      else state = 'open'; // pending / changes_requested / 未知
-    } else state = 'open';
+  const pushBase = (findingId: string, entry: { audit: AuditRecord; item: AuditItem }, state: ProjectedState, chain?: { id: string; status: CandidateChainInfo['status'] }): void => {
     projections.push({
       findingId,
-      title: item.title,
-      summary: item.summary,
-      targetFiles: item.targetFiles,
-      kind: item.kind,
-      dependsOn: item.dependsOn,
+      title: entry.item.title,
+      summary: entry.item.summary,
+      targetFiles: entry.item.targetFiles,
+      kind: entry.item.kind,
+      dependsOn: entry.item.dependsOn,
       state,
-      lastStatus: item.status,
-      lastObservedAudit: audit.meta.auditId,
-      lastObservedAt: audit.meta.createdAt,
-      ...(item.candidate ? { candidate: item.candidate } : {}),
-      ...(candidateStatus ? { candidateStatus } : {}),
+      lastStatus: entry.item.status,
+      lastObservedAudit: entry.audit.meta.auditId,
+      lastObservedAt: entry.audit.meta.createdAt,
+      ...(chain ? { candidate: chain.id, candidateStatus: chain.status } : {}),
     });
+  };
+  for (const [findingId, entry] of latest) {
+    const { item } = entry;
+    if (item.status === 'dismissed') { pushBase(findingId, entry, 'dismissed'); continue; }
+    if (item.status === 'resolved') { pushBase(findingId, entry, 'closed'); continue; }
+    if (item.status !== 'converted') { pushBase(findingId, entry, 'open'); continue; }
+    if (!item.candidate) { pushBase(findingId, entry, 'open'); continue; }
+    const start = candidateInfoById(item.candidate);
+    if (start === null) {
+      errors.push(`finding ${findingId}：converted 候选 ${item.candidate} 缺失或状态不可读，不参与正常投影`);
+      continue;
+    }
+    let currentId = item.candidate;
+    let current = start;
+    const visited = new Set<string>([currentId]);
+    for (;;) {
+      if (current.status === 'approved') { pushBase(findingId, entry, 'closed', { id: currentId, status: current.status }); break; }
+      if (current.status === 'pending' || current.status === 'changes_requested') { pushBase(findingId, entry, 'open', { id: currentId, status: current.status }); break; }
+      // rejected：查找 reopened_from 指向它的直接替代候选（应最多一个）。
+      const replacements = candidateIds
+        .filter((id) => !visited.has(id))
+        .map((id) => ({ id, info: candidateInfoById(id) }))
+        .filter((next): next is { id: string; info: CandidateChainInfo } => next.info !== null && next.info.reopenedFrom === currentId);
+      if (replacements.length === 0) { pushBase(findingId, entry, 'reopened', { id: currentId, status: current.status }); break; }
+      if (replacements.length > 1) {
+        errors.push(`finding ${findingId}：rejected 候选 ${currentId} 有 ${String(replacements.length)} 个直接替代候选（应最多 1 个），不参与正常投影`);
+        break;
+      }
+      const next = replacements[0];
+      if (!next) break;
+      visited.add(next.id);
+      currentId = next.id;
+      current = next.info;
+    }
   }
-  return projections.sort((left, right) => left.findingId.localeCompare(right.findingId));
+  return { findings: projections.sort((left, right) => left.findingId.localeCompare(right.findingId)), errors };
 }

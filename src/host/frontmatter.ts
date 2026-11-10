@@ -90,7 +90,7 @@ function parseComment(value: unknown, index: number): ReviewComment {
   if (side !== undefined && side !== 'LEFT' && side !== 'RIGHT') {
     throw new ReviewFormatError(`comments[${String(index)}].side 只能是 LEFT | RIGHT`);
   }
-  const extraComment = collectExtra(value, new Set(['id', 'revision', 'file', 'line', 'side', 'author', 'content', 'status', 'created_at']));
+  const extraComment = collectExtra(value, new Set(['id', 'revision', 'file', 'line', 'side', 'author', 'content', 'status', 'created_at', 'anchor']));
   const comment: ReviewComment = {
     id: asString(value['id'], `comments[${String(index)}].id`),
     revision: asNumber(value['revision'], `comments[${String(index)}].revision`),
@@ -102,6 +102,21 @@ function parseComment(value: unknown, index: number): ReviewComment {
     status: status as CommentStatus,
     ...(Object.keys(extraComment).length > 0 ? { extra: extraComment } : {}),
   };
+  // §4.3/G39：anchor 仅行内评论可带，snippet 非空；原 revision/file/line/side 仍是权威锚点。
+  const anchorRaw = value['anchor'];
+  if (isRecord(anchorRaw)) {
+    const snippet = asString(anchorRaw['snippet'], `comments[${String(index)}].anchor.snippet`, '');
+    if (!snippet) throw new ReviewFormatError(`comments[${String(index)}].anchor.snippet 不能为空`);
+    if (comment.file === '' && comment.line === 0) {
+      throw new ReviewFormatError(`comments[${String(index)}].anchor 仅行内评论可携带`);
+    }
+    const anchor: { snippet: string; before?: string; after?: string } = { snippet };
+    const before = anchorRaw['before'];
+    const after = anchorRaw['after'];
+    if (typeof before === 'string' && before) anchor.before = before;
+    if (typeof after === 'string' && after) anchor.after = after;
+    comment.anchor = anchor;
+  }
   if (!comment.id) throw new ReviewFormatError(`comments[${String(index)}].id 不能为空`);
   if (!comment.content.trim()) throw new ReviewFormatError(`comments[${String(index)}].content 不能为空`);
   const createdAt = value['created_at'];
@@ -141,7 +156,6 @@ function parseApproval(value: unknown): ApprovalMeta | null {
   if (!isRecord(value)) throw new ReviewFormatError('approval 必须是对象或 null');
   const approvedBy = asString(value['approved_by'], 'approval.approved_by', '');
   const approvedAt = asString(value['approved_at'], 'approval.approved_at', '');
-  const commitRevision = value['commit_revision'];
   if (!approvedBy.trim() || !approvedAt.trim()) {
     // §4.7：approval 存在但关键字段缺失属于格式错误，不得伪装成"未批准"。
     throw new ReviewFormatError('approval.approved_by / approval.approved_at 不能为空');
@@ -161,13 +175,11 @@ function parseApproval(value: unknown): ApprovalMeta | null {
         reason: asString(item['reason'], 'approval.waived_decisions[].reason'),
       }))
     : undefined;
-  const extra = collectExtra(value, new Set(['approved_by', 'approved_at', 'commit_revision', 'gate_checks', 'gate_results', 'confirmed_decisions', 'waived_decisions']));
+  // §4.3（2026-11-09 修订）：commit_revision 已从 approval 契约移除；旧数据落入 extra 原样保留（I14）。
+  const extra = collectExtra(value, new Set(['approved_by', 'approved_at', 'gate_checks', 'gate_results', 'confirmed_decisions', 'waived_decisions']));
   return {
     approvedBy,
     approvedAt,
-    commitRevision: commitRevision === null || commitRevision === undefined || commitRevision === ''
-      ? null
-      : String(commitRevision),
     ...(gateChecksRaw ? { gateChecks: gateChecksRaw } : {}),
     ...(gateResultsRaw ? { gateResults: gateResultsRaw } : {}),
     ...(confirmedRaw ? { confirmedDecisions: confirmedRaw } : {}),
@@ -233,7 +245,8 @@ export function parseReviewMarkdown(text: string): ParsedReview {
   if (!current.patch.trim()) throw new ReviewFormatError(`revision ${String(currentRevision)} 缺少 patch 文件名`);
 
   const tagsRaw = asArray(doc['tags']);
-  const tags = tagsRaw.map((tag) => String(tag)).filter((tag) => tag.length > 0);
+  // §4.3：tags 逐项 trim 后转 ASCII 小写，空项丢弃，再按规范化值去重。
+  const tags = [...new Set(tagsRaw.map((tag) => String(tag).trim().toLowerCase()).filter((tag) => tag.length > 0))];
   const gateRaw = asArray(doc['gate_checks']);
   const gateChecks = gateRaw.map((check) => String(check)).map((check) => check.trim()).filter((check) => check.length > 0);
   const comments = asArray(doc['comments']).map(parseComment);
@@ -324,6 +337,15 @@ export function serializeReviewMarkdown(meta: ReviewFrontmatter, body: string): 
         file: comment.file,
         line: comment.line,
         ...(comment.side ? { side: comment.side } : {}),
+        ...(comment.anchor
+          ? {
+              anchor: {
+                snippet: comment.anchor.snippet,
+                ...(comment.anchor.before ? { before: comment.anchor.before } : {}),
+                ...(comment.anchor.after ? { after: comment.anchor.after } : {}),
+              },
+            }
+          : {}),
         author: comment.author,
         content: comment.content,
         status: comment.status,
@@ -344,7 +366,6 @@ export function serializeReviewMarkdown(meta: ReviewFrontmatter, body: string): 
       ? {
           approved_by: meta.approval.approvedBy,
           approved_at: meta.approval.approvedAt,
-          commit_revision: meta.approval.commitRevision,
           ...(meta.approval.gateChecks ? { gate_checks: meta.approval.gateChecks } : {}),
           ...(meta.approval.gateResults ? { gate_results: meta.approval.gateResults } : {}),
           ...(meta.approval.confirmedDecisions ? { confirmed_decisions: meta.approval.confirmedDecisions } : {}),

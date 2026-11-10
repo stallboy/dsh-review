@@ -25,21 +25,31 @@ export interface ProcessOptions {
 
 const DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
 
-function killTree(pid: number | undefined): void {
-  if (pid === undefined) return;
+/**
+ * §7.3：终止整个进程组/进程树并等待清理完成。
+ * POSIX：spawn 使用 detached 形成进程组，kill(-pid) 一次清理全部子进程；
+ * Windows：taskkill /t /f 并等待其退出（不再 fire-and-forget）。
+ * 目标已退出时静默成功（taskkill/kill 报 ESRCH 均视为已清理）。
+ */
+function killTree(pid: number | undefined): Promise<void> {
+  if (pid === undefined) return Promise.resolve();
   if (process.platform === 'win32') {
-    const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], {
-      windowsHide: true,
-      stdio: 'ignore',
+    return new Promise((resolve) => {
+      const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      killer.on('close', () => resolve());
+      killer.on('error', () => resolve());
     });
-    killer.unref();
-    return;
   }
   try {
-    process.kill(pid, 'SIGKILL');
+    // 进程组整体终止；组已不存在（ESRCH）视为已清理。
+    process.kill(-pid, 'SIGKILL');
   } catch {
-    // already gone
+    try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
   }
+  return Promise.resolve();
 }
 
 export function runProcess(exe: string, args: string[], options: ProcessOptions): Promise<ProcessResult> {
@@ -49,6 +59,8 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
       child = spawn(exe, args, {
         cwd: options.cwd,
         windowsHide: true,
+        // POSIX 下建立独立进程组，超时/取消可 kill(-pid) 清理全部子进程。
+        detached: process.platform !== 'win32',
         env: { ...process.env, ...options.env },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -71,6 +83,7 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
     let pendingStdout = '';
     let pendingStderr = '';
     let timedOut = false;
+    let killPromise: Promise<void> = Promise.resolve();
 
     const emit = (stream: 'stdout' | 'stderr', chunk: string): void => {
       if (!options.onLine) return;
@@ -101,15 +114,23 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
 
     const timer = setTimeout(() => {
       timedOut = true;
-      killTree(child.pid);
+      killPromise = killTree(child.pid);
     }, options.timeoutMs ?? 120_000);
     timer.unref?.();
 
+    // §7.3：主进程退出后清理进程组内残留子进程。
+    // POSIX：kill(-pid) 同步且廉价，正常退出后也执行；
+    // Windows：taskkill 每次约 2-3 秒，仅在超时/终止路径执行，正常退出跳过（由超时机制兜底）。
     const finish = (code: number | null, signal: NodeJS.Signals | null, error?: string): void => {
       clearTimeout(timer);
-      if (pendingStdout) options.onLine?.(pendingStdout, 'stdout');
-      if (pendingStderr) options.onLine?.(pendingStderr, 'stderr');
-      resolve({ code, signal, timedOut, stdout, stderr, ...(error ? { error } : {}) });
+      const cleanup = process.platform === 'win32' && !timedOut
+        ? killPromise
+        : Promise.all([killPromise, killTree(child.pid)]).then(() => undefined);
+      void cleanup.then(() => {
+        if (pendingStdout) options.onLine?.(pendingStdout, 'stdout');
+        if (pendingStderr) options.onLine?.(pendingStderr, 'stderr');
+        resolve({ code, signal, timedOut, stdout, stderr, ...(error ? { error } : {}) });
+      });
     };
 
     child.on('error', (error) => finish(null, null, error.message));

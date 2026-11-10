@@ -103,16 +103,23 @@ const meta = (over = {}) => ({
   approval: null, rejection: null, commitMessage: '', extra: {}, ...over,
 });
 
-test('P4: 指纹规范化——target_files 排序、title 小写合并空白', () => {
+test('P4: 指纹规范化——规范 JSON 数组、UTF-8 字节序排序、title 小写合并空白', () => {
   assert.equal(normalizeTitle('  Net:   FIX '), 'net: fix');
   const a = fingerprintOf(meta());
   const b = fingerprintOf(meta({ targetFiles: ['a.js', 'b.js'], title: 't' }));
   assert.equal(a, b);
+  // §6.1：确定性指纹使用无分隔符碰撞的规范 JSON 数组。
+  assert.equal(a, '["net",["a.js","b.js"],"bugfix","t"]');
+  // UTF-8 字节序：'B'(0x42) < 'a'(0x61)，大写排前。
+  assert.equal(
+    fingerprintOf(meta({ targetFiles: ['a.js', 'B.js'] })),
+    '["net",["B.js","a.js"],"bugfix","t"]',
+  );
   const c = fingerprintOf(meta({ auditType: 'shrink' }));
   assert.notEqual(a, c);
 });
 
-test('P4: 窗口内完全重复被阻止；窗口外/换写法/重开不阻止', () => {
+test('P4: 窗口内完全重复被阻止；窗口外/换写法不阻止（链豁免在 store 层）', () => {
   const rejected = entryFromCandidate({
     candidateId: '2026-10/old',
     meta: meta({
@@ -124,15 +131,16 @@ test('P4: 窗口内完全重复被阻止；窗口外/换写法/重开不阻止',
   assert.ok(rejected);
   const memory = [rejected];
   const now = Date.now();
-  // 完全相同、窗口内 → 阻止。
+  // 完全相同、窗口内 → 阻止；duplicateOf 取 rejected_at 倒序第一条未豁免匹配。
   assert.equal(findDuplicate({ candidateId: 'n1', meta: meta({ targetFiles: ['a.js'], title: 't' }) }, memory, 30, now)?.candidateId, '2026-10/old');
   // 换写法（title 不同）→ 不阻止。
   assert.equal(findDuplicate({ candidateId: 'n2', meta: meta({ targetFiles: ['a.js'], title: 'other' }) }, memory, 30, now), null);
   // 窗口外 → 不阻止。
   const old = [{ ...rejected, rejectedAtMs: now - 60 * 86_400_000 }];
   assert.equal(findDuplicate({ candidateId: 'n3', meta: meta({ targetFiles: ['a.js'] }) }, old, 30, now), null);
-  // 带重开字段 → 豁免。
-  assert.equal(findDuplicate({ candidateId: 'n4', meta: meta({ targetFiles: ['a.js'], reopenedFrom: '2026-10/old' }) }, memory, 30, now), null);
+  // §6.2（2026-11-10）：豁免判定上移到 store 的重开链计算——findDuplicate 本身返回匹配，
+  // store.list 会把合法链上祖先从 duplicateOf 候选中剔除（见“队列标记 duplicateOf”测试）。
+  assert.equal(findDuplicate({ candidateId: 'n4', meta: meta({ targetFiles: ['a.js'], reopenedFrom: '2026-10/old' }) }, memory, 30, now)?.candidateId, '2026-10/old');
 });
 
 test('P4: topPerModule 按 rejected_at 倒序限量 + 注入摘要格式', () => {
@@ -178,7 +186,7 @@ test('P4: POST /reopen——合法重开成功；非 rejected 目标与空理由
   const badTarget = await fetch(`${base}/reopen`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261104-net-new', from: '2026-11/20261104-net-other', reason: '误判', expectedRevision: 1, expectedOwner: 'tester' }),
+    body: JSON.stringify({ id: '2026-11/20261104-net-new', from: '2026-11/20261104-net-other', reason: '误判', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-01T10:00:00+08:00' }),
   });
   assert.equal(badTarget.status, 409);
 
@@ -186,7 +194,7 @@ test('P4: POST /reopen——合法重开成功；非 rejected 目标与空理由
   const noReason = await fetch(`${base}/reopen`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261104-net-new', from: '2026-11/20261104-net-old', reason: '  ', expectedRevision: 1, expectedOwner: 'tester' }),
+    body: JSON.stringify({ id: '2026-11/20261104-net-new', from: '2026-11/20261104-net-old', reason: '  ', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-01T10:00:00+08:00' }),
   });
   assert.equal(noReason.status, 400);
 
@@ -194,7 +202,7 @@ test('P4: POST /reopen——合法重开成功；非 rejected 目标与空理由
   const ok = await fetch(`${base}/reopen`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261104-net-new', from: '2026-11/20261104-net-old', reason: '此前拒绝为误判，方案已修正', expectedRevision: 1, expectedOwner: 'tester' }),
+    body: JSON.stringify({ id: '2026-11/20261104-net-new', from: '2026-11/20261104-net-old', reason: '此前拒绝为误判，方案已修正', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-01T10:00:00+08:00' }),
   });
   assert.equal(ok.status, 200);
   const { candidate } = await ok.json();

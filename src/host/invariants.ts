@@ -41,14 +41,14 @@ export function quickReviewInvariants(candidate: ReviewInvariantInput['candidate
   const errors: string[] = [];
   const meta = candidate.meta;
 
-  // I1：candidate_id 等于相对 .ai-review/ 的目录路径格式。
-  if (!/^\d{4}-\d{2}$/.test(candidate.month) || !/^[A-Za-z0-9._-]+$/.test(candidate.slug)) {
+  // I1：candidate_id 等于相对 .ai-review/ 的目录路径格式（slug 不得以 . 开头）。
+  if (!/^\d{4}-\d{2}$/.test(candidate.month) || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(candidate.slug)) {
     errors.push(`I1: 候选目录命名非法：${candidate.id}`);
   }
   // I2：schema_version 必须是 1（解析层已拦截，此处兜底）。
   if (meta.schemaVersion !== 1) errors.push(`I2: schema_version 必须是 1，实际 ${String(meta.schemaVersion)}`);
 
-  // I3：current_revision == max(revisions[].id)；ID 正整数、唯一、连续递增。
+  // I3：current_revision == max(revisions[].id)；ID 正整数、唯一、连续递增且与补丁编号一致。
   const ids = meta.revisions.map((revision) => revision.id);
   if (ids.length === 0) {
     errors.push('I3: revisions 为空');
@@ -61,6 +61,12 @@ export function quickReviewInvariants(candidate: ReviewInvariantInput['candidate
     if (meta.currentRevision !== sorted[sorted.length - 1]) {
       errors.push(`I3: current_revision=${String(meta.currentRevision)} 不等于最高版本 ${String(sorted[sorted.length - 1] ?? -1)}`);
     }
+    // §4.6：补丁文件名必须是与 revision id 一致的三位零填充编号。
+    for (const revision of meta.revisions) {
+      if (revision.patch !== `${String(revision.id).padStart(3, '0')}.patch`) {
+        errors.push(`I3: 版本 ${String(revision.id)} 的补丁名必须为 ${String(revision.id).padStart(3, '0')}.patch，实际 ${revision.patch}`);
+      }
+    }
   }
 
   // I6：status == approved ⟺ approval != null；rejected ⟺ rejection != null；互斥。
@@ -69,10 +75,14 @@ export function quickReviewInvariants(candidate: ReviewInvariantInput['candidate
   if (approvedMismatch || rejectedMismatch) errors.push('I6: status 与 approval/rejection 不一致');
   if (meta.approval && meta.rejection) errors.push('I6: approval 与 rejection 互斥违反');
 
-  // I11：评论引用与总体/行内形态。
+  // I11：评论 id 候选内唯一；引用与总体/行内形态。
   const knownIds = new Set(ids);
+  const commentIds = new Set<string>();
   meta.comments.forEach((comment, index) => {
     const at = `comments[${String(index)}]`;
+    if (!comment.id) errors.push(`I11: ${at}.id 不能为空`);
+    else if (commentIds.has(comment.id)) errors.push(`I11: 评论 id 重复：${comment.id}`);
+    commentIds.add(comment.id);
     if (!knownIds.has(comment.revision)) errors.push(`I11: ${at}.revision=${String(comment.revision)} 指向不存在的版本`);
     const inline = comment.file !== '' || comment.line !== 0;
     if (inline) {
@@ -80,8 +90,13 @@ export function quickReviewInvariants(candidate: ReviewInvariantInput['candidate
       if (comment.line <= 0) errors.push(`I11: ${at} 行内评论 line 必须为正整数`);
       if (comment.side !== 'LEFT' && comment.side !== 'RIGHT') errors.push(`I11: ${at} 行内评论缺少 LEFT/RIGHT side`);
       if (!isRepoRelativePath(comment.file)) errors.push(`I11: ${at}.file 不是仓库相对路径：${comment.file}`);
-    } else if (comment.side !== undefined) {
-      errors.push(`I11: ${at} 总体评论不应有 side`);
+      // §4.3：anchor 仅行内评论可带，snippet 非空。
+      if (comment.anchor !== undefined && !comment.anchor.snippet.trim()) {
+        errors.push(`I11: ${at}.anchor.snippet 不能为空`);
+      }
+    } else {
+      if (comment.side !== undefined) errors.push(`I11: ${at} 总体评论不应有 side`);
+      if (comment.anchor !== undefined) errors.push(`I11: ${at} 总体评论不应有 anchor`);
     }
   });
 
@@ -145,7 +160,10 @@ export function fullReviewInvariants(input: ReviewInvariantInput): string[] {
     }
   }
 
-  // I5：target_files 与当前补丁实际触及的业务文件一致（仅在声明非空时强制，开发期旧数据宽松）。
+  // I5：target_files 与当前补丁实际触及的业务文件一致；活跃候选必须非空。
+  if (!archived && meta.targetFiles.length === 0) {
+    errors.push('I5: 活跃候选 target_files 不能为空');
+  }
   if (input.currentPatchPaths !== null && meta.targetFiles.length > 0 && !archived) {
     const declared = [...meta.targetFiles].sort();
     const actual = [...input.currentPatchPaths].sort();

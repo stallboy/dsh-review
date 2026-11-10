@@ -1,22 +1,35 @@
 import type { ReviewFrontmatter } from './types.js';
 
 /**
- * §7 负向记忆：事实源是被拒候选（module + target_files + audit_type + title + rejection.reason）。
- * 指纹完全相同且窗口内的候选被阻止进入队列；带合法 reopened_from 的人工重开例外。
+ * §6 负向记忆（2026-11-10 对齐 SPEC）：事实源是被拒候选的
+ * module + target_files + audit_type + title（+ rejection.reason 作为展示信息）。
+ * 确定性指纹使用规范 JSON 数组（无分隔符碰撞），target_files 按 UTF-8 字节序排序。
  * 一切实时计算，不持久化。
  */
 
-/** §7.3 规范化：去首尾空白、合并连续空白、ASCII 小写化。 */
+/** §6.1 规范化：去首尾空白、合并连续空白、ASCII 小写化。 */
 export function normalizeTitle(title: string): string {
   return title.trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
-/** §7.2 指纹：module + 排序后的 target_files + audit_type + 规范化 title。 */
+/** §6.1：target_files 按 UTF-8 字节序排序（Buffer.compare）。 */
+function sortByUtf8Bytes(files: string[]): string[] {
+  return [...files].sort((left, right) => Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8')));
+}
+
+/**
+ * §6.1 确定性指纹：JSON.stringify([module 小写, 排序 target_files, audit_type, 规范化 title])。
+ * JSON 字段转义与数组边界是指纹的一部分——禁止改用逗号或竖线拼接。
+ */
 export function fingerprintOf(
   meta: Pick<ReviewFrontmatter, 'module' | 'targetFiles' | 'auditType' | 'title'>,
 ): string {
-  const files = [...meta.targetFiles].sort().join(',');
-  return [meta.module.toLowerCase(), files, meta.auditType, normalizeTitle(meta.title)].join('|');
+  return JSON.stringify([
+    meta.module.toLowerCase(),
+    sortByUtf8Bytes(meta.targetFiles),
+    meta.auditType,
+    normalizeTitle(meta.title),
+  ]);
 }
 
 export interface RejectionMemoryEntry {
@@ -28,6 +41,12 @@ export interface RejectionMemoryEntry {
   rejectedAt: string;
   rejectedAtMs: number;
   reason: string;
+  /** §4.3/G38：拒绝分类（缺省/未知归入 unspecified 分组）。 */
+  category?: string;
+  /** §4.3/G38：Host 从补丁 hunk header 提取的相关符号；仅用于提示词/UI，不进指纹。 */
+  relatedSymbols?: string[];
+  /** §6.2：system:stale 超时归档——弱信号，提示词必须标注，不得描述为“方案被拒绝”。 */
+  staleArchived?: boolean;
   fingerprint: string;
 }
 
@@ -42,6 +61,9 @@ export function entryFromCandidate(input: RejectionMemoryInput): RejectionMemory
   if (meta.status !== 'rejected' || !meta.rejection) return null;
   const rejectedAtMs = new Date(meta.rejection.rejectedAt).getTime();
   if (Number.isNaN(rejectedAtMs)) return null;
+  const category = (meta.rejection.extra?.['category'] as string | undefined) ?? undefined;
+  const relatedRaw = meta.rejection.extra?.['related_symbols'];
+  const rejectedBy = meta.rejection.rejectedBy;
   return {
     candidateId: input.candidateId,
     module: meta.module,
@@ -51,6 +73,9 @@ export function entryFromCandidate(input: RejectionMemoryInput): RejectionMemory
     rejectedAt: meta.rejection.rejectedAt,
     rejectedAtMs,
     reason: meta.rejection.reason,
+    ...(category !== undefined ? { category } : {}),
+    ...(Array.isArray(relatedRaw) ? { relatedSymbols: relatedRaw.map((item) => String(item)) } : {}),
+    ...(rejectedBy === 'system:stale' ? { staleArchived: true } : {}),
     fingerprint: fingerprintOf(meta),
   };
 }
@@ -61,8 +86,10 @@ export function withinWindow(entry: RejectionMemoryEntry, windowDays: number, no
 }
 
 /**
- * §7.4 + §4.8：判断活跃候选是否被负向记忆阻止。
- * 完全相同指纹且在窗口内 → 阻止，除非该候选带合法人工重开（reopened_from 指向该 rejected 候选）。
+ * §6.2 阻止与豁免：
+ * - 豁免集合 = 沿合法重开链向上追溯到的全部被拒祖先（active → reopenedFrom → … ，带环防护）；
+ * - duplicateOf = 按 rejected_at 倒序的第一条**未豁免**同指纹窗口内记录；
+ * - 链外或其他同指纹未豁免记录仍正常阻止。
  */
 export function findDuplicate(
   active: { candidateId: string; meta: ReviewFrontmatter },
@@ -71,12 +98,14 @@ export function findDuplicate(
   now = Date.now(),
 ): RejectionMemoryEntry | null {
   if (active.meta.status === 'rejected' || active.meta.status === 'approved') return null;
-  if (active.meta.reopenedFrom) return null; // 人工重开豁免确定性阻止
+  // 本候选自身带重开标记（链成员）→ 只豁免链上祖先，链外匹配仍阻止（在 store 层传入豁免集）。
   const fp = fingerprintOf(active.meta);
-  return memory.find((entry) => entry.fingerprint === fp && withinWindow(entry, windowDays, now)) ?? null;
+  return memory
+    .filter((entry) => entry.fingerprint === fp && withinWindow(entry, windowDays, now))
+    .sort((left, right) => right.rejectedAtMs - left.rejectedAtMs)[0] ?? null;
 }
 
-/** §7.6：按 rejected_at 倒序取每模块最近 max 条，供提示词注入。 */
+/** §6.3：按 rejected_at 倒序取每模块最近 max 条，供提示词注入。 */
 export function topPerModule(memory: RejectionMemoryEntry[], max: number): RejectionMemoryEntry[] {
   const byModule = new Map<string, RejectionMemoryEntry[]>();
   for (const entry of memory) {
@@ -92,9 +121,31 @@ export function topPerModule(memory: RejectionMemoryEntry[], max: number): Rejec
   return picked;
 }
 
-/** 提示词注入摘要（few-shot 用）。 */
+/** §6.3 提示词注入摘要：按 category 分组呈现约束；stale 标注为弱信号；不注入大段历史正文。 */
 export function formatMemorySummary(entries: RejectionMemoryEntry[]): string {
-  return entries
-    .map((entry) => `- [${entry.module || '?'}] ${entry.title}（被拒于 ${entry.rejectedAt}）：${entry.reason}`)
-    .join('\n');
+  if (entries.length === 0) return '- 无（近期没有被拒绝的方案）。';
+  const groups = new Map<string, RejectionMemoryEntry[]>();
+  for (const entry of entries) {
+    const key = entry.staleArchived ? 'stale' : entry.category && entry.category.trim() ? entry.category : 'unspecified';
+    const list = groups.get(key) ?? [];
+    list.push(entry);
+    groups.set(key, list);
+  }
+  const groupTitles: Record<string, string> = {
+    stale: '超时归档（弱信号——不代表方案被拒绝，仍禁止逐字重复）',
+    false_positive: '误报（false_positive）',
+    intentional_design: '有意设计（intentional_design）',
+    high_risk: '高风险（high_risk）',
+    out_of_scope: '超范围（out_of_scope）',
+    unspecified: '未分类',
+  };
+  const lines: string[] = [];
+  for (const [key, list] of groups) {
+    lines.push(`### ${groupTitles[key] ?? key}`);
+    for (const entry of list) {
+      const symbols = entry.relatedSymbols && entry.relatedSymbols.length > 0 ? `，相关符号 ${entry.relatedSymbols.join('/')}` : '';
+      lines.push(`- [${entry.module || '?'}] ${entry.title}（被拒于 ${entry.rejectedAt}${symbols}）：${entry.reason}`);
+    }
+  }
+  return lines.join('\n');
 }

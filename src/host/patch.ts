@@ -180,9 +180,17 @@ export function parsePatch(text: string): ParsedPatch {
   return { stats, paths: [...touched], text, binary };
 }
 
+/** §4.6/G15：补丁不得触及的仓库路径前缀与 VCS 管理文件。 */
+const FORBIDDEN_PATH_PREFIXES = ['.ai-review/', '.tmp/', 'node_modules/', '.git/', '.svn/'];
+
 export function isAiReviewPath(path: string): boolean {
   const normalized = path.replaceAll('\\', '/');
-  return normalized === '.ai-review' || normalized.startsWith('.ai-review/');
+  if (FORBIDDEN_PATH_PREFIXES.some((prefix) => normalized === prefix.slice(0, -1) || normalized.startsWith(prefix))) {
+    return true;
+  }
+  // 名为 .git 的 worktree 管理文件（根或任意目录下）。
+  const segments = normalized.split('/');
+  return segments.includes('.git') || segments.includes('.svn');
 }
 
 /**

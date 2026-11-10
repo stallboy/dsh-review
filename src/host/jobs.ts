@@ -21,7 +21,13 @@ export class JobManager {
     this.prune();
     const log = (line: string): void => {
       record.log.push(line);
-      if (record.log.length > MAX_LOG_LINES) record.log.splice(0, record.log.length - MAX_LOG_LINES);
+      record.logStartOffset ??= 0;
+      if (record.log.length > MAX_LOG_LINES) {
+        const dropped = record.log.length - MAX_LOG_LINES;
+        record.log.splice(0, dropped);
+        // §8.2/G36：日志偏移使用单调递增绝对序号——截断不丢失后续行。
+        record.logStartOffset += dropped;
+      }
     };
     void (async () => {
       try {

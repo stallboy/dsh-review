@@ -47,8 +47,10 @@ function normalizeSettings(raw: unknown): AppSettings {
       ? Math.min(input['gateTimeoutMs'], 3_600_000)
       : DEFAULT_SETTINGS.gateTimeoutMs,
     syncBeforeApprove: input['syncBeforeApprove'] !== false,
-    scheduleIntervalMinutes: typeof input['scheduleIntervalMinutes'] === 'number' && input['scheduleIntervalMinutes'] > 0
-      ? input['scheduleIntervalMinutes']
+    scheduleIntervalMinutes: typeof input['scheduleIntervalMinutes'] === 'number'
+      && Number.isFinite(input['scheduleIntervalMinutes'])
+      && input['scheduleIntervalMinutes'] > 0
+      ? Math.min(input['scheduleIntervalMinutes'], 1440)
       : 0,
   };
 }

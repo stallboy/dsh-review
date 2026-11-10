@@ -60,22 +60,30 @@
   interface Comment {
     id: string; revision: number; file: string; line: number; author: string;
     content: string; status: 'unresolved' | 'partial' | 'resolved'; createdAt?: string;
+    /** §4.3/G34：行内评论的基线侧（LEFT）/补丁侧（RIGHT）。 */
+    side?: 'LEFT' | 'RIGHT';
+    /** §4.3/G39：锚点（被评行原文 + 前后各一行），跨版本重定位用。 */
+    anchor?: { snippet: string; before?: string; after?: string };
   }
   interface QueueItem {
     id: string; title: string; owner: string; status: string; tags: string[]; ticket: string | null;
     currentRevision: number; createdAt: string; patchStats: Stats; unresolvedComments: number;
     humanJudgmentCount: number; humanJudgmentDeclared: boolean; isBaseBehind: boolean; baseRevision: string; lastFeedback: string; parseError?: string;
+    /** §7.1/§10.1：本地视图（未提交/有本地改动），不计入共享 KPI。 */
+    local?: boolean; isStale?: boolean; duplicateOf?: string;
   }
   interface Queue {
     configured: boolean; items: QueueItem[]; errors: string[]; currentBase: string | null;
     counts: Record<string, number>; owner: string; me: string; repoRoot?: string;
   }
   interface CandidateMeta {
-    schemaVersion: number; title: string; createdAt: string; owner: string; tags: string[]; status: string;
+    schemaVersion: number; title: string; createdAt: string; updatedAt: string; owner: string; tags: string[]; status: string;
     ticket: string | null; currentRevision: number;
+    /** §4.3/§10.2：人工判断项的唯一机器数据源（正文只作人类可读呈现）。 */
+    humanDecisions?: { id: string; question: string; note?: string }[];
     revisions: { id: number; baseRevision: string; patch: string }[];
     gateChecks: string[]; comments: Comment[];
-    approval: { approvedBy: string; approvedAt: string; commitRevision: string | null } | null;
+    approval: { approvedBy: string; approvedAt: string } | null;
   }
   interface Detail {
     candidate: {
@@ -87,6 +95,9 @@
     currentBase: string | null; isBaseBehind: boolean; patchText: string; patchStats: Stats; patchPaths: string[];
     comments: Comment[]; validation: string[];
     revisionStats: Record<string, { patch: string; baseRevision: string; stats: Stats | null }>;
+    /** §5.5：approved 候选的派生业务提交版本与三态诊断（仅诊断展示）。 */
+    approvalCommitRevision?: string;
+    approvalCommitLookup?: 'found' | 'ambiguous' | 'unknown';
     canAct: boolean; me: string;
   }
   interface DiffResult {
@@ -461,12 +472,24 @@
       const [error, setError] = useState('');
       const [busy, setBusy] = useState(false);
       const [stale, setStale] = useState(false);
+      /** §12.2/G4：reviewers.yml 的门禁白名单（非白名单命令批准前需二次确认）。 */
+      const [allowedGates, setAllowedGates] = useState<string[] | null>(null);
       const [job, setJob] = useState<Job | null>(null);
       const [panel, setPanel] = useState<'' | 'approve' | 'reject'>('');
-      const [ack, setAck] = useState<Record<number, boolean>>({});
+      const [ack, setAck] = useState<Record<string, boolean>>({});
+      const [waiveReason, setWaiveReason] = useState<Record<string, string>>({});
+      /** §8.2/G36：Job 增量日志游标（绝对偏移）与已合并日志行。 */
+      const jobLogOffsetRef = useRef<number | null>(null);
+      const jobLogRef = useRef<string[]>([]);
       const [general, setGeneral] = useState('');
+      /** §8.3/G37：多条总体评论草稿，一次批量提交（全有或全无，一次共享写入）。 */
+      const [batchDrafts, setBatchDrafts] = useState<string[]>([]);
+      /** §10.2/G34/G39：行类型 → side；行号（LEFT=oldNo，RIGHT=newNo）。 */
+      const rowSideOf = (l: { kind: string }): 'LEFT' | 'RIGHT' => (l.kind === 'del' ? 'LEFT' : 'RIGHT');
+      const rowNoOf = (l: { kind: string; oldNo: number | null; newNo: number | null }): number | null =>
+        l.kind === 'del' ? l.oldNo : l.newNo;
       const [rejectReason, setRejectReason] = useState('');
-      const [draft, setDraft] = useState<{ file: string; line: number; text: string } | null>(null);
+      const [draft, setDraft] = useState<{ file: string; line: number; text: string; side: 'LEFT' | 'RIGHT' } | null>(null);
       const [auditOpen, setAuditOpen] = useState(false);
       const [auditTarget, setAuditTarget] = useState('');
       const [auditNote, setAuditNote] = useState('');
@@ -476,7 +499,7 @@
       const [auditCopied, setAuditCopied] = useState(false);
       const [auditSessionId, setAuditSessionId] = useState('');
       const [filter, setFilter] = useState({ owner: '', statuses: '', text: '', tag: '' });
-      const guardRef = useRef<{ revision: number; owner: string } | null>(null);
+      const guardRef = useRef<{ revision: number; owner: string; updatedAt: string } | null>(null);
       const diffFiles = useMemo(() => parseDiff(diff?.unifiedDiff ?? ''), [diff]);
 
       const refreshHealth = useCallback(async (): Promise<Health | null> => {
@@ -512,9 +535,14 @@
         setLoading(true);
         try {
           const value = await api.get<Detail>(`/candidate?id=${encodeURIComponent(id)}`);
+          // 顺带刷新门禁白名单（缺席时视为全部非白名单，均需确认）。
+          void api.get<{ config?: { allowedGateCommands?: string[] } }>('/reviewers')
+            .then((reviewers) => setAllowedGates(reviewers.config?.allowedGateCommands ?? []))
+            .catch(() => setAllowedGates([]));
           const snapshot = guardRef.current;
-          if (snapshot && (snapshot.revision !== value.candidate.meta.currentRevision || snapshot.owner !== value.candidate.meta.owner)) setStale(true);
-          else if (!snapshot) guardRef.current = { revision: value.candidate.meta.currentRevision, owner: value.candidate.meta.owner };
+          if (snapshot && (snapshot.revision !== value.candidate.meta.currentRevision || snapshot.owner !== value.candidate.meta.owner
+            || snapshot.updatedAt !== value.candidate.meta.updatedAt)) setStale(true);
+          else if (!snapshot) guardRef.current = { revision: value.candidate.meta.currentRevision, owner: value.candidate.meta.owner, updatedAt: value.candidate.meta.updatedAt };
           setDetail(value);
           setError('');
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
@@ -565,6 +593,8 @@
 
       useEffect(() => {
         setAck({});
+        setWaiveReason({});
+        setBatchDrafts([]);
         setGeneral('');
         setDraft(null);
         setPanel('');
@@ -584,8 +614,18 @@
         const timer = setInterval(() => {
           void (async () => {
             try {
-              const value = await api.get<Job>(`/jobs/${encodeURIComponent(job.id)}`);
-              setJob(value);
+              // §10.2/G36：使用绝对偏移增量轮询；logResetRequired 时丢弃旧日志按快照重建。
+              const since = jobLogOffsetRef.current;
+              const value = await api.get<Job & { logOffset?: number; logResetRequired?: boolean }>(
+                `/jobs/${encodeURIComponent(job.id)}${since === null ? '' : `?since=${String(since)}`}`,
+              );
+              if (since === null || value.logResetRequired) {
+                jobLogRef.current = [...(value.log ?? [])];
+              } else {
+                jobLogRef.current = [...jobLogRef.current, ...(value.log ?? [])];
+              }
+              jobLogOffsetRef.current = value.logOffset ?? jobLogRef.current.length;
+              setJob({ ...value, log: [...jobLogRef.current] });
               if (value.status !== 'running') {
                 setBusy(false);
                 if (selectedId) {
@@ -606,14 +646,21 @@
       const startJob = async (path: string, body: unknown): Promise<void> => {
         setBusy(true); setError('');
         try {
+          // 新 Job：重置增量日志游标。
+          jobLogRef.current = [];
+          jobLogOffsetRef.current = null;
           const response = await api.post<{ jobId: string; job: Job }>(path, body);
           setJob(response.job);
         } catch (e) { setBusy(false); setError(e instanceof Error ? e.message : String(e)); }
       };
 
-      const guard = (): { expectedRevision: number; expectedOwner: string } => {
+      const guard = (): { expectedRevision: number; expectedOwner: string; expectedUpdatedAt: string } => {
         if (!detail) throw new Error('候选未加载');
-        return { expectedRevision: detail.candidate.meta.currentRevision, expectedOwner: detail.candidate.meta.owner };
+        return {
+          expectedRevision: detail.candidate.meta.currentRevision,
+          expectedOwner: detail.candidate.meta.owner,
+          expectedUpdatedAt: detail.candidate.meta.updatedAt,
+        };
       };
 
       const afterWrite = async (): Promise<void> => {
@@ -621,14 +668,19 @@
         await loadQueue();
       };
 
-      const addComment = async (file: string, line: number, text: string, autoFix = false): Promise<void> => {
+      const addComment = async (file: string, line: number, text: string, autoFix = false, side: 'LEFT' | 'RIGHT' = 'RIGHT', anchor?: { snippet: string; before?: string; after?: string }): Promise<void> => {
         if (!detail || !text.trim()) return;
         setBusy(true); setError('');
         try {
           const response = await api.post<{ job?: Job; autoFixError?: string }>('/comments', {
             id: detail.candidate.id, ...guard(), file, line, content: text, autoFix,
-            side: 'RIGHT', // 行内评论入口位于补丁新代码行（newNo），按 §4.6 定 side
+            // §10.2/G34：side 由行类型决定——删除行（oldNo）LEFT，新增/上下文新侧 RIGHT。
+            ...(file !== '' && line !== 0 ? { side } : {}),
+            // §4.3/G39：附带锚点（被评行原文 + 前后一行），供跨版本重定位。
+            ...(file !== '' && line !== 0 && anchor ? { anchor } : {}),
           });
+          // 本端写入推进 updated_at：重置快照避免把自己判定为 stale。
+          guardRef.current = null;
           await afterWrite();
           if (response.autoFixError) {
             setError(`意见已保存，但 AI 修复未能启动：${response.autoFixError}`);
@@ -636,7 +688,36 @@
             return;
           }
           if (response.job) {
-            setJob(response.job);
+            jobLogRef.current = [];
+            jobLogOffsetRef.current = null;            setJob(response.job);
+            setBusy(response.job.status === 'running');
+            return;
+          }
+          setBusy(false);
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+          setBusy(false);
+        }
+      };
+
+      // §8.3/G37：批量草稿一次提交（全有或全无；状态只在批次内转换一次）。
+      const submitBatch = async (drafts: string[], autoFix: boolean): Promise<void> => {
+        if (!detail || drafts.length === 0) return;
+        setBusy(true); setError('');
+        try {
+          const response = await api.post<{ job?: Job; autoFixError?: string }>('/comments/batch', {
+            id: detail.candidate.id, ...guard(), comments: drafts.map((content) => ({ content })), autoFix,
+          });
+          guardRef.current = null;
+          await afterWrite();
+          if (response.autoFixError) {
+            setError(`意见已保存，但 AI 修复未能启动：${response.autoFixError}`);
+            setBusy(false);
+            return;
+          }
+          if (response.job) {
+            jobLogRef.current = [];
+            jobLogOffsetRef.current = null;            setJob(response.job);
             setBusy(response.job.status === 'running');
             return;
           }
@@ -652,6 +733,7 @@
         setBusy(true);
         try {
           await api.post('/comment-status', { id: detail.candidate.id, ...guard(), commentId, status });
+          guardRef.current = null;
           await afterWrite();
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
         finally { setBusy(false); }
@@ -695,8 +777,35 @@
 
       const approve = (): void => {
         if (!detail) return;
+        // §12.2/G4：非白名单门禁命令必须二次确认（白名单只降低确认成本，不是安全边界）。
+        const gates = detail.candidate.meta.gateChecks.map((command) => command.trim()).filter(Boolean);
+        const nonWhitelisted = allowedGates === null ? gates : gates.filter((command) => !allowedGates.includes(command));
+        if (nonWhitelisted.length > 0
+          && !window.confirm(`以下门禁命令不在 reviewers.yml 白名单中，将以当前用户权限执行（可能联网、修改或删除文件）：\n${nonWhitelisted.join('\n')}\n\n确认执行？`)) {
+          return;
+        }
         setPanel('');
-        void startJob('/approve', { id: detail.candidate.id, ...guard() });
+        // §5.4/G2：上行 confirmedDecisions / waivedDecisions（来自 Frontmatter human_decisions 的精确覆盖）。
+        const decisions = detail.candidate.meta.humanDecisions ?? [];
+        const confirmedDecisions = decisions.filter((item) => ack[item.id]).map((item) => item.id);
+        const waivedDecisions = decisions
+          .filter((item) => !ack[item.id] && (waiveReason[item.id] ?? '').trim().length > 0)
+          .map((item) => ({ id: item.id, reason: (waiveReason[item.id] ?? '').trim() }));
+        void startJob('/approve', { id: detail.candidate.id, ...guard(), confirmedDecisions, waivedDecisions });
+      };
+
+      // §5.1/G12：Owner 显式把 changes_requested 转回 pending（不产生新版本）。
+      const resumeCandidate = async (): Promise<void> => {
+        if (!detail) return;
+        setBusy(true); setError('');
+        try {
+          await api.post('/resume', { id: detail.candidate.id, ...guard() });
+          guardRef.current = null;
+          setAck({}); setWaiveReason({});
+          if (selectedId) await loadDetail(selectedId);
+          await loadQueue();
+        } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+        finally { setBusy(false); }
       };
 
       const toggleAudit = (): void => {
@@ -894,6 +1003,10 @@
                   h('h2', null, item.title),
                   h('div', { className: 'dcr-meta' },
                     h('span', { className: `dcr-chip ${item.status}` }, statusText(item.status)),
+                    // §10.1：stale/duplicate/local 使用不同徽标；local 不计入共享 KPI。
+                    item.local ? h('span', { className: 'dcr-chip rejected' }, '本地视图（未提交）') : null,
+                    item.isStale ? h('span', { className: 'dcr-chip warn' }, '已过期') : null,
+                    item.duplicateOf ? h('span', { className: 'dcr-chip rejected' }, `重复候选（${item.duplicateOf}）`) : null,
                     h('span', null, `rev ${String(item.currentRevision)}`),
                     h('span', null, item.ticket ? `#${item.ticket}` : '无 ticket'),
                     h('span', null, `owner ${item.owner}`),
@@ -920,9 +1033,11 @@
         if (!detail) return h('div', { className: 'dcr-body' }, error ? h('div', { className: 'dcr-banner err' }, error) : h('div', { className: 'dcr-empty' }, '加载候选…'));
         const candidate = detail.candidate;
         const canAct = detail.canAct && !stale && candidate.meta.status !== 'approved' && candidate.meta.status !== 'rejected';
-        const items = candidate.humanJudgment;
-        const ackCount = items.filter((_, index) => ack[index]).length;
-        const allAck = items.length === 0 || ackCount === items.length;
+        // §10.2/G2：人工判断项只使用 Frontmatter human_decisions 作为数据源；正文不一致只告警。
+        const items = (candidate.meta.humanDecisions ?? []).map((decision) => ({ id: decision.id, label: decision.question }));
+        const ackCount = items.filter((item) => ack[item.id]).length;
+        const waivedCount = items.filter((item) => !ack[item.id] && (waiveReason[item.id] ?? '').trim().length > 0).length;
+        const allAck = items.length === 0 || ackCount + waivedCount === items.length;
         const files = diffFiles;
         const baseRevision = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision)?.baseRevision ?? '';
         const steps = [
@@ -953,10 +1068,17 @@
                 : `还有 ${String(items.length - ackCount)} 项需人工判断项未确认；请先在上方逐项勾选。`,
           ),
           items.length > 0 ? h('div', { className: 'dcr-approve-acks' },
-            h('div', { className: 'dcr-small dcr-muted' }, '逐项确认（与下方“需人工判断项”同步）：'),
-            ...items.map((item, index) => h('label', { key: index, className: 'dcr-check' },
-              h('input', { type: 'checkbox', checked: Boolean(ack[index]), onChange: (e: any) => setAck({ ...ack, [index]: Boolean(e.target.checked) }) }),
-              h('span', null, item.label),
+            h('div', { className: 'dcr-small dcr-muted' }, '逐项确认或填写理由放弃（精确覆盖后才解锁批准）：'),
+            ...items.map((item) => h('div', { key: item.id, className: 'dcr-row', style: { alignItems: 'center', marginTop: 4 } },
+              h('label', { className: 'dcr-check dcr-grow' },
+                h('input', { type: 'checkbox', checked: Boolean(ack[item.id]), onChange: (e: any) => setAck({ ...ack, [item.id]: Boolean(e.target.checked) }) }),
+                h('span', null, item.label),
+              ),
+              h('input', {
+                className: 'dcr-input', style: { width: 220 },
+                placeholder: '放弃理由（选填）', value: waiveReason[item.id] ?? '',
+                onChange: (e: any) => setWaiveReason({ ...waiveReason, [item.id]: String(e.target.value) }),
+              }),
             )),
           ) : null,
           h('details', { className: 'dcr-details', open: true, style: { marginTop: 10 } },
@@ -1003,10 +1125,18 @@
                     ...candidate.meta.tags.map((tag) => h('span', { key: tag, className: 'dcr-chip' }, tag)),
                   ),
                   h('div', { className: 'dcr-small dcr-muted dcr-mono', style: { marginTop: 6 } }, candidate.id),
-                  candidate.meta.approval ? h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 4 } }, `批准：${candidate.meta.approval.approvedBy} · ${dateText(candidate.meta.approval.approvedAt)} · commit ${short(candidate.meta.approval.commitRevision)}`) : null,
+                  candidate.meta.approval ? h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 4 } },
+                    `批准：${candidate.meta.approval.approvedBy} · ${dateText(candidate.meta.approval.approvedAt)}`,
+                    // §5.5：显示派生业务提交版本；ambiguous/unknown 只显示诊断提示，不显示为失败。
+                    detail.approvalCommitRevision ? ` · commit ${short(detail.approvalCommitRevision)}` : '',
+                    detail.approvalCommitLookup === 'ambiguous' ? ' · 派生提交不唯一，请人工确认' : '',
+                    detail.approvalCommitLookup === 'unknown' ? ' · 业务提交版本未派生（仅诊断）' : '',
+                  ) : null,
                 ),
                 h('div', { className: 'dcr-row' },
                   !detail.canAct ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void takeover(); } }, '接管审核') : null,
+                  canAct && candidate.meta.status === 'changes_requested'
+                    ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void resumeCandidate(); } }, '转回待审核') : null,
                   canAct ? h('button', { className: 'dcr-btn d', disabled: busy, onClick: () => setPanel(panel === 'reject' ? '' : 'reject') }, panel === 'reject' ? '收起放弃' : '放弃') : null,
                   canAct ? h('button', {
                     className: 'dcr-btn p',
@@ -1045,13 +1175,13 @@
                   ? null
                   : h('div', { className: 'dcr-banner warn' }, 'AI 未填写需人工判断项；批准前请在总体意见中要求 AI 补全该章节。'))
               : h('div', { className: 'dcr-judge' },
-                  h('h3', null, `需人工判断项 · ${String(ackCount)}/${String(items.length)} 已确认`),
-                  ...items.map((item, index) => h('div', { key: index, className: 'dcr-judge-item' },
+                  h('h3', null, `需人工判断项 · ${String(ackCount + waivedCount)}/${String(items.length)} 已处理`),
+                  ...items.map((item) => h('div', { key: item.id, className: 'dcr-judge-item' },
                     h('div', { className: 'dcr-grow' },
                       h('div', { className: 'dcr-judge-label' }, item.label),
-                      h(RichText, { text: item.text, className: 'dcr-small' }),
+                      (waiveReason[item.id] ?? '').trim() ? h('div', { className: 'dcr-small' }, `放弃理由：${String(waiveReason[item.id])}`) : null,
                     ),
-                    h('label', { className: 'dcr-check' }, h('input', { type: 'checkbox', checked: Boolean(ack[index]), disabled: !canAct, onChange: (e: any) => setAck({ ...ack, [index]: Boolean(e.target.checked) }) }), h('span', null, '已审阅')),
+                    h('label', { className: 'dcr-check' }, h('input', { type: 'checkbox', checked: Boolean(ack[item.id]), disabled: !canAct, onChange: (e: any) => setAck({ ...ack, [item.id]: Boolean(e.target.checked) }) }), h('span', null, '已确认')),
                   )),
                 ),
             h('div', { className: 'dcr-card' }, h('h3', null, '问题与影响'), h(RichText, { text: candidate.sections.problem })),
@@ -1074,7 +1204,14 @@
               h('h3', null, '总体意见'),
               h('div', { className: 'dcr-small dcr-muted', style: { marginBottom: 6 } },
                 '提交后默认立即让 AI 读取这条意见和所有未解决的行内意见，生成下一版；只想记录意见时点「仅提交意见」。想再修一版，直接在意见里写清要求再提交即可。'),
-              h('textarea', { className: 'dcr-textarea', value: general, disabled: !canAct, placeholder: canAct ? '写给 AI/作者的整体意见…' : '仅 owner 可提交意见', onChange: (e: any) => setGeneral(e.target.value) }),
+              h('textarea', { className: 'dcr-textarea', value: general, disabled: !canAct, placeholder: canAct ? '写给 AI/作者的整体意见（可加入草稿批量提交）…' : '仅 owner 可提交意见', onChange: (e: any) => setGeneral(e.target.value) }),
+              batchDrafts.length > 0 ? h('div', { className: 'dcr-banner info', style: { marginTop: 6 } },
+                h('div', { className: 'dcr-small' }, `草稿 ${String(batchDrafts.length)} 条：`),
+                ...batchDrafts.map((draft, index) => h('div', { key: index, className: 'dcr-row', style: { alignItems: 'center', marginTop: 2 } },
+                  h('span', { className: 'dcr-small dcr-grow', style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, `· ${draft}`),
+                  h('button', { className: 'dcr-btn', onClick: () => setBatchDrafts(batchDrafts.filter((_, i) => i !== index)) }, '移除'),
+                )),
+              ) : null,
               h('div', { className: 'dcr-row', style: { marginTop: 8 } },
                 h('button', {
                   className: 'dcr-btn p',
@@ -1086,6 +1223,22 @@
                   disabled: !canAct || busy || !general.trim(),
                   onClick: () => { const value = general; setGeneral(''); void addComment('', 0, value, false); },
                 }, '仅提交意见'),
+                // §8.3/G37：多条评论进入草稿列表，一次批量提交（单次共享写入 + 单次提交）。
+                h('button', {
+                  className: 'dcr-btn',
+                  disabled: !canAct || general.trim().length === 0,
+                  onClick: () => { if (general.trim()) { setBatchDrafts([...batchDrafts, general.trim()]); setGeneral(''); } },
+                }, '加入草稿'),
+                batchDrafts.length > 0 ? h('button', {
+                  className: 'dcr-btn p',
+                  disabled: !canAct || busy,
+                  onClick: () => { const drafts = batchDrafts; setBatchDrafts([]); void submitBatch(drafts, false); },
+                }, `批量提交 ${String(batchDrafts.length)} 条`) : null,
+                batchDrafts.length > 0 ? h('button', {
+                  className: 'dcr-btn',
+                  disabled: !canAct || busy,
+                  onClick: () => { const drafts = batchDrafts; setBatchDrafts([]); void submitBatch(drafts, true); },
+                }, `批量提交并让 AI 修复`) : null,
                 h('span', { className: 'dcr-grow' }),
                 h('span', { className: 'dcr-small dcr-muted' }, '提交后状态变为“待修改”，并写入仓库 review.md。'),
               ),
@@ -1108,18 +1261,44 @@
                   h('div', { className: 'dcr-banner warn', style: { marginBottom: 8 } }, '跨基线且旧补丁无法三方应用：当前为 Hunk 级近似对比，不代表逐行真实 diff。'),
                   h('pre', { className: 'dcr-raw' }, diff?.unifiedDiff || '（无差异）'),
                 ) :
-                h('div', { className: 'dcr-diff-body' }, ...files.map((file) => h('div', { key: file.path },
+                h('div', { className: 'dcr-diff-body' }, ...files.map((file) => {
+                  // §10.2/G39：跨版本重定位——行内评论先按 file+line+side 匹配；
+                  // 未匹配且带锚点的评论按 anchor.snippet 在当前差异中重定位（原文位置展示，不改写评论）。
+                  const lineKeys = new Set(file.lines.map((l) => `${rowSideOf(l)}:${String(rowNoOf(l))}`));
+                  const relocated = new Map<string, { side: 'LEFT' | 'RIGHT'; line: number }>();
+                  for (const comment of detail.comments) {
+                    if (comment.file !== file.path || !comment.anchor) continue;
+                    const key = `${comment.side ?? 'RIGHT'}:${String(comment.line)}`;
+                    if (lineKeys.has(key)) continue;
+                    const target = file.lines.find((l) => l.text === comment.anchor?.snippet);
+                    if (target) {
+                      const side = rowSideOf(target);
+                      const line = rowNoOf(target);
+                      if (line !== null) relocated.set(comment.id, { side, line });
+                    }
+                  }
+                  return h('div', { key: file.path },
                   h('div', { className: 'dcr-file' }, file.path),
                   ...file.lines.map((line, index) => {
                     const lineNo = line.newNo ?? line.oldNo;
-                    const comments = lineNo === null ? [] : detail.comments.filter((c) => c.file === file.path && c.line === lineNo);
+                    // §10.2/G34：行类型决定 side 与行号——删除行用 oldNo/LEFT，其余用 newNo/RIGHT。
+                    const rowSide: 'LEFT' | 'RIGHT' = line.kind === 'del' ? 'LEFT' : 'RIGHT';
+                    const rowNo = rowSide === 'LEFT' ? line.oldNo : line.newNo;
+                    const comments = rowNo === null ? [] : detail.comments.filter((c) => {
+                      if (c.file !== file.path) return false;
+                      const exact = c.line === rowNo && (c.side ?? 'RIGHT') === rowSide;
+                      const re = relocated.get(c.id);
+                      const relocatedHere = re !== undefined && re.line === rowNo && re.side === rowSide;
+                      return exact || relocatedHere;
+                    });
                     return h('div', { key: `${file.path}-${String(index)}` },
                       h('div', { className: `dcr-line ${line.kind}` },
                         h('span', { className: 'dcr-num' }, line.oldNo === null ? '' : String(line.oldNo)),
                         h('span', { className: 'dcr-num' }, line.newNo === null ? '' : String(line.newNo)),
                         h('span', { className: 'dcr-sign' }, line.kind === 'add' ? '+' : line.kind === 'del' ? '-' : ''),
                         h('span', { className: 'dcr-code' }, line.text),
-                        canAct && line.newNo !== null && line.kind !== 'meta' ? h('span', { className: 'dcr-plus', title: '添加行内意见', onClick: () => setDraft({ file: file.path, line: line.newNo ?? 0, text: '' }) }, '+') : null,
+                        canAct && line.kind !== 'meta' && rowNo !== null
+                          ? h('span', { className: 'dcr-plus', title: rowSide === 'LEFT' ? '对基线侧该行添加意见（LEFT）' : '添加行内意见（RIGHT）', onClick: () => setDraft({ file: file.path, line: rowNo ?? 0, text: '', side: rowSide }) }, '+') : null,
                       ),
                       ...comments.map((comment) => h('div', { key: comment.id, className: 'dcr-thread' },
                         h('div', { className: 'dcr-thread-head' },
@@ -1134,13 +1313,34 @@
                       )),
                     );
                   }),
-                ))),
+                );
+                }),
+              ),
               draft ? h('div', { style: { padding: '0 10px 10px' } },
                 h('div', { className: 'dcr-card' },
                   h('h3', null, `行内意见 ${draft.file}:${String(draft.line)}`),
                   h('textarea', { className: 'dcr-textarea', autoFocus: true, value: draft.text, onChange: (e: any) => setDraft({ ...draft, text: e.target.value }) }),
                   h('div', { className: 'dcr-row', style: { marginTop: 8 } },
-                    h('button', { className: 'dcr-btn p', disabled: !draft.text.trim(), onClick: () => { const value = draft.text; setDraft(null); void addComment(draft.file, draft.line, value); } }, '提交行内意见'),
+                    h('button', { className: 'dcr-btn p', disabled: !draft.text.trim(), onClick: () => {
+                      const value = draft.text;
+                      const side = draft.side;
+                      const { file: draftFile, line: draftLine } = draft;
+                      setDraft(null);
+                      // §4.3/G39：从差异行构造锚点（被评行原文 + 前后各一行）。
+                      const entry = diffFiles.find((item) => item.path === draftFile);
+                      const idx = entry ? entry.lines.findIndex((l) => (side === 'LEFT' ? l.oldNo : l.newNo) === draftLine) : -1;
+                      const target = entry && idx >= 0 ? entry.lines[idx] : undefined;
+                      const prevLine = entry && idx > 0 ? entry.lines[idx - 1] : undefined;
+                      const nextLine = entry && idx >= 0 ? entry.lines[idx + 1] : undefined;
+                      const anchor = target
+                        ? {
+                            snippet: target.text,
+                            ...(prevLine ? { before: prevLine.text } : {}),
+                            ...(nextLine ? { after: nextLine.text } : {}),
+                          }
+                        : undefined;
+                      void addComment(draftFile, draftLine, value, false, side, anchor);
+                    } }, '提交行内意见'),
                     h('button', { className: 'dcr-btn', onClick: () => setDraft(null) }, '取消'),
                   ),
                 ),
@@ -1189,17 +1389,27 @@
         const running = job.status === 'running';
         const failed = job.status === 'failed';
         const lastLine = job.log.length > 0 ? job.log[job.log.length - 1] : '等待输出…';
-        return h('div', { className: `dcr-card dcr-job ${failed ? 'failed' : ''}` },
+        // §10.2/G21：按 result.status 区分业务结果，不得只看外层 succeeded。
+        const outcome = typeof result?.status === 'string' ? result.status : null;
+        const outcomeText: Record<string, string> = {
+          COMMITTED: '业务提交成功', FALLBACK_TO_PENDING: '退回待审核', ABORTED: '已中止',
+          RECOVERY_REQUIRED: '需人工恢复', MANUAL_REQUIRED: '需手动执行', VALIDATION_FAILED: '校验未全部通过',
+        };
+        const outcomeChip = outcome === 'COMMITTED' ? 'approved' : outcome && outcome !== 'MANUAL_REQUIRED' ? 'rejected' : 'pending';
+        const outcomeIsErr = outcome !== null && outcome !== 'COMMITTED' && outcome !== 'MANUAL_REQUIRED';
+        return h('div', { className: `dcr-card dcr-job ${failed || outcomeIsErr ? 'failed' : ''}` },
           h('div', { className: 'dcr-row' },
-            h('strong', null, job.type === 'approve' ? '批准与验证' : 'AI 修复'),
-            h('span', { className: `dcr-chip ${job.status === 'succeeded' ? 'approved' : failed ? 'rejected' : 'pending'}` }, running ? '执行中' : job.status === 'succeeded' ? '完成' : '失败'),
+            h('strong', null, job.type === 'approve' ? '批准与验证' : job.type === 'audit' ? '仓库审查' : 'AI 修复'),
+            h('span', { className: `dcr-chip ${running ? 'pending' : outcome ? outcomeChip : job.status === 'succeeded' ? 'approved' : failed ? 'rejected' : 'pending'}` },
+              running ? '执行中' : outcome ? (outcomeText[outcome] ?? outcome) : job.status === 'succeeded' ? '完成' : '失败'),
             h('span', { className: 'dcr-small dcr-muted' }, dateText(job.startedAt)),
             h('span', { className: 'dcr-grow' }),
             !running ? h('button', { className: 'dcr-btn g', onClick: () => setJob(null) }, '关闭') : null,
           ),
           running ? h('div', { className: 'dcr-small dcr-muted dcr-mono', style: { marginTop: 6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, lastLine) : null,
           job.error ? h('div', { className: 'dcr-banner err', style: { marginTop: 8 } }, job.error) : null,
-          result?.message ? h('div', { className: `dcr-banner ${result?.success === false ? 'err' : 'info'}`, style: { marginTop: 8 } }, result.message) : null,
+          result?.reason ? h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 6 } }, `reason：${String(result.reason)}`) : null,
+          result?.message ? h('div', { className: `dcr-banner ${outcomeIsErr ? 'err' : 'info'}`, style: { marginTop: 8 } }, result.message) : null,
           result?.commitRevision ? h('div', { className: 'dcr-small dcr-mono dcr-muted', style: { marginTop: 6 } }, `commit ${short(result.commitRevision)}`) : null,
           h('details', { className: 'dcr-joblog', open: running ? true : undefined },
             h('summary', null, `${running ? '实时日志' : '运行日志'}（${String(job.log.length)} 行）`),

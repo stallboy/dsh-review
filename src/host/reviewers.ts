@@ -19,6 +19,10 @@ export interface ReviewersConfig {
   rejectionMemoryDays: number;
   /** §5：每模块最多注入的负向摘要数量，默认 20。 */
   maxAntiPatterns: number;
+  /** §4.2/G42：收尾门禁复算模式 none/smoke/declared，默认 none。 */
+  verifyGateOnAuditFinalize: 'none' | 'smoke' | 'declared';
+  /** §4.2/G42：smoke 模式按顺序在仓库根目录执行的命令。 */
+  auditSmokeCommands: string[];
 }
 
 export const EMPTY_REVIEWERS: ReviewersConfig = {
@@ -28,6 +32,8 @@ export const EMPTY_REVIEWERS: ReviewersConfig = {
   staleDays: null,
   rejectionMemoryDays: 30,
   maxAntiPatterns: 20,
+  verifyGateOnAuditFinalize: 'none',
+  auditSmokeCommands: [],
 };
 
 export function reviewersPath(repoRoot: string): string {
@@ -69,6 +75,11 @@ export async function loadReviewers(repoRoot: string): Promise<ReviewersConfig> 
       staleDays: asPositiveInt(record['stale_days']),
       rejectionMemoryDays: asPositiveInt(record['rejection_memory_days']) ?? EMPTY_REVIEWERS.rejectionMemoryDays,
       maxAntiPatterns: asPositiveInt(record['max_anti_patterns']) ?? EMPTY_REVIEWERS.maxAntiPatterns,
+      verifyGateOnAuditFinalize:
+        record['verify_gate_on_audit_finalize'] === 'smoke' || record['verify_gate_on_audit_finalize'] === 'declared'
+          ? record['verify_gate_on_audit_finalize']
+          : 'none',
+      auditSmokeCommands: asStringArray(record['audit_smoke_commands']),
     };
   } catch {
     return { ...EMPTY_REVIEWERS };

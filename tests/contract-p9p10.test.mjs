@@ -1,7 +1,8 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../dist/api.js';
 import { DEFAULT_SETTINGS } from '../dist/settings.js';
@@ -19,7 +20,13 @@ async function startApi(root, extraDeps = {}, settingsPatch = {}) {
     ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType: 'git', runner: 'manual', syncBeforeApprove: false,
     ...settingsPatch,
   };
-  const api = new ReviewApi({ settings, saveSettings: async (next) => next, ...extraDeps });
+  const api = new ReviewApi({
+    settings,
+    saveSettings: async (next) => next,
+    // 租约状态文件放仓库外（生产为 DSH_HOME），避免测试污染真实 DSH_HOME 或被 git clean 删除。
+    statePath: path.join(await mkdtemp(path.join(tmpdir(), 'dcr-p9-state-')), 'runtime-state.json'),
+    ...extraDeps,
+  });
   await api.init();
   const server = createServer((req, res) => {
     void api.handle(req, res);
@@ -80,6 +87,7 @@ test('P10: 检出级写互斥——并发超时归档串行化，恰好一个成
   const root = await createGitFixture();
   const dir = path.join(root, '.ai-review', '2026-11', '20261105-net-stale');
   await mkdir(dir, { recursive: true });
+  const staleIso = new Date(Date.now() - 20 * 86_400_000).toISOString();
   await writeFile(path.join(dir, 'review.md'), [
     '---', 'schema_version: 1', 'title: "net: stale"', 'module: net', 'audit_type: bugfix',
     'created_at: "2026-11-01T09:00:00+08:00"',
@@ -88,7 +96,7 @@ test('P10: 检出级写互斥——并发超时归档串行化，恰好一个成
     'revisions:', '  - id: 1', '    base_revision: "1"', '    patch: 001.patch', '    author: ai',
     'gate_checks: []', 'comments: []', 'human_decisions: []', 'approval: null', 'rejection: null',
     'commit_message: "net: x"', '---', '', '# 问题与影响', '',
-  ].join('\n').replaceAll('"2026-11-01T09:00:00+08:00"', `"${new Date(Date.now() - 20 * 86_400_000).toISOString()}"`), 'utf8');
+  ].join('\n').replaceAll('"2026-11-01T09:00:00+08:00"', `"${staleIso}"`), 'utf8');
   await writeFile(path.join(dir, '001.patch'), 'diff --git a/src/math.js b/src/math.js\n', 'utf8');
   await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nstale_days: 14\n', 'utf8');
   runCommand('git', ['add', '.ai-review'], root);
@@ -99,7 +107,7 @@ test('P10: 检出级写互斥——并发超时归档串行化，恰好一个成
   const results = await Promise.all([1, 2, 3, 4].map(() =>
     fetch(`${base}/archive-stale`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id: '2026-11/20261105-net-stale', expectedRevision: 1, expectedOwner: 'tester' }),
+      body: JSON.stringify({ id: '2026-11/20261105-net-stale', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: staleIso }),
     })));
   const statuses = results.map((r) => r.status);
   assert.equal(statuses.filter((code) => code === 200).length, 1, statuses.join(','));
@@ -111,7 +119,7 @@ test('P10: 检出级写互斥——并发超时归档串行化，恰好一个成
   assert.equal(item?.status, 'rejected');
 });
 
-test('P10: approved 但 commit_revision 为 null → 队列提示 needsBackfill', async () => {
+test('P10: approved 无可派生提交 → lookup unknown 仅诊断；遗留 commit_revision 不再触发 needsBackfill', async () => {
   const root = await createGitFixture();
   const dir = path.join(root, '.ai-review', '2026-11', '20261105-net-bf');
   await mkdir(dir, { recursive: true });
@@ -129,16 +137,9 @@ test('P10: approved 但 commit_revision 为 null → 队列提示 needsBackfill'
   const { base } = await startApi(root);
   const queue = await (await fetch(`${base}/queue`)).json();
   const item = queue.items.find((entry) => entry.id.endsWith('net-bf'));
-  assert.equal(item?.needsBackfill, true);
-  // 已回填的不提示。
-  const dir2 = path.join(root, '.ai-review', '2026-11', '20261105-net-ok');
-  await mkdir(dir2, { recursive: true });
-  await writeFile(path.join(dir2, 'review.md'), (await (await import('node:fs/promises')).readFile(path.join(dir, 'review.md'), 'utf8'))
-    .replace('20261105-net-bf', '20261105-net-ok')
-    .replace('commit_revision: null', 'commit_revision: "abc123"'), 'utf8');
-  runCommand('git', ['add', '.ai-review'], root);
-  runCommand('git', ['commit', '-q', '-m', 'fixture2'], root);
-  const queue2 = await (await fetch(`${base}/queue`)).json();
-  const okItem = queue2.items.find((entry) => entry.id.endsWith('net-ok'));
-  assert.equal(okItem?.needsBackfill, undefined);
+  // §5.5：unknown 只是诊断，不显示为失败，也不产生 needsBackfill。
+  assert.equal(item?.approvalCommitLookup, 'unknown');
+  assert.equal(item?.approvalCommitRevision, undefined);
+  assert.equal(item?.needsBackfill, undefined);
+  assert.equal(item?.parseError, undefined);
 });

@@ -82,7 +82,7 @@ test('P8: Rebase——基线落后时产生新版本（author ai）；基线最�
   const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   const fm = await readFile(path.join(root, '.ai-review', '2026-11', '20261105-net-rb', 'review.md'), 'utf8');
   await writeFile(path.join(root, '.ai-review', '2026-11', '20261105-net-rb', 'review.md'), fm.replace(`base_revision: "${base}"`, `base_revision: "${head}"`), 'utf8');
-  const noop = await runJob(apiBase, '/rebase', { id: '2026-11/20261105-net-rb', expectedRevision: 1, expectedOwner: 'tester' });
+  const noop = await runJob(apiBase, '/rebase', { id: '2026-11/20261105-net-rb', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-05T09:00:00+08:00' });
   assert.match(noop.job.result.message, /无需 Rebase/);
 
   // 基线前进后 → Rebase 产生版本 2。
@@ -91,7 +91,7 @@ test('P8: Rebase——基线落后时产生新版本（author ai）；基线最�
   runCommand('git', ['commit', '-q', '-m', 'base moves'], root);
   const newBase = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
 
-  const ok = await runJob(apiBase, '/rebase', { id: '2026-11/20261105-net-rb', expectedRevision: 1, expectedOwner: 'tester' });
+  const ok = await runJob(apiBase, '/rebase', { id: '2026-11/20261105-net-rb', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-05T09:00:00+08:00' });
   assert.equal(ok.job.result.status, 'COMMITTED', JSON.stringify(ok.job.result));
   assert.equal(ok.job.result.newRevision, 2);
   const dir = path.join(root, '.ai-review', '2026-11', '20261105-net-rb');
@@ -119,7 +119,7 @@ test('P8: 人工微调——补丁可应用且门禁通过时产生版本（auth
 
   // 坏补丁 → ABORTED，不产生 002.patch。
   const bad = await runJob(apiBase, '/manual-revision', {
-    id: '2026-11/20261105-net-rb', expectedRevision: 1, expectedOwner: 'tester',
+    id: '2026-11/20261105-net-rb', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-05T09:00:00+08:00',
     patchText: 'not a patch\n',
   });
   assert.equal(bad.job.result.status, 'ABORTED');
@@ -127,7 +127,7 @@ test('P8: 人工微调——补丁可应用且门禁通过时产生版本（auth
 
   // 好补丁 → 版本 2，author human，回 pending。
   const ok = await runJob(apiBase, '/manual-revision', {
-    id: '2026-11/20261105-net-rb', expectedRevision: 1, expectedOwner: 'tester',
+    id: '2026-11/20261105-net-rb', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-05T09:00:00+08:00',
     patchText: PATCH('+'),
   });
   assert.equal(ok.job.result.status, 'COMMITTED', JSON.stringify(ok.job.result));

@@ -35,6 +35,8 @@ export interface ReviewComment {
   content: string;
   status: CommentStatus;
   createdAt?: string;
+  /** §4.3/G39：可选锚点——保存被评论行原文摘要与前后各一行，用于跨版本重定位；仅行内评论可带。 */
+  anchor?: { snippet: string; before?: string; after?: string };
   /** I14：本评论对象中未建模的键原样保留。 */
   extra?: Record<string, unknown>;
 }
@@ -65,7 +67,8 @@ export interface WaivedDecision {
 export interface ApprovalMeta {
   approvedBy: string;
   approvedAt: string;
-  commitRevision: string | null;
+  /** §4.3：commit_revision 已从契约移除（2026-11-09 修订）；业务提交版本由 Host 从 VCS 历史派生（§5.5）。
+   *  旧数据中的 commit_revision 作为未知键保留在 extra，仅作只读诊断。 */
   /** §4.7：批准时生效的门禁快照（必须与当时顶层 gate_checks 一致）。P5 起写入。 */
   gateChecks?: string[];
   /** §4.7：逐条执行结果（command/exit_code/duration_ms）。P5 起写入。 */
@@ -187,10 +190,14 @@ export interface CandidateSummary {
   fingerprint?: string;
   /** §4.8：人工重开指向的被拒候选；null 表示非重开。 */
   reopenedFrom?: string | null;
-  /** §7.4：窗口内完全重复的被拒候选 id——该候选被阻止进入审核。 */
+  /** §7：窗口内完全重复的被拒候选 id——该候选被阻止进入审核。 */
   duplicateOf?: string;
-  /** §18.8：approved 但 commit_revision 未回填——队列提示幂等补填。 */
-  needsBackfill?: boolean;
+  /** §5.5：approved 候选的派生业务提交版本（仅诊断展示，非共享事实）。 */
+  approvalCommitRevision?: string;
+  /** §5.5：派生定位三态诊断；ambiguous/unknown 不得阻塞队列或显示为失败。 */
+  approvalCommitLookup?: 'found' | 'ambiguous' | 'unknown';
+  /** §7.1：候选存在未提交/本地改动——仅诊断展示，不参与共享流程、不计入共享 KPI。 */
+  local?: boolean;
   parseError?: string;
 }
 
@@ -207,6 +214,8 @@ export interface ReviewFilter {
 export interface ConcurrencyGuard {
   expectedRevision: number;
   expectedOwner: string;
+  /** §8.1：必须等于候选当前规范化后的 updated_at；用于发现不推进补丁版本的写入。 */
+  expectedUpdatedAt: string;
 }
 
 export interface ApplyPatchResult {
@@ -247,18 +256,24 @@ export interface RunnerExecutionResult {
   manual?: boolean;
 }
 
-export type ApprovalOutcomeStatus = 'COMMITTED' | 'FALLBACK_TO_PENDING' | 'ABORTED';
+export type ApprovalOutcomeStatus = 'COMMITTED' | 'FALLBACK_TO_PENDING' | 'ABORTED' | 'RECOVERY_REQUIRED';
+/** §7.5：FALLBACK_TO_PENDING 专属原因（不属于 ABORTED）。 */
+export type ApprovalFallbackReason = 'PATCH_CONFLICT' | 'GATE_CHECK_FAILED';
 export type ApprovalAbortReason =
   | 'CONCURRENCY_MISMATCH'
-  | 'DIRTY_WORKSPACE'
-  | 'MAX_RETRIES_EXCEEDED'
-  | 'RUNNER_FAILED'
-  | 'PATCH_CONFLICT'
-  | 'GATE_CHECK_FAILED'
+  | 'STATE_CONFLICT'
+  | 'DUPLICATE_CANDIDATE'
   | 'DECISIONS_UNCONFIRMED'
   | 'COMMIT_MESSAGE_MISMATCH'
-  | 'NOT_CONFIGURED'
-  | 'INTERNAL_ERROR';
+  | 'INVALID_CANDIDATE'
+  | 'DIRTY_WORKSPACE'
+  | 'SYNC_FAILED'
+  | 'BUSINESS_CONTENT_CHANGED'
+  | 'COMMIT_FAILED'
+  | 'MAX_RETRIES_EXCEEDED'
+  | 'RUNNER_FAILED';
+/** §7.5：提交/同步结果不明，必须人工确认 VCS 与工作区状态。 */
+export type ApprovalRecoveryReason = 'COMMIT_OUTCOME_UNKNOWN' | 'SYNC_STATE_UNKNOWN';
 
 /** §4.7：批准时人工判断项的处理记录。 */
 export interface ApprovalDecisions {
@@ -268,11 +283,23 @@ export interface ApprovalDecisions {
 
 export interface ApprovalOutcome {
   status: ApprovalOutcomeStatus;
-  reason?: ApprovalAbortReason;
+  reason?: ApprovalAbortReason | ApprovalFallbackReason | ApprovalRecoveryReason;
   message: string;
+  /** RECOVERY_REQUIRED 必含：说明需要人工确认的具体状态。 */
+  detail?: string;
+  /** COMMITTED 必含非空提交版本号。 */
   commitRevision?: string;
   newRevision?: number;
+  /** FALLBACK_TO_PENDING + manual runner：可复制的人工修复提示词。 */
+  manualPrompt?: string;
   jobId?: string;
+}
+
+/** §5.5：业务提交版本的派生定位结果（只读诊断）。 */
+export interface ApprovalCommitLookup {
+  revision: string | null;
+  lookup: 'found' | 'ambiguous' | 'unknown';
+  diagnostic?: string;
 }
 
 export interface AppSettings {
@@ -319,7 +346,11 @@ export interface AuditReportInfo {
 }
 
 export interface AuditOutcome {
+  /** §7.7 判别字段：Client 按 result.status 解释业务结果，不得只看外层 Job 状态。 */
+  status: 'MANUAL_REQUIRED' | 'COMMITTED' | 'VALIDATION_FAILED' | 'ABORTED' | 'RECOVERY_REQUIRED';
   manual: boolean;
+  /** 本轮审查档案 id（目录式 .ai-review/audits/<audit_id>/）。 */
+  auditId: string;
   /** Manual mode only: the prompt to hand to any external agent. */
   prompt?: string;
   created: AuditCandidateResult[];
@@ -340,6 +371,8 @@ export interface JobRecord {
   startedAt: string;
   finishedAt?: string;
   log: string[];
+  /** §8.2/G36：log[0] 的绝对行序号（截断后递增）；未截断为 0。 */
+  logStartOffset?: number;
   result?: unknown;
   error?: string;
 }

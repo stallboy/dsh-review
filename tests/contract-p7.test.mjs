@@ -51,7 +51,7 @@ async function writeCandidate(root, slug, status = 'pending') {
 }
 
 const META = (items) => ({
-  schemaVersion: 1, auditId: '20261104-020000-src-host', createdAt: '2026-11-04T02:00:00+08:00',
+  schemaVersion: 1, auditId: '20261104-020000-src-host', createdAt: '2026-11-04T02:00:00Z',
   baseRevision: 'abc', scope: 'src/host', trigger: 'manual', previousAudit: null, candidates: [], items,
 });
 const ITEM = (over = {}) => ({

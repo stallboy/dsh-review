@@ -230,21 +230,24 @@ test('修复：duplicateOf 候选被阻止批准；broken 候选详情可读', a
   // duplicateOf 阻止批准。
   const blocked = await fetch(`${base}/approve`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261106-dup', expectedRevision: 1, expectedOwner: 'tester' }),
+    body: JSON.stringify({ id: '2026-11/20261106-dup', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-04T10:00:00+08:00' }),
   });
   assert.equal(blocked.status, 409);
   assert.match((await blocked.json()).error.message, /完全重复/);
 
-  // broken 候选详情可读（之前 422 死胡同）。构造真 broken：把 dup 的 review 改坏。
+  // broken 候选详情可读（之前 422 死胡同）。构造真 broken：把 dup 的 review 改坏并提交为共享事实
+  // （§7.1：详情只读 HEAD 同一快照，未提交的手改只作 local 诊断、不进入共享事实）。
   const dupPath = path.join(dirOf('20261106-dup'), 'review.md');
   const original = await readFile(dupPath, 'utf8');
   await writeFile(dupPath, original.replace('current_revision: 1', 'current_revision: 9'), 'utf8');
+  runCommand('git', ['add', '.ai-review'], root);
+  runCommand('git', ['commit', '-q', '-m', 'break dup'], root);
   const detail = await (await fetch(`${base}/candidate?id=2026-11/20261106-dup`)).json();
   assert.ok(detail.candidate?.parseError?.includes('current_revision=9'), detail.candidate?.parseError);
   await writeFile(dupPath, original, 'utf8');
 });
 
-test('修复：/backfill 幂等且不改变 updated_at', async () => {
+test('修复：approval 不再保存 commit_revision——旧字段只读保留，派生 unknown 仅诊断（§5.5）', async () => {
   const root = await createGitFixture();
   const dir = path.join(root, '.ai-review', '2026-11', '20261106-bf');
   await mkdir(dir, { recursive: true });
@@ -262,25 +265,20 @@ test('修复：/backfill 幂等且不改变 updated_at', async () => {
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const { base } = await startApi(root);
 
-  const ok = await fetch(`${base}/backfill`, {
+  // /backfill 端点已随单次原子提交契约移除。
+  const gone = await fetch(`${base}/backfill`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ id: '2026-11/20261106-bf', commitRevision: 'deadbeef' }),
   });
-  assert.equal(ok.status, 200);
-  const text = await readFile(path.join(dir, 'review.md'), 'utf8');
-  assert.match(text, /commit_revision: deadbeef/);
-  assert.match(text, /updated_at: ['"]?2026-11-04T11:00:00\+08:00['"]?/); // updated_at 未被回填改变
-  // 幂等：重复回填同值直接短路。
-  const again = await fetch(`${base}/backfill`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261106-bf', commitRevision: 'deadbeef' }),
-  });
-  assert.equal(again.status, 200);
-  assert.match((await again.json()).message, /无需回填/);
-  // 非 approved 拒绝。
-  const notApproved = await fetch(`${base}/backfill`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/nonexist', commitRevision: 'x' }),
-  });
-  assert.equal(notApproved.status, 404);
+  assert.equal(gone.status, 404);
+
+  // 历史中没有"删除补丁 + approved 状态迁移"的提交 → 派生 unknown，仅诊断，不 broken、不阻塞队列。
+  const detail = await (await fetch(`${base}/candidate?id=${encodeURIComponent('2026-11/20261106-bf')}`)).json();
+  assert.equal(detail.approvalCommitLookup, 'unknown');
+  assert.equal(detail.approvalCommitRevision, undefined);
+  assert.equal(detail.candidate.parseError, undefined);
+  const queue = await (await fetch(`${base}/queue`)).json();
+  const item = queue.items.find((entry) => entry.id.endsWith('20261106-bf'));
+  assert.equal(item?.approvalCommitLookup, 'unknown');
+  assert.equal(item?.needsBackfill, undefined);
 });

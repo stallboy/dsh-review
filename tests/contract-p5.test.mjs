@@ -135,6 +135,7 @@ test('P5: 判断项未全覆盖 / 知悉缺理由 / 标题不一致 —— 批�
     id: '2026-11/20261105-net-a',
     expectedRevision: 1,
     expectedOwner: 'tester',
+    expectedUpdatedAt: '2026-11-01T10:00:00+08:00',
     confirmedDecisions: [],
     waivedDecisions: [{ id: 'h1', reason: '' }],
   });
@@ -145,6 +146,7 @@ test('P5: 判断项未全覆盖 / 知悉缺理由 / 标题不一致 —— 批�
     id: '2026-11/20261105-net-a',
     expectedRevision: 1,
     expectedOwner: 'tester',
+    expectedUpdatedAt: '2026-11-01T10:00:00+08:00',
     confirmedDecisions: [],
     waivedDecisions: [],
   });
@@ -160,6 +162,7 @@ test('P5: 判断项未全覆盖 / 知悉缺理由 / 标题不一致 —— 批�
     id: '2026-11/20261105-net-b',
     expectedRevision: 1,
     expectedOwner: 'tester',
+    expectedUpdatedAt: '2026-11-01T10:00:00+08:00',
   });
   assert.equal(mismatch.job.result.reason, 'COMMIT_MESSAGE_MISMATCH');
 });
@@ -178,6 +181,7 @@ test('P5: 合法批准——快照/结果/决定留痕 + 业务提交使用 comm
     id: '2026-11/20261105-net-ok',
     expectedRevision: 1,
     expectedOwner: 'tester',
+    expectedUpdatedAt: '2026-11-01T10:00:00+08:00',
     confirmedDecisions: ['h1'],
     waivedDecisions: [{ id: 'h2', reason: '发布说明由产品另行补充' }],
   });
@@ -192,8 +196,16 @@ test('P5: 合法批准——快照/结果/决定留痕 + 业务提交使用 comm
   assert.match(reviewText, /waived_decisions:/);
   assert.match(reviewText, /发布说明由产品另行补充/);
 
-  // 提交顺序：最新是 commit_revision 回填，其前是业务提交（首行 == title，§4.9）。
+  // §5.5（2026-11-09 修订）：单次原子提交——最新提交即业务提交（首行 == title），无第二次回填提交。
   const log = runCommand('git', ['log', '-2', '--format=%s'], root).stdout.trim().split('\n');
-  assert.match(log[0] ?? '', /^review\(/);
-  assert.equal(log[1], 'net: 修复加法');
+  assert.equal(log[0], 'net: 修复加法');
+  assert.equal(log[1], 'fixture');
+  // review.md 不保存 commit_revision。
+  assert.doesNotMatch(reviewText, /commit_revision/);
+
+  // §5.5 派生读模型：/candidate 返回 found 与业务提交版本（AC-APPROVE-01）。
+  const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const detail = await (await fetch(`${base}/candidate?id=${encodeURIComponent('2026-11/20261105-net-ok')}`)).json();
+  assert.equal(detail.approvalCommitLookup, 'found', JSON.stringify(detail.approvalCommitLookup));
+  assert.equal(detail.approvalCommitRevision, head);
 });

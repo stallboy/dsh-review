@@ -6,7 +6,7 @@ import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../dist/api.js';
 import { DEFAULT_SETTINGS } from '../dist/settings.js';
 import { AuditArchive, auditInvariantErrors, parseAuditMarkdown, projectFindings, serializeAuditMarkdown } from '../dist/audit-archive.js';
-import { createGitFixture, fakeAuditAgentPath } from './helpers.mjs';
+import { createGitFixture, fakeAuditAgentPath, runCommand } from './helpers.mjs';
 
 /** P6 验收：audit.md 新契约（I1/I9/I10/I13）+ §3.4 投影四规则 + API /audits /findings。 */
 
@@ -34,7 +34,7 @@ async function startApi(root) {
 const META = (over = {}) => ({
   schemaVersion: 1,
   auditId: '20261104-020000-src-host',
-  createdAt: '2026-11-04T02:00:00+08:00',
+  createdAt: '2026-11-04T02:00:00Z',
   baseRevision: 'abc123',
   scope: 'src/host',
   trigger: 'manual',
@@ -71,7 +71,7 @@ test('P6: I1/I9/I10/I13 反例', () => {
   assert.ok(auditInvariantErrors(META({ items: [ITEM({ kind: 'deferred' })] }), META().auditId).some((e) => e.startsWith('I10')));
   assert.ok(auditInvariantErrors(META({ items: [ITEM({ dependsOn: 'x' })] }), META().auditId).some((e) => e.startsWith('I10')));
   // I13：时间戳不一致。
-  assert.ok(auditInvariantErrors(META({ createdAt: '2026-11-04T03:00:00+08:00' }), '20261104-020000-src-host').some((e) => e.startsWith('I13')));
+  assert.ok(auditInvariantErrors(META({ createdAt: '2026-11-04T03:00:00Z' }), '20261104-020000-src-host').some((e) => e.startsWith('I13')));
 });
 
 test('P6: 档案写入/读取/目录冲突/updateItem 不重写历史', async () => {
@@ -106,19 +106,22 @@ test('P6: 投影——覆盖判定/最新观察/当前状态/可见性', async (
   }), BODY);
   // 第 2 轮（更新）：api-race 仍 pending；net-close 覆盖（全仓 '.'）。
   await archive.write(META({
-    auditId: '20261105-020000-repo', createdAt: '2026-11-05T02:00:00+08:00', scope: '.',
+    auditId: '20261105-020000-repo', createdAt: '2026-11-05T02:00:00Z', scope: '.',
     previousAudit: '20261104-020000-src-host',
     items: [ITEM({ findingId: 'api-race' }), ITEM({ findingId: 'net-close', targetFiles: ['src/net/session.ts'] })],
   }), BODY);
   // 候选状态映射：net-close 的候选已 approved → closed；api-race 的候选 rejected → reopened。
-  const projections = projectFindings(await archive.list(), (candidateId) =>
-    candidateId.endsWith('net-cand') ? 'approved' : candidateId.endsWith('api-cand') ? 'rejected' : null);
+  const { findings: projections } = projectFindings(await archive.list(), (candidateId) =>
+    candidateId.endsWith('net-cand') ? { status: 'approved', reopenedFrom: null }
+      : candidateId.endsWith('api-cand') ? { status: 'rejected', reopenedFrom: null }
+        : null,
+    ['2026-11/net-cand', '2026-11/api-cand']);
   const byId = new Map(projections.map((p) => [p.findingId, p]));
   // 覆盖判定：net-close 只被第 2 轮（全仓）观察。
   assert.equal(byId.get('net-close')?.lastObservedAudit, '20261105-020000-repo');
   // 最新观察：api-race 最新来自第 2 轮。
   assert.equal(byId.get('api-race')?.lastObservedAudit, '20261105-020000-repo');
-  assert.equal(byId.get('api-race')?.lastObservedAt, '2026-11-05T02:00:00+08:00');
+  assert.equal(byId.get('api-race')?.lastObservedAt, '2026-11-05T02:00:00Z');
   // 当前状态规则（converted 结合候选真实状态）在下面 API 测试验证。
 });
 
@@ -152,6 +155,9 @@ test('P6: API /audits 与 /findings——converted 结合候选状态出 closed/
       '---', '', '# 问题与影响', '',
     ].join('\n'), 'utf8');
   }
+  // §7.1：档案与候选只有进入共享提交后才可被 /audits 与 /findings 读取。
+  runCommand('git', ['add', '-A'], root);
+  runCommand('git', ['commit', '-q', '-m', 'shared audit fixture'], root);
   const { base } = await startApi(root);
   const audits = await (await fetch(`${base}/audits`)).json();
   assert.equal(audits.audits.length, 1);

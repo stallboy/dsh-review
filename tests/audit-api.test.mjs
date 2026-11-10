@@ -29,6 +29,8 @@ async function startApi(root, extraDeps = {}, settingsPatch = {}) {
       settings = next;
       return next;
     },
+    // §7.6：租约状态注入临时路径，避免污染真实 DSH_HOME 并跨测试阻塞。
+    statePath: path.join(root, '.tmp', 'runtime-state.json'),
     ...extraDeps,
   });
   await api.init();
@@ -128,13 +130,18 @@ test('API creates a DSH audit session with the session prompt', async () => {
   });
 
   assert.equal(response.sessionId, 'session-test');
+  // §7.6/G20：会话审查返回跟踪 Job 与执行租约 auditId，收尾经 /audit/finalize。
+  assert.ok(response.jobId, '应返回跟踪 jobId');
+  assert.match(response.auditId, /^\d{8}-\d{6}-[a-z0-9][a-z0-9._-]*$/);
+  assert.match(response.reportPath, new RegExp(`.ai-review/audits/${response.auditId}/audit.md$`));
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cwd, root);
   assert.equal(calls[0].ownerSessionId, 'session-owner');
   assert.match(calls[0].title, /仓库审查/);
   assert.match(calls[0].title, /src/);
   assert.match(calls[0].prompt, /独立 DSH 会话/);
-  assert.match(calls[0].prompt, /只提交 `\.ai-review`/);
+  // §11.4（2026-11-10）：会话模式同样严禁 Agent 自行提交，收尾由 Host 统一执行。
+  assert.match(calls[0].prompt, /严禁执行 `git commit`/);
   assert.match(calls[0].prompt, /重点看边界条件/);
   await assert.rejects(stat(path.join(root, '.ai-review')), /ENOENT/);
 });
@@ -166,6 +173,7 @@ async function writeQueueCandidate(root, slug, status, baseRevision) {
     'tags: [queue]',
     `status: ${status}`,
     'ticket: null',
+    'target_files: [src/math.js]',
     'current_revision: 1',
     'revisions:',
     '  - id: 1',
@@ -210,6 +218,9 @@ test('API queue filters items but keeps owner-wide status counts', async () => {
   const baseRevision = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   await writeQueueCandidate(root, 'pending-one', 'pending', baseRevision);
   await writeQueueCandidate(root, 'approved-one', 'approved', baseRevision);
+  // §7.1：队列只读共享事实（HEAD 同一快照）——夹具必须先提交。
+  runCommand('git', ['add', '.ai-review'], root);
+  runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const server = await startApi(root);
   servers.push(server);
 
@@ -237,6 +248,7 @@ test('API chains an overall comment into an AI fix job', async () => {
       id: '2026-10/pending-one',
       expectedRevision: 1,
       expectedOwner: 'tester',
+      expectedUpdatedAt: '2026-10-31T20:00:00+08:00',
       content: '请补充边界测试',
       autoFix: true,
     }),
@@ -260,6 +272,8 @@ test('API chains an overall comment into an AI fix job', async () => {
       id: '2026-10/pending-one',
       expectedRevision: 1,
       expectedOwner: 'tester',
+      // 第一条评论已推进 updated_at：使用重新读取后的最新共享事实（AC-LOCK-01）。
+      expectedUpdatedAt: detail.candidate.meta.updatedAt,
       content: '只记一条意见',
       autoFix: false,
     }),

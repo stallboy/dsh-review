@@ -6,3 +6,7 @@ dist/
 .npm-cache/
 .pnpm-store/
 *.log
+
+out*.txt
+.dsh-acl-reports/
+

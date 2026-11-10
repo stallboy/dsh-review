@@ -668,7 +668,7 @@ title 规范化仅包括去首尾空白、合并连续空白和 ASCII 小写化�
 
 队列、详情、批准、转换、负向记忆和 finding 投影只能使用共享事实。本地草稿不得因“扫描到文件”而进入共享流程，不计入共享 KPI。提交失败的写入必须恢复操作前文件，避免留下长期本地项。
 
-每次共享读取必须绑定明确的 VCS 版本快照。候选的 review.md、所有引用补丁及必要关联文件必须整体来自同一提交；不得从工作区拼凑 Frontmatter 与补丁。候选任一相关文件存在本地或暂存变化时，整个候选只能作为 local。队列或投影的一次计算也不得混合不同 VCS 快照。
+每次共享读取必须绑定明确的 VCS 版本快照。候选的 review.md、所有引用补丁及必要关联文件必须整体来自同一提交；不得从工作区拼凑 Frontmatter 与补丁。候选任一相关文件存在本地或暂存变化时，整个候选只能作为 local。队列或投影的一次计算也不得混合不同 VCS 快照。SVN 的实现准则：先用本地 `svn info` 与 `svn status --xml` 确认候选目录处于同一基准 revision 且无本地改动（即上表共享事实判定），确认后可直接从本地工作副本文件读取，严禁为每个文件发起远端 `svn cat` 请求；仅当本地状态无法证明同一快照时才回退远端读取。
 
 broken 候选不参与批准、投影、负向记忆或提示词注入。唯一恢复路径是 Owner 人工修复，并通过一次仅含该候选目录的显式提交形成新的共享事实；仅修改本地文件不得恢复流转。AI 不得自动改写 broken 文件。
 
@@ -719,7 +719,7 @@ Runner 模式：
 
 1. **重读同一 VCS 快照中的共享事实与 guard**：候选必须为 pending；revision、owner、updated_at 任一不符，返回 `ABORTED / CONCURRENCY_MISMATCH`；非 pending 返回 `ABORTED / STATE_CONFLICT`。同时按 §6 检查重复候选；发现则返回 `ABORTED / DUPLICATE_CANDIDATE`，detail 携带 duplicateOf。
 2. **人工判断项**：按 §5.4 精确校验，失败返回 `ABORTED / DECISIONS_UNCONFIRMED`。
-3. **提交信息**：commit_message 非空且首行等于 title，否则返回 `ABORTED / COMMIT_MESSAGE_MISMATCH`。
+3. **提交信息**：commit_message 非空且首行等于 title，否则返回 `ABORTED / COMMIT_MESSAGE_MISMATCH`。批准请求经 `/approve` 提供了 `commitMessage` 时，先以该值替换候选 `commit_message` 再做本项校验；校验通过的替换值在步骤 10 的原子提交中一并写入 `review.md`，不产生独立的元数据提交。
 4. **候选完整性**：全部适用不变量通过，否则返回 `ABORTED / INVALID_CANDIDATE`。
 5. **工作区检查**：不干净返回 `ABORTED / DIRTY_WORKSPACE`。
 6. **同步与基线**：默认先同步。已知且可安全恢复的失败返回 `ABORTED / SYNC_FAILED`；部分同步或基线状态无法确定时返回 `RECOVERY_REQUIRED / SYNC_STATE_UNKNOWN`，禁止自动重试。随后重新绑定同步后的共享快照，重跑步骤 1–4（包括负向记忆）；后续补丁、门禁与批准记录均使用该快照。
@@ -774,7 +774,7 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 
 `/convert` 与 `/dismiss-finding` 只能修改该 finding 的**最新有效观察**中的 pending item；指定旧档案或当前投影不是 pending 时返回 409，不得修改后仍被更新观察覆盖。
 
-`/convert` 将该 item 与一个解析有效、未归档的已存在候选绑定，不生成 review.md 骨架。deferred 必须按 §4.8 取得依赖 finding 的最新有效投影：item 为 resolved，或 item 为 converted 且重开链当前候选 approved 时才满足；无观察、pending、rejected 或其他状态均拒绝。档案与候选目录必须在同一提交中完成，失败或结果不明按 §5.6 的三分支处理两侧。
+`/convert` 将该 item 与一个解析有效、未归档的已存在候选绑定，不生成 review.md 骨架。deferred 必须按 §4.8 取得依赖 finding 的最新有效投影：item 为 resolved，或 item 为 converted 且重开链当前候选 approved 时才满足；无观察、pending、rejected 或其他状态均拒绝。同提交语义：若目标候选已是共享事实且自身无需改动，则本次转换仅提交更新后的 audit.md；仅当需要把本地新生成的候选目录合入共享事实时，才在同一原子提交中纳入该候选目录与 audit.md。绑定必须在 repo 锁内重新解析目标候选，确认其此刻仍解析有效、未归档；候选在绑定瞬间已发生变化时返回 409，不得依据锁外读取的旧状态绑定。档案与候选目录必须在同一提交中完成，失败或结果不明按 §5.6 的三分支处理两侧。
 
 `/dismiss-finding` body 必须含 auditId、findingId 和非空 reason。Host 在正文 `# 审查项处理记录` 追加时间、操作者和理由，candidate 保持 null，并独立提交该档案。
 
@@ -789,7 +789,7 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 - 定时审查默认关闭；任一 Job 运行中、工作区脏或无基线时跳过本次，插件卸载时停止调度。
 - `POST /jobs/:id/cancel` 只请求停止后续执行，不强行把业务结果改为 ABORTED。Host 终止完整进程树或结束会话并等待清理后：已证明共享提交不存在才返回 ABORTED；普通共享提交已存在则返回对应 COMMITTED/VALIDATION_FAILED；批准业务提交已存在则返回 COMMITTED，并返回该提交的 VCS 版本号；结果不明返回 RECOVERY_REQUIRED 且禁止恢复。已结束 Job 直接返回原结果。手动租约不得随取消自动释放，必须按 §7.6 经人工确认停止后释放。不得靠 Host 重启释放锁。
 
-Rebase 由插件自身以 ai_fix Job 执行：读取当前基线，基线未变则 ABORTED；工作区必须干净；在新基线 three-way 应用当前补丁并重跑门禁；门禁通过后必须基于新基线导出包含实际冲突解决结果的完整 `--binary` diff，并验证该新补丁能在新基线干净应用。只有该验证通过才追加 author=ai 的新 revision、回到 pending 并提交 `.ai-review/`。不得复用旧补丁文本。已证明未提交的明确失败不产生新版本并还原工作区；提交结果不明时返回 RECOVERY_REQUIRED，不得按普通失败还原。
+Rebase 由插件自身以 ai_fix Job 执行：读取当前基线，基线未变则 ABORTED；工作区必须干净。执行分两段：先尝试确定性的 VCS three-way 应用与门禁重跑——干净应用且门禁通过时无需调用 Runner，直接进入导出步骤（author 仍记为 `ai`）；应用冲突或门禁失败时，按 §7.4 转入 `RESOLVE_CONFLICT`（Mode C），由 Runner 从干净的新基线开始消解冲突并生成新版本，`runner` 为 `manual` 时不自动调用，返回 `ABORTED / REBASE_CONFLICT` 并在 message 携带人工修复提示词。门禁通过后必须基于新基线导出包含实际冲突解决结果的完整 `--binary` diff，并验证该新补丁能在新基线干净应用。只有该验证通过才追加 author=ai 的新 revision、回到 pending 并提交 `.ai-review/`。不得复用旧补丁文本。已证明未提交的明确失败不产生新版本并还原工作区；提交结果不明时返回 RECOVERY_REQUIRED，不得按普通失败还原。
 
 ### 7.8 会话级仓库解析
 
@@ -879,7 +879,7 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 | POST | `/dismiss-finding` | `{auditId, findingId, reason}`，均非空；不传候选 guard | 200 `{audit, commitRevision}`；按 §7.6 留痕并独立提交。 |
 | POST | `/rebase` | `{id, ...guard}` | 202 `{jobId, job}`，Job 类型 ai_fix。 |
 | POST | `/manual-revision` | `{id, ...guard, patchText}`；非空全量 Unified Diff | 202 `{jobId, job}`；验证与门禁通过后追加 human revision。 |
-| POST | `/approve` | `{id, ...guard, confirmedDecisions?: string[], waivedDecisions?: {id, reason}[]}`；缺省数组按 `[]` | 202 `{jobId, job}`；最终结果读取 job.result。 |
+| POST | `/approve` | `{id, ...guard, confirmedDecisions?: string[], waivedDecisions?: {id, reason}[], commitMessage?: string}`；缺省数组按 `[]`；`commitMessage` 可选，提供时非空且首行必须等于 title（否则按 §7.5 返回 `COMMIT_MESSAGE_MISMATCH`），批准原子提交中一并更新 `review.md` 的 `commit_message` 并以其作为本次业务提交说明 | 202 `{jobId, job}`；最终结果读取 job.result。 |
 | POST | `/ai-fix` | `{id, ...guard}`；必须有未 resolved 评论 | 202 `{jobId, job}`；无 unresolved/partial 评论时在创建 Job 前返回 409。 |
 | POST | `/sync` | 空 object `{}` | 200 VCS 同步结果；在 repo 工作区锁内串行，不创建候选写入。 |
 

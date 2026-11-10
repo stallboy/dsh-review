@@ -164,7 +164,7 @@ test('P2: 队列 broken 隔离——违反不变量的候选标记 broken 且不
     '# 问题与影响',
     '',
   ].join('\n');
-  await writeFile(path.join(goodDir, 'review.md'), fm('pending', 'null'), 'utf8');
+  await writeFile(path.join(goodDir, 'review.md'), fm('pending', 'null').replace('target_files: []', 'target_files: [src/math.js]'), 'utf8');
   await writeFile(path.join(goodDir, '001.patch'), [
     'diff --git a/src/math.js b/src/math.js',
     '--- a/src/math.js',
