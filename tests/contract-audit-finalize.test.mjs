@@ -159,6 +159,19 @@ test('G20：重复 finalize 拒绝；release 需显式确认停止', async () =>
   });
   assert.equal(noConfirm.status, 409);
 
+  // §8.3：租约仍活跃时 release 必须 409。
+  const activeRelease = await fetch(`${base}/audit/release`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ auditId: manual.auditId, confirmStopped: true }),
+  });
+  assert.equal(activeRelease.status, 409);
+
+  // 取消审查 Job → 租约置 releasable（仍阻塞），再确认停止才允许释放。
+  const cancelled = await fetch(`${base}/jobs/${encodeURIComponent(manual.jobId)}/cancel`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(cancelled.status, 202);
+
   // 确认停止 + 工作区干净 → 释放成功。
   const released = await fetch(`${base}/audit/release`, {
     method: 'POST', headers: { 'content-type': 'application/json' },

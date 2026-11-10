@@ -98,3 +98,12 @@
 - **仍未修（低优先，不阻塞契约）**：Client 组低危展示项与 §8 错误码边界的剩余细节；
   会话 turn 自动收尾钩子（平台能力限制）。这些不影响共享事实、批准主流程与三分支语义。
 - 本文件自此为唯一权威状态；后续审查请以第 4、6 节为输入，勿再引用 DEVIATIONS 的旧“已完成”声明。
+
+## 7. 第三轮修复（2026-11-10 下午，按独立审查报告 D 节顺序）
+
+- **P0 提交完整性**：`vcs.atomicCommit` 新增 `verifyEntries`/`verifyDeletions`，在 `git add -A` 后读取 `git ls-files -s -z` 逐路径核对暂存 blob、模式与删除集合；核对命令失败或内容不符一律 fail-closed 并清空暂存。批准、审查收尾、共享写提交均传入“已审核内容”的 blob 哈希；批准步骤 7 记录业务文件内容 blob + 模式快照。
+- **P0 共享快照**：批准补丁改为从 `sharedSource` 读取并物化到仓库外临时文件后应用，不再读取本地 `.ai-review` 补丁；补丁应用前拒绝 `.ai-review/.tmp/node_modules/.git/.svn` 路径。
+- **P1**：decisions 精确集合（未知/重复/交叉/遗漏）与 I8 读端；批准/收尾/独立 finalize 统一 `validateFullCandidate`（I4/I5/I16 引用目标）；评论写端校验 revision/line/file/side 与 I12；`/comments/batch` 严格 422 且不再静默过滤；Host 从 Hunk 兜底提取 anchor；`/reopen` 强制每个 rejected 最多一个直接替代；Rebase 基于新基线导出完整 diff 并验证可应用；G42 在门禁复算后再渲染复核块且失败错误入块；audit finalize 证明未提交时清理本地写入并回滚 Git 暂存；`/audit/manual` 创建可追踪 audit Job；租约新增 releasable 迁移，active 租约 release 返回 409；headless `/audit` 与 `ai_fix` 纳入 repo 锁；`/jobs/:id/cancel` 对审查 Job 置 releasable 并结束跟踪；Owner 路由 AND 语义与 default_owner 复核；同步失败改为结构化标志；SVN 共享源改为本地 info/status 证明后读本地文件、无法证明才回退 BASE；Windows 门禁/Runner 正常退出也 taskkill 清理（VCS 命令默认跳过以避免误杀与开销）；写入 review.md/补丁前用 realpath 校验仍在仓库 `.ai-review` 内并拒绝符号链接；负向记忆摘要补 target_files/audit_type 且未知 category 归 unspecified；Client stale 刷新解锁、patchCheck/Rebase 入口、草稿+AI 修复走 `/comments/batch(autoFix)`、粘性头。
+- **测试**：新增 `contract-round3.test.mjs`（评论字段/anchor、manual Job/租约、Owner AND、记忆摘要、提交树核对、取消终止 Runner）；更新 `contract-p4/p5/p6/p8`、`contract-audit-finalize`、`contract-round2`、`audit-api` 中固化旧行为的断言。
+- **验证**：`npm run typecheck` / `npm run build` 通过；全量 **145 项测试通过**（`node --test --test-concurrency=1 --test-reporter=tap tests/*.test.mjs`，输出落盘）。
+- **仍开（已记录，非本轮目标）**：audit 报告“历史问题复查”未解析为 `items[]`；审计档案未知 Frontmatter 键未保留（I14 的 audit 侧）；SVN 共享源/派生仍缺真机自动测试（实现已按 §7.1 调整）；会话 turn 结束自动收尾仍依赖手动 `/audit/finalize`。

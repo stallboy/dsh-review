@@ -123,19 +123,32 @@ export function resolveOwner(config: ReviewersConfig, input: RouteInput): RouteD
   const tags = new Set(input.tags.map((tag) => tag.toLowerCase()));
   let best: { rule: ReviewerRule; pathHits: number; tagHits: number } | null = null;
   for (const rule of config.rules) {
-    const pathHits = normalizedPaths.reduce((count, candidate) => {
-      return count + (rule.paths.some((glob) => globToRegExp(glob).test(candidate)) ? 1 : 0);
-    }, 0);
-    const tagHits = rule.tags.reduce((count, tag) => count + (tags.has(tag.toLowerCase()) ? 1 : 0), 0);
-    if (best === null) {
-      best = { rule, pathHits, tagHits };
-      continue;
+    const hasPaths = rule.paths.length > 0;
+    const hasTags = rule.tags.length > 0;
+    // §4.2：两类都缺省的规则无效，不得作为通配规则。
+    if (!hasPaths && !hasTags) continue;
+    const pathHits = hasPaths
+      ? normalizedPaths.reduce((count, candidate) => {
+          return count + (rule.paths.some((glob) => globToRegExp(glob).test(candidate)) ? 1 : 0);
+        }, 0)
+      : 0;
+    // tagHits：至少命中一个规则标签的不同规范化候选 tag 数（同一 tag 只计一次）。
+    const matchedTags = new Set<string>();
+    if (hasTags) {
+      for (const tag of tags) {
+        if (rule.tags.some((ruleTag) => ruleTag.toLowerCase() === tag)) matchedTags.add(tag);
+      }
     }
-    if (pathHits > best.pathHits || (pathHits === best.pathHits && tagHits > best.tagHits)) {
+    const tagHits = matchedTags.size;
+    // §4.2：两类同时存在时必须 AND（都至少命中一次）才参与。
+    if (hasPaths && hasTags && (pathHits === 0 || tagHits === 0)) continue;
+    if (hasPaths && !hasTags && pathHits === 0) continue;
+    if (!hasPaths && hasTags && tagHits === 0) continue;
+    if (best === null || pathHits > best.pathHits || (pathHits === best.pathHits && tagHits > best.tagHits)) {
       best = { rule, pathHits, tagHits };
     }
   }
-  if (best && (best.pathHits > 0 || best.tagHits > 0)) {
+  if (best) {
     return {
       owner: best.rule.owner,
       ruleOwner: best.rule.owner,

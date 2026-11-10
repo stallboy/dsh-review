@@ -238,6 +238,8 @@ test('API chains an overall comment into an AI fix job', async () => {
   const root = await createGitFixture();
   const baseRevision = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   await writeQueueCandidate(root, 'pending-one', 'pending', baseRevision);
+  runCommand('git', ['add', '.ai-review'], root);
+  runCommand('git', ['commit', '-q', '-m', 'fixture candidate'], root);
   const server = await startApi(root, {}, { runner: 'manual' });
   servers.push(server);
 

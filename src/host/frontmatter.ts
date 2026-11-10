@@ -110,11 +110,13 @@ function parseComment(value: unknown, index: number): ReviewComment {
     if (comment.file === '' && comment.line === 0) {
       throw new ReviewFormatError(`comments[${String(index)}].anchor 仅行内评论可携带`);
     }
-    const anchor: { snippet: string; before?: string; after?: string } = { snippet };
+    const anchor: { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> } = { snippet };
     const before = anchorRaw['before'];
     const after = anchorRaw['after'];
     if (typeof before === 'string' && before) anchor.before = before;
     if (typeof after === 'string' && after) anchor.after = after;
+    const extra = collectExtra(anchorRaw, new Set(['snippet', 'before', 'after']));
+    if (Object.keys(extra).length > 0) anchor.extra = extra;
     comment.anchor = anchor;
   }
   if (!comment.id) throw new ReviewFormatError(`comments[${String(index)}].id 不能为空`);
@@ -162,18 +164,26 @@ function parseApproval(value: unknown): ApprovalMeta | null {
   }
   const gateChecksRaw = Array.isArray(value['gate_checks']) ? value['gate_checks'].map((item) => String(item)) : undefined;
   const gateResultsRaw = Array.isArray(value['gate_results'])
-    ? value['gate_results'].filter((item): item is Record<string, unknown> => isRecord(item)).map((item) => ({
-        command: asString(item['command'], 'approval.gate_results[].command'),
-        exit_code: asNumber(item['exit_code'], 'approval.gate_results[].exit_code'),
-        duration_ms: asNumber(item['duration_ms'], 'approval.gate_results[].duration_ms'),
-      }))
+    ? value['gate_results'].filter((item): item is Record<string, unknown> => isRecord(item)).map((item) => {
+        const extra = collectExtra(item, new Set(['command', 'exit_code', 'duration_ms']));
+        return {
+          command: asString(item['command'], 'approval.gate_results[].command'),
+          exit_code: asNumber(item['exit_code'], 'approval.gate_results[].exit_code'),
+          duration_ms: asNumber(item['duration_ms'], 'approval.gate_results[].duration_ms'),
+          ...(Object.keys(extra).length > 0 ? { extra } : {}),
+        };
+      })
     : undefined;
   const confirmedRaw = Array.isArray(value['confirmed_decisions']) ? value['confirmed_decisions'].map((item) => String(item)) : undefined;
   const waivedRaw = Array.isArray(value['waived_decisions'])
-    ? value['waived_decisions'].filter((item): item is Record<string, unknown> => isRecord(item)).map((item) => ({
-        id: asString(item['id'], 'approval.waived_decisions[].id'),
-        reason: asString(item['reason'], 'approval.waived_decisions[].reason'),
-      }))
+    ? value['waived_decisions'].filter((item): item is Record<string, unknown> => isRecord(item)).map((item) => {
+        const extra = collectExtra(item, new Set(['id', 'reason']));
+        return {
+          id: asString(item['id'], 'approval.waived_decisions[].id'),
+          reason: asString(item['reason'], 'approval.waived_decisions[].reason'),
+          ...(Object.keys(extra).length > 0 ? { extra } : {}),
+        };
+      })
     : undefined;
   // §4.3（2026-11-09 修订）：commit_revision 已从 approval 契约移除；旧数据落入 extra 原样保留（I14）。
   const extra = collectExtra(value, new Set(['approved_by', 'approved_at', 'gate_checks', 'gate_results', 'confirmed_decisions', 'waived_decisions']));
@@ -343,6 +353,7 @@ export function serializeReviewMarkdown(meta: ReviewFrontmatter, body: string): 
                 snippet: comment.anchor.snippet,
                 ...(comment.anchor.before ? { before: comment.anchor.before } : {}),
                 ...(comment.anchor.after ? { after: comment.anchor.after } : {}),
+                ...(comment.anchor.extra ?? {}),
               },
             }
           : {}),
@@ -367,9 +378,26 @@ export function serializeReviewMarkdown(meta: ReviewFrontmatter, body: string): 
           approved_by: meta.approval.approvedBy,
           approved_at: meta.approval.approvedAt,
           ...(meta.approval.gateChecks ? { gate_checks: meta.approval.gateChecks } : {}),
-          ...(meta.approval.gateResults ? { gate_results: meta.approval.gateResults } : {}),
+          ...(meta.approval.gateResults
+            ? {
+                gate_results: meta.approval.gateResults.map((result) => ({
+                  command: result.command,
+                  exit_code: result.exit_code,
+                  duration_ms: result.duration_ms,
+                  ...(result.extra ?? {}),
+                })),
+              }
+            : {}),
           ...(meta.approval.confirmedDecisions ? { confirmed_decisions: meta.approval.confirmedDecisions } : {}),
-          ...(meta.approval.waivedDecisions ? { waived_decisions: meta.approval.waivedDecisions } : {}),
+          ...(meta.approval.waivedDecisions
+            ? {
+                waived_decisions: meta.approval.waivedDecisions.map((item) => ({
+                  id: item.id,
+                  reason: item.reason,
+                  ...(item.extra ?? {}),
+                })),
+              }
+            : {}),
           ...(meta.approval.extra ?? {}),
         }
       : null,

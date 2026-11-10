@@ -7,7 +7,7 @@ import type { ReviewCandidate, RevisionEntry } from './types.js';
 
 const TIME_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
-function isRepoRelativePath(value: string): boolean {
+export function isRepoRelativePath(value: string): boolean {
   if (!value || value.includes('\\') || value.includes('..') || value.startsWith('/') || value.endsWith('/')) return false;
   if (value.includes('./')) return false;
   return true;
@@ -126,9 +126,31 @@ export function quickReviewInvariants(candidate: ReviewInvariantInput['candidate
     }
   }
 
-  // I8：human_decisions[].id 唯一。
+  // I8：human_decisions[].id 唯一；批准快照的 confirmed/waived 必须是精确集合。
   const decisionIds = meta.humanDecisions.map((decision) => decision.id);
   if (new Set(decisionIds).size !== decisionIds.length) errors.push('I8: human_decisions 存在重复 id');
+  if (meta.approval) {
+    const valid = new Set(decisionIds);
+    const confirmed = meta.approval.confirmedDecisions ?? [];
+    const waived = meta.approval.waivedDecisions ?? [];
+    const confirmedSeen = new Set<string>();
+    for (const id of confirmed) {
+      if (!valid.has(id)) errors.push(`I8: approval.confirmed_decisions 含未知 id：${id}`);
+      if (confirmedSeen.has(id)) errors.push(`I8: approval.confirmed_decisions 重复 id：${id}`);
+      confirmedSeen.add(id);
+    }
+    const waivedSeen = new Set<string>();
+    for (const item of waived) {
+      if (!valid.has(item.id)) errors.push(`I8: approval.waived_decisions 含未知 id：${item.id}`);
+      if (waivedSeen.has(item.id)) errors.push(`I8: approval.waived_decisions 重复 id：${item.id}`);
+      if (confirmedSeen.has(item.id)) errors.push(`I8: 判断项 ${item.id} 同时被确认与知悉`);
+      if (!item.reason.trim()) errors.push(`I8: approval.waived_decisions ${item.id} 缺少理由`);
+      waivedSeen.add(item.id);
+    }
+    for (const id of decisionIds) {
+      if (!confirmedSeen.has(id) && !waivedSeen.has(id)) errors.push(`I8: 判断项 ${id} 未出现在 approval 覆盖集合中`);
+    }
+  }
 
   // I16：重开字段同时出现或同时缺省；出现时 reason 非空。
   const hasFrom = meta.reopenedFrom !== undefined && meta.reopenedFrom !== null;

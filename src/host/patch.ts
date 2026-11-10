@@ -194,6 +194,84 @@ export function isAiReviewPath(path: string): boolean {
 }
 
 /**
+ * §4.3：从当前 revision 的补丁 Hunk 中提取被评论行的原文与前后行，作为 Host 兜底 anchor。
+ * 只做内存解析；目标行不在 Hunk 覆盖范围内时返回 undefined（调用方静默省略）。
+ */
+export function anchorFromPatch(
+  patchText: string,
+  file: string,
+  line: number,
+  side: 'LEFT' | 'RIGHT',
+): { snippet: string; before?: string; after?: string } | undefined {
+  const target = file.replaceAll('\\', '/').replace(/^\.\//, '');
+  const lines = patchText.split(/\r?\n/);
+  let currentFile = '';
+  let inTarget = false;
+  let oldNo = 0;
+  let newNo = 0;
+  let inHunk = false;
+  const rows: { oldNo: number | null; newNo: number | null; text: string }[] = [];
+  const flush = (): { snippet: string; before?: string; after?: string } | undefined => {
+    const index = rows.findIndex((row) => (side === 'LEFT' ? row.oldNo === line : row.newNo === line));
+    if (index < 0) return undefined;
+    const row = rows[index];
+    if (!row) return undefined;
+    return {
+      snippet: row.text,
+      ...(index > 0 && rows[index - 1] ? { before: rows[index - 1]?.text ?? '' } : {}),
+      ...(index + 1 < rows.length && rows[index + 1] ? { after: rows[index + 1]?.text ?? '' } : {}),
+    };
+  };
+  for (const raw of lines) {
+    if (raw.startsWith('diff --git ')) {
+      if (inTarget) {
+        const found = flush();
+        if (found) return found;
+      }
+      rows.length = 0;
+      inTarget = false;
+      inHunk = false;
+      continue;
+    }
+    if (raw.startsWith('+++ ')) {
+      const plus = raw.slice(4).trim().replace(/^b\//, '');
+      inTarget = plus === target;
+      rows.length = 0;
+      inHunk = false;
+      continue;
+    }
+    if (raw.startsWith('--- ')) {
+      currentFile = raw.startsWith('--- /dev/null') ? '' : raw.slice(4).trim().replace(/^a\//, '');
+      // 删除文件的 Hunk 只有 `--- a/file` + `+++ /dev/null`：从旧路径命中目标。
+      if (currentFile === target) inTarget = true;
+      if (inTarget && currentFile !== '' && currentFile !== target) inTarget = false;
+      continue;
+    }
+    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
+    if (hunk) {
+      oldNo = Number(hunk[1] ?? 0);
+      newNo = Number(hunk[2] ?? 0);
+      inHunk = inTarget;
+      continue;
+    }
+    if (!inHunk) continue;
+    if (raw.startsWith('\\')) continue;
+    if (raw.startsWith(' ')) {
+      rows.push({ oldNo, newNo, text: raw.slice(1) });
+      oldNo += 1;
+      newNo += 1;
+    } else if (raw.startsWith('-')) {
+      rows.push({ oldNo, newNo: null, text: raw.slice(1) });
+      oldNo += 1;
+    } else if (raw.startsWith('+')) {
+      rows.push({ oldNo: null, newNo, text: raw.slice(1) });
+      newNo += 1;
+    }
+  }
+  return inTarget ? flush() : undefined;
+}
+
+/**
  * Hunk-level fallback for cross-base diffs. It deliberately does not pretend to
  * be a computed diff: it shows both patches' per-file hunks side by side in one
  * text report, which the UI renders with an explicit "unreliable" banner.

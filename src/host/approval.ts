@@ -1,9 +1,10 @@
-import { readFile, writeFile } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { readFile, writeFile, rm, stat, readdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parsePatch, isAiReviewPath } from './patch.js';
 import { parseReviewMarkdown } from './frontmatter.js';
 import { runGateChecks } from './validator.js';
+import { gitBlobHash } from './vcs.js';
 import type { Runner, RunnerRequest } from './runner.js';
 import type { CandidateSource, ReviewStore } from './store.js';
 import type {
@@ -19,20 +20,44 @@ import type { VcsAdapter } from './vcs.js';
 
 export const MAX_COMMIT_RETRIES = 2;
 
-/** §4.7/I8：human_decisions 全覆盖校验——每个 id 被确认或知悉，waived 必须有非空理由。 */
+/**
+ * §5.4/I8：human_decisions 精确集合校验。
+ * confirmed/waived 的 id 必须属于当前判断项，两集合互不相交，各自无重复，
+ * 并集恰好覆盖全部判断项；每项 waive 必须有非空理由。
+ */
 export function checkDecisionCoverage(
   decisions: { id: string; question: string }[],
   confirmed: string[],
   waived: { id: string; reason: string }[],
 ): string[] {
   const errors: string[] = [];
-  for (const item of waived) {
-    if (!item.reason.trim()) errors.push(`知悉项 ${item.id} 缺少理由`);
+  const validIds = new Set(decisions.map((item) => item.id));
+  const confirmedSeen = new Set<string>();
+  for (const raw of confirmed) {
+    const id = typeof raw === 'string' ? raw.trim() : '';
+    if (!id) {
+      errors.push('确认项 id 不能为空');
+      continue;
+    }
+    if (!validIds.has(id)) errors.push(`确认项 ${id} 不属于当前人工判断项`);
+    if (confirmedSeen.has(id)) errors.push(`确认项 ${id} 重复`);
+    confirmedSeen.add(id);
   }
-  const confirmedSet = new Set(confirmed);
-  const waivedSet = new Set(waived.map((item) => item.id));
+  const waivedSeen = new Set<string>();
+  for (const item of waived) {
+    const id = typeof item.id === 'string' ? item.id.trim() : '';
+    if (!id) {
+      errors.push('知悉项 id 不能为空');
+      continue;
+    }
+    if (!validIds.has(id)) errors.push(`知悉项 ${id} 不属于当前人工判断项`);
+    if (waivedSeen.has(id)) errors.push(`知悉项 ${id} 重复`);
+    if (confirmedSeen.has(id)) errors.push(`判断项 ${id} 同时被确认与知悉`);
+    if (!item.reason.trim()) errors.push(`知悉项 ${id} 缺少理由`);
+    waivedSeen.add(id);
+  }
   for (const item of decisions) {
-    if (!confirmedSet.has(item.id) && !waivedSet.has(item.id)) {
+    if (!confirmedSeen.has(item.id) && !waivedSeen.has(item.id)) {
       errors.push(`人工判断项 ${item.id} 未确认也未标记知悉：${item.question}`);
     }
   }
@@ -63,6 +88,8 @@ export interface ApprovalDeps {
   checkDuplicate?: () => Promise<string | null>;
   /** §7.7/G30：取消请求轮询；在安全检查点（未产生共享提交前）读取并中止。 */
   shouldCancel?: () => boolean;
+  /** §7.7：取消信号，用于终止批准回退中的 Runner。 */
+  signal?: AbortSignal;
 }
 
 /** §5.5：commit 内容核对用——指定版本中的 review.md 是否为 approved 且 approval 非空。 */
@@ -86,13 +113,24 @@ interface ReloadResult {
   /** guard（版本/负责人/updated_at/解析失败）或 state（非 pending）冲突；成功为 null。 */
   conflict: 'guard' | 'state' | null;
   status?: string;
+  /** 本次重读绑定的共享快照源；补丁内容必须与 review.md 来自同一源。 */
+  source?: CandidateSource;
 }
 
-/** §7.5 步骤 9：比较门禁前后的业务快照，返回发生变化的路径（内容变化/新增/删除）。 */
-function diffBusinessSnapshot(before: Map<string, string | null>, after: Map<string, string | null>): string[] {
+interface BusinessFileSnapshot {
+  blobHash: string;
+  mode: string;
+}
+
+/** §7.5 步骤 9：比较门禁前后的业务快照（内容 blob + 模式），返回发生变化的路径。 */
+function diffBusinessSnapshot(
+  before: Map<string, BusinessFileSnapshot | null>,
+  after: Map<string, BusinessFileSnapshot | null>,
+): string[] {
   const changed: string[] = [];
-  for (const [file, hash] of before) {
-    if (after.get(file) !== hash) changed.push(file);
+  for (const [file, snapshot] of before) {
+    const next = after.get(file) ?? null;
+    if (JSON.stringify(snapshot) !== JSON.stringify(next)) changed.push(file);
   }
   return changed;
 }
@@ -126,6 +164,7 @@ export class ApprovalOrchestrator {
       const pre = await this.runPrechecks(id, guard, decisions, jobId, log, commitMessage);
       if ('outcome' in pre) return pre.outcome;
       let candidate = pre.candidate;
+      let sharedSource = pre.source;
       const duplicate1 = await this.deps.checkDuplicate?.();
       if (duplicate1) {
         return {
@@ -144,7 +183,7 @@ export class ApprovalOrchestrator {
       if (settings.syncBeforeApprove) {
         const sync = await vcs.syncAndGetLatestBase();
         log(sync.message);
-        if (/同步失败/.test(sync.message)) {
+        if (sync.failed) {
           // §7.5：已知且可安全恢复的同步失败返回 SYNC_FAILED。
           return {
             status: 'ABORTED',
@@ -153,7 +192,7 @@ export class ApprovalOrchestrator {
             jobId,
           };
         }
-        if (sync.base === null || sync.base === undefined) {
+        if (sync.uncertain || sync.base === null || sync.base === undefined) {
           // §7.5：部分同步或基线状态无法确定 → 禁止自动重试，人工恢复。
           return {
             status: 'RECOVERY_REQUIRED',
@@ -167,6 +206,7 @@ export class ApprovalOrchestrator {
         const resync = await this.runPrechecks(id, guard, decisions, jobId, log, commitMessage);
         if ('outcome' in resync) return resync.outcome;
         candidate = resync.candidate;
+        sharedSource = resync.source;
         const duplicate2 = await this.deps.checkDuplicate?.();
         if (duplicate2) {
           return {
@@ -182,9 +222,31 @@ export class ApprovalOrchestrator {
       if (!base) {
         return { status: 'ABORTED', reason: 'SYNC_FAILED', message: '无法读取当前基线版本', jobId };
       }
-      const patch = await store.currentPatch(candidate);
+      // §7.1/§7.5 步骤 7：补丁必须与 review.md 来自同一共享快照，不得读取工作区本地补丁。
+      const patch = sharedSource
+        ? await store.currentPatch(candidate, sharedSource)
+        : await store.currentPatch(candidate);
+      const touchedPaths = parsePatch(patch.text).paths;
+      const forbiddenPaths = touchedPaths.filter((file) => isAiReviewPath(file));
+      if (forbiddenPaths.length > 0) {
+        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        return {
+          status: 'ABORTED',
+          reason: 'INVALID_CANDIDATE',
+          message: `补丁包含禁止路径，已在应用前拒绝：\n${forbiddenPaths.join('\n')}`,
+          jobId,
+        };
+      }
       log(`严格应用版本 ${String(candidate.meta.currentRevision)} 的补丁（基线 ${base.slice(0, 12)}）`);
-      const applied = await vcs.applyPatch(patch.path, false);
+      // git/svn apply 都以文件为输入：把共享快照中的补丁文本物化到仓库外临时文件。
+      const tempPatch = path.join(tmpdir(), `dcr-approval-${String(process.pid)}-${String(Date.now())}.patch`);
+      await writeFile(tempPatch, patch.text, 'utf8');
+      let applied;
+      try {
+        applied = await vcs.applyPatch(tempPatch, false);
+      } finally {
+        await rm(tempPatch, { force: true }).catch(() => undefined);
+      }
       if (!applied.ok) {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
         return this.fixOrFallback(
@@ -195,8 +257,8 @@ export class ApprovalOrchestrator {
           log,
         );
       }
-      // §7.5 步骤 7：记录目标业务文件的内容/存在性快照。
-      const businessPaths = parsePatch(patch.text).paths.filter((file) => !isAiReviewPath(file));
+      // §7.5 步骤 7：记录目标业务文件的内容（blob）与模式快照。
+      const businessPaths = touchedPaths.filter((file) => !isAiReviewPath(file));
       const businessSnapshot = await this.snapshotBusiness(businessPaths);
       log('补丁已应用，开始执行门禁检查');
       const report = await runGateChecks(candidate.meta.gateChecks, {
@@ -284,10 +346,26 @@ export class ApprovalOrchestrator {
       const patchPaths = fresh.meta.revisions.map((revision) =>
         relative(store.repoRoot, path.join(fresh.dirPath, revision.patch)),
       );
-      // §4.9：业务提交使用 review.md 中的最新 commit_message（首行 == title），不用插件拼接的固定标题。
-      const businessMessage = fresh.meta.commitMessage.trim()
-        || `review(${id}): approve rev ${String(fresh.meta.currentRevision)}`;
       const reviewRelPath = relative(store.repoRoot, fresh.reviewPath);
+      // §7.5 步骤 9/10：提交前把“已审核内容”的 blob/模式作为强制核对输入。
+      const reviewText = await readFile(fresh.reviewPath, 'utf8');
+      const reviewStat = await stat(fresh.reviewPath);
+      const verifyEntries = businessPaths.flatMap((rel) => {
+        const snapshot = snapshotAfter.get(rel);
+        return snapshot ? [{ path: rel, blobHash: snapshot.blobHash, mode: snapshot.mode }] : [];
+      });
+      verifyEntries.push({
+        path: reviewRelPath,
+        blobHash: gitBlobHash(reviewText),
+        mode: (reviewStat.mode & 0o111) !== 0 ? '100755' : '100644',
+      });
+      const verifyDeletions = [...new Set([
+        ...patchPaths,
+        ...businessPaths.filter((rel) => !snapshotAfter.get(rel)),
+      ])];
+      // §5.6：业务提交必须使用候选 commit_message 全文（首行已校验等于 title）。
+      const businessMessage = fresh.meta.commitMessage
+        || `review(${id}): approve rev ${String(fresh.meta.currentRevision)}`;
       const probePaths = [reviewRelPath, ...patchPaths];
       // §5.6：提交探针按目标路径取值——SVN 的根 revision 不随子路径提交前进（H1）。
       const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
@@ -295,6 +373,8 @@ export class ApprovalOrchestrator {
         message: businessMessage,
         paths: [...businessPaths, relative(store.repoRoot, fresh.dirPath)],
         deletePaths: patchPaths,
+        verifyEntries,
+        verifyDeletions,
       });
       if (!commit.success) {
         lastCommitError = commit.errorOutput;
@@ -445,7 +525,7 @@ export class ApprovalOrchestrator {
         log(`候选状态是 ${candidate.meta.status}，不是 pending`);
         return { candidate: null, conflict: 'state', status: candidate.meta.status };
       }
-      return { candidate, conflict: null };
+      return { candidate, conflict: null, ...(source ? { source } : {}) };
     } catch (error) {
       log(`读取候选失败：${error instanceof Error ? error.message : String(error)}`);
       return { candidate: null, conflict: 'guard' };
@@ -460,7 +540,7 @@ export class ApprovalOrchestrator {
     jobId: string,
     log: (line: string) => void,
     commitMessage?: string,
-  ): Promise<{ candidate: ReviewCandidate } | { outcome: ApprovalOutcome }> {
+  ): Promise<{ candidate: ReviewCandidate; source?: CandidateSource } | { outcome: ApprovalOutcome }> {
     const { store } = this.deps;
     const reload = await this.reload(id, guard, log);
     if (!reload.candidate) {
@@ -503,7 +583,7 @@ export class ApprovalOrchestrator {
     if (messageError) {
       return { outcome: { status: 'ABORTED', reason: 'COMMIT_MESSAGE_MISMATCH', message: messageError, jobId } };
     }
-    const validation = await store.validateCandidate(candidate);
+    const validation = await store.validateFullCandidate(candidate);
     if (validation.length > 0) {
       return {
         outcome: {
@@ -514,16 +594,20 @@ export class ApprovalOrchestrator {
         },
       };
     }
-    return { candidate };
+    return { candidate, ...(reload.source ? { source: reload.source } : {}) };
   }
 
-  /** §7.5 步骤 7/9：目标业务文件的内容与存在性快照（sha1；缺失为 null）。 */
-  private async snapshotBusiness(businessPaths: string[]): Promise<Map<string, string | null>> {
-    const snapshot = new Map<string, string | null>();
+  /** §7.5 步骤 7/9：目标业务文件的内容（Git blob）与模式快照；缺失为 null。 */
+  private async snapshotBusiness(businessPaths: string[]): Promise<Map<string, BusinessFileSnapshot | null>> {
+    const snapshot = new Map<string, BusinessFileSnapshot | null>();
     for (const rel of businessPaths) {
+      const absolute = path.join(this.deps.store.repoRoot, rel);
       try {
-        const buffer = await readFile(path.join(this.deps.store.repoRoot, rel));
-        snapshot.set(rel, createHash('sha1').update(buffer).digest('hex'));
+        const [buffer, fileStat] = await Promise.all([readFile(absolute), stat(absolute)]);
+        snapshot.set(rel, {
+          blobHash: gitBlobHash(buffer),
+          mode: (fileStat.mode & 0o111) !== 0 ? '100755' : '100644',
+        });
       } catch {
         snapshot.set(rel, null);
       }
@@ -552,6 +636,15 @@ export class ApprovalOrchestrator {
     }
   }
 
+  /** §5.6(2)：恢复操作前文件，并删除本次 Runner 新生成、操作前不存在的文件。 */
+  private async restoreWithCleanup(backup: Backup, dirPath: string, entriesBefore: Set<string>): Promise<void> {
+    await this.restore(backup);
+    const after = await readdir(dirPath).catch(() => [] as string[]);
+    for (const name of after) {
+      if (!entriesBefore.has(name)) await rm(path.join(dirPath, name), { force: true }).catch(() => undefined);
+    }
+  }
+
   private async fixOrFallback(
     reason: ApprovalFallbackReason,
     detail: string,
@@ -570,6 +663,7 @@ export class ApprovalOrchestrator {
     }
     log(`批准中止（${reason}），尝试 AI 修复失败原因`);
     const backup = await this.backup(candidate);
+    const entriesBefore = new Set(await readdir(candidate.dirPath).catch(() => [] as string[]));
     const runner = this.deps.makeRunner({
       kind: settings.runner,
       settings,
@@ -581,6 +675,7 @@ export class ApprovalOrchestrator {
       workingTree: 'clean_base',
       log,
       ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
+      ...(this.deps.signal ? { signal: this.deps.signal } : {}),
     });
     let result: RunnerExecutionResult;
     try {
@@ -613,9 +708,45 @@ export class ApprovalOrchestrator {
     try {
       const { store } = this.deps;
       const latest = await store.get(candidate.id, null);
-      const validationErrors = await store.validateCandidate(latest.candidate);
-      if (validationErrors.length > 0) {
-        await this.restore(backup);
+      const validationErrors: string[] = [];
+      if (latest.candidate.parseError) validationErrors.push(latest.candidate.parseError);
+      if (latest.candidate.meta.status !== 'pending') {
+        validationErrors.push(`AI 新版本状态必须是 pending，当前为 ${latest.candidate.meta.status}`);
+      }
+      if (latest.candidate.meta.approval !== null) validationErrors.push('AI 新版本的 approval 必须为 null');
+      if (latest.candidate.meta.currentRevision <= candidate.meta.currentRevision) {
+        validationErrors.push(`AI 未推进版本：current_revision 仍为 ${String(latest.candidate.meta.currentRevision)}`);
+      }
+      validationErrors.push(...await store.validateFullCandidate(latest.candidate));
+      const current = latest.candidate.meta.revisions.find(
+        (revision) => revision.id === latest.candidate.meta.currentRevision,
+      );
+      let patchText: string | null = null;
+      if (current) {
+        try {
+          patchText = await readFile(path.join(latest.candidate.dirPath, current.patch), 'utf8');
+        } catch {
+          validationErrors.push(`新补丁不存在：${current.patch}`);
+        }
+        if (patchText !== null && parsePatch(patchText).paths.some((file) => isAiReviewPath(file))) {
+          validationErrors.push('新补丁包含禁止路径（.ai-review/.tmp/node_modules/.git/.svn）');
+        }
+      }
+      if (validationErrors.length === 0 && patchText !== null) {
+        // §7.4：补丁必须能在干净基线上应用；验证后立即还原。
+        const tempFixPatch = path.join(tmpdir(), `dcr-fix-${String(process.pid)}-${String(Date.now())}.patch`);
+        await writeFile(tempFixPatch, patchText, 'utf8');
+        let applied;
+        try {
+          applied = await this.deps.vcs.applyPatch(tempFixPatch, false);
+        } finally {
+          await rm(tempFixPatch, { force: true }).catch(() => undefined);
+        }
+        await this.deps.vcs.revertBusinessWorkspace().catch(() => undefined);
+        if (!applied.ok) validationErrors.push(`AI 新补丁无法在基线干净应用：${applied.message}`);
+      }
+      if (validationErrors.length > 0 || !current || patchText === null) {
+        await this.restoreWithCleanup(backup, candidate.dirPath, entriesBefore);
         return {
           status: 'ABORTED',
           reason: 'RUNNER_FAILED',
@@ -627,9 +758,26 @@ export class ApprovalOrchestrator {
       const probePaths = [reviewRelPath];
       const probeBeforeFix = await this.deps.vcs.getCommitProbe(probePaths).catch(() => null);
       const writtenReview = await readFile(latest.candidate.reviewPath, 'utf8').catch(() => null);
+      const reviewStat = writtenReview === null ? null : await stat(latest.candidate.reviewPath).catch(() => null);
+      const patchStat = await stat(path.join(latest.candidate.dirPath, current.patch)).catch(() => null);
+      const verifyEntries = [
+        ...(writtenReview !== null && reviewStat !== null
+          ? [{
+              path: reviewRelPath,
+              blobHash: gitBlobHash(writtenReview),
+              mode: (reviewStat.mode & 0o111) !== 0 ? '100755' : '100644',
+            }]
+          : []),
+        {
+          path: relative(store.repoRoot, path.join(latest.candidate.dirPath, current.patch)),
+          blobHash: gitBlobHash(patchText),
+          ...(patchStat ? { mode: (patchStat.mode & 0o111) !== 0 ? '100755' : '100644' } : {}),
+        },
+      ];
       const commit = await this.deps.vcs.atomicCommit({
         message: `review(${candidate.id}): fix ${reason} (rev ${String(latest.candidate.meta.currentRevision)})`,
         paths: [relative(store.repoRoot, latest.candidate.dirPath)],
+        verifyEntries,
       });
       if (!commit.success) {
         const probeAfter = await this.deps.vcs.getCommitProbe(probePaths).catch(() => null);
@@ -658,7 +806,7 @@ export class ApprovalOrchestrator {
             };
           }
         } else {
-          await this.restore(backup);
+          await this.restoreWithCleanup(backup, candidate.dirPath, entriesBefore);
           return {
             status: 'ABORTED',
             reason: 'COMMIT_FAILED',
@@ -669,7 +817,7 @@ export class ApprovalOrchestrator {
       }
       log(`AI 修复新版本已提交：${commit.commitRevision?.slice(0, 12) ?? ''}`);
     } catch (error) {
-      await this.restore(backup).catch(() => undefined);
+      await this.restoreWithCleanup(backup, candidate.dirPath, entriesBefore).catch(() => undefined);
       return {
         status: 'ABORTED',
         reason: 'RUNNER_FAILED',

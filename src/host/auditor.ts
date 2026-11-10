@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { patchTouchesReviewData, type VcsAdapter } from './vcs.js';
+import { patchTouchesReviewData, gitBlobHash, type VcsAdapter } from './vcs.js';
 import { reviewersPath } from './reviewers.js';
 import { runAgent, wrapAgentPrompt } from './runner.js';
 import { ReviewStore } from './store.js';
@@ -527,6 +527,9 @@ export interface AuditFinalizeResult {
   body: string;
   commitRevision: string | null;
   status: 'COMMITTED' | 'VALIDATION_FAILED' | 'ABORTED' | 'RECOVERY_REQUIRED';
+  /** §7.7：RECOVERY_REQUIRED 必含 reason 与 detail（COMMIT_OUTCOME_UNKNOWN / SYNC_STATE_UNKNOWN）。 */
+  reason?: 'COMMIT_OUTCOME_UNKNOWN' | 'SYNC_STATE_UNKNOWN';
+  detail?: string;
   warnings: string[];
   message: string;
 }
@@ -678,6 +681,8 @@ export interface AuditDeps {
   resolveCredential?: (reference: string) => Promise<string | undefined>;
   /** §7.1/G10：审查提示词中的共享事实读取源（绑定同一 VCS 快照）；缺省为工作区视图。 */
   candidateSource?: CandidateSource;
+  /** §7.7：Job 取消信号，用于终止 headless Runner。 */
+  signal?: AbortSignal;
 }
 
 /**
@@ -754,6 +759,7 @@ export class Auditor {
       timeoutMs: AUDIT_TIMEOUT_MS,
       label: '仓库审查',
       ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
+      ...(this.deps.signal ? { signal: this.deps.signal } : {}),
     });
     const runError = run.ok ? null : run.errorMessage ?? '执行器失败';
     const postRunClean = await vcs.ensureCleanWorkspace().catch(() => null);
@@ -775,6 +781,26 @@ export class Auditor {
     const afterBase = await vcs.getCurrentBase();
     if (afterBase !== null && afterBase !== base) {
       warnings.push(`执行期间基线从 ${base.slice(0, 12)} 变为 ${afterBase.slice(0, 12)}，审查结果可能已过期`);
+    }
+
+    // §7.7：取消只停止执行，不执行收尾提交；返回 ABORTED 供 Job 记录。
+    if (this.deps.signal?.aborted || run.aborted) {
+      const message = '仓库审查已取消（未执行收尾提交）';
+      warnings.push(message);
+      this.log(message);
+      return {
+        manual: false,
+        status: 'ABORTED',
+        auditId,
+        created: [],
+        deferred: [],
+        report: null,
+        commitRevision: null,
+        baseRevision: base,
+        targetPath: target.targetPath,
+        warnings,
+        message,
+      };
     }
 
     const created = await this.verifyCandidates(before, base, warnings);
@@ -812,6 +838,8 @@ export class Auditor {
       baseRevision: base,
       targetPath: target.targetPath,
       warnings: result.warnings,
+      ...(result.reason ? { reason: result.reason } : {}),
+      ...(result.detail ? { detail: result.detail } : {}),
       message,
       ...(run.outputTail ? { outputTail: run.outputTail } : {}),
     };
@@ -845,19 +873,11 @@ export class Auditor {
     }
     body = body.replace(/^\uFEFF/, '').replace(/^---\n[\s\S]*?\n---\n?/, '');
     const deferredItems = parseAuditReport(body).deferred;
-    const block = renderVerificationBlock({
-      created,
-      warnings,
-      runError: input.runError,
-      now: input.now,
-      baseRevision: input.baseRevision,
-      targetPath: input.targetPath,
-    });
-    const finalBody = upsertVerificationBlock(body, block);
 
     // §4.2/G42：verify_gate_on_audit_finalize 为 smoke/declared 时，对合法候选
     // 在补丁应用后的工作区复算门禁（smoke=audit_smoke_commands，declared=候选 gate_checks）；
     // 失败则该候选不提交；无论成败都还原业务工作区。
+    // 注意：复核块必须在门禁复算之后渲染，否则失败错误不会出现在块内。
     const { loadReviewers } = await import('./reviewers.js');
     const { runGateChecks } = await import('./validator.js');
     const reviewersConfig = await loadReviewers(store.repoRoot);
@@ -870,6 +890,7 @@ export class Auditor {
     if (gateMode !== 'none') {
       for (const candidate of created) {
         if (candidate.errors.length > 0) continue;
+        this.log(`收尾门禁复算：候选 ${candidate.id}（${gateMode}）`);
         try {
           const detail = await store.get(candidate.id, null);
           const current = detail.candidate.meta.revisions.find((revision) => revision.id === detail.candidate.meta.currentRevision);
@@ -884,7 +905,9 @@ export class Auditor {
             cwd: store.repoRoot,
             baseRevision: input.baseRevision,
             timeoutMs: this.deps.settings.gateTimeoutMs,
-            onLine: (line: string) => { if (line.trim()) this.log(`  ${line.slice(0, 300)}`); },
+            onLine: (line: string, _stream: 'stdout' | 'stderr', command: string) => {
+              if (line.trim()) this.log(`  [${candidate.id}] ${command.slice(0, 80)}: ${line.slice(0, 300)}`);
+            },
           });
           if (!report.allPassed) {
             candidate.errors.push(`收尾门禁（${gateMode}）未通过：\n${report.formattedEvidenceMarkdown}`);
@@ -897,15 +920,23 @@ export class Auditor {
           await vcs.revertBusinessWorkspace().catch(() => undefined);
         }
       }
-      // 复算失败的候选从合法集合中剔除（candidates 与正文 A 类列表均以 validAfterGates 为准）。
     }
     const validAfterGates = created.filter((item) => item.errors.length === 0).map((item) => item.id);
-    // §7.6/G42：正文 A 类列表必须与 frontmatter candidates 使用同一合法集合；复算失败的
-    // 候选同样要从正文移除，因此只能在收尾门禁复算之后生成 filteredBody（无重复追加说明）。
+    // §7.6：复核块在门禁复算之后渲染，失败候选及其错误会进入块内；正文 A 类列表同步过滤。
+    const block = renderVerificationBlock({
+      created,
+      warnings,
+      runError: input.runError,
+      now: input.now,
+      baseRevision: input.baseRevision,
+      targetPath: input.targetPath,
+    });
+    const finalBody = upsertVerificationBlock(body, block);
     const filteredBody = filterAClassSection(finalBody, validAfterGates, created.map((item) => item.id));
+    const gateFailed = created.filter((item) => item.errors.some((error) => error.startsWith('收尾门禁'))).length;
     const gateNote = gateMode === 'none'
       ? '门禁未由 Host 复算（audit 期门禁为 AI 报告；批准时 Host 仍会重新执行全部门禁）'
-      : `门禁已由 Host 复算（${gateMode}）：${gateRechecked.length}/${String(validAfterGates.length)} 通过`;
+      : `门禁已由 Host 复算（${gateMode}）：${String(gateRechecked.length)} 通过，${String(gateFailed)} 失败（失败候选已从 candidates 与 A 类列表剔除）`;
     const bodyWithGateNote = `${filteredBody.replace(/\s+$/, '')}\n\n> 收尾说明：${gateNote}\n`;
     const archive = new AuditArchive(store.repoRoot);
     const items = buildAuditItems(deferredItems, warnings, input.targetPath || '.');
@@ -937,6 +968,8 @@ export class Auditor {
     ];
     let commitRevision: string | null = null;
     let status: AuditFinalizeResult['status'];
+    let recoveryReason: AuditFinalizeResult['reason'];
+    let recoveryDetail: string | undefined;
     if (validAfterGates.length > 0 || input.runError === null) {
       const scopeLabel = input.targetPath || 'repo';
       // §5.6 三分支：按路径级提交探针判定（Git=HEAD；SVN=相关路径 last-changed-revision），
@@ -948,6 +981,9 @@ export class Auditor {
       const commit = await vcs.atomicCommit({
         message: `audit(${scopeLabel}): 仓库审查生成 ${String(created.length)} 个候选${created.length === 0 ? '（仅报告）' : ''} [skip ci]`,
         paths: commitPaths,
+        ...(writtenAudit !== null
+          ? { verifyEntries: [{ path: reportPath, blobHash: gitBlobHash(writtenAudit) }] }
+          : {}),
       });
       if (commit.success) {
         commitRevision = commit.commitRevision;
@@ -966,12 +1002,16 @@ export class Auditor {
           status = created.some((item) => item.errors.length > 0) ? 'VALIDATION_FAILED' : 'COMMITTED';
         } else if (probeBefore === null || probeAfter === null || probeAfter !== probeBefore) {
           status = 'RECOVERY_REQUIRED';
+          recoveryReason = 'COMMIT_OUTCOME_UNKNOWN';
+          recoveryDetail = commit.errorOutput;
           const warning = `提交结果无法确定（提交探针不可读或提交内容不匹配），现场保留待人工核对：${commit.errorOutput}`;
           warnings.push(warning);
           this.log(warning);
         } else {
           status = 'ABORTED';
-          const warning = `提交 .ai-review 失败：${commit.errorOutput}`;
+          // §5.6(2)：已证明提交不存在 → 恢复操作前状态（删除本轮新写的 audit 目录与新候选目录）。
+          await this.removeFinalizeArtifacts(input.auditId, created.map((item) => item.id)).catch(() => undefined);
+          const warning = `提交 .ai-review 失败，已清理本轮本地写入：${commit.errorOutput}`;
           warnings.push(warning);
           this.log(warning);
         }
@@ -983,7 +1023,29 @@ export class Auditor {
     const message = created.length > 0
       ? `收尾完成：新增 ${String(created.length)} 个候选（合法 ${String(validAfterGates.length)} 个）${commitRevision ? '，已提交' : '，提交失败'}`
       : `收尾完成：未生成 A 类候选，档案 ${reportPath}`;
-    return { created, deferred: deferredItems, reportPath, body: filteredBody, commitRevision, status, warnings, message };
+    return {
+      created,
+      deferred: deferredItems,
+      reportPath,
+      body: filteredBody,
+      commitRevision,
+      status,
+      ...(recoveryReason ? { reason: recoveryReason } : {}),
+      ...(recoveryDetail ? { detail: recoveryDetail } : {}),
+      warnings,
+      message,
+    };
+  }
+
+  /** §5.6(2)：已证明收尾提交不存在时，删除本轮新生成本地写入。 */
+  private async removeFinalizeArtifacts(auditId: string, candidateIds: string[]): Promise<void> {
+    const { rm } = await import('node:fs/promises');
+    await rm(path.join(this.deps.store.repoRoot, '.ai-review', 'audits', auditId), { recursive: true, force: true }).catch(() => undefined);
+    for (const id of candidateIds) {
+      await rm(path.join(this.deps.store.repoRoot, '.ai-review', id), { recursive: true, force: true }).catch(() => undefined);
+    }
+    // 清空首次失败提交留在索引中的暂存（Git）并还原工作区，避免下一次收尾被“额外暂存条目”拒绝。
+    await this.deps.vcs.revertBusinessWorkspace().catch(() => undefined);
   }
 
   private async verifyCandidates(
@@ -1032,13 +1094,15 @@ export class Auditor {
         if (meta.approval !== null) result.errors.push('新候选的 approval 必须为 null');
         // §4.2/G3：owner 必须等于 Host 按 reviewers.yml 计算的路由结果。
         const routing = resolveOwner(reviewers, { paths: meta.targetFiles, tags: meta.tags });
-        if (routing.owner && meta.owner !== routing.owner) {
+        if (!routing.owner) {
+          result.errors.push('reviewers.yml 未配置 default_owner，无法完成 owner 路由复核');
+        } else if (meta.owner !== routing.owner) {
           result.errors.push(`owner 应为 ${routing.owner}（${routing.reason}），实际为 ${meta.owner || '(空)'}`);
         }
         if (current.baseRevision !== baseRevision) {
           result.errors.push(`候选基线 ${current.baseRevision || '(空)'} 与当前基线 ${baseRevision} 不一致`);
         }
-        result.errors.push(...await store.validateCandidate(detail.candidate));
+        result.errors.push(...await store.validateFullCandidate(detail.candidate));
         if (patchTouchesReviewData(detail.patchText)) {
           result.errors.push('补丁包含 .ai-review/ 自身改动');
         }

@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import type { CandidateSource } from './store.js';
 import { runProcess, type ProcessResult } from './shell.js';
 
@@ -158,13 +160,11 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
   }
 
   async readReviewText(month: string, slug: string): Promise<string | null> {
-    const result = await svn(this.root, ['cat', '-r', 'BASE', `.ai-review/${month}/${slug}/review.md`]);
-    return result.code === 0 ? result.stdout : null;
+    return this.readSharedFile(`.ai-review/${month}/${slug}/review.md`);
   }
 
   async readPatchText(month: string, slug: string, patchName: string): Promise<string | null> {
-    const result = await svn(this.root, ['cat', '-r', 'BASE', `.ai-review/${month}/${slug}/${patchName}`]);
-    return result.code === 0 ? result.stdout : null;
+    return this.readSharedFile(`.ai-review/${month}/${slug}/${patchName}`);
   }
 
   async hasLocalChanges(month: string, slug: string): Promise<boolean> {
@@ -195,7 +195,33 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
   }
 
   async readAuditText(dirName: string): Promise<string | null> {
-    const result = await svn(this.root, ['cat', '-r', 'BASE', `.ai-review/audits/${dirName}/audit.md`]);
+    return this.readSharedFile(`.ai-review/audits/${dirName}/audit.md`);
+  }
+
+  /**
+   * §7.1 SVN 实现准则：先用 `svn info --xml -R` + `svn status --xml` 证明候选目录
+   * 处于同一基准 revision 且无本地改动，然后直接读本地工作副本文件；
+   * 仅当无法证明同快照时才回退 `svn cat -r BASE`（绝不逐文件无条件远端读取）。
+   */
+  private async readSharedFile(relPath: string): Promise<string | null> {
+    const dir = relPath.includes('/') ? relPath.slice(0, relPath.lastIndexOf('/')) : '.';
+    if (await this.canReadLocalShared(dir)) {
+      try {
+        return await readFile(path.join(this.root, relPath), 'utf8');
+      } catch {
+        // 本地文件缺失：回退 BASE 读取。
+      }
+    }
+    const result = await svn(this.root, ['cat', '-r', 'BASE', '--', relPath]);
     return result.code === 0 ? result.stdout : null;
+  }
+
+  private async canReadLocalShared(dir: string): Promise<boolean> {
+    const status = await svn(this.root, ['status', '--xml', '--', dir]);
+    if (status.code !== 0 || /<entry\b/.test(status.stdout)) return false;
+    const info = await svn(this.root, ['info', '--xml', '-R', '--', dir]);
+    if (info.code !== 0) return false;
+    const revisions = [...info.stdout.matchAll(/<commit\s+revision="(\d+)"/g)].map((match) => match[1]);
+    return revisions.length > 0 && revisions.every((revision) => revision === revisions[0]);
   }
 }

@@ -53,7 +53,7 @@ async function writeCandidate(root, base) {
     'commit_message: "net: 修复加法"',
     '---', '', '# 问题与影响', '',
   ].join('\n'), 'utf8');
-  await writeFile(path.join(dir, '001.patch'), PATCH('-'), 'utf8');
+  await writeFile(path.join(dir, '001.patch'), PATCH('+'), 'utf8');
 }
 
 async function runJob(base, route, payload) {
@@ -78,14 +78,7 @@ test('P8: Rebase——基线落后时产生新版本（author ai）；基线最�
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const { base: apiBase } = await startApi(root);
 
-  // 基线最新（回写 base 为当前 HEAD）→ 拒绝。
-  const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  const fm = await readFile(path.join(root, '.ai-review', '2026-11', '20261105-net-rb', 'review.md'), 'utf8');
-  await writeFile(path.join(root, '.ai-review', '2026-11', '20261105-net-rb', 'review.md'), fm.replace(`base_revision: "${base}"`, `base_revision: "${head}"`), 'utf8');
-  const noop = await runJob(apiBase, '/rebase', { id: '2026-11/20261105-net-rb', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-05T09:00:00+08:00' });
-  assert.match(noop.job.result.message, /无需 Rebase/);
-
-  // 基线前进后 → Rebase 产生版本 2。
+  // 基线前进后 → Rebase 产生版本 2（共享候选的 base 必然落后于其提交后的 HEAD）。
   await writeFile(path.join(root, 'src', 'other.js'), 'export const x = 1;\n', 'utf8');
   runCommand('git', ['add', 'src'], root);
   runCommand('git', ['commit', '-q', '-m', 'base moves'], root);

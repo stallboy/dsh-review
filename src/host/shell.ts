@@ -9,6 +9,8 @@ export interface ProcessResult {
   code: number | null;
   signal: NodeJS.Signals | null;
   timedOut: boolean;
+  /** §7.7：由 Job 取消信号终止（区别于超时）。 */
+  aborted?: boolean;
   stdout: string;
   stderr: string;
   error?: string;
@@ -21,6 +23,14 @@ export interface ProcessOptions {
   input?: string;
   onLine?: (line: string, stream: 'stdout' | 'stderr') => void;
   maxBytes?: number;
+  /**
+   * Windows 上主进程正常退出后是否也执行 taskkill /t /f 清理残留子进程。
+   * 仅用于门禁/Runner 这类可能派生后台进程的 shell；VCS 命令保持默认 false，
+   * 避免每条 git/svn 命令额外付出 taskkill 开销与误杀风险。
+   */
+  killTreeOnExit?: boolean;
+  /** §7.7：Job 取消信号；触发后终止进程组并等待清理。 */
+  signal?: AbortSignal;
 }
 
 const DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
@@ -31,6 +41,22 @@ const DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
  * Windows：taskkill /t /f 并等待其退出（不再 fire-and-forget）。
  * 目标已退出时静默成功（taskkill/kill 报 ESRCH 均视为已清理）。
  */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** §7.3：等待进程组真正消失（而不只是“发了信号”）。 */
+async function waitProcessGroupGone(pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      process.kill(-pid, 0);
+    } catch {
+      return;
+    }
+    await delay(50);
+  }
+}
+
 function killTree(pid: number | undefined): Promise<void> {
   if (pid === undefined) return Promise.resolve();
   if (process.platform === 'win32') {
@@ -49,11 +75,15 @@ function killTree(pid: number | undefined): Promise<void> {
   } catch {
     try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
   }
-  return Promise.resolve();
+  return waitProcessGroupGone(pid);
 }
 
 export function runProcess(exe: string, args: string[], options: ProcessOptions): Promise<ProcessResult> {
   return new Promise((resolve) => {
+    if (options.signal?.aborted) {
+      resolve({ code: null, signal: null, timedOut: false, aborted: true, stdout: '', stderr: '' });
+      return;
+    }
     let child;
     try {
       child = spawn(exe, args, {
@@ -83,6 +113,7 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
     let pendingStdout = '';
     let pendingStderr = '';
     let timedOut = false;
+    let aborted = false;
     let killPromise: Promise<void> = Promise.resolve();
 
     const emit = (stream: 'stdout' | 'stderr', chunk: string): void => {
@@ -118,18 +149,29 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
     }, options.timeoutMs ?? 120_000);
     timer.unref?.();
 
-    // §7.3：主进程退出后清理进程组内残留子进程。
-    // POSIX：kill(-pid) 同步且廉价，正常退出后也执行；
-    // Windows：taskkill 每次约 2-3 秒，仅在超时/终止路径执行，正常退出跳过（由超时机制兜底）。
+    // §7.7：取消信号立即终止完整进程树；close 后由 finish 等待清理完成。
+    const onAbort = (): void => {
+      aborted = true;
+      killPromise = Promise.all([killPromise, killTree(child.pid)]).then(() => undefined);
+    };
+    if (options.signal) {
+      if (options.signal.aborted) onAbort();
+      else options.signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    // §7.3：主进程无论成功、失败或超时退出后，都必须终止并等待进程组内残留子进程退出。
+    // Windows 的 taskkill /t /f 需要父进程仍存在；对 VCS 命令关闭正常退出清理（见 ProcessOptions）。
     const finish = (code: number | null, signal: NodeJS.Signals | null, error?: string): void => {
       clearTimeout(timer);
-      const cleanup = process.platform === 'win32' && !timedOut
-        ? killPromise
-        : Promise.all([killPromise, killTree(child.pid)]).then(() => undefined);
+      options.signal?.removeEventListener('abort', onAbort);
+      const shouldKill = timedOut || aborted || process.platform !== 'win32' || options.killTreeOnExit === true;
+      const cleanup = shouldKill
+        ? Promise.all([killPromise, killTree(child.pid)]).then(() => undefined)
+        : killPromise;
       void cleanup.then(() => {
         if (pendingStdout) options.onLine?.(pendingStdout, 'stdout');
         if (pendingStderr) options.onLine?.(pendingStderr, 'stderr');
-        resolve({ code, signal, timedOut, stdout, stderr, ...(error ? { error } : {}) });
+        resolve({ code, signal, timedOut, aborted, stdout, stderr, ...(error ? { error } : {}) });
       });
     };
 
@@ -156,9 +198,9 @@ export async function runShell(command: string, options: ProcessOptions): Promis
   try {
     await writeFile(file, body, 'utf8');
     if (isWindows) {
-      return await runProcess(process.env['COMSPEC'] ?? 'cmd.exe', ['/d', '/s', '/c', file], options);
+      return await runProcess(process.env['COMSPEC'] ?? 'cmd.exe', ['/d', '/s', '/c', file], { ...options, killTreeOnExit: true });
     }
-    return await runProcess('/bin/sh', [file], options);
+    return await runProcess('/bin/sh', [file], { ...options, killTreeOnExit: true });
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }

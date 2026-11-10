@@ -7,9 +7,13 @@ const MAX_LOG_LINES = 4000;
 
 export class JobManager {
   private readonly jobs = new Map<string, JobRecord>();
+  /** §7.7：运行中 Job 的取消信号，用于终止 Runner 进程树。 */
+  private readonly controllers = new Map<string, AbortController>();
 
-  start(type: JobType, task: (log: (line: string) => void, id: string) => Promise<unknown>): JobRecord {
+  start(type: JobType, task: (log: (line: string) => void, id: string, signal: AbortSignal) => Promise<unknown>): JobRecord {
     const id = `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    const controller = new AbortController();
+    this.controllers.set(id, controller);
     const record: JobRecord = {
       id,
       type,
@@ -31,17 +35,26 @@ export class JobManager {
     };
     void (async () => {
       try {
-        record.result = await task(log, id);
+        record.result = await task(log, id, controller.signal);
         record.status = 'succeeded';
       } catch (error) {
         record.status = 'failed';
         record.error = error instanceof Error ? error.message : String(error);
         log(`失败：${record.error}`);
       } finally {
+        this.controllers.delete(id);
         record.finishedAt = new Date().toISOString();
       }
     })();
     return record;
+  }
+
+  /** §7.7：请求取消运行中的 Job（终止 Runner 进程树/会话）。 */
+  abort(id: string): boolean {
+    const controller = this.controllers.get(id);
+    if (!controller) return false;
+    controller.abort();
+    return true;
   }
 
   private prune(): void {

@@ -154,6 +154,18 @@ test('P6: API /audits 与 /findings——converted 结合候选状态出 closed/
       'comments: []', 'human_decisions: []', approval, rejection, 'commit_message: "x: y"',
       '---', '', '# 问题与影响', '',
     ].join('\n'), 'utf8');
+    if (status === 'pending') {
+      // 活跃候选必须带补丁文件，且 target_files 与补丁路径一致（I4/I5）。
+      await writeFile(path.join(dir, '001.patch'), [
+        'diff --git a/src/host/api.ts b/src/host/api.ts',
+        '--- a/src/host/api.ts',
+        '+++ b/src/host/api.ts',
+        '@@ -1 +1 @@',
+        '-const x = 1;',
+        '+const x = 2;',
+        '',
+      ].join('\n'), 'utf8');
+    }
   }
   // §7.1：档案与候选只有进入共享提交后才可被 /audits 与 /findings 读取。
   runCommand('git', ['add', '-A'], root);

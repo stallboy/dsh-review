@@ -7,9 +7,14 @@ import type { ReviewFrontmatter } from './types.js';
  * 一切实时计算，不持久化。
  */
 
-/** §6.1 规范化：去首尾空白、合并连续空白、ASCII 小写化。 */
+/** §6.1 规范化：去首尾空白、合并连续空白、ASCII 小写化（不改变非 ASCII 字符）。 */
 export function normalizeTitle(title: string): string {
-  return title.trim().replace(/\s+/g, ' ').toLowerCase();
+  return title.trim().replace(/\s+/g, ' ').replace(/[A-Z]/g, (char) => char.toLowerCase());
+}
+
+/** §4.3：module/tags 的 ASCII 小写化，避免 Unicode 大小写折叠导致的指纹碰撞。 */
+export function asciiLower(value: string): string {
+  return value.replace(/[A-Z]/g, (char) => char.toLowerCase());
 }
 
 /** §6.1：target_files 按 UTF-8 字节序排序（Buffer.compare）。 */
@@ -25,7 +30,7 @@ export function fingerprintOf(
   meta: Pick<ReviewFrontmatter, 'module' | 'targetFiles' | 'auditType' | 'title'>,
 ): string {
   return JSON.stringify([
-    meta.module.toLowerCase(),
+    asciiLower(meta.module),
     sortByUtf8Bytes(meta.targetFiles),
     meta.auditType,
     normalizeTitle(meta.title),
@@ -124,9 +129,16 @@ export function topPerModule(memory: RejectionMemoryEntry[], max: number): Rejec
 /** §6.3 提示词注入摘要：按 category 分组呈现约束；stale 标注为弱信号；不注入大段历史正文。 */
 export function formatMemorySummary(entries: RejectionMemoryEntry[]): string {
   if (entries.length === 0) return '- 无（近期没有被拒绝的方案）。';
+  const knownCategories = new Set(['false_positive', 'intentional_design', 'high_risk', 'out_of_scope', 'stale']);
   const groups = new Map<string, RejectionMemoryEntry[]>();
   for (const entry of entries) {
-    const key = entry.staleArchived ? 'stale' : entry.category && entry.category.trim() ? entry.category : 'unspecified';
+    const hasCategory = typeof entry.category === 'string' && entry.category.trim().length > 0;
+    // §6.3：分类缺省或未知时归入 unspecified 分组。
+    const key = entry.staleArchived
+      ? 'stale'
+      : hasCategory && knownCategories.has(entry.category ?? '')
+        ? String(entry.category)
+        : 'unspecified';
     const list = groups.get(key) ?? [];
     list.push(entry);
     groups.set(key, list);
@@ -144,7 +156,10 @@ export function formatMemorySummary(entries: RejectionMemoryEntry[]): string {
     lines.push(`### ${groupTitles[key] ?? key}`);
     for (const entry of list) {
       const symbols = entry.relatedSymbols && entry.relatedSymbols.length > 0 ? `，相关符号 ${entry.relatedSymbols.join('/')}` : '';
-      lines.push(`- [${entry.module || '?'}] ${entry.title}（被拒于 ${entry.rejectedAt}${symbols}）：${entry.reason}`);
+      const category = entry.category && !knownCategories.has(entry.category) ? `，分类 ${entry.category}` : '';
+      lines.push(
+        `- [${entry.module || '?'}] ${entry.title}（审查类型 ${entry.auditType || '?'}；目标文件 ${entry.targetFiles.length > 0 ? entry.targetFiles.join(', ') : '—'}；被拒于 ${entry.rejectedAt}${category}${symbols}）：${entry.reason}`,
+      );
     }
   }
   return lines.join('\n');

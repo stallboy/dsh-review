@@ -36,7 +36,7 @@ export interface ReviewComment {
   status: CommentStatus;
   createdAt?: string;
   /** §4.3/G39：可选锚点——保存被评论行原文摘要与前后各一行，用于跨版本重定位；仅行内评论可带。 */
-  anchor?: { snippet: string; before?: string; after?: string };
+  anchor?: { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> };
   /** I14：本评论对象中未建模的键原样保留。 */
   extra?: Record<string, unknown>;
 }
@@ -62,6 +62,8 @@ export interface RejectionMeta {
 export interface WaivedDecision {
   id: string;
   reason: string;
+  /** I14：未建模键保留。 */
+  extra?: Record<string, unknown>;
 }
 
 export interface ApprovalMeta {
@@ -72,7 +74,7 @@ export interface ApprovalMeta {
   /** §4.7：批准时生效的门禁快照（必须与当时顶层 gate_checks 一致）。P5 起写入。 */
   gateChecks?: string[];
   /** §4.7：逐条执行结果（command/exit_code/duration_ms）。P5 起写入。 */
-  gateResults?: Array<{ command: string; exit_code: number; duration_ms: number }>;
+  gateResults?: Array<{ command: string; exit_code: number; duration_ms: number; extra?: Record<string, unknown> }>;
   /** §4.7：已确认的 human_decisions[].id。P5 起写入。 */
   confirmedDecisions?: string[];
   /** §4.7：知悉但接受风险的判断项（id + 非空 reason）。P5 起写入。 */
@@ -254,6 +256,8 @@ export interface RunnerExecutionResult {
   outputTail?: string;
   /** True when nothing was run because the user must act manually. */
   manual?: boolean;
+  /** §7.7：Runner 被 Job 取消信号终止。 */
+  aborted?: boolean;
 }
 
 export type ApprovalOutcomeStatus = 'COMMITTED' | 'FALLBACK_TO_PENDING' | 'ABORTED' | 'RECOVERY_REQUIRED';
@@ -357,6 +361,9 @@ export interface AuditOutcome {
   deferred: AuditDeferredItem[];
   report: AuditReportInfo | null;
   commitRevision: string | null;
+  /** §7.7：RECOVERY_REQUIRED 必含 reason/detail。 */
+  reason?: 'COMMIT_OUTCOME_UNKNOWN' | 'SYNC_STATE_UNKNOWN';
+  detail?: string;
   baseRevision: string;
   targetPath: string;
   warnings: string[];

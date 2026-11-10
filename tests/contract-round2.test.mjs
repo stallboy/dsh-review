@@ -100,7 +100,7 @@ test('G15：补丁触及禁止路径 → finalize 拒绝', async () => {
   assert.match(job.result.errors.join('\n'), /禁止路径/);
 });
 
-test('G39：行内评论携带 anchor 往返；总体评论带 anchor 400', async () => {
+test('G39：行内评论携带 anchor 往返；总体评论带 anchor 422', async () => {
   const root = await createGitFixture();
   await writeCandidate(root, '20261109-anchor');
   runCommand('git', ['add', '.ai-review'], root);
@@ -114,7 +114,7 @@ test('G39：行内评论携带 anchor 往返；总体评论带 anchor 400', asyn
       anchor: { snippet: 'x' },
     }),
   });
-  assert.equal(bad.status, 400);
+  assert.equal(bad.status, 422);
   const ok = await fetch(`${base}/comments`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({

@@ -28,6 +28,8 @@ export interface RunnerRequest {
   workingTree?: 'current_patch_applied' | 'clean_base';
   log: (line: string) => void;
   resolveCredential?: (reference: string) => Promise<string | undefined>;
+  /** §7.7：Job 取消信号，透传给进程型 Runner。 */
+  signal?: AbortSignal;
 }
 
 export interface AgentRunOptions {
@@ -41,6 +43,8 @@ export interface AgentRunOptions {
   timeoutMs?: number;
   /** Human-readable task name used in timeout/exit messages. */
   label?: string;
+  /** §7.7：Job 取消信号。 */
+  signal?: AbortSignal;
 }
 
 export interface AgentRunOutcome {
@@ -49,6 +53,7 @@ export interface AgentRunOutcome {
   outputTail: string;
   code: number | null;
   timedOut: boolean;
+  aborted?: boolean;
 }
 
 /** Compose the system/user prompt envelope shared by every headless executor. */
@@ -196,6 +201,7 @@ async function runDshAgent(options: AgentRunOptions, timeoutMs: number): Promise
     env,
     input: options.prompt,
     maxBytes: 8 * 1024 * 1024,
+    signal: options.signal,
     onLine: (line, stream) => {
       if (stream === 'stderr' && line.trim().length > 0) options.log(`stderr: ${line.slice(0, 500)}`);
       logDshEvent(line, options.log);
@@ -205,6 +211,9 @@ async function runDshAgent(options: AgentRunOptions, timeoutMs: number): Promise
   const label = options.label ?? 'AI 修复';
   if (result.error) {
     return { ok: false, errorMessage: `启动 DSH 失败：${result.error}`, outputTail: tail, code: result.code, timedOut: false };
+  }
+  if (result.aborted) {
+    return { ok: false, errorMessage: `${label}已取消`, outputTail: tail, code: result.code, timedOut: false, aborted: true };
   }
   if (result.timedOut) {
     return {
@@ -232,12 +241,16 @@ async function runExternalAgent(options: AgentRunOptions, timeoutMs: number): Pr
     timeoutMs,
     input: options.prompt,
     maxBytes: 8 * 1024 * 1024,
+    signal: options.signal,
     onLine: (line) => options.log(line.slice(0, 500)),
   });
   const tail = tailLines([result.stdout, result.stderr].filter(Boolean).join('\n'), 200);
   const label = options.label ?? '外部修复命令';
   if (result.error) {
     return { ok: false, errorMessage: `外部命令启动失败：${result.error}`, outputTail: tail, code: result.code, timedOut: false };
+  }
+  if (result.aborted) {
+    return { ok: false, errorMessage: `${label}已取消`, outputTail: tail, code: result.code, timedOut: false, aborted: true };
   }
   if (result.timedOut) {
     return {
@@ -283,9 +296,15 @@ export class Runner {
       prompt: wrapAgentPrompt(system, user),
       log: (line) => this.log(line),
       ...(this.request.resolveCredential ? { resolveCredential: this.request.resolveCredential } : {}),
+      ...(this.request.signal ? { signal: this.request.signal } : {}),
     });
     if (!outcome.ok) {
-      return { success: false, errorMessage: outcome.errorMessage ?? '执行器失败', outputTail: outcome.outputTail };
+      return {
+        success: false,
+        errorMessage: outcome.errorMessage ?? '执行器失败',
+        outputTail: outcome.outputTail,
+        ...(outcome.aborted ? { aborted: true } : {}),
+      };
     }
     return this.verifyOutcome(outcome.outputTail);
   }

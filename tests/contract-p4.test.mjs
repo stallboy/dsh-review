@@ -151,8 +151,8 @@ test('P4: topPerModule 按 rejected_at 倒序限量 + 注入摘要格式', () =>
   const top = topPerModule(entries, 2);
   assert.deepEqual(top.map((e) => e.candidateId), ['c3', 'c2']);
   const summary = formatMemorySummary(top);
-  assert.match(summary, /\[net\] t3（被拒于 2026-11-03/);
-  assert.match(summary, /\[net\] t2（被拒于 2026-11-02/);
+  assert.match(summary, /\[net\] t3（审查类型 bugfix；目标文件 —；被拒于 2026-11-03/);
+  assert.match(summary, /\[net\] t2（审查类型 bugfix；目标文件 —；被拒于 2026-11-02/);
   assert.ok(!summary.includes('t1'));
 });
 
@@ -190,13 +190,13 @@ test('P4: POST /reopen——合法重开成功；非 rejected 目标与空理由
   });
   assert.equal(badTarget.status, 409);
 
-  // 空理由 → 400。
+  // 空理由 → 422。
   const noReason = await fetch(`${base}/reopen`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ id: '2026-11/20261104-net-new', from: '2026-11/20261104-net-old', reason: '  ', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-01T10:00:00+08:00' }),
   });
-  assert.equal(noReason.status, 400);
+  assert.equal(noReason.status, 422);
 
   // 合法重开 → 成功并留痕。
   const ok = await fetch(`${base}/reopen`, {

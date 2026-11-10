@@ -189,7 +189,16 @@
 - ✅ **细节**：tags 解析 trim/ASCII 小写/去重（§4.3）；slug 正则收紧为不得以 `.` 开头（store.resolveCandidateDir）。
 - 新增 tests/contract-round2.test.mjs（5 项）+ contract-gaps；全量 121 项测试分组通过。
 
-**仍开**：G24（投影沿重开链）、G32（回退 Runner 成功后 Host 提交新版本）、G27（Runner 提交前完整校验）、评论/接管/重开等共享写端点三分支、SVN 派生与共享源、批准提交树逐路径核验、G36 Client 增量轮询、Client 批量草稿、G39 Client 锚点重定位、G41 投影缓存、I3/I5/I11/I16 读端细节、会话 turn 事件自动收尾。
+### 追加批次 6（2026-11-10 下午，第三轮修复）
+- ✅ **提交树核对（P0）**：`vcs.atomicCommit` 的 `verifyEntries/verifyDeletions` 逐路径核对暂存 blob/模式/删除集合，核对失败 fail-closed；批准/收尾/共享写传入已验证内容哈希。
+- ✅ **批准共享快照（P0）**：批准补丁从共享快照读取并物化后应用；业务快照含模式；禁止路径应用前拒绝。
+- ✅ **精确 decisions/I8**：未知/重复/交叉/遗漏均拒绝；读端 I8 校验 approval 覆盖集合。
+- ✅ **全量不变量**：批准、审查收尾、独立 finalize 统一 `validateFullCandidate`（I4/I5/I16 引用目标）。
+- ✅ **评论契约**：revision/line/file/side/I12 写端校验；batch 严格全有或全无；Host anchor 兜底提取；/reopen 唯一替代。
+- ✅ **审查编排**：Rebase 新基线导出 + 可应用验证；G42 复核块在门禁复算后渲染；finalize 三分支恢复；/audit/manual Job；租约 releasable/release 409；headless audit/ai_fix 纳入 repo 锁；cancel 审查 Job 置 releasable。
+- ✅ **其余**：Owner AND/default_owner；同步失败结构化；SVN 共享源本地优先；Windows 门禁/Runner 正常退出清理；负向记忆摘要字段/未知分类；Client stale/patchCheck/Rebase/批量草稿修复；Job 取消信号终止 dsh/external Runner 并等待进程树清理。
+- 验证：typecheck/build 通过；全量 145 项测试通过。
+- **仍开**：audit 历史复查未解析 items；审计档案未知键 I14；SVN 真机自动化仍缺；会话 turn 自动收尾依赖手动 finalize。
 
 ### 追加批次 1（2026-11-10 下午）
 - ✅ **G25/G6/G24（负向记忆）**：指纹改规范 JSON 数组 + UTF-8 字节序排序；豁免改为**按候选各自重开链**计算（链上候选只豁免自己的全部被拒祖先，链外同指纹仍阻止，环/缺失链保守停止）；duplicateOf 取 rejected_at 倒序第一条未豁免匹配。

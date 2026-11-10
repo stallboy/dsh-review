@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import { lstat, readFile, readdir, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import {
@@ -11,8 +11,8 @@ import {
   ReviewFormatError,
   serializeReviewMarkdown,
 } from './frontmatter.js';
-import { parsePatch } from './patch.js';
-import { quickReviewInvariants, fullReviewInvariants } from './invariants.js';
+import { parsePatch, isAiReviewPath, anchorFromPatch } from './patch.js';
+import { quickReviewInvariants, fullReviewInvariants, isRepoRelativePath } from './invariants.js';
 import { entryFromCandidate, fingerprintOf, withinWindow } from './memory.js';
 import type {
   CandidateSummary,
@@ -520,7 +520,26 @@ export class ReviewStore {
     return text;
   }
 
+  /**
+   * §12.2：写入前用真实路径确认仍在 `.ai-review` 内，并拒绝覆盖符号链接目标；
+   * 写入后再复核一次，防止校验后被替换为 symlink。
+   */
+  private async ensureSafeWriteTarget(filePath: string): Promise<void> {
+    const dir = path.dirname(filePath);
+    const realDir = await realpath(dir).catch(() => null);
+    const realRepo = await realpath(this.repoRoot).catch(() => path.resolve(this.repoRoot));
+    const realRoot = await realpath(this.aiReviewRoot).catch(() => path.resolve(this.aiReviewRoot));
+    if (!realDir) throw new ApiError(422, 'bad_request', `写入目录不存在：${dir}`);
+    ensureInside(realRepo, realRoot);
+    ensureInside(realRoot, realDir);
+    const existing = await lstat(filePath).catch(() => null);
+    if (existing?.isSymbolicLink()) {
+      throw new ApiError(422, 'bad_request', `拒绝写入符号链接目标：${filePath}`);
+    }
+  }
+
   async write(candidate: ReviewCandidate, options?: { touchUpdatedAt?: boolean }): Promise<void> {
+    await this.ensureSafeWriteTarget(candidate.reviewPath);
     if (options?.touchUpdatedAt !== false) {
       // §4.3：每次共享写入严格推进 updated_at（冻结时钟/回拨时上一值 +1ms，规范为 UTC）。
       candidate.meta.updatedAt = nextUpdatedAt(candidate.meta.updatedAt);
@@ -529,6 +548,10 @@ export class ReviewStore {
     const temp = `${candidate.reviewPath}.tmp-${String(process.pid)}`;
     await writeFile(temp, text, 'utf8');
     await rename(temp, candidate.reviewPath);
+    // 操作后复核包含关系，防止校验后父目录被替换为 symlink。
+    const realAfter = await realpath(path.dirname(candidate.reviewPath)).catch(() => null);
+    const realRoot = await realpath(this.aiReviewRoot).catch(() => path.resolve(this.aiReviewRoot));
+    if (realAfter) ensureInside(realRoot, realAfter);
     candidate.sections = parseSections(candidate.sections.rawBody);
     candidate.humanJudgment = extractHumanJudgment(candidate.sections.humanJudgment);
     candidate.humanJudgmentDeclared = candidate.sections.humanJudgment.trim().length > 0;
@@ -555,6 +578,63 @@ export class ReviewStore {
     }
   }
 
+  /** §4.3/I11：统一校验评论形状，并在行内评论未提供 anchor 时由 Host 从 Hunk 兜底提取。 */
+  private async normalizeCommentInput(
+    candidate: ReviewCandidate,
+    input: { content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> } },
+  ): Promise<{ content: string; revision: number; file: string; line: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> } }> {
+    const content = input.content.trim();
+    if (!content) throw new ApiError(422, 'bad_request', '意见内容不能为空');
+    const revision = input.revision ?? candidate.meta.currentRevision;
+    if (!Number.isInteger(revision) || !candidate.meta.revisions.some((item) => item.id === revision)) {
+      throw new ApiError(422, 'bad_request', `评论 revision 必须指向已有版本：${String(revision)}`);
+    }
+    const file = (input.file ?? '').replaceAll('\\', '/');
+    const line = input.line ?? 0;
+    if (file === '') {
+      if (line !== 0) throw new ApiError(422, 'bad_request', '总体评论必须 line=0');
+      if (input.side !== undefined) throw new ApiError(422, 'bad_request', '总体评论不能携带 side');
+      if (input.anchor !== undefined) throw new ApiError(422, 'bad_request', '总体评论不能携带 anchor');
+      return { content, revision, file: '', line: 0 };
+    }
+    if (!isRepoRelativePath(file)) throw new ApiError(422, 'bad_request', `行内评论文件不是合法仓库相对路径：${file}`);
+    if (!Number.isInteger(line) || line <= 0) throw new ApiError(422, 'bad_request', '行内评论 line 必须为正整数');
+    if (input.side !== 'LEFT' && input.side !== 'RIGHT') {
+      throw new ApiError(422, 'bad_request', '行内评论必须指明 LEFT 或 RIGHT');
+    }
+    let anchor = input.anchor;
+    if (anchor !== undefined) {
+      if (!anchor.snippet.trim()) throw new ApiError(422, 'bad_request', 'anchor.snippet 不能为空');
+      anchor = {
+        snippet: anchor.snippet,
+        ...(typeof anchor.before === 'string' && anchor.before ? { before: anchor.before } : {}),
+        ...(typeof anchor.after === 'string' && anchor.after ? { after: anchor.after } : {}),
+        ...(anchor.extra ? { extra: anchor.extra } : {}),
+      };
+    } else {
+      // §4.3：Client 未上传时 Host 从该 revision 的补丁 Hunk 提取；失败静默省略。
+      anchor = await this.extractHostAnchor(candidate, revision, file, line, input.side);
+    }
+    return { content, revision, file, line, side: input.side, ...(anchor ? { anchor } : {}) };
+  }
+
+  private async extractHostAnchor(
+    candidate: ReviewCandidate,
+    revision: number,
+    file: string,
+    line: number,
+    side: 'LEFT' | 'RIGHT',
+  ): Promise<{ snippet: string; before?: string; after?: string } | undefined> {
+    const entry = candidate.meta.revisions.find((item) => item.id === revision);
+    if (!entry) return undefined;
+    try {
+      const patchText = await readFile(path.join(candidate.dirPath, entry.patch), 'utf8');
+      return anchorFromPatch(patchText, file, line, side);
+    } catch {
+      return undefined;
+    }
+  }
+
   async addComment(
     id: string,
     author: string,
@@ -565,39 +645,11 @@ export class ReviewStore {
     const candidate = await this.readCandidate(month, slug);
     if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
     await this.ensureWriteAllowed(candidate, guard);
-    const content = input.content.trim();
-    if (!content) throw new ApiError(400, 'bad_request', '意见内容不能为空');
-    const revision = input.revision ?? candidate.meta.currentRevision;
-    const file = (input.file ?? '').replaceAll('\\', '/');
-    const line = input.line ?? 0;
-    const isInline = file !== '' || line !== 0;
-    // §4.6：行内评论必须带 LEFT/RIGHT；总体评论不带。
-    let side = input.side;
-    if (isInline) {
-      if (side !== 'LEFT' && side !== 'RIGHT') throw new ApiError(400, 'bad_request', '行内评论必须指明 LEFT 或 RIGHT');
-    } else {
-      side = undefined;
-    }
-    // §4.3/G39：anchor 仅行内评论可带，snippet 非空。
-    let anchor = input.anchor;
-    if (anchor !== undefined) {
-      if (!isInline) throw new ApiError(400, 'bad_request', '总体评论不能携带 anchor');
-      if (!anchor.snippet || !anchor.snippet.trim()) throw new ApiError(422, 'bad_request', 'anchor.snippet 不能为空');
-      anchor = {
-        snippet: anchor.snippet,
-        ...(typeof anchor.before === 'string' && anchor.before ? { before: anchor.before } : {}),
-        ...(typeof anchor.after === 'string' && anchor.after ? { after: anchor.after } : {}),
-      };
-    }
+    const normalized = await this.normalizeCommentInput(candidate, input);
     const comment: ReviewComment = {
       id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
-      revision,
-      file,
-      line,
-      ...(side ? { side } : {}),
-      ...(anchor ? { anchor } : {}),
+      ...normalized,
       author,
-      content,
       status: 'unresolved',
       createdAt: new Date().toISOString(),
     };
@@ -631,7 +683,7 @@ export class ReviewStore {
   async addComments(
     id: string,
     author: string,
-    inputs: Array<{ content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT' }>,
+    inputs: Array<{ content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string } }>,
     guard: ConcurrencyGuard,
   ): Promise<ReviewCandidate> {
     if (inputs.length === 0) throw new ApiError(422, 'bad_request', '批量评论不能为空');
@@ -639,30 +691,18 @@ export class ReviewStore {
     const candidate = await this.readCandidate(month, slug);
     if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
     await this.ensureWriteAllowed(candidate, guard);
-    // 先整体校验（不写入），任一条非法即抛错。
-    const comments: ReviewComment[] = inputs.map((input) => {
-      const content = input.content.trim();
-      if (!content) throw new ApiError(422, 'bad_request', '意见内容不能为空');
-      const file = (input.file ?? '').replaceAll('\\', '/');
-      const line = input.line ?? 0;
-      let side = input.side;
-      if (file !== '' || line !== 0) {
-        if (side !== 'LEFT' && side !== 'RIGHT') throw new ApiError(422, 'bad_request', '行内评论必须指明 LEFT 或 RIGHT');
-      } else {
-        side = undefined;
-      }
-      return {
-        id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
-        revision: input.revision ?? candidate.meta.currentRevision,
-        file,
-        line,
-        ...(side ? { side } : {}),
-        author,
-        content,
-        status: 'unresolved' as const,
-        createdAt: new Date().toISOString(),
-      };
-    });
+    // §8.3：先整体校验（含 Host anchor 兜底），任一条非法即抛错，不部分写入。
+    const normalized: Array<{ content: string; revision: number; file: string; line: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string } }> = [];
+    for (const input of inputs) {
+      normalized.push(await this.normalizeCommentInput(candidate, input));
+    }
+    const comments: ReviewComment[] = normalized.map((item) => ({
+      id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+      ...item,
+      author,
+      status: 'unresolved' as const,
+      createdAt: new Date().toISOString(),
+    }));
     candidate.meta.comments.push(...comments);
     if (candidate.meta.status === 'pending') candidate.meta.status = 'changes_requested';
     await this.write(candidate);
@@ -709,7 +749,7 @@ export class ReviewStore {
     if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
     await this.ensureWriteAllowed(candidate, guard);
     const trimmed = reason.trim();
-    if (!trimmed) throw new ApiError(400, 'bad_request', '放弃原因不能为空');
+    if (!trimmed) throw new ApiError(422, 'bad_request', '放弃原因不能为空');
     if (options?.category !== undefined && !options.category.trim()) {
       throw new ApiError(422, 'bad_request', '拒绝分类必须是非空字符串');
     }
@@ -759,7 +799,7 @@ export class ReviewStore {
     if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
     await this.ensureWriteAllowed(candidate, guard);
     const trimmedReason = reason.trim();
-    if (!trimmedReason) throw new ApiError(400, 'bad_request', '重开理由不能为空');
+    if (!trimmedReason) throw new ApiError(422, 'bad_request', '重开理由不能为空');
     const { month: fromMonth, slug: fromSlug } = this.resolveCandidateDir(fromId);
     const fromPath = path.join(this.aiReviewRoot, fromMonth, fromSlug, 'review.md');
     if (!existsSync(fromPath)) throw new ApiError(404, 'not_found', `被拒候选不存在：${fromId}`);
@@ -768,10 +808,36 @@ export class ReviewStore {
     if (fromCandidate.meta.status !== 'rejected' || !fromCandidate.meta.rejection) {
       throw new ApiError(409, 'conflict', `reopened_from 必须指向 rejected 候选：${fromId}`);
     }
+    // §8.3/I16：每个 rejected 候选最多一个直接替代候选，/reopen 必须在锁内强制。
+    if (await this.hasDirectReplacement(fromId, candidate.id)) {
+      throw new ApiError(409, 'conflict', `被拒候选 ${fromId} 已有直接替代候选，不能再重开（I16）`);
+    }
     candidate.meta.reopenedFrom = fromId;
     candidate.meta.reopenedReason = trimmedReason;
     await this.write(candidate);
     return candidate;
+  }
+
+  /** §8.3/I16：扫描现有候选，判断某个 rejected 候选是否已有直接替代。 */
+  private async hasDirectReplacement(fromId: string, excludeId: string): Promise<boolean> {
+    const months = await readdir(this.aiReviewRoot, { withFileTypes: true }).catch(() => []);
+    for (const monthEntry of months) {
+      if (!monthEntry.isDirectory() || !MONTH_PATTERN.test(monthEntry.name)) continue;
+      const month = monthEntry.name;
+      const slugs = await readdir(path.join(this.aiReviewRoot, month), { withFileTypes: true }).catch(() => []);
+      for (const slugEntry of slugs) {
+        if (!slugEntry.isDirectory()) continue;
+        const slug = slugEntry.name;
+        if (candidateId(month, slug) === excludeId) continue;
+        try {
+          const candidate = await this.readCandidate(month, slug);
+          if (candidate.meta.reopenedFrom === fromId) return true;
+        } catch {
+          // 不可读候选不影响唯一性判断。
+        }
+      }
+    }
+    return false;
   }
 
   /**
@@ -790,7 +856,9 @@ export class ReviewStore {
     const nextId = candidate.meta.currentRevision + 1;
     const patchName = `${String(nextId).padStart(3, '0')}.patch`;
     const { writeFile: writePatchFile } = await import('node:fs/promises');
-    await writePatchFile(path.join(candidate.dirPath, patchName), input.patchText, 'utf8');
+    const patchPath = path.join(candidate.dirPath, patchName);
+    await this.ensureSafeWriteTarget(patchPath);
+    await writePatchFile(patchPath, input.patchText, 'utf8');
     candidate.meta.revisions.push({ id: nextId, baseRevision: input.baseRevision, patch: patchName, author: input.author });
     candidate.meta.currentRevision = nextId;
     candidate.meta.status = 'pending';
@@ -853,15 +921,53 @@ export class ReviewStore {
     return errors;
   }
 
-  async currentPatch(candidate: ReviewCandidate): Promise<{ path: string; text: string; baseRevision: string }> {
+  async currentPatch(candidate: ReviewCandidate, source?: CandidateSource): Promise<{ path: string; text: string; baseRevision: string }> {
     const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
     if (!current) throw new ApiError(500, 'internal', '当前版本缺失');
     const patchPath = this.patchPathFor(candidate, current.patch);
+    // §7.1：传入共享源时补丁必须与 review.md 来自同一快照，不得读取工作区本地文件。
+    const text = source
+      ? await source.readPatchText(candidate.month, candidate.slug, current.patch)
+      : await readFile(patchPath, 'utf8');
+    if (text === null) throw new ApiError(404, 'not_found', `共享快照中不存在补丁：${current.patch}`);
     return {
       path: patchPath,
-      text: await readFile(patchPath, 'utf8'),
+      text,
       baseRevision: current.baseRevision,
     };
+  }
+
+  /** §7.5 步骤 4 / §7.6：批准与收尾必须通过的完整不变量（含 I4/I5/I16 引用目标）。 */
+  async validateFullCandidate(candidate: ReviewCandidate): Promise<string[]> {
+    const errors = await this.validateCandidate(candidate);
+    const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
+    if (!current) return errors;
+    let currentPatchPaths: string[] | null = null;
+    try {
+      const text = await readFile(this.patchPathFor(candidate, current.patch), 'utf8');
+      currentPatchPaths = parsePatch(text).paths.filter((file) => !isAiReviewPath(file));
+    } catch {
+      currentPatchPaths = null;
+    }
+    const reopenedTargetRejected = candidate.meta.reopenedFrom
+      ? await (async (): Promise<((target: string) => boolean | null) | undefined> => {
+          try {
+            const { month, slug } = this.resolveCandidateDir(candidate.meta.reopenedFrom ?? '');
+            const targetCandidate = await this.readCandidate(month, slug);
+            const rejected = targetCandidate.meta.status === 'rejected' && targetCandidate.meta.rejection !== null;
+            return () => rejected;
+          } catch {
+            return () => false;
+          }
+        })()
+      : undefined;
+    errors.push(...fullReviewInvariants({
+      candidate,
+      patchExists: (revision) => existsSync(this.patchPathFor(candidate, revision.patch)),
+      currentPatchPaths,
+      ...(reopenedTargetRejected ? { reopenedTargetRejected } : {}),
+    }));
+    return errors;
   }
 
   async listStatusCounts(owner: string): Promise<Record<ReviewStatus, number>> {

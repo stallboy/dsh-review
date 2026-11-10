@@ -98,6 +98,8 @@
     /** §5.5：approved 候选的派生业务提交版本与三态诊断（仅诊断展示）。 */
     approvalCommitRevision?: string;
     approvalCommitLookup?: 'found' | 'ambiguous' | 'unknown';
+    /** §8.2/G40：补丁预检派生诊断（不构成批准证据）。 */
+    patchCheck?: { state: 'clean' | 'conflicted' | 'unknown'; checkedBase: string; checkedAt: string };
     canAct: boolean; me: string;
   }
   interface DiffResult {
@@ -240,6 +242,7 @@
     const CSS = `
 .dcr{display:flex;flex-direction:column;height:100%;min-height:0;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-size:13px}
 .dcr-top{display:flex;gap:12px;align-items:center;padding:12px 18px;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}
+.dcr-candidate-head{position:sticky;top:0;z-index:2;background:var(--dsw-alias-bg-layer-2)}
 .dcr-top h1{margin:0;font-size:16px;font-weight:650}
 .dcr-sub{font-size:12px;color:var(--dsw-alias-label-secondary);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dcr-grow{flex:1;min-width:0}
@@ -549,6 +552,14 @@
         finally { setLoading(false); }
       }, [api]);
 
+      /** §10.2：guard 变化后“刷新”必须重新绑定新快照并解除锁定。 */
+      const reloadCurrent = (): void => {
+        if (!selectedId) return;
+        guardRef.current = null;
+        setStale(false);
+        void loadDetail(selectedId);
+      };
+
       const loadDiff = useCallback(async (id: string, mode: 'full' | 'incremental', from: number): Promise<void> => {
         setDiffLoading(true);
         try {
@@ -661,6 +672,12 @@
           expectedOwner: detail.candidate.meta.owner,
           expectedUpdatedAt: detail.candidate.meta.updatedAt,
         };
+      };
+
+      /** §10.1/§10.2：conflicted 时提供 Rebase 入口；预检不作为批准证据。 */
+      const rebaseCandidate = async (): Promise<void> => {
+        if (!detail) return;
+        await startJob('/rebase', { id: detail.candidate.id, ...guard() });
       };
 
       const afterWrite = async (): Promise<void> => {
@@ -1110,9 +1127,23 @@
         return h('div', { className: 'dcr-body' },
           h('div', { className: 'dcr-wrap' },
             renderJob(),
-            stale ? h('div', { className: 'dcr-banner err' }, '该候选已在其他窗口更新（版本或 owner 变化），当前页面已锁定，请刷新后重新审核。') : null,
+            stale ? h('div', { className: 'dcr-banner err' },
+              h('div', null, '该候选已在其他窗口更新（版本或 owner 变化），当前页面已锁定。'),
+              h('button', { className: 'dcr-btn', style: { marginTop: 6 }, onClick: reloadCurrent }, '加载最新并解除锁定'),
+            ) : null,
             detail.isBaseBehind ? h('div', { className: 'dcr-banner warn' }, `仓库基线 ${short(detail.currentBase)} 已不同于候选基线 ${short(baseRevision)}；批准时会先同步再严格应用补丁。`) : null,
-            h('div', { className: 'dcr-card' },
+            detail.patchCheck ? h('div', { className: `dcr-banner ${detail.patchCheck.state === 'conflicted' ? 'warn' : 'info'}`, style: { marginTop: 6 } },
+              h('span', { className: 'dcr-grow' },
+                detail.patchCheck.state === 'conflicted'
+                  ? `补丁预检：在基线 ${short(detail.patchCheck.checkedBase)} 无法干净应用；可先 Rebase（批准时仍会重新严格应用）。`
+                  : detail.patchCheck.state === 'clean'
+                    ? `补丁预检：可应用到基线 ${short(detail.patchCheck.checkedBase)}（仅诊断，不构成批准证据）。`
+                    : '补丁预检：状态未知（仅诊断）。'),
+              detail.patchCheck.state === 'conflicted'
+                ? h('button', { className: 'dcr-btn', disabled: busy || !canAct, onClick: () => { void rebaseCandidate(); } }, 'Rebase')
+                : null,
+            ) : null,
+            h('div', { className: 'dcr-card dcr-candidate-head' },
               h('div', { className: 'dcr-row', style: { alignItems: 'flex-start' } },
                 h('div', { className: 'dcr-grow' },
                   h('h2', { style: { margin: '0 0 7px', fontSize: 18 } }, candidate.meta.title),
@@ -1215,13 +1246,24 @@
               h('div', { className: 'dcr-row', style: { marginTop: 8 } },
                 h('button', {
                   className: 'dcr-btn p',
-                  disabled: !canAct || busy || !general.trim(),
-                  onClick: () => { const value = general; setGeneral(''); void addComment('', 0, value, true); },
+                  disabled: !canAct || busy || (batchDrafts.length === 0 && !general.trim()),
+                  onClick: () => {
+                    // §10.2：存在本地草稿时一次 /comments/batch(autoFix) 完成提交与修复触发。
+                    const drafts = [...batchDrafts, ...(general.trim() ? [general.trim()] : [])];
+                    setBatchDrafts([]); setGeneral('');
+                    if (drafts.length > 1) void submitBatch(drafts, true);
+                    else if (drafts[0]) void addComment('', 0, drafts[0], true);
+                  },
                 }, busy ? '执行中…' : '提交意见并让 AI 修复'),
                 h('button', {
                   className: 'dcr-btn',
-                  disabled: !canAct || busy || !general.trim(),
-                  onClick: () => { const value = general; setGeneral(''); void addComment('', 0, value, false); },
+                  disabled: !canAct || busy || (batchDrafts.length === 0 && !general.trim()),
+                  onClick: () => {
+                    const drafts = [...batchDrafts, ...(general.trim() ? [general.trim()] : [])];
+                    setBatchDrafts([]); setGeneral('');
+                    if (drafts.length > 1) void submitBatch(drafts, false);
+                    else if (drafts[0]) void addComment('', 0, drafts[0], false);
+                  },
                 }, '仅提交意见'),
                 // §8.3/G37：多条评论进入草稿列表，一次批量提交（单次共享写入 + 单次提交）。
                 h('button', {
@@ -1440,7 +1482,7 @@
             h('div', { className: 'dcr-sub' }, `${health?.repoRoot || '会话没有工作目录'} · 审核者 ${health?.owner || settings?.owner || '未设置'}`),
           ),
           screen === 'detail' ? h('button', { className: 'dcr-btn g', onClick: () => setScreen('queue') }, '← 队列') : null,
-          h('button', { className: 'dcr-btn', onClick: () => { void refreshHealth(); if (screen === 'queue') void loadQueue(); if (screen === 'detail' && selectedId) void loadDetail(selectedId); } }, '刷新'),
+          h('button', { className: 'dcr-btn', onClick: () => { void refreshHealth(); if (screen === 'queue') void loadQueue(); if (screen === 'detail') reloadCurrent(); } }, '刷新'),
           h('button', { className: 'dcr-btn', onClick: () => { void (async () => { try { await loadSettings(); } finally { setScreen('settings'); } })(); } }, '设置'),
         ),
         content,

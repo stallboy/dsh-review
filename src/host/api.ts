@@ -31,7 +31,7 @@ import type {
   VcsType,
 } from './types.js';
 import { ApiError } from './types.js';
-import { createVcs, patchTouchesReviewData, type VcsAdapter } from './vcs.js';
+import { createVcs, patchTouchesReviewData, gitBlobHash, type VcsAdapter } from './vcs.js';
 
 export const API_PREFIX = '/dsh-code-review/api';
 const APP_VERSION = '0.3.0';
@@ -112,11 +112,11 @@ function sendJson(res: ServerResponse, status: number, data: unknown): void {
 
 function sendError(res: ServerResponse, error: unknown): void {
   if (error instanceof ApiError) {
-    sendJson(res, error.status, { error: { code: error.code, message: error.message, details: error.details } });
+    sendJson(res, error.status, { error: { code: error.code, message: error.message, details: error.details ?? {} } });
     return;
   }
   const message = error instanceof Error ? error.message : String(error);
-  sendJson(res, 500, { error: { code: 'internal', message } });
+  sendJson(res, 500, { error: { code: 'internal', message, details: {} } });
 }
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -165,7 +165,7 @@ function guardFrom(body: Record<string, unknown>): ConcurrencyGuard {
   return { expectedRevision, expectedOwner, expectedUpdatedAt };
 }
 
-function isAnchor(value: unknown): value is { snippet: string; before?: string; after?: string } {
+function isAnchor(value: unknown): value is { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> } {
   if (typeof value !== 'object' || value === null) return false;
   const record = value as Record<string, unknown>;
   return typeof record['snippet'] === 'string' && record['snippet'].trim().length > 0
@@ -328,10 +328,35 @@ export class ReviewApi {
       state: 'active',
     });
     // 跟踪 Job 保持 running，直到 /audit/finalize（或 release / 取消）完成它。
-    this.jobs.start('audit', () => new Promise<void>((resolve) => {
-      this.auditJobFinishes.set(auditId, () => resolve());
-    }));
+    this.startAuditTrackingJob(auditId);
+    this.armAuditLeaseTimeout(auditId);
     void created;
+  }
+
+  /** §7.6：审查执行超时上限 1 小时；超时只把租约置 releasable，不自动解除互斥。 */
+  private armAuditLeaseTimeout(auditId: string): void {
+    const timer = setTimeout(() => {
+      const lease = this.auditLeases.find((entry) => entry.auditId === auditId);
+      if (!lease || lease.state !== 'active') return;
+      lease.state = 'releasable';
+      void this.saveAuditLeases().catch(() => undefined);
+      this.auditJobFinishes.get(auditId)?.({
+        status: 'RECOVERY_REQUIRED',
+        reason: 'SYNC_STATE_UNKNOWN',
+        detail: '审查执行超过 1 小时上限，租约已置为 releasable，请人工确认后 /audit/release',
+      });
+      this.auditJobFinishes.delete(auditId);
+    }, 60 * 60 * 1000);
+    timer.unref?.();
+  }
+
+  /** §7.7：创建 audit 跟踪 Job；取消/超时只把租约置 releasable，不自动释放。 */
+  private startAuditTrackingJob(auditId: string): JobRecord {
+    const job = this.jobs.start('audit', () => new Promise<unknown>((resolve) => {
+      this.auditJobFinishes.set(auditId, (result) => { resolve(result); });
+    }));
+    this.auditJobLeases.set(job.id, auditId);
+    return job;
   }
 
   /** §18.2：把 reviewers.yml 解析结果作为提示词参数传入审查会话。 */
@@ -358,8 +383,10 @@ export class ReviewApi {
   // ---------- §7.6 手动审查执行租约（Host 重启后仍阻塞自动写操作） ----------
 
   private auditLeases: AuditLease[] = [];
-  /** 会话审查跟踪 Job 的完成回调（仅内存；重启后由 finalize 直接新建 Job）。 */
-  private auditJobFinishes = new Map<string, () => void>();
+  /** 会话/手动/定时审查跟踪 Job 的完成回调（仅内存；重启后由 finalize 直接新建 Job）。 */
+  private auditJobFinishes = new Map<string, (result?: unknown) => void>();
+  /** 跟踪 Job id → auditId，供 /jobs/:id/cancel 把租约转为 releasable。 */
+  private auditJobLeases = new Map<string, string>();
 
   private get leaseStatePath(): string {
     return this.deps.statePath ?? path.join(dshHome(), 'dsh-code-review', 'runtime-state.json');
@@ -477,6 +504,37 @@ export class ReviewApi {
    * §12.2 操作隔离：Owner 是本地协作约定（非安全身份）。非 Owner 的候选共享写
    * 返回 403 forbidden；唯一例外是 /takeover。不得用 expectedOwner 冒充身份校验。
    */
+  /**
+   * §7.1：候选共享写只能作用于共享事实。
+   * 本地草稿（HEAD 中不存在）与存在本地改动的候选必须拒绝，避免把本地视图提交为共享事实。
+   */
+  private async requireSharedCandidate(runtime: Runtime, id: string): Promise<void> {
+    const view = await sharedViewFor(runtime);
+    if (!view?.source) return; // 空仓库/无 HEAD：沿用既有错误路径
+    const { month, slug } = runtime.store.resolveCandidateDir(id);
+    const text = await view.source.readReviewText(month, slug).catch(() => null);
+    if (text === null) {
+      throw new ApiError(409, 'conflict', `候选 ${id} 不是共享事实（当前 VCS 快照中不存在），不能执行共享写；请先完成 /candidate/finalize 或审查收尾`);
+    }
+    if (await view.source.hasLocalChanges(month, slug).catch(() => false)) {
+      throw new ApiError(409, 'conflict', `候选 ${id} 存在本地未提交改动，不能执行共享写；请先还原工作区后重试`);
+    }
+  }
+
+  /** §7.1：审查档案写入（convert/dismiss）只能修改共享快照中的档案。 */
+  private async requireSharedAudit(runtime: Runtime, auditId: string, localPath: string): Promise<void> {
+    const view = await sharedViewFor(runtime);
+    if (!view?.source) return;
+    const sharedText = await view.source.readAuditText(auditId).catch(() => null);
+    if (sharedText === null) {
+      throw new ApiError(409, 'conflict', `审查档案 ${auditId} 不是共享事实，不能修改`);
+    }
+    const localText = await readFile(localPath, 'utf8').catch(() => null);
+    if (localText !== null && localText !== sharedText) {
+      throw new ApiError(409, 'conflict', `审查档案 ${auditId} 存在本地未提交改动，不能执行共享写`);
+    }
+  }
+
   private async requireOwnerOf(store: ReviewStore, id: string): Promise<void> {
     const me = await this.ownerFor(store.repoRoot);
     const detail = await store.get(id, null);
@@ -491,6 +549,13 @@ export class ReviewApi {
     if (url.pathname !== API_PREFIX && !url.pathname.startsWith(`${API_PREFIX}/`)) return false;
     const route = url.pathname.slice(API_PREFIX.length) || '/';
     try {
+      // §8.1：带 body 的请求必须声明 application/json（解析/Content-Type 错误 400）。
+      if ((req.method === 'POST' || req.method === 'PUT') && (req.headers['content-length'] ?? '0') !== '0') {
+        const contentType = String(req.headers['content-type'] ?? '').toLowerCase();
+        if (!contentType.startsWith('application/json')) {
+          throw new ApiError(400, 'bad_request', '带 body 的请求必须使用 Content-Type: application/json');
+        }
+      }
       await this.dispatch(req, res, route, url);
     } catch (error) {
       sendError(res, error);
@@ -636,6 +701,16 @@ export class ReviewApi {
       ...(typeof body['gateTimeoutMs'] === 'number' ? { gateTimeoutMs: body['gateTimeoutMs'] } : {}),
       ...(typeof body['scheduleIntervalMinutes'] === 'number' ? { scheduleIntervalMinutes: body['scheduleIntervalMinutes'] } : {}),
     };
+    // §9：owner 保存时校验非空；vcsType 必须与实际仓库一致。
+    if (body['owner'] !== undefined && (typeof body['owner'] !== 'string' || !body['owner'].trim())) {
+      throw new ApiError(422, 'bad_request', 'owner 不能为空');
+    }
+    if (merged.vcsType !== 'auto' && merged.repoRoot.trim()) {
+      const detected = await detectVcs(path.resolve(merged.repoRoot)).catch(() => null);
+      if (detected !== null && detected !== merged.vcsType) {
+        throw new ApiError(422, 'bad_request', `vcsType=${merged.vcsType} 与实际仓库（${detected}）不一致`);
+      }
+    }
     const saved = await this.deps.saveSettings(merged);
     await this.reconfigure(saved);
     this.startScheduler(); // 调度间隔运行期可改，立即生效
@@ -706,7 +781,7 @@ export class ReviewApi {
     const view = await sharedViewFor(runtime);
     const currentBase = view?.snapshot ?? await vcs.getCurrentBase().catch(() => null);
     const detail = await store.get(id, currentBase, view?.source);
-    const validation = await store.validateCandidate(detail.candidate);
+    const validation = await store.validateFullCandidate(detail.candidate);
     const revisionStats: Record<number, unknown> = {};
     for (const revision of detail.candidate.meta.revisions) {
       try {
@@ -908,14 +983,16 @@ export class ReviewApi {
     }
     const records = await archive.list(view?.source);
     const queue = await runtime.store.list({}, null, undefined, undefined, view?.source);
-    const infoById = new Map(queue.items.map((item) => [item.id, {
+    // §7.1/§4.8：投影只使用共享事实；local/broken 候选不进入重开链。
+    const sharedItems = queue.items.filter((item) => !item.local && !item.parseError);
+    const infoById = new Map(sharedItems.map((item) => [item.id, {
       status: item.status,
       reopenedFrom: item.reopenedFrom ?? null,
     } as import('./audit-archive.js').CandidateChainInfo]));
     const projected = projectFindings(
       records,
       (candidateId) => infoById.get(candidateId) ?? null,
-      queue.items.map((item) => item.id),
+      sharedItems.map((item) => item.id),
     );
     const errors = [
       ...records.filter((record) => record.parseError).map((record) => `${record.dirName}: ${record.parseError}`),
@@ -1061,13 +1138,9 @@ export class ReviewApi {
       candidateIdsBefore,
       state: 'active',
     });
-    // 跟踪 Job 保持 running，直到 /audit/finalize（或 release）完成它。
-    let finishJob: (() => void) | null = null;
-    const job = this.jobs.start('audit', () => new Promise<void>((resolve) => {
-      finishJob = resolve;
-      this.auditJobFinishes.set(auditId, () => resolve());
-    }));
-    void finishJob;
+    // 跟踪 Job 保持 running，直到 /audit/finalize（或 release / 取消）完成它。
+    const job = this.startAuditTrackingJob(auditId);
+    this.armAuditLeaseTimeout(auditId);
     sendJson(res, 202, {
       sessionId: created.sessionId,
       jobId: job.id,
@@ -1101,7 +1174,8 @@ export class ReviewApi {
       throw new ApiError(409, 'conflict', `仓库审查要求业务工作区干净。\n${clean.message}`);
     }
     const owner = await this.ownerFor(runtime.root);
-    const job = this.jobs.start('audit', async (log) => {
+    // §7.7：headless Runner 的工作区事务必须与其他共享写经同一 repo 锁串行。
+    const job = this.jobs.start('audit', (log, _jobId, signal) => this.withWriteLock(runtime.root, async () => {
       const sharedSource = await sharedSourceFor(runtime);
       const auditor = new Auditor({
         store: runtime.store,
@@ -1113,11 +1187,12 @@ export class ReviewApi {
         log,
         ...(sharedSource ? { candidateSource: sharedSource } : {}),
         ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
+        signal,
       });
       const outcome = await auditor.run();
       log(`结果：${outcome.status} — ${outcome.message}`);
       return outcome;
-    });
+    }));
     sendJson(res, 202, { jobId: job.id, job });
   }
 
@@ -1170,9 +1245,12 @@ export class ReviewApi {
       candidateIdsBefore,
       state: 'active',
     });
+    // §7.6/§8.3：手动模式同样创建可追踪的 audit Job，并受 1 小时执行上限约束。
+    const job = this.startAuditTrackingJob(auditId);
+    this.armAuditLeaseTimeout(auditId);
     sendJson(res, 202, {
-      jobId: null,
-      job: null,
+      jobId: job.id,
+      job,
       auditId,
       prompt,
       targetPath: target.targetPath,
@@ -1237,7 +1315,13 @@ export class ReviewApi {
       if (result.status === 'COMMITTED' || result.status === 'VALIDATION_FAILED') {
         lease.state = 'released';
         await this.saveAuditLeases();
-        this.auditJobFinishes.get(lease.auditId)?.();
+        this.auditJobFinishes.get(lease.auditId)?.({
+          status: result.status,
+          auditId: lease.auditId,
+          commitRevision: result.commitRevision,
+          message: result.message,
+        });
+        this.auditJobFinishes.delete(lease.auditId);
       } else {
         log(`收尾未完成（${result.status}），租约 ${lease.auditId} 保持占用，请核对后重试 finalize 或 /audit/release`);
       }
@@ -1248,6 +1332,8 @@ export class ReviewApi {
         commitRevision: result.commitRevision,
         created: result.created,
         reportPath: result.reportPath,
+        ...(result.reason ? { reason: result.reason } : {}),
+        ...(result.detail ? { detail: result.detail } : {}),
         message: result.message,
       };
     }));
@@ -1266,16 +1352,23 @@ export class ReviewApi {
     if (!lease) throw new ApiError(404, 'not_found', `审查租约不存在：${auditId}`);
     if (lease.root !== runtime.root) throw new ApiError(409, 'conflict', '租约属于另一个仓库检出');
     if (lease.state === 'released') throw new ApiError(409, 'conflict', `租约 ${auditId} 已释放`);
+    // §8.3：仅在租约已取消/超时（releasable）后可用；仍活跃的租约必须 409。
     if (lease.state === 'active') {
-      // active 租约原则上也应经人工确认停止后释放：复核工作区后放行。
-      const clean = await runtime.vcs.ensureCleanWorkspace();
-      if (!clean.clean) {
-        throw new ApiError(409, 'conflict', `工作区仍有未还原改动，不能释放租约。\n${clean.message}`);
-      }
+      throw new ApiError(409, 'conflict', `租约 ${auditId} 仍处于活跃状态；请先取消审查 Job 或等待超时（releasable）后再释放`);
+    }
+    // 复核工作区：外部执行可能残留未还原改动。
+    const clean = await runtime.vcs.ensureCleanWorkspace();
+    if (!clean.clean) {
+      throw new ApiError(409, 'conflict', `工作区仍有未还原改动，不能释放租约。\n${clean.message}`);
     }
     lease.state = 'released';
     await this.saveAuditLeases();
-    this.auditJobFinishes.get(lease.auditId)?.();
+    this.auditJobFinishes.get(lease.auditId)?.({
+      status: 'ABORTED',
+      auditId: lease.auditId,
+      message: '租约已由人工确认停止后释放',
+    });
+    this.auditJobFinishes.delete(lease.auditId);
     sendJson(res, 200, { released: true });
   }
 
@@ -1308,6 +1401,11 @@ export class ReviewApi {
       message: input.message,
       paths,
       ...(input.deletePaths && input.deletePaths.length > 0 ? { deletePaths: input.deletePaths } : {}),
+      // §7.5 步骤 9：内容核对——暂存 blob 必须等于调用方写入/核对过的文本。
+      ...((input.expectedFiles?.length ?? 0) > 0
+        ? { verifyEntries: input.expectedFiles?.map((expected) => ({ path: expected.relPath, blobHash: gitBlobHash(expected.text) })) }
+        : {}),
+      ...(input.deletePaths && input.deletePaths.length > 0 ? { verifyDeletions: input.deletePaths } : {}),
     });
     if (commit.success) {
       if (commit.commitRevision) return { landed: true, commitRevision: commit.commitRevision };
@@ -1402,15 +1500,24 @@ export class ReviewApi {
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
     await this.requireOwnerOf(store, id); // §12.2：非 Owner 403（takeover 除外）
+    await this.requireSharedCandidate(runtime, id); // §7.1：共享写只能来自共享事实
+    // §8.1：字段类型错误 400（不得静默降级为总体评论/当前版本）。
+    if (body['file'] !== undefined && typeof body['file'] !== 'string') throw new ApiError(400, 'bad_request', 'file 必须是 string');
+    if (body['side'] !== undefined && typeof body['side'] !== 'string') throw new ApiError(400, 'bad_request', 'side 必须是 LEFT/RIGHT');
+    if (body['line'] !== undefined && typeof body['line'] !== 'number') throw new ApiError(400, 'bad_request', 'line 必须是 number');
+    if (body['revision'] !== undefined && typeof body['revision'] !== 'number') throw new ApiError(400, 'bad_request', 'revision 必须是 number');
     const backupText = await this.reviewBackup(store, id); // §5.6：写入前备份
+    if (body['anchor'] !== undefined && !isAnchor(body['anchor'])) {
+      throw new ApiError(422, 'bad_request', 'anchor 必须是 {snippet: 非空 string, before?, after?}');
+    }
     const candidate = await store.addComment(id, author, {
       content: stringField(body, 'content'),
       ...(typeof body['file'] === 'string' ? { file: body['file'] } : {}),
       ...(typeof body['line'] === 'number' ? { line: body['line'] } : {}),
       ...(typeof body['revision'] === 'number' ? { revision: body['revision'] } : {}),
-      // §4.6/I11：行内评论必须带 LEFT/RIGHT；UI 侧按行类型传 RIGHT（补丁新代码）。
+      // §4.3/I11：行内评论必须带 LEFT/RIGHT。
       ...(body['side'] === 'LEFT' || body['side'] === 'RIGHT' ? { side: body['side'] } : {}),
-      // §4.3/G39：可选锚点 {snippet, before?, after?}。
+      // §4.3/G39：可选锚点 {snippet, before?, after?}；Host 在缺失时兜底提取。
       ...(isAnchor(body['anchor']) ? { anchor: body['anchor'] } : {}),
     }, guard);
     const commit = await this.commitSharedWrite(`review(${id}): 审核意见 (rev ${String(candidate.meta.currentRevision)})`, candidate, runtime, backupText);
@@ -1446,9 +1553,10 @@ export class ReviewApi {
     const commentId = stringField(body, 'commentId');
     const status = stringField(body, 'status');
     if (status !== 'unresolved' && status !== 'partial' && status !== 'resolved') {
-      throw new ApiError(400, 'bad_request', '非法意见状态');
+      throw new ApiError(422, 'bad_request', '非法意见状态');
     }
     await this.requireOwnerOf(store, id); // §12.2：非 Owner 403（takeover 除外）
+    await this.requireSharedCandidate(runtime, id); // §7.1
     const backupText = await this.reviewBackup(store, id); // §5.6：写入前备份
     const candidate = await store.setCommentStatus(id, commentId, status, guard);
     const commit = await this.commitSharedWrite(`review(${id}): 更新意见状态`, candidate, runtime, backupText);
@@ -1462,6 +1570,7 @@ export class ReviewApi {
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
     const owner = stringField(body, 'owner') || await this.ownerFor(store.repoRoot);
+    await this.requireSharedCandidate(runtime, id); // §7.1
     const backupText = await this.reviewBackup(store, id); // §5.6：写入前备份
     const candidate = await store.transferOwner(id, owner, guard);
     const commit = await this.commitSharedWrite(`review(${id}): 接管审核 (owner ${owner})`, candidate, runtime, backupText);
@@ -1476,6 +1585,7 @@ export class ReviewApi {
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
     await this.requireOwnerOf(store, id);
+    await this.requireSharedCandidate(runtime, id); // §7.1
     const backupText = await this.reviewBackup(store, id); // §5.6：写入前备份
     const candidate = await store.resume(id, guard);
     const commit = await this.commitSharedWrite(`review(${id}): resume to pending`, candidate, runtime, backupText);
@@ -1491,17 +1601,44 @@ export class ReviewApi {
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
     await this.requireOwnerOf(store, id);
-    const rawComments = Array.isArray(body['comments']) ? body['comments'] : [];
-    const inputs = rawComments
-      .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
-      .map((item) => ({
-        content: typeof item['content'] === 'string' ? item['content'] : '',
-        ...(typeof item['file'] === 'string' ? { file: item['file'] } : {}),
-        ...(typeof item['line'] === 'number' ? { line: item['line'] } : {}),
-        ...(typeof item['revision'] === 'number' ? { revision: item['revision'] } : {}),
-        ...(item['side'] === 'LEFT' || item['side'] === 'RIGHT' ? { side: item['side'] as 'LEFT' | 'RIGHT' } : {}),
-      }));
-    if (inputs.length === 0) throw new ApiError(422, 'bad_request', 'comments 必须是非空数组');
+    await this.requireSharedCandidate(runtime, id); // §7.1
+    const rawComments = body['comments'];
+    if (!Array.isArray(rawComments) || rawComments.length === 0) {
+      throw new ApiError(422, 'bad_request', 'comments 必须是非空数组');
+    }
+    // §8.3：任一条非法整批 422，不静默过滤或部分写入。
+    const inputs = rawComments.map((item, index) => {
+      if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+        throw new ApiError(422, 'bad_request', `comments[${String(index)}] 必须是对象`);
+      }
+      const record = item as Record<string, unknown>;
+      if (record['content'] !== undefined && typeof record['content'] !== 'string') {
+        throw new ApiError(400, 'bad_request', `comments[${String(index)}].content 必须是 string`);
+      }
+      if (record['file'] !== undefined && typeof record['file'] !== 'string') {
+        throw new ApiError(400, 'bad_request', `comments[${String(index)}].file 必须是 string`);
+      }
+      if (record['side'] !== undefined && typeof record['side'] !== 'string') {
+        throw new ApiError(400, 'bad_request', `comments[${String(index)}].side 必须是 LEFT/RIGHT`);
+      }
+      if (record['line'] !== undefined && typeof record['line'] !== 'number') {
+        throw new ApiError(400, 'bad_request', `comments[${String(index)}].line 必须是 number`);
+      }
+      if (record['revision'] !== undefined && typeof record['revision'] !== 'number') {
+        throw new ApiError(400, 'bad_request', `comments[${String(index)}].revision 必须是 number`);
+      }
+      if (record['anchor'] !== undefined && !isAnchor(record['anchor'])) {
+        throw new ApiError(422, 'bad_request', `comments[${String(index)}].anchor 必须是 {snippet: 非空 string, before?, after?}`);
+      }
+      return {
+        content: typeof record['content'] === 'string' ? record['content'] : '',
+        ...(typeof record['file'] === 'string' ? { file: record['file'] } : {}),
+        ...(typeof record['line'] === 'number' ? { line: record['line'] } : {}),
+        ...(typeof record['revision'] === 'number' ? { revision: record['revision'] } : {}),
+        ...(record['side'] === 'LEFT' || record['side'] === 'RIGHT' ? { side: record['side'] as 'LEFT' | 'RIGHT' } : {}),
+        ...(isAnchor(record['anchor']) ? { anchor: record['anchor'] } : {}),
+      };
+    });
     const backupText = await this.reviewBackup(store, id); // §5.6：写入前备份
     const candidate = await store.addComments(id, author, inputs, guard);
     const commit = await this.commitSharedWrite(`review(${id}): 批量审核意见 (${String(inputs.length)} 条)`, candidate, runtime, backupText);
@@ -1536,13 +1673,15 @@ export class ReviewApi {
     }
     const detail = await store.get(id, null);
     await this.requireOwnerOf(store, id); // §12.2：非 Owner 403（takeover 除外）
+    await this.requireSharedCandidate(runtime, id); // §7.1
     await store.ensureWriteAllowed(detail.candidate, guard);
     // §4.3/G38：Host 在删除补丁前从当前补丁 hunk header 提取函数/结构体名。
     const relatedSymbols = [...new Set(
       [...detail.patchText.matchAll(/^@@[^\n]*@@\s*(\S[^\n]*)$/gm)]
         .map((match) => (match[1] ?? '').trim())
-        .filter((symbol) => symbol.length > 0),
-    )].slice(0, 10);
+        .filter((symbol) => symbol.length > 0)
+        .map((symbol) => symbol.slice(0, 120)),
+    )].slice(0, 16);
     const reviewers = await loadReviewers(store.repoRoot);
     if (mode === 'stale' && reviewers.staleDays === null) {
       throw new ApiError(409, 'conflict', 'reviewers.yml 未配置 stale_days，不能按超时归档');
@@ -1598,6 +1737,7 @@ export class ReviewApi {
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
     await this.requireOwnerOf(store, id); // §12.2：非 Owner 403（takeover 除外）
+    await this.requireSharedCandidate(runtime, id); // §7.1
     const detail = await store.get(id, null);
     await store.ensureWriteAllowed(detail.candidate, guard);
     const job = this.jobs.start('ai_fix', (log, jobId) => this.withWriteLock(store.repoRoot, async () => {
@@ -1613,6 +1753,8 @@ export class ReviewApi {
       if (!clean.clean) return { status: 'ABORTED', message: `工作区不干净：${clean.message}`, jobId };
       log(`在最新基线 ${base.slice(0, 12)} 上应用补丁`);
       const patchPath = path.join(store.repoRoot, '.ai-review', id, current.patch);
+      const oldPatchText = await readFile(patchPath, 'utf8');
+      const touchedPaths = parsePatch(oldPatchText).paths.filter((file) => !isAiReviewPath(file));
       const applied = await vcs.applyPatch(patchPath, true);
       if (!applied.ok) {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
@@ -1623,15 +1765,41 @@ export class ReviewApi {
         cwd: store.repoRoot, baseRevision: base, timeoutMs: this.settings.gateTimeoutMs,
         onLine: (line) => { if (line.trim()) log(`  ${line.slice(0, 300)}`); },
       });
-      await vcs.revertBusinessWorkspace().catch(() => undefined);
       if (!report.allPassed) {
+        await vcs.revertBusinessWorkspace().catch(() => undefined);
         return { status: 'ABORTED', message: `门禁未通过，Rebase 未产生新版本：\n${report.formattedEvidenceMarkdown}`, jobId };
       }
-      const { readFile: readFs, readdir } = await import('node:fs/promises');
+      // §7.7：门禁通过后必须基于新基线导出包含实际冲突解决结果的完整 diff，不得复用旧补丁文本。
+      let newPatchText = '';
+      try {
+        newPatchText = await vcs.exportWorkingTreeDiff(base, touchedPaths);
+      } catch (error) {
+        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        return { status: 'ABORTED', message: `Rebase 无法导出新基线补丁：${error instanceof Error ? error.message : String(error)}`, jobId };
+      }
+      await vcs.revertBusinessWorkspace().catch(() => undefined);
+      if (!newPatchText.trim() || patchTouchesReviewData(newPatchText)) {
+        return { status: 'ABORTED', message: 'Rebase 导出的新补丁为空或包含禁止路径，未产生新版本', jobId };
+      }
+      // 新补丁必须能在新基线干净应用，验证后立即还原。
+      const { writeFile: writeTmp, rm: rmTmp, readFile: readFs, readdir } = await import('node:fs/promises');
+      const os = await import('node:os');
+      const tmpNewPatch = path.join(os.tmpdir(), `dcr-rebase-${String(process.pid)}-${String(Date.now())}.patch`);
+      await writeTmp(tmpNewPatch, newPatchText, 'utf8');
+      let verifyApply;
+      try {
+        verifyApply = await vcs.applyPatch(tmpNewPatch, false);
+      } finally {
+        await rmTmp(tmpNewPatch, { force: true }).catch(() => undefined);
+      }
+      await vcs.revertBusinessWorkspace().catch(() => undefined);
+      if (!verifyApply.ok) {
+        return { status: 'ABORTED', message: `Rebase 新补丁无法在新基线干净应用：${verifyApply.message}`, jobId };
+      }
       const reviewBackup = await readFs(candidate.reviewPath, 'utf8');
       const entriesBefore = new Set(await readdir(candidate.dirPath).catch(() => [] as string[]));
       const updated = await store.appendRevision(id, {
-        author: 'ai', baseRevision: base, patchText: await readFs(patchPath, 'utf8'),
+        author: 'ai', baseRevision: base, patchText: newPatchText,
       }, guard);
       const writtenReview = await readFs(updated.reviewPath, 'utf8').catch(() => null);
       const result = await this.commitAndClassify({
@@ -1674,8 +1842,9 @@ export class ReviewApi {
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
     const patchText = stringField(body, 'patchText');
-    if (!patchText.trim()) throw new ApiError(400, 'bad_request', 'patchText 不能为空');
+    if (!patchText.trim()) throw new ApiError(422, 'bad_request', 'patchText 不能为空');
     await this.requireOwnerOf(store, id); // §12.2：非 Owner 403（takeover 除外）
+    await this.requireSharedCandidate(runtime, id); // §7.1
     const detail = await store.get(id, null);
     await store.ensureWriteAllowed(detail.candidate, guard);
     const job = this.jobs.start('ai_fix', (log, jobId) => this.withWriteLock(store.repoRoot, async () => {
@@ -1689,7 +1858,7 @@ export class ReviewApi {
       const tmpPath = path.join(os.tmpdir(), `dcr-tweak-${String(process.pid)}.patch`);
       await writeTmp(tmpPath, patchText, 'utf8');
       try {
-        const applied = await vcs.applyPatch(tmpPath, true);
+        const applied = await vcs.applyPatch(tmpPath, false);
         if (!applied.ok) {
           await vcs.revertBusinessWorkspace().catch(() => undefined);
           return { status: 'ABORTED', message: `补丁无法应用：${applied.message}`, jobId };
@@ -1751,6 +1920,7 @@ export class ReviewApi {
     const archive = new AuditArchive(runtime.root);
     const record = await archive.read(auditId);
     if (record.parseError) throw new ApiError(422, 'bad_request', `审查档案无效：${record.parseError}`);
+    await this.requireSharedAudit(runtime, auditId, record.reviewPath); // §7.1
     const item = record.meta.items.find((entry) => entry.findingId === findingId);
     if (!item) throw new ApiError(404, 'not_found', `finding 不存在：${findingId}`);
     if (item.status !== 'pending') {
@@ -1813,6 +1983,7 @@ export class ReviewApi {
     const archive = new AuditArchive(runtime.root);
     const record = await archive.read(auditId);
     if (record.parseError) throw new ApiError(422, 'bad_request', `审查档案无效：${record.parseError}`);
+    await this.requireSharedAudit(runtime, auditId, record.reviewPath); // §7.1
     const item = record.meta.items.find((entry) => entry.findingId === findingId);
     if (!item) throw new ApiError(404, 'not_found', `finding 不存在：${findingId}`);
     if (item.status !== 'pending') {
@@ -1836,11 +2007,30 @@ export class ReviewApi {
         throw new ApiError(409, 'conflict', `depends_on 未满足，阻塞转换——${blocker}`);
       }
     }
-    const detail = await store.get(candidateId, null);
+    const detail = await (async () => {
+      const view = await sharedViewFor(runtime);
+      if (view?.source) {
+        const { month, slug } = store.resolveCandidateDir(candidateId);
+        const sharedText = await view.source.readReviewText(month, slug).catch(() => null);
+        if (sharedText !== null) {
+          if (await view.source.hasLocalChanges(month, slug).catch(() => false)) {
+            throw new ApiError(409, 'conflict', `候选 ${candidateId} 存在本地未提交改动，不能作为转换目标；请先还原工作区`);
+          }
+          return store.get(candidateId, null, view.source);
+        }
+      }
+      return store.get(candidateId, null);
+    })();
     if (detail.candidate.parseError) throw new ApiError(422, 'bad_request', `候选数据无效：${detail.candidate.parseError}`);
     if (detail.candidate.meta.status === 'approved' || detail.candidate.meta.status === 'rejected') {
       throw new ApiError(409, 'conflict', `候选 ${candidateId} 已归档，不能作为转换目标`);
     }
+    // §7.6：只有当目标候选是本地新生成（尚未共享）时才把候选目录纳入同一提交。
+    const sharedView = await sharedViewFor(runtime);
+    const targetIsShared = sharedView?.source
+      ? (await sharedView.source.readReviewText(detail.candidate.month, detail.candidate.slug).catch(() => null)) !== null
+      : false;
+    const commitPaths = [`.ai-review/audits/${auditId}`, ...(targetIsShared ? [] : [`.ai-review/${candidateId}`])];
     // 两侧同一提交：先备份档案，更新 item，再连同候选目录一起原子提交；失败恢复档案。
     const { readFile, writeFile } = await import('node:fs/promises');
     const auditBackup = await readFile(record.reviewPath, 'utf8');
@@ -1849,7 +2039,7 @@ export class ReviewApi {
     const result = await this.commitAndClassify({
       runtime,
       message: `audit(${auditId}): convert ${findingId} -> ${candidateId}`,
-      paths: [`.ai-review/audits/${auditId}`, `.ai-review/${candidateId}`],
+      paths: commitPaths,
       probePaths: [`.ai-review/audits/${auditId}/audit.md`],
       ...(writtenAudit !== null
         ? { expectedFiles: [{ relPath: `.ai-review/audits/${auditId}/audit.md`, text: writtenAudit }] }
@@ -1878,6 +2068,7 @@ export class ReviewApi {
     const from = stringField(body, 'from');
     const reason = stringField(body, 'reason');
     await this.requireOwnerOf(store, id); // §12.2：非 Owner 403（takeover 除外）
+    await this.requireSharedCandidate(runtime, id); // §7.1
     const backupText = await this.reviewBackup(store, id); // §5.6：写入前备份
     const candidate = await store.reopen(id, from, reason, guard);
     const commit = await this.commitSharedWrite(`review(${id}): 人工重开（来自 ${from}）`, candidate, runtime, backupText);
@@ -1893,15 +2084,15 @@ export class ReviewApi {
     const guard = guardFrom(body);
     // §4.7：人工判断项的确认/知悉记录随批准提交。
     const confirmed = Array.isArray(body['confirmedDecisions'])
-      ? body['confirmedDecisions'].map((item) => String(item)).filter(Boolean)
+      ? body['confirmedDecisions'].map((item) => String(item).trim()).filter(Boolean)
       : [];
     const waivedRaw = Array.isArray(body['waivedDecisions']) ? body['waivedDecisions'] : [];
     const waived = waivedRaw
       .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
-      .map((item) => ({ id: String(item['id'] ?? ''), reason: String(item['reason'] ?? '') }))
+      .map((item) => ({ id: String(item['id'] ?? '').trim(), reason: String(item['reason'] ?? '') }))
       .filter((item) => item.id);
     for (const item of waived) {
-      if (!item.reason.trim()) throw new ApiError(400, 'bad_request', `知悉项 ${item.id} 必须填写理由`);
+      if (!item.reason.trim()) throw new ApiError(422, 'bad_request', `知悉项 ${item.id} 必须填写理由`);
     }
     // §8.3/§7.5：可选 commitMessage——提供时先替换候选 commit_message 再校验首行；
     // 校验通过的值在批准原子提交中一并写入 review.md，并作为业务提交说明。
@@ -1909,10 +2100,11 @@ export class ReviewApi {
       ? undefined
       : (typeof body['commitMessage'] === 'string' ? body['commitMessage'] : '');
     if (commitMessage !== undefined && !commitMessage.trim()) {
-      throw new ApiError(400, 'bad_request', 'commitMessage 提供时必须非空');
+      throw new ApiError(422, 'bad_request', 'commitMessage 提供时必须非空');
     }
     // §12.2：非 Owner 403（takeover 除外）。
     await this.requireOwnerOf(store, id);
+    await this.requireSharedCandidate(runtime, id); // §7.1
     // §7.5/G19：受理前完整 guard 预检（409 stale）与 pending-only 状态预检（409 conflict）。
     {
       const detail = await store.get(id, null, await sharedSourceFor(runtime));
@@ -1940,7 +2132,7 @@ export class ReviewApi {
         }
       }
     }
-    const job = this.jobs.start('approve', async (log, jobId) => {
+    const job = this.jobs.start('approve', async (log, jobId, signal) => {
       // §6/§7.5 重复候选复检闭包：供受理后、同步后、门禁后三处复检（G35）。
       const checkDuplicate = async (): Promise<string | null> => {
         const reviewersCfg = await loadReviewers(store.repoRoot);
@@ -1956,9 +2148,10 @@ export class ReviewApi {
         checkDuplicate,
         // §7.1：批准流程内部重读候选必须绑定共享快照（每次重建，同步后重绑）。
         sharedSource: () => sharedSourceFor(runtime),
-        // §7.7/G30：批准流程在安全检查点读取取消标志。
+        // §7.7/G30：批准流程在安全检查点读取取消标志；Runner 由取消信号终止。
         shouldCancel: () => Boolean((job as { cancelRequested?: boolean }).cancelRequested),
         ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
+        signal,
       });
       // §12.1：批准人使用实际操作者，不用 expectedOwner 冒充身份。
       const me = await this.ownerFor(store.repoRoot);
@@ -1988,6 +2181,7 @@ export class ReviewApi {
     const { store, vcs } = runtime;
     const detail = await store.get(id, null);
     await this.requireOwnerOf(store, id); // §12.2：非 Owner 403（takeover 除外）
+    await this.requireSharedCandidate(runtime, id); // §7.1：AI 修复只能作用于共享事实
     // §7.4/G23：显式 ai-fix 必须至少有一条 unresolved/partial 评论作为输入。
     const actionable = detail.candidate.meta.comments.filter((comment) => comment.status !== 'resolved');
     if (actionable.length === 0) {
@@ -2002,7 +2196,7 @@ export class ReviewApi {
     }
     const clean = await vcs.ensureCleanWorkspace();
     if (!clean.clean) throw new ApiError(409, 'conflict', clean.message);
-    return this.jobs.start('ai_fix', async (log) => {
+    return this.jobs.start('ai_fix', (log, _jobId, signal) => this.withWriteLock(runtime.root, async () => {
       const comments = detail.candidate.meta.comments.filter((comment) => comment.status !== 'resolved');
       const patch = await store.currentPatch(detail.candidate);
       const { readFile: readFs, readdir } = await import('node:fs/promises');
@@ -2026,6 +2220,7 @@ export class ReviewApi {
         workingTree,
         log,
         ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
+        signal,
       });
       let result;
       try {
@@ -2036,6 +2231,13 @@ export class ReviewApi {
       if (result.manual) return { manual: true, prompt: result.prompt ?? '' };
       if (!result.success) {
         await this.restoreAppendedRevision(detail.candidate, reviewBackup, entriesBefore);
+        if (result.aborted) {
+          return {
+            status: 'ABORTED',
+            reason: 'RUNNER_FAILED',
+            message: 'AI 修复已取消（未产生共享提交）',
+          };
+        }
         throw new Error(result.errorMessage ?? 'AI 修复失败');
       }
       const latest = await store.get(id, null);
@@ -2068,7 +2270,7 @@ export class ReviewApi {
         };
       }
       return { manual: false, result, status: 'COMMITTED', commitRevision: outcome.commitRevision };
-    });
+    }));
   }
 
   /**
@@ -2095,12 +2297,14 @@ export class ReviewApi {
       if (meta.status !== 'pending') errors.push(`独立候选状态必须是 pending，当前为 ${meta.status}`);
       if (meta.currentRevision !== 1) errors.push(`独立候选 current_revision 必须为 1，当前为 ${String(meta.currentRevision)}`);
       if (meta.approval !== null) errors.push('独立候选的 approval 必须为 null');
-      errors.push(...await store.validateCandidate(detail.candidate));
+      errors.push(...await store.validateFullCandidate(detail.candidate));
       if (patchTouchesReviewData(detail.patchText)) errors.push('补丁包含禁止路径（.ai-review/.tmp/node_modules/.git/.svn）');
       // §4.2：owner 路由复核。
       const reviewers = await loadReviewers(store.repoRoot);
       const routing = resolveOwner(reviewers, { paths: meta.targetFiles, tags: meta.tags });
-      if (routing.owner && meta.owner !== routing.owner) {
+      if (!routing.owner) {
+        errors.push('reviewers.yml 未配置 default_owner，无法完成 owner 路由复核');
+      } else if (meta.owner !== routing.owner) {
         errors.push(`owner 应为 ${routing.owner}（${routing.reason}），实际为 ${meta.owner || '(空)'}`);
       }
       // 补丁可在当前基线干净应用。
@@ -2164,6 +2368,25 @@ export class ReviewApi {
       return;
     }
     (job as { cancelRequested?: boolean }).cancelRequested = true;
+    // §7.7：终止进程型 Runner（若该 Job 正在运行 dsh/external 命令）。
+    this.jobs.abort(job.id);
+    // §7.6/§7.7：取消审查 Job 只把租约置 releasable 并结束跟踪 Job；
+    // 租约仍阻塞自动写，必须人工确认外部执行停止后 /audit/release。
+    const auditId = this.auditJobLeases.get(job.id);
+    if (auditId) {
+      const lease = this.auditLeases.find((entry) => entry.auditId === auditId);
+      if (lease && lease.state === 'active') {
+        lease.state = 'releasable';
+        await this.saveAuditLeases();
+      }
+      this.auditJobFinishes.get(auditId)?.({
+        status: 'ABORTED',
+        auditId,
+        message: '审查 Job 已取消；租约保持占用，确认外部执行停止后调用 /audit/release',
+      });
+      this.auditJobFinishes.delete(auditId);
+      this.auditJobLeases.delete(job.id);
+    }
     sendJson(res, 202, { jobId: job.id, job });
   }
 

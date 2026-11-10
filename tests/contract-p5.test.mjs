@@ -139,7 +139,7 @@ test('P5: 判断项未全覆盖 / 知悉缺理由 / 标题不一致 —— 批�
     confirmedDecisions: [],
     waivedDecisions: [{ id: 'h1', reason: '' }],
   });
-  assert.equal(bad.httpStatus, 400);
+  assert.equal(bad.httpStatus, 422);
 
   // 判断项漏确认 → job 结果 DECISIONS_UNCONFIRMED。
   const miss = await approveAndWait(base, {
@@ -208,4 +208,33 @@ test('P5: 合法批准——快照/结果/决定留痕 + 业务提交使用 comm
   const detail = await (await fetch(`${base}/candidate?id=${encodeURIComponent('2026-11/20261105-net-ok')}`)).json();
   assert.equal(detail.approvalCommitLookup, 'found', JSON.stringify(detail.approvalCommitLookup));
   assert.equal(detail.approvalCommitRevision, head);
+});
+
+test('AC-DECISION-01：未知 id / 重复 / 交叉的确认-知悉集合均拒绝且不写 approval', async () => {
+  const root = await createGitFixture();
+  await writeCandidate(root, '20261105-net-decisions', {
+    decisions: [{ id: 'h1', q: '是否接受行为变化？' }, { id: 'h2', q: '是否写入发布说明？' }],
+  });
+  runCommand('git', ['add', '.ai-review'], root);
+  runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
+  const { base } = await startApi(root);
+  const guard = {
+    id: '2026-11/20261105-net-decisions',
+    expectedRevision: 1,
+    expectedOwner: 'tester',
+    expectedUpdatedAt: '2026-11-01T10:00:00+08:00',
+  };
+  const cases = [
+    { confirmedDecisions: ['h1', 'unknown'], waivedDecisions: [{ id: 'h2', reason: '产品补充' }] },
+    { confirmedDecisions: ['h1', 'h1'], waivedDecisions: [{ id: 'h2', reason: '产品补充' }] },
+    { confirmedDecisions: ['h1'], waivedDecisions: [{ id: 'h1', reason: '交叉' }, { id: 'h2', reason: '产品补充' }] },
+  ];
+  for (const decisions of cases) {
+    const outcome = await approveAndWait(base, { ...guard, ...decisions });
+    assert.equal(outcome.job.result.status, 'ABORTED');
+    assert.equal(outcome.job.result.reason, 'DECISIONS_UNCONFIRMED');
+  }
+  const reviewText = await readFile(path.join(root, '.ai-review', '2026-11', '20261105-net-decisions', 'review.md'), 'utf8');
+  assert.match(reviewText, /status: pending/);
+  assert.match(reviewText, /approval: null/);
 });

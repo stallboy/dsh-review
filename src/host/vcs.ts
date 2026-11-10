@@ -2,7 +2,7 @@ import { mkdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { buildHunkFallbackDiff, isAiReviewPath, parsePatch } from './patch.js';
 import { parseReviewMarkdown } from './frontmatter.js';
 import { runProcess, tailLines, type ProcessResult } from './shell.js';
@@ -22,12 +22,29 @@ export interface DiffInput {
   toPatchText: string;
 }
 
+/** §7.5 步骤 9：提交前逐路径核对预期暂存 blob 与模式（防止 clean filter / 门禁夹带）。 */
+export interface ExpectedCommitEntry {
+  /** 仓库相对路径（正斜杠）。 */
+  path: string;
+  /** 已验证内容的 Git blob 哈希（对原始字节计算，不经过 clean filter）。 */
+  blobHash: string;
+  /** Git 索引模式（100644 / 100755）；平台不跟踪文件模式时忽略。 */
+  mode?: string;
+}
+
 export interface CommitInput {
   message: string;
   /** Absolute or repo-relative paths that must be part of the commit. */
   paths: string[];
   /** Paths that must be deleted (and staged as deletions) in this commit. */
   deletePaths?: string[];
+  /**
+   * §7.5 步骤 9：这些路径必须以给定 blob/模式暂存；任一不符则拒绝提交。
+   * 未提供时仍执行“暂存集合 ⊆ 指定路径 + 删除集合”的路径级核对。
+   */
+  verifyEntries?: ExpectedCommitEntry[];
+  /** §7.5 步骤 9：这些路径必须已从索引删除（暂存删除）。 */
+  verifyDeletions?: string[];
 }
 
 export interface CommitResult {
@@ -47,6 +64,10 @@ export interface SyncResult {
   base: string | null;
   synced: boolean;
   message: string;
+  /** §7.5 步骤 6：已知且可安全恢复的同步失败（区别于“无远端/无 upstream 的明确跳过”）。 */
+  failed?: boolean;
+  /** §7.5 步骤 6：同步部分完成或基线状态无法确定，调用方必须 RECOVERY_REQUIRED。 */
+  uncertain?: boolean;
 }
 
 export interface ApprovalDeriveInput {
@@ -73,6 +94,8 @@ export interface VcsAdapter {
   /** §5.6 分支 1：读取指定 VCS 版本下的仓库相对文件内容；不存在或不可读时返回 null。 */
   readFileAt(revision: string, relPath: string): Promise<string | null>;
   applyPatch(patchPath: string, threeWay: boolean): Promise<ApplyPatchResult>;
+  /** §7.7：把当前工作区相对 base 的完整改动导出为 Unified Diff（Rebase 新基线补丁）。 */
+  exportWorkingTreeDiff(base: string, paths: string[]): Promise<string>;
   revertBusinessWorkspace(): Promise<void>;
   computeInterRevisionDiff(input: DiffInput): Promise<InterRevisionDiff>;
   atomicCommit(input: CommitInput): Promise<CommitResult>;
@@ -106,6 +129,31 @@ function toRepoRelative(value: string): string {
     .replace(/^(?:\.\/)+/, '')
     .replace(/^\/+/, '')
     .replace(/\/+$/, '');
+}
+
+/** §7.5 步骤 9：对原始字节计算 Git blob 哈希（不含 clean filter，用于与索引暂存值比对）。 */
+export function gitBlobHash(content: Buffer | string): string {
+  const buffer = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8');
+  return createHash('sha1').update(`blob ${String(buffer.length)}\0`).update(buffer).digest('hex');
+}
+
+/** 把提交/索引路径规范化为仓库相对正斜杠形式。 */
+function normalizeCommitPath(root: string, value: string): string {
+  const relativePath = path.isAbsolute(value) ? path.relative(root, value) : value;
+  return toRepoRelative(relativePath);
+}
+
+/** §7.5 步骤 9：解析 `git ls-files -s -z` 输出，得到索引中 stage 0 条目的模式与 blob 哈希。 */
+function parseStagedIndex(output: string): Map<string, { mode: string; hash: string }> {
+  const entries = new Map<string, { mode: string; hash: string }>();
+  for (const record of output.split('\0')) {
+    if (!record) continue;
+    const match = /^(\d{6}) ([0-9a-f]+) (\d)\t(.+)$/s.exec(record);
+    if (!match || match[3] !== '0') continue;
+    const [, mode = '', hash = '', , file = ''] = match;
+    if (file) entries.set(file, { mode, hash });
+  }
+  return entries;
 }
 
 /** SVN 输出中的 URL/XML 路径可能是百分号编码；解码失败时保留原文。 */
@@ -262,20 +310,24 @@ export class GitAdapter implements VcsAdapter {
     if (this.baseBranch.trim().length > 0) {
       const fetch = await git(this.root, ['fetch', 'origin', this.baseBranch]);
       if (fetch.code !== 0) {
-        return { base: before, synced: false, message: `同步失败：${describe(fetch)}` };
+        return { base: before, synced: false, failed: true, message: `同步失败：${describe(fetch)}` };
       }
       const current = await git(this.root, ['rev-parse', '--abbrev-ref', 'HEAD']);
       const onBranch = current.code === 0 && current.stdout.trim() === this.baseBranch;
       if (onBranch) {
         const pull = await git(this.root, ['pull', '--ff-only']);
-        if (pull.code !== 0) return { base: before, synced: false, message: `同步失败：${describe(pull)}` };
+        if (pull.code !== 0) return { base: before, synced: false, failed: true, message: `同步失败：${describe(pull)}` };
       } else {
         // ff-only 推进本地 baseBranch（非快进会被 fetch 拒绝，不产生合并提交）。
         const advance = await git(this.root, ['fetch', 'origin', `${this.baseBranch}:${this.baseBranch}`]);
-        if (advance.code !== 0) return { base: before, synced: false, message: `同步失败：${describe(advance)}` };
+        if (advance.code !== 0) return { base: before, synced: false, failed: true, message: `同步失败：${describe(advance)}` };
       }
       const head = await git(this.root, ['rev-parse', this.baseBranch]);
-      const base = head.code === 0 ? head.stdout.trim() : before;
+      if (head.code !== 0) {
+        // 已 fetch 但无法证明本地基线状态：不得当作“已同步成功”。
+        return { base: null, synced: false, uncertain: true, message: `同步后无法读取 ${this.baseBranch} 基线：${describe(head)}` };
+      }
+      const base = head.stdout.trim();
       return { base, synced: base !== before, message: base === before ? '已是最新基线' : `已同步 ${this.baseBranch} 到 ${String(base).slice(0, 12)}` };
     }
     const upstream = await git(this.root, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
@@ -284,9 +336,12 @@ export class GitAdapter implements VcsAdapter {
     }
     const pull = await git(this.root, ['pull', '--ff-only']);
     if (pull.code !== 0) {
-      return { base: before, synced: false, message: `同步失败：${describe(pull)}` };
+      return { base: before, synced: false, failed: true, message: `同步失败：${describe(pull)}` };
     }
     const base = await this.getCurrentBase();
+    if (base === null) {
+      return { base: null, synced: false, uncertain: true, message: '同步后无法读取当前 HEAD，基线状态不明' };
+    }
     return {
       base,
       synced: base !== before,
@@ -322,6 +377,17 @@ export class GitAdapter implements VcsAdapter {
     return check.code === 0
       ? { ok: true, conflict: false, message: '补丁可应用到当前基线' }
       : { ok: false, conflict: true, message: tailLines(describe(check), 40) };
+  }
+
+  /** §7.7：导出工作区相对 base 的完整 diff（含新文件），供 Rebase 生成新基线补丁。 */
+  async exportWorkingTreeDiff(base: string, paths: string[]): Promise<string> {
+    const rel = [...new Set(paths.map((item) => normalizeCommitPath(this.root, item)).filter((item) => item.length > 0))];
+    if (rel.length === 0) return '';
+    await git(this.root, ['add', '-N', '--', ...rel]).catch(() => undefined);
+    const diff = await git(this.root, ['diff', '--binary', '--no-ext-diff', base, '--', ...rel]);
+    await git(this.root, ['reset', '-q', '--', ...rel]).catch(() => undefined);
+    if (diff.code !== 0) throw new Error(`导出工作区 diff 失败：${describe(diff)}`);
+    return diff.stdout;
   }
 
   async revertBusinessWorkspace(): Promise<void> {
@@ -445,38 +511,67 @@ export class GitAdapter implements VcsAdapter {
   async atomicCommit(input: CommitInput): Promise<CommitResult> {
     const paths = input.paths.filter((item) => item.trim().length > 0);
     const deletions = (input.deletePaths ?? []).filter((item) => item.trim().length > 0);
+    const stagingPaths = [...new Set(paths.map((item) => normalizeCommitPath(this.root, item)))];
+    const deletionPaths = [...new Set(deletions.map((item) => normalizeCommitPath(this.root, item)))];
+    if (stagingPaths.length === 0) {
+      return { success: false, commitRevision: null, outOfDate: false, errorOutput: '没有指定要提交的路径' };
+    }
     for (const deletion of deletions) {
       const absolute = path.isAbsolute(deletion) ? deletion : path.join(this.root, deletion);
       await rm(absolute, { force: true }).catch(() => undefined);
     }
-    const stagingPaths = [...new Set(paths)].map((item) =>
-      path.isAbsolute(item) ? path.relative(this.root, item) : item,
-    );
-    const add = await git(this.root, ['add', '-A', '--', ...(stagingPaths.length > 0 ? stagingPaths : ['.'])]);
+    const fail = async (errorOutput: string): Promise<CommitResult> => {
+      // §7.5 步骤 9：核对失败必须 fail-closed，并只清空本次暂存的路径，
+      // 不丢弃用户/其他流程事先暂存的内容。
+      const resetPaths = [...new Set([...stagingPaths, ...deletionPaths])];
+      await git(this.root, ['reset', '-q', '--', ...resetPaths]).catch(() => undefined);
+      return { success: false, commitRevision: null, outOfDate: false, errorOutput };
+    };
+    const add = await git(this.root, ['add', '-A', '--', ...stagingPaths]);
     if (add.code !== 0) {
       return { success: false, commitRevision: null, outOfDate: false, errorOutput: describe(add) };
     }
-    // §7.5 步骤 9：逐路径核对暂存集合——索引中不得出现指定路径之外的条目
-    // （防止门禁或 clean filter 夹带未审核代码进入提交）。
-    const stagedList = await git(this.root, ['diff', '--cached', '--name-only']);
-    if (stagedList.code === 0) {
-      const allowed = new Set([
-        ...stagingPaths,
-        ...(input.deletePaths ?? []).filter((item) => item.trim().length > 0),
-      ]);
-      const unexpected = stagedList.stdout
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0 && ![...allowed].some((item) => line === item || line.startsWith(`${item}/`)));
-      if (unexpected.length > 0) {
-        await git(this.root, ['reset', '-q', '--', '.']).catch(() => undefined);
-        return {
-          success: false,
-          commitRevision: null,
-          outOfDate: false,
-          errorOutput: `暂存区包含指定路径之外的条目，已拒绝提交：\n${unexpected.slice(0, 20).join('\n')}`,
-        };
+    // §7.5 步骤 9：暂存集合必须 ⊆ 指定路径 + 删除集合；读取失败时不得继续提交。
+    const stagedList = await git(this.root, ['diff', '--cached', '--name-only', '-z']);
+    if (stagedList.code !== 0) {
+      return fail(`无法读取暂存区，拒绝提交：${describe(stagedList)}`);
+    }
+    const allowed = [...stagingPaths, ...deletionPaths];
+    const stagedFiles = stagedList.stdout.split('\0').map((line) => line.trim()).filter((line) => line.length > 0);
+    const unexpected = stagedFiles.filter((line) => !allowed.some((item) => line === item || line.startsWith(`${item}/`)));
+    if (unexpected.length > 0) {
+      return fail(`暂存区包含指定路径之外的条目，已拒绝提交：\n${unexpected.slice(0, 20).join('\n')}`);
+    }
+    // §7.5 步骤 9：逐路径核对暂存 blob、模式与删除集合（防止 clean filter / 门禁夹带）。
+    const indexResult = await git(this.root, ['ls-files', '-s', '-z', '--', ...allowed]);
+    if (indexResult.code !== 0) {
+      return fail(`无法读取索引，拒绝提交：${describe(indexResult)}`);
+    }
+    const index = parseStagedIndex(indexResult.stdout);
+    const fileMode = process.platform !== 'win32'
+      ? true
+      : (await git(this.root, ['config', '--get', 'core.filemode'])).stdout.trim() === 'true';
+    const problems: string[] = [];
+    for (const expected of input.verifyEntries ?? []) {
+      const rel = normalizeCommitPath(this.root, expected.path);
+      const entry = index.get(rel);
+      if (!entry) {
+        problems.push(`缺少暂存条目：${rel}`);
+        continue;
       }
+      if (entry.hash !== expected.blobHash) {
+        problems.push(`暂存内容与已审核内容不一致：${rel}`);
+      }
+      if (fileMode && expected.mode && entry.mode !== expected.mode) {
+        problems.push(`暂存模式与已审核模式不一致：${rel}（${entry.mode} ≠ ${expected.mode}）`);
+      }
+    }
+    for (const deleted of input.verifyDeletions ?? []) {
+      const rel = normalizeCommitPath(this.root, deleted);
+      if (index.has(rel)) problems.push(`删除未在暂存区生效：${rel}`);
+    }
+    if (problems.length > 0) {
+      return fail(`已审核内容与暂存区不一致，已拒绝提交：\n${problems.slice(0, 20).join('\n')}`);
     }
     const staged = await git(this.root, ['diff', '--cached', '--quiet']);
     if (staged.code === 0) {
@@ -488,7 +583,8 @@ export class GitAdapter implements VcsAdapter {
       return {
         success: false,
         commitRevision: null,
-        outOfDate: /index\.lock|unable to create|EACCES|EBUSY/i.test(output),
+        // §7.2：只把本地锁冲突特征视为可重试撞车，不得把权限/占用等确定性失败误分类。
+        outOfDate: /index\.lock|cannot lock ref|unable to create.*lock|Another git process/i.test(output),
         errorOutput: output,
       };
     }
@@ -642,9 +738,12 @@ export class SvnAdapter implements VcsAdapter {
     const before = await this.getCurrentBase();
     const update = await svn(this.root, ['update']);
     if (update.code !== 0) {
-      return { base: before, synced: false, message: `svn update 失败：${describe(update)}` };
+      return { base: before, synced: false, failed: true, message: `同步失败：svn update 失败：${describe(update)}` };
     }
     const base = await this.getCurrentBase();
+    if (base === null) {
+      return { base: null, synced: false, uncertain: true, message: '同步后无法读取工作副本 revision，基线状态不明' };
+    }
     return {
       base,
       synced: base !== before,
@@ -662,6 +761,15 @@ export class SvnAdapter implements VcsAdapter {
   /** §8.2：SVN 无 dry-run 等价物——返回 unknown 诊断，不作为批准依据。 */
   async checkPatch(_patchPath: string): Promise<ApplyPatchResult> {
     return { ok: false, conflict: false, message: 'SVN 暂不支持补丁预检（仅诊断）' };
+  }
+
+  /** §7.7：SVN 无三方合并，但可导出工作副本相对 BASE 的完整 diff。 */
+  async exportWorkingTreeDiff(_base: string, paths: string[]): Promise<string> {
+    const rel = [...new Set(paths.map((item) => normalizeCommitPath(this.root, item)).filter((item) => item.length > 0))];
+    if (rel.length === 0) return '';
+    const diff = await svn(this.root, ['diff', '--', ...rel]);
+    if (diff.code !== 0) throw new Error(`导出工作区 diff 失败：${describe(diff)}`);
+    return diff.stdout;
   }
 
   async revertBusinessWorkspace(): Promise<void> {

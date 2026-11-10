@@ -3,6 +3,7 @@ import { readdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { load, dump } from './yaml.js';
+import { isRepoRelativePath } from './invariants.js';
 
 /**
  * §3 audit.md 新契约：目录式审查档案（audits/<audit_id>/audit.md）+ §3.4 finding 投影。
@@ -160,14 +161,47 @@ export function auditInvariantErrors(meta: AuditFrontmatter, dirName: string): s
   const errors: string[] = [];
   if (!AUDIT_DIR_PATTERN.test(dirName)) errors.push(`I1: audit 目录名非法：${dirName}`);
   if (meta.auditId !== dirName) errors.push(`I1: audit_id=${meta.auditId} 与目录名 ${dirName} 不一致`);
-  // I9：converted ⟺ candidate 非空。
+  const findingIds = new Set<string>();
   for (const item of meta.items) {
     const at = `items[${item.findingId}]`;
+    // I1：finding_id 必须匹配规范且同一档案内唯一。
+    if (!FINDING_ID_PATTERN.test(item.findingId)) errors.push(`I1: ${at} finding_id 非法`);
+    if (findingIds.has(item.findingId)) errors.push(`I1: ${at} finding_id 在同一档案内重复`);
+    findingIds.add(item.findingId);
+    // I12：item.target_files 必须是合法仓库相对路径（空数组允许）。
+    for (const target of item.targetFiles) {
+      if (!isRepoRelativePath(target)) errors.push(`I12: ${at} target_files 含非法路径：${target}`);
+    }
+    // I9：converted ⟺ candidate 非空。
     if (item.status === 'converted' && !item.candidate) errors.push(`I9: ${at} converted 但 candidate 为空`);
     if (item.status !== 'converted' && item.candidate) errors.push(`I9: ${at} 非 converted 但 candidate 非空`);
-    // I10：deferred 必须有依赖；confirm 必须没有。
+    // I10：deferred 必须有依赖且不得自依赖；confirm 必须没有。
     if (item.kind === 'deferred' && !item.dependsOn) errors.push(`I10: ${at} deferred 缺少 depends_on`);
+    if (item.kind === 'deferred' && item.dependsOn === item.findingId) errors.push(`I10: ${at} deferred 不得自依赖`);
     if (item.kind === 'confirm' && item.dependsOn) errors.push(`I10: ${at} confirm 不应有 depends_on`);
+  }
+  // I10：pending 依赖环必须报告。
+  const pendingDeps = new Map<string, string>();
+  for (const item of meta.items) {
+    if (item.kind === 'deferred' && item.status === 'pending' && item.dependsOn) {
+      pendingDeps.set(item.findingId, item.dependsOn);
+    }
+  }
+  const reportedCycles = new Set<string>();
+  for (const start of pendingDeps.keys()) {
+    const pathSeen = new Set<string>();
+    let current: string | undefined = start;
+    while (current !== undefined) {
+      if (pathSeen.has(current)) {
+        if (!reportedCycles.has(current)) {
+          reportedCycles.add(current);
+          errors.push(`I10: pending 依赖形成环：${[...pathSeen, current].join(' → ')}`);
+        }
+        break;
+      }
+      pathSeen.add(current);
+      current = pendingDeps.get(current);
+    }
   }
   // I13：audit_id 时间戳与 created_at 的 UTC 日历时刻一致（§4.7：与创建/读取机器时区无关）。
   const stamp = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/.exec(meta.auditId);
