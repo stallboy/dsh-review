@@ -260,8 +260,10 @@ test('API chains an overall comment into an AI fix job', async () => {
 
   const job = await waitForJob(server.base, response.job.id);
   assert.equal(job.status, 'succeeded', job.error ?? '');
-  assert.equal(job.result.manual, true);
-  assert.match(job.result.prompt, /请补充边界测试/);
+  // §7.7：ai_fix Job 的 manual 结果使用判别形状 status=MANUAL_REQUIRED + manualPrompt
+  // （旧的非判别形状 {manual:true,prompt} 已统一为 AiFixOutcome）。
+  assert.equal(job.result.status, 'MANUAL_REQUIRED', JSON.stringify(job.result));
+  assert.match(job.result.manualPrompt, /请补充边界测试/);
 
   const detail = await getJson(`${server.base}/candidate?id=${encodeURIComponent('2026-10/pending-one')}`);
   assert.equal(detail.candidate.meta.status, 'changes_requested');

@@ -937,15 +937,39 @@ export class ReviewStore {
     };
   }
 
+  /**
+   * §7.1/§7.7：从**共享快照**读取当前版本补丁。返回值**不含工作区路径**——调用方
+   * 没有机会再回头读本地文件（历史缺陷 B2：Rebase 绕过共享源读了工作区补丁）。
+   * 这是批准、Rebase、收尾、转换等所有共享流程唯一合法的补丁读取入口。
+   */
+  async readSharedPatch(
+    candidate: ReviewCandidate,
+    source: CandidateSource,
+    revisionId?: number,
+  ): Promise<{ revision: number; patchName: string; text: string; baseRevision: string }> {
+    const revision = revisionId === undefined
+      ? candidate.meta.revisions.find((item) => item.id === candidate.meta.currentRevision)
+      : candidate.meta.revisions.find((item) => item.id === revisionId);
+    if (!revision) throw new ApiError(500, 'internal', '版本缺失');
+    const text = await source.readPatchText(candidate.month, candidate.slug, revision.patch);
+    if (text === null) {
+      throw new ApiError(404, 'not_found', `共享快照中不存在补丁：${revision.patch}（候选 ${candidate.id}）`);
+    }
+    return { revision: revision.id, patchName: revision.patch, text, baseRevision: revision.baseRevision };
+  }
+
   /** §7.5 步骤 4 / §7.6：批准与收尾必须通过的完整不变量（含 I4/I5/I16 引用目标）。 */
-  async validateFullCandidate(candidate: ReviewCandidate): Promise<string[]> {
+  async validateFullCandidate(candidate: ReviewCandidate, source?: CandidateSource): Promise<string[]> {
     const errors = await this.validateCandidate(candidate);
     const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
     if (!current) return errors;
     let currentPatchPaths: string[] | null = null;
     try {
-      const text = await readFile(this.patchPathFor(candidate, current.patch), 'utf8');
-      currentPatchPaths = parsePatch(text).paths.filter((file) => !isAiReviewPath(file));
+      // §7.1：共享流程的完整性校验必须与提交内容来自同一快照。
+      const text = source
+        ? await source.readPatchText(candidate.month, candidate.slug, current.patch)
+        : await readFile(this.patchPathFor(candidate, current.patch), 'utf8');
+      currentPatchPaths = text === null ? null : parsePatch(text).paths.filter((file) => !isAiReviewPath(file));
     } catch {
       currentPatchPaths = null;
     }

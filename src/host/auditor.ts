@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { patchTouchesReviewData, gitBlobHash, type VcsAdapter } from './vcs.js';
+import { patchTouchesReviewData, collectCommitEntries, type VcsAdapter } from './vcs.js';
 import { reviewersPath } from './reviewers.js';
 import { runAgent, wrapAgentPrompt } from './runner.js';
 import { ReviewStore } from './store.js';
@@ -978,13 +978,14 @@ export class Auditor {
       // SVN 下目录 revision 不随子文件修改前进：探针至少覆盖 audit.md 本身。
       const probePaths = [reportPath, ...validAfterGates.map((id) => `.ai-review/${id}`)];
       const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
+      // §7.5 步骤 9（B1）：先展开完整提交集合（目录 → 文件），再核对，防止另存文件夹带。
+      const { entries: commitEntries } = await collectCommitEntries(store.repoRoot, commitPaths);
       const commit = await vcs.atomicCommit({
         message: `audit(${scopeLabel}): 仓库审查生成 ${String(created.length)} 个候选${created.length === 0 ? '（仅报告）' : ''} [skip ci]`,
         paths: commitPaths,
-        ...(writtenAudit !== null
-          ? { verifyEntries: [{ path: reportPath, blobHash: gitBlobHash(writtenAudit) }] }
-          : {}),
+        verifyEntries: commitEntries,
       });
+      void writtenAudit;
       if (commit.success) {
         commitRevision = commit.commitRevision;
         this.log(`已提交审查收尾：${commitRevision?.slice(0, 12) ?? '(无版本号)'}`);

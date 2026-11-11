@@ -18,6 +18,7 @@
     useMemo<T>(factory: () => T, deps: readonly unknown[]): T;
     useRef<T>(initial: T): { current: T };
     useCallback<T extends (...args: any[]) => any>(fn: T, deps: readonly unknown[]): T;
+    useReducer<S, A>(reducer: (state: S, action: A) => S, initial: S): [S, (action: A) => void];
   }
   interface Slots {
     inject(name: string, callback: () => void | (() => void)): void;
@@ -191,6 +192,71 @@
     return status === 'resolved' ? '已处理' : status === 'partial' ? '部分处理' : '未处理';
   }
 
+  /**
+   * §10.2（A9）：判定页面持有的 guard 是否已过期——revision / owner / updated_at
+   * 任一变化都必须提示 stale（updated_at 检出“不推进版本”的评论类写入）。
+   * 抽成纯函数，避免内联条件在多点重复（历史缺陷：刷新解锁与过期判定分散）。
+   */
+  function isGuardStale(
+    snapshot: { revision: number; owner: string; updatedAt: string } | null,
+    meta: { currentRevision: number; owner: string; updatedAt: string },
+  ): boolean {
+    if (!snapshot) return false;
+    return snapshot.revision !== meta.currentRevision
+      || snapshot.owner !== meta.owner
+      || snapshot.updatedAt !== meta.updatedAt;
+  }
+
+  /** §10.2：详情页持有的 guard（候选快照版本三字段）。 */
+  type GuardSnapshot = { revision: number; owner: string; updatedAt: string };
+
+  /**
+   * §10.2（A9）详情页状态机。
+   *
+   * 收敛前：`detail` / `selectedId` / `stale` 三个 useState 加一个 guardRef，过期判定、
+   * 刷新解锁、切换候选三种迁移分散在 8 处手工赋值里（历史缺陷就是漏清 guard）。
+   * 现在只有四个语义动作，任何迁移都只能通过 reducer，guard 与 stale 不可能失同步：
+   *   - open(id)      进入某候选详情，清空旧快照与 stale
+   *   - leave()       离开详情页
+   *   - loaded(detail) 收到服务端详情：无快照则绑定；有快照且失配则标记 stale
+   *   - rebind()      人工刷新：丢弃旧快照并解除锁定（下一次 loaded 会重新绑定）
+   */
+  interface DetailState {
+    id: string;
+    detail: Detail | null;
+    stale: boolean;
+    guard: GuardSnapshot | null;
+  }
+
+  type DetailAction =
+    | { type: 'open'; id: string }
+    | { type: 'leave' }
+    | { type: 'loaded'; detail: Detail }
+    | { type: 'rebind' };
+
+  const EMPTY_DETAIL_STATE: DetailState = { id: '', detail: null, stale: false, guard: null };
+
+  function detailReducer(state: DetailState, action: DetailAction): DetailState {
+    switch (action.type) {
+      case 'open':
+        // 切换候选：旧快照必须丢弃，否则会拿 A 的 guard 去判定 B。
+        return { id: action.id, detail: null, stale: false, guard: null };
+      case 'leave':
+        return EMPTY_DETAIL_STATE;
+      case 'loaded': {
+        const meta = action.detail.candidate.meta;
+        const nextGuard = { revision: meta.currentRevision, owner: meta.owner, updatedAt: meta.updatedAt };
+        if (!state.guard) return { ...state, detail: action.detail, guard: nextGuard };
+        const stale = isGuardStale(state.guard, meta) || state.stale;
+        return { ...state, detail: action.detail, stale };
+      }
+      case 'rebind':
+        return { ...state, stale: false, guard: null };
+      default:
+        return state;
+    }
+  }
+
   function parseDiff(text: string): DiffFile[] {
     const files: DiffFile[] = [];
     let current: DiffFile | null = null;
@@ -237,7 +303,7 @@
   function createPlugin(requireModule: (id: string) => any) {
     const React = requireModule('react') as ReactLike;
     const h = React.createElement;
-    const { useState, useEffect, useMemo, useRef, useCallback } = React;
+    const { useState, useEffect, useMemo, useRef, useCallback, useReducer } = React;
 
     const CSS = `
 .dcr{display:flex;flex-direction:column;height:100%;min-height:0;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-size:13px}
@@ -465,8 +531,6 @@
       const [settings, setSettings] = useState<Settings | null>(null);
       const [screen, setScreen] = useState<'loading' | 'setup' | 'queue' | 'detail' | 'settings'>('loading');
       const [queue, setQueue] = useState<Queue | null>(null);
-      const [detail, setDetail] = useState<Detail | null>(null);
-      const [selectedId, setSelectedId] = useState('');
       const [diff, setDiff] = useState<DiffResult | null>(null);
       const [diffMode, setDiffMode] = useState<'full' | 'incremental'>('full');
       const [diffFrom, setDiffFrom] = useState(1);
@@ -474,7 +538,10 @@
       const [loading, setLoading] = useState(false);
       const [error, setError] = useState('');
       const [busy, setBusy] = useState(false);
-      const [stale, setStale] = useState(false);
+      /** §10.2（A9）：详情页状态（id/detail/stale/guard）由单一 reducer 持有。 */
+      const [detailState, dispatchDetail] = useReducer(detailReducer, EMPTY_DETAIL_STATE);
+      const { detail, stale } = detailState;
+      const selectedId = detailState.id;
       /** §12.2/G4：reviewers.yml 的门禁白名单（非白名单命令批准前需二次确认）。 */
       const [allowedGates, setAllowedGates] = useState<string[] | null>(null);
       const [job, setJob] = useState<Job | null>(null);
@@ -502,7 +569,6 @@
       const [auditCopied, setAuditCopied] = useState(false);
       const [auditSessionId, setAuditSessionId] = useState('');
       const [filter, setFilter] = useState({ owner: '', statuses: '', text: '', tag: '' });
-      const guardRef = useRef<{ revision: number; owner: string; updatedAt: string } | null>(null);
       const diffFiles = useMemo(() => parseDiff(diff?.unifiedDiff ?? ''), [diff]);
 
       const refreshHealth = useCallback(async (): Promise<Health | null> => {
@@ -542,11 +608,8 @@
           void api.get<{ config?: { allowedGateCommands?: string[] } }>('/reviewers')
             .then((reviewers) => setAllowedGates(reviewers.config?.allowedGateCommands ?? []))
             .catch(() => setAllowedGates([]));
-          const snapshot = guardRef.current;
-          if (snapshot && (snapshot.revision !== value.candidate.meta.currentRevision || snapshot.owner !== value.candidate.meta.owner
-            || snapshot.updatedAt !== value.candidate.meta.updatedAt)) setStale(true);
-          else if (!snapshot) guardRef.current = { revision: value.candidate.meta.currentRevision, owner: value.candidate.meta.owner, updatedAt: value.candidate.meta.updatedAt };
-          setDetail(value);
+          // §10.2（A9）：绑定与过期判定全部交给 reducer（'loaded'），不再手工同步 guard。
+          dispatchDetail({ type: 'loaded', detail: value });
           setError('');
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
         finally { setLoading(false); }
@@ -555,8 +618,7 @@
       /** §10.2：guard 变化后“刷新”必须重新绑定新快照并解除锁定。 */
       const reloadCurrent = (): void => {
         if (!selectedId) return;
-        guardRef.current = null;
-        setStale(false);
+        dispatchDetail({ type: 'rebind' });
         void loadDetail(selectedId);
       };
 
@@ -640,8 +702,7 @@
               if (value.status !== 'running') {
                 setBusy(false);
                 if (selectedId) {
-                  guardRef.current = null;
-                  setStale(false);
+                  dispatchDetail({ type: 'rebind' });
                   await loadDetail(selectedId);
                   await loadDiff(selectedId, diffMode, diffFrom);
                 }
@@ -697,7 +758,7 @@
             ...(file !== '' && line !== 0 && anchor ? { anchor } : {}),
           });
           // 本端写入推进 updated_at：重置快照避免把自己判定为 stale。
-          guardRef.current = null;
+          dispatchDetail({ type: 'rebind' });
           await afterWrite();
           if (response.autoFixError) {
             setError(`意见已保存，但 AI 修复未能启动：${response.autoFixError}`);
@@ -725,7 +786,7 @@
           const response = await api.post<{ job?: Job; autoFixError?: string }>('/comments/batch', {
             id: detail.candidate.id, ...guard(), comments: drafts.map((content) => ({ content })), autoFix,
           });
-          guardRef.current = null;
+          dispatchDetail({ type: 'rebind' });
           await afterWrite();
           if (response.autoFixError) {
             setError(`意见已保存，但 AI 修复未能启动：${response.autoFixError}`);
@@ -750,7 +811,7 @@
         setBusy(true);
         try {
           await api.post('/comment-status', { id: detail.candidate.id, ...guard(), commentId, status });
-          guardRef.current = null;
+          dispatchDetail({ type: 'rebind' });
           await afterWrite();
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
         finally { setBusy(false); }
@@ -774,7 +835,7 @@
         setBusy(true);
         try {
           await api.post('/takeover', { id: detail.candidate.id, ...guard(), owner: detail.me });
-          guardRef.current = null; setStale(false);
+          dispatchDetail({ type: 'rebind' });
           await afterWrite();
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
         finally { setBusy(false); }
@@ -786,7 +847,7 @@
         try {
           await api.post('/reject', { id: detail.candidate.id, ...guard(), reason: rejectReason });
           setPanel(''); setRejectReason('');
-          setScreen('queue'); setSelectedId(''); setDetail(null);
+          setScreen('queue'); dispatchDetail({ type: 'leave' });
           await loadQueue();
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
         finally { setBusy(false); }
@@ -817,7 +878,7 @@
         setBusy(true); setError('');
         try {
           await api.post('/resume', { id: detail.candidate.id, ...guard() });
-          guardRef.current = null;
+          dispatchDetail({ type: 'rebind' });
           setAck({}); setWaiveReason({});
           if (selectedId) await loadDetail(selectedId);
           await loadQueue();
@@ -887,8 +948,10 @@
       };
 
       const openCandidate = (id: string): void => {
-        guardRef.current = null; setStale(false); setDetail(null); setDiff(null);
-        setDiffMode('full'); setDiffFrom(1); setSelectedId(id); setScreen('detail');
+        // §10.2：切换候选由 reducer 的 'open' 一次性清空 detail/stale/guard（旧的 A 快照不会污染 B）。
+        dispatchDetail({ type: 'open', id });
+        setDiff(null);
+        setDiffMode('full'); setDiffFrom(1); setScreen('detail');
       };
 
       const auditReady = Boolean(queue?.currentBase ?? health?.currentBase);
@@ -1457,9 +1520,10 @@
             h('summary', null, `${running ? '实时日志' : '运行日志'}（${String(job.log.length)} 行）`),
             h('div', { className: 'dcr-log' }, job.log.length ? job.log.join('\n') : '等待输出…'),
           ),
-          result?.prompt ? h('details', { className: 'dcr-joblog' },
+          // §10.2/§7.7：manual 结果统一走判别形状 manualPrompt（recognize 旧 prompt 仅作向后兼容展示）。
+          result?.manualPrompt || result?.prompt ? h('details', { className: 'dcr-joblog' },
             h('summary', null, '修复提示词'),
-            h('textarea', { className: 'dcr-textarea', style: { minHeight: 180, marginTop: 6 }, readOnly: true, value: result.prompt }),
+            h('textarea', { className: 'dcr-textarea', style: { minHeight: 180, marginTop: 6 }, readOnly: true, value: String(result.manualPrompt ?? result.prompt) }),
           ) : null,
         );
       };

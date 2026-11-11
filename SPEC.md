@@ -791,6 +791,15 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 
 Rebase 由插件自身以 ai_fix Job 执行：读取当前基线，基线未变则 ABORTED；工作区必须干净。执行分两段：先尝试确定性的 VCS three-way 应用与门禁重跑——干净应用且门禁通过时无需调用 Runner，直接进入导出步骤（author 仍记为 `ai`）；应用冲突或门禁失败时，按 §7.4 转入 `RESOLVE_CONFLICT`（Mode C），由 Runner 从干净的新基线开始消解冲突并生成新版本，`runner` 为 `manual` 时不自动调用，返回 `ABORTED / REBASE_CONFLICT` 并在 message 携带人工修复提示词。门禁通过后必须基于新基线导出包含实际冲突解决结果的完整 `--binary` diff，并验证该新补丁能在新基线干净应用。只有该验证通过才追加 author=ai 的新 revision、回到 pending 并提交 `.ai-review/`。不得复用旧补丁文本。已证明未提交的明确失败不产生新版本并还原工作区；提交结果不明时返回 RECOVERY_REQUIRED，不得按普通失败还原。
 
+**有效业务基线（2026-11-10 澄清）**：候选元数据（`review.md`、补丁、审查档案）本身存放在 `.ai-review/` 并随版本库提交，因此任何评论、状态变更、拒绝或审查收尾都会推进 Git `HEAD` / SVN `revision`。判定“基线未变”、以及 §8.2 中 `/candidate` 与 `/queue` 的 `isBaseBehind`，一律指**业务代码基线**是否变化，而不是直接比较包含 `.ai-review/` 元数据提交的顶层版本号：
+
+- 当 `base_revision === currentBase` 时视为业务基线未变；
+- 当两者不同时，必须进一步比较两个版本之间的变更路径，排除 `.ai-review/`（Git 可用 `git diff --name-only <base> <current> -- . ":(exclude).ai-review"`；SVN 检查 `(base : current]` 区间内是否存在非 `.ai-review/` 的变更路径）；
+- 若差异中**只有** `.ai-review/` 变更，判定为业务基线未变：`isBaseBehind = false`，且 `/rebase` 命中“基线未变”分支返回 `ABORTED / BASE_UNCHANGED`；
+- 无法证明是否变化（浅克隆、版本不可读等）时不得猜测为“未变”，`/rebase` 按无法确定处理并中止。
+
+**ai_fix Job 的 Outcome 边界（2026-11-10 澄清）**：§7.5 的 `ApprovalOutcome`（含其封闭的 ABORTED 原因表）**只属于 approve Job**；批准流程中遇到补丁冲突或门禁失败必须返回 `FALLBACK_TO_PENDING`（reason 为 `PATCH_CONFLICT` / `GATE_CHECK_FAILED`），绝不返回 ABORTED。`/rebase`、`/manual-revision`、`/candidate/finalize` 与显式 `/ai-fix` 运行在 ai_fix Job 下，使用 §7.7 第二条的通用业务取值（`COMMITTED / MANUAL_REQUIRED / VALIDATION_FAILED / ABORTED / RECOVERY_REQUIRED`），其 ABORTED 的 reason 取值为 `REBASE_CONFLICT / GATE_CHECK_FAILED / BASE_UNCHANGED / DIRTY_WORKSPACE / CONCURRENCY_MISMATCH / STATE_CONFLICT / INVALID_CANDIDATE / SYNC_FAILED / COMMIT_FAILED / RUNNER_FAILED / CANCELLED`。因此 `REBASE_CONFLICT` 与 `BASE_UNCHANGED` **不属于** §7.5 的审批原因枚举，实现不得把它们写进 ApprovalOutcome。
+
 ### 7.8 会话级仓库解析
 
 API 优先根据请求 query 中的 sessionId 解析会话 cwd 作为仓库根；repoRoot 为空不代表不可用。每请求解析并缓存，缓存最多 8 个仓库。仍无法解析时，操作型接口返回 412 `not_configured`；`/health`、`/settings` 与 `/queue` 返回 200 诊断/空队列响应，其中 `configured: false`，以便 Client 展示设置入口。
@@ -839,7 +848,7 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 | GET | `/health` | 应用、版本、configured、repoRoot、owner、VCS、当前基线、诊断和状态计数。 |
 | GET | `/settings` | `{settings, validation, suggestedOwner, runners}`。 |
 | GET | `/queue?owner=&statuses=&tag=&dir=&text=&createdAfter=&createdBefore=` | `{configured, items, errors, currentBase, counts, owner, me, repoRoot}`；owner 缺省为当前操作者、显式空值表示全部；statuses 为逗号分隔合法状态，缺省/空值为全部；tag 小写比较，dir/text 为大小写不敏感包含匹配；createdAfter/Before 均为含边界的 ISO 时间点。approved 项可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup: found / ambiguous / unknown`；`ambiguous/unknown` 只作诊断，不得阻塞队列。可含缓存字段 `patchCheck`，但必须携带 `checkedBase` 与非空 ISO-8601 `checkedAt`，且不得作为共享事实或批准依据。`patchCheck` 的执行策略：预检内存缓存以 `(candidateId, revision, base)` 为键；`/queue` 只读已有缓存，未命中时该项返回 `state: "unknown"` 或省略，并由 Host 在后台以低优先级异步触发预检填充缓存，严禁在队列请求内同步批量执行补丁检查；`/candidate` 未命中缓存时可同步执行单候选预检并写回缓存。 |
-| GET | `/candidate?id=` | `{candidate, currentBase, isBaseBehind, patchCheck, approvalCommitRevision?, approvalCommitLookup?, patchText, patchStats, patchPaths, comments, validation, revisionStats, canAct, me, jobs}`。approved 候选可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup`，含义同 `/queue`。`patchCheck` 为派生诊断：`{state: clean / conflicted / unknown, checkedBase: string, checkedAt: ISO-8601 string}`；`clean/conflicted` 只表示补丁能否应用到 `checkedBase`，不构成批准证据，批准 Job 必须重新严格应用。 |
+| GET | `/candidate?id=` | `{candidate, currentBase, isBaseBehind, patchCheck, approvalCommitRevision?, approvalCommitLookup?, patchText, patchStats, patchPaths, comments, validation, revisionStats, canAct, me, jobs}`。approved 候选可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup`，含义同 `/queue`。`patchCheck` 为派生诊断：`{state: clean / conflicted / unknown, checkedBase: string, checkedAt: ISO-8601 string}`；`clean/conflicted` 只表示补丁能否应用到 `checkedBase`，不构成批准证据，批准 Job 必须重新严格应用。**`isBaseBehind`（2026-11-10 澄清）表示“业务代码基线是否变化”**：候选元数据随 `.ai-review/` 提交，会持续推进顶层版本号，因此不得用 `base_revision !== currentBase` 直接判定；两者不同时须比较两版本的变更路径并排除 `.ai-review/`，差异只含评审元数据时 `isBaseBehind = false`，与 `/rebase` 的 `BASE_UNCHANGED` 判定同源（规则见 §7.7「有效业务基线」）。无法证明是否变化时保守返回 `true`。 |
 | GET | `/patch?id=&name=` | `{name, text}`；name 必须是该候选已有 revision 的补丁文件名。 |
 | GET | `/diff?id=&from=&to=` | to 缺省当前版本；from 缺省或等于 to 返回 full，否则返回 incremental、resolutionMode 与 notes。 |
 | GET | `/fix-prompt?id=` | `{prompt, comments}`，comments 为全部未 resolved 评论。 |
@@ -912,7 +921,7 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 
 默认筛选当前操作者，状态默认全部。卡片显示 ticket、title、revision、变更规模、Owner、人工判断项、未解决评论、基线状态与本地瞬态进度。
 
-stale、duplicate、local 和基线冲突必须使用不同徽标；local 不计入共享 KPI。基线落后时提示批准将在新基线重放；`patchCheck.state == conflicted` 时提示可先 Rebase，但不得单独阻止查看或批准；批准 Job 仍须重新严格应用，冲突时按 §7.5 回退。无批量批准，整卡点击进入详情。
+stale、duplicate、local 和基线冲突必须使用不同徽标；local 不计入共享 KPI。基线落后时提示批准将在新基线重放（“落后”同样按 §7.7「有效业务基线」判定，排除 `.ai-review/` 评审元数据提交，避免每次评论后所有候选集体显示落后）；`patchCheck.state == conflicted` 时提示可先 Rebase，但不得单独阻止查看或批准；批准 Job 仍须重新严格应用，冲突时按 §7.5 回退。无批量批准，整卡点击进入详情。
 
 ### 10.2 详情页
 

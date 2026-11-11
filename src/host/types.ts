@@ -299,8 +299,64 @@ export interface ApprovalOutcome {
   jobId?: string;
 }
 
-/** §5.5：业务提交版本的派生定位结果（只读诊断）。 */
-export interface ApprovalCommitLookup {
+/**
+ * §7.7：`ai_fix` 类型 Job 的业务结果（/rebase、/manual-revision、/candidate/finalize、/ai-fix）。
+ *
+ * 类型边界（重要，勿混用）：
+ * - **§7.5 的 `ApprovalOutcome` 只属于 approve Job**：批准遇到补丁冲突/门禁失败时必须是
+ *   `FALLBACK_TO_PENDING`（reason 为 PATCH_CONFLICT / GATE_CHECK_FAILED），绝不能是
+ *   `ABORTED`（附录 A G16）。其 ABORTED 原因表是封闭枚举，**不得**加入 REBASE_CONFLICT。
+ * - **本类型属于 ai_fix Job**：只使用 §7.7 第二条的通用业务取值
+ *   （COMMITTED / MANUAL_REQUIRED / VALIDATION_FAILED / ABORTED / RECOVERY_REQUIRED），
+ *   ABORTED 的 reason 由本枚举定义。
+ */
+export type AiFixOutcomeStatus = 'COMMITTED' | 'MANUAL_REQUIRED' | 'VALIDATION_FAILED' | 'ABORTED' | 'RECOVERY_REQUIRED';
+
+/** §7.7：ai_fix Job 的 ABORTED 原因（与 §7.5 ApprovalAbortReason 相互独立）。 */
+export type AiFixAbortReason =
+  /** /rebase：三方应用冲突，且未自动消解（runner=manual 或消解失败）。 */
+  | 'REBASE_CONFLICT'
+  /** 门禁未通过，未产生新版本。 */
+  | 'GATE_CHECK_FAILED'
+  /** /rebase：有效业务基线未变（业务代码在两基线间没有任何变化）。 */
+  | 'BASE_UNCHANGED'
+  /** 工作区不干净。 */
+  | 'DIRTY_WORKSPACE'
+  /** 候选在排队期间被更新（guard 失配）或状态不再是 pending。 */
+  | 'CONCURRENCY_MISMATCH'
+  | 'STATE_CONFLICT'
+  /** 候选数据不合法、补丁不可应用或导出的新补丁不可用。 */
+  | 'INVALID_CANDIDATE'
+  /** 无法读取基线。 */
+  | 'SYNC_FAILED'
+  /** 提交新版本失败（已证明提交不存在并已恢复）。 */
+  | 'COMMIT_FAILED'
+  /** Runner 失败或被取消。 */
+  | 'RUNNER_FAILED'
+  | 'CANCELLED';
+
+/** §7.7：ai_fix Job 的 RECOVERY_REQUIRED 原因。 */
+export type AiFixRecoveryReason = 'COMMIT_OUTCOME_UNKNOWN' | 'SYNC_STATE_UNKNOWN';
+
+export interface AiFixOutcome {
+  status: AiFixOutcomeStatus;
+  /** ABORTED / RECOVERY_REQUIRED 必含。 */
+  reason?: AiFixAbortReason | AiFixRecoveryReason;
+  message: string;
+  /** RECOVERY_REQUIRED 必含：需要人工确认的具体状态。 */
+  detail?: string;
+  /** COMMITTED 必含非空提交版本号。 */
+  commitRevision?: string | null;
+  /** 追加了新版本时给出新版本号。 */
+  newRevision?: number;
+  /** manual runner 或冲突时给出可复制的人工修复提示词。 */
+  manualPrompt?: string;
+  /** VALIDATION_FAILED 的逐项错误。 */
+  errors?: string[];
+  jobId?: string;
+}
+
+/** §5.5：业务提交版本的派生定位结果（只读诊断）。 */export interface ApprovalCommitLookup {
   revision: string | null;
   lookup: 'found' | 'ambiguous' | 'unknown';
   diagnostic?: string;

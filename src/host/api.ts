@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -10,7 +11,9 @@ import {
   loadAuditSystemPrompt,
   resolveAuditTarget,
 } from './auditor.js';
+import { AuditLifecycle, LeaseTransitionError, type AuditLeaseRecord } from './audit-lifecycle.js';
 import { JobManager } from './jobs.js';
+import { RouteTable, blockedByRunningAudit, holdsRepoLock, isAuditSelfManaged } from './routes.js';
 import { parsePatch, isAiReviewPath } from './patch.js';
 import { Runner, wrapAgentPrompt } from './runner.js';
 import { loadReviewers, resolveOwner } from './reviewers.js';
@@ -22,6 +25,9 @@ import { dshHome } from './settings.js';
 import { detectVcs, suggestOwner, validateSettings } from './settings.js';
 import type {
   AppSettings,
+  AiFixAbortReason,
+  AiFixOutcome,
+  AiFixRecoveryReason,
   ConcurrencyGuard,
   HealthInfo,
   JobRecord,
@@ -31,7 +37,7 @@ import type {
   VcsType,
 } from './types.js';
 import { ApiError } from './types.js';
-import { createVcs, patchTouchesReviewData, gitBlobHash, type VcsAdapter } from './vcs.js';
+import { createVcs, patchTouchesReviewData, gitBlobHash, collectCommitEntries, type VcsAdapter } from './vcs.js';
 
 export const API_PREFIX = '/dsh-code-review/api';
 const APP_VERSION = '0.3.0';
@@ -289,7 +295,7 @@ export class ReviewApi {
     const running = this.jobs.list().find((job) => job.status === 'running');
     if (running) return;
     // §7.6/§7.7：执行租约参与全部互斥——有未释放租约时跳过本次定时审查。
-    if (this.auditLeases.some((lease) => lease.state !== 'released' && lease.root === runtime.root)) return;
+    if (this.auditLifecycle.blockingLeaseFor(runtime.root)) return;
     const baseRevision = await runtime.vcs.getCurrentBase().catch(() => null);
     if (!baseRevision) return;
     const clean = await runtime.vcs.ensureCleanWorkspace().catch(() => ({ clean: false, message: 'unknown' }));
@@ -336,16 +342,16 @@ export class ReviewApi {
   /** §7.6：审查执行超时上限 1 小时；超时只把租约置 releasable，不自动解除互斥。 */
   private armAuditLeaseTimeout(auditId: string): void {
     const timer = setTimeout(() => {
-      const lease = this.auditLeases.find((entry) => entry.auditId === auditId);
-      if (!lease || lease.state !== 'active') return;
-      lease.state = 'releasable';
-      void this.saveAuditLeases().catch(() => undefined);
-      this.auditJobFinishes.get(auditId)?.({
-        status: 'RECOVERY_REQUIRED',
-        reason: 'SYNC_STATE_UNKNOWN',
-        detail: '审查执行超过 1 小时上限，租约已置为 releasable，请人工确认后 /audit/release',
-      });
-      this.auditJobFinishes.delete(auditId);
+      // §7.6：超时只把 active 迁到 releasable（仍阻塞），绝不自动释放。
+      void this.auditLifecycle.markReleasable(auditId).then((changed) => {
+        if (!changed) return;
+        this.auditJobFinishes.get(auditId)?.({
+          status: 'RECOVERY_REQUIRED',
+          reason: 'SYNC_STATE_UNKNOWN',
+          detail: '审查执行超过 1 小时上限，租约已置为 releasable，请人工确认后 /audit/release',
+        });
+        this.auditJobFinishes.delete(auditId);
+      }).catch(() => undefined);
     }, 60 * 60 * 1000);
     timer.unref?.();
   }
@@ -376,13 +382,19 @@ export class ReviewApi {
   // ---------- §8/§18.8 检出级写互斥（进程内串行化共享写操作） ----------
 
   private writeLocks = new Map<string, Promise<unknown>>();
+  /** §12.1：标记“当前异步上下文已持有该仓库的 repo 锁”，用于把锁重入变成可诊断错误而不是死锁。 */
+  private readonly lockContext = new AsyncLocalStorage<string>();
 
   /** §5.5：派生定位内存缓存（repoRoot|candidateId|VCS 快照 → 结果）；不持久化。 */
   private approvalLookupCache = new Map<string, import('./types.js').ApprovalCommitLookup>();
 
-  // ---------- §7.6 手动审查执行租约（Host 重启后仍阻塞自动写操作） ----------
+  // ---------- §7.6 审查执行租约（Host 重启后仍阻塞自动写操作） ----------
 
-  private auditLeases: AuditLease[] = [];
+  /**
+   * A4：租约状态机集中到 AuditLifecycle（唯一迁移入口）。此处只保留持久化适配器：
+   * 状态文件位于 DSH_HOME（测试可注入 statePath），写入用临时文件 + rename 原子替换。
+   */
+  private lifecycle: AuditLifecycle | null = null;
   /** 会话/手动/定时审查跟踪 Job 的完成回调（仅内存；重启后由 finalize 直接新建 Job）。 */
   private auditJobFinishes = new Map<string, (result?: unknown) => void>();
   /** 跟踪 Job id → auditId，供 /jobs/:id/cancel 把租约转为 releasable。 */
@@ -392,37 +404,74 @@ export class ReviewApi {
     return this.deps.statePath ?? path.join(dshHome(), 'dsh-code-review', 'runtime-state.json');
   }
 
+  private get auditLifecycle(): AuditLifecycle {
+    if (!this.lifecycle) throw new ApiError(500, 'internal', '审查租约状态机未初始化');
+    return this.lifecycle;
+  }
+
   /** Host 启动时加载持久化租约：active/releasable 租约继续参与互斥，直到 finalize 或 release。 */
   private async loadAuditLeases(): Promise<void> {
+    this.lifecycle = new AuditLifecycle({
+      load: async () => {
+        try {
+          const text = await readFile(this.leaseStatePath, 'utf8');
+          const parsed = JSON.parse(text) as { leases?: AuditLeaseRecord[] };
+          return Array.isArray(parsed.leases) ? parsed.leases : [];
+        } catch {
+          return [];
+        }
+      },
+      save: async (leases) => {
+        const file = this.leaseStatePath;
+        await mkdir(path.dirname(file), { recursive: true }).catch(() => undefined);
+        const temp = `${file}.tmp-${String(process.pid)}-${String(Math.random()).slice(2, 8)}`;
+        const { writeFile: writeState, rename: renameState } = await import('node:fs/promises');
+        await writeState(temp, JSON.stringify({ leases }, null, 2), 'utf8');
+        await renameState(temp, file);
+      },
+    });
+    await this.lifecycle.load();
+  }
+
+  private activeLeaseFor(root: string): AuditLeaseRecord | undefined {
+    return this.auditLifecycle.blockingLeaseFor(root);
+  }
+
+  private async upsertLease(lease: AuditLeaseRecord): Promise<void> {
+    await this.auditLifecycle.create(lease);
+  }
+
+  /**
+   * §7.6/§7.7：把指定租约迁到 `released`（默认）并持久化。
+   * 只用于“Host 自身已证明执行结束”的场景：审查 Job 正常结束、会话创建失败、finalize 已完成。
+   * 取消/超时只迁到 `releasable`，必须人工确认后 release。
+   */
+  private async releaseLeaseById(auditId: string, state: 'released' | 'releasable' = 'released'): Promise<void> {
+    const lease = this.auditLifecycle.find(auditId);
+    if (!lease || lease.state === state) return;
     try {
-      const text = await readFile(this.leaseStatePath, 'utf8');
-      const parsed = JSON.parse(text) as { leases?: AuditLease[] };
-      this.auditLeases = Array.isArray(parsed.leases) ? parsed.leases : [];
-    } catch {
-      this.auditLeases = [];
+      await this.auditLifecycle.transition(auditId, state);
+    } catch (error) {
+      if (error instanceof LeaseTransitionError) return; // 已是终态或非法迁移：保持现状
+      throw error;
+    }
+    if (state === 'released') {
+      this.auditJobFinishes.get(auditId)?.({ status: 'ABORTED', auditId, message: '审查执行已结束，租约已释放' });
+      this.auditJobFinishes.delete(auditId);
     }
   }
 
-  private async saveAuditLeases(): Promise<void> {
-    const file = this.leaseStatePath;
-    await mkdir(path.dirname(file), { recursive: true }).catch(() => undefined);
-    const temp = `${file}.tmp-${String(process.pid)}`;
-    const { writeFile: writeState, rename: renameState } = await import('node:fs/promises');
-    await writeState(temp, JSON.stringify({ leases: this.auditLeases }, null, 2), 'utf8');
-    await renameState(temp, file).catch(() => undefined);
-  }
-
-  private activeLeaseFor(root: string): AuditLease | undefined {
-    return this.auditLeases.find((lease) => lease.root === root && lease.state !== 'released');
-  }
-
-  private async upsertLease(lease: AuditLease): Promise<void> {
-    const index = this.auditLeases.findIndex((entry) => entry.auditId === lease.auditId);
-    if (index >= 0) this.auditLeases[index] = lease;
-    else this.auditLeases.push(lease);
-    await this.saveAuditLeases();
-  }
-
+  /**
+   * §12.1 进程内 repo 级锁：同一检出的共享写与工作区事务串行化。
+   *
+   * 该锁**不可重入**：handler 在同一临界区内再次取锁会永久等待（历史缺陷：`/audit`
+   * 被路由整体持锁后又在 handler 内 withWriteLock）。为避免这种自死锁，
+   * `withRepoLock` 用 AsyncLocalStorage 标记“当前异步上下文中是否已持锁”，
+   * 重入时直接抛出可诊断错误。
+   *
+   * 注意：不能用全局 Set 记录“已持锁”——并发请求会在第一个成功获取锁期间
+   * 被误判为重入（真实回归：P10 并发归档 500）。
+   */
   private withWriteLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.writeLocks.get(repoRoot) ?? Promise.resolve();
     const next = previous.then(fn, fn);
@@ -430,10 +479,15 @@ export class ReviewApi {
     return next;
   }
 
-  /** 共享写路由统一加锁（§8/§18.8：同一检出的写操作串行化）。 */
+  /** 共享写路由统一加锁（§12.1：同一检出的写操作串行化）。 */
   private withRepoLock<T>(url: URL, fn: () => Promise<T>): Promise<T> {
     return this.runtimeFor(url).then(
-      (runtime) => this.withWriteLock(runtime.root, fn),
+      (runtime) => {
+        if (this.lockContext.getStore() === runtime.root) {
+          throw new ApiError(500, 'internal', 'repo 锁重入：该路由已在锁定临界区内再次取锁（路由类别与 handler 取锁策略冲突）');
+        }
+        return this.lockContext.run(runtime.root, () => this.withWriteLock(runtime.root, fn));
+      },
       () => fn(),
     );
   }
@@ -563,55 +617,87 @@ export class ReviewApi {
     return true;
   }
 
+  /**
+   * §7.7/§12.1：声明式路由表。横切语义（repo 锁、审查互斥、runtime 解析）由
+   * `dispatch` 依据 `RouteKind` 统一套用，不再依赖命令式 if 链手工登记
+   * （历史缺陷 C1：`/comments` 等端点漏了审查互斥）。
+   */
+  private readonly routes = new RouteTable().addAll([
+    // ---------- 全局只读状态 ----------
+    { method: 'GET', path: '/', kind: 'global-read', handler: ({ res, url }) => this.health(res, url) },
+    { method: 'GET', path: '/health', kind: 'global-read', handler: ({ res, url }) => this.health(res, url) },
+    { method: 'GET', path: '/settings', kind: 'global-read', handler: ({ res, url }) => this.getSettingsResponse(res, url) },
+    { method: 'PUT', path: '/settings', kind: 'settings-write', handler: ({ req, res }) => this.putSettings(req, res) },
+    { method: 'GET', path: '/jobs', kind: 'global-read', handler: ({ res }) => this.jobsList(res) },
+    { method: 'GET', path: '/jobs/:id', kind: 'global-read', handler: ({ res, url, params }) => this.jobGet(res, params['id'] ?? '', url) },
+    { method: 'POST', path: '/jobs/:id/cancel', kind: 'control', handler: ({ req, res, params }) => this.jobCancel(req, res, params['id'] ?? '') },
+    {
+      method: 'GET',
+      path: '/client-entry',
+      kind: 'global-read',
+      handler: ({ res }) => {
+        let entry: unknown = null;
+        try {
+          entry = this.deps.clientEntry?.() ?? null;
+        } catch (error) {
+          entry = { error: error instanceof Error ? error.message : String(error) };
+        }
+        sendJson(res, 200, { entry });
+      },
+    },
+    // ---------- 共享事实读 ----------
+    { method: 'GET', path: '/queue', kind: 'read', handler: ({ res, url }) => this.queue(res, url) },
+    { method: 'GET', path: '/candidate', kind: 'read', handler: ({ res, url }) => this.candidate(res, url) },
+    { method: 'GET', path: '/patch', kind: 'read', handler: ({ res, url }) => this.patch(res, url) },
+    { method: 'GET', path: '/diff', kind: 'read', handler: ({ res, url }) => this.diff(res, url) },
+    { method: 'GET', path: '/fix-prompt', kind: 'read', handler: ({ res, url }) => this.fixPrompt(res, url) },
+    { method: 'GET', path: '/reviewers', kind: 'read', handler: ({ res, url }) => this.reviewers(res, url) },
+    { method: 'GET', path: '/audits', kind: 'read', handler: ({ res, url }) => this.auditsList(res, url) },
+    { method: 'GET', path: '/findings', kind: 'read', handler: ({ res, url }) => this.findings(res, url) },
+    { method: 'GET', path: '/audit/prompt', kind: 'read', handler: ({ res, url }) => this.auditPrompt(res, url) },
+    // ---------- 审查控制（handler 自管理互斥，不套 ensureNoAuditRunning；finalize/release 另有豁免） ----------
+    { method: 'POST', path: '/audit/session', kind: 'audit-control', handler: ({ req, res, url }) => this.auditSession(req, res, url) },
+    { method: 'POST', path: '/audit', kind: 'audit-control', handler: ({ req, res, url }) => this.audit(req, res, url) },
+    { method: 'POST', path: '/audit/manual', kind: 'audit-control', handler: ({ req, res, url }) => this.auditManual(req, res, url) },
+    { method: 'POST', path: '/audit/finalize', kind: 'audit-control', handler: ({ req, res, url }) => this.auditFinalize(req, res, url) },
+    { method: 'POST', path: '/audit/release', kind: 'audit-control', handler: ({ req, res, url }) => this.auditRelease(req, res, url) },
+    { method: 'POST', path: '/sync', kind: 'audit-control', handler: ({ res, url }) => this.sync(res, url) },
+    // ---------- 候选/档案共享写（repo 锁 + 审查互斥） ----------
+    { method: 'POST', path: '/comments', kind: 'candidate-write', handler: ({ req, res, url }) => this.addComment(req, res, url) },
+    { method: 'POST', path: '/comments/batch', kind: 'candidate-write', handler: ({ req, res, url }) => this.addCommentsBatch(req, res, url) },
+    { method: 'POST', path: '/comment-status', kind: 'candidate-write', handler: ({ req, res, url }) => this.commentStatus(req, res, url) },
+    { method: 'POST', path: '/takeover', kind: 'candidate-write', handler: ({ req, res, url }) => this.takeover(req, res, url) },
+    { method: 'POST', path: '/resume', kind: 'candidate-write', handler: ({ req, res, url }) => this.resume(req, res, url) },
+    { method: 'POST', path: '/reject', kind: 'candidate-write', handler: ({ req, res, url }) => this.reject(req, res, url) },
+    { method: 'POST', path: '/archive-stale', kind: 'candidate-write', handler: ({ req, res, url }) => this.reject(req, res, url, 'stale') },
+    { method: 'POST', path: '/reopen', kind: 'candidate-write', handler: ({ req, res, url }) => this.reopen(req, res, url) },
+    { method: 'POST', path: '/convert', kind: 'candidate-write', handler: ({ req, res, url }) => this.convert(req, res, url) },
+    { method: 'POST', path: '/dismiss-finding', kind: 'candidate-write', handler: ({ req, res, url }) => this.dismissFinding(req, res, url) },
+    { method: 'POST', path: '/candidate/finalize', kind: 'candidate-write', handler: ({ req, res, url }) => this.candidateFinalize(req, res, url) },
+    // ---------- 工作区事务（handler 内部在 Job 中取锁） ----------
+    { method: 'POST', path: '/rebase', kind: 'workspace-txn', handler: ({ req, res, url }) => this.rebase(req, res, url) },
+    { method: 'POST', path: '/manual-revision', kind: 'workspace-txn', handler: ({ req, res, url }) => this.manualRevision(req, res, url) },
+    // ---------- 长任务启动（受理前做审查互斥，Job 内取锁） ----------
+    { method: 'POST', path: '/approve', kind: 'job-start', handler: ({ req, res, url }) => this.approve(req, res, url) },
+    { method: 'POST', path: '/ai-fix', kind: 'job-start', handler: ({ req, res, url }) => this.aiFix(req, res, url) },
+  ]);
+
   private async dispatch(req: IncomingMessage, res: ServerResponse, route: string, url: URL): Promise<void> {
     const method = req.method ?? 'GET';
-    if (method === 'GET' && (route === '/health' || route === '/')) return this.health(res, url);
-    if (method === 'GET' && route === '/settings') return this.getSettingsResponse(res, url);
-    if (method === 'PUT' && route === '/settings') return this.putSettings(req, res);
-    if (method === 'GET' && route === '/queue') return this.queue(res, url);
-    if (method === 'GET' && route === '/candidate') return this.candidate(res, url);
-    if (method === 'GET' && route === '/patch') return this.patch(res, url);
-    if (method === 'GET' && route === '/diff') return this.diff(res, url);
-    if (method === 'GET' && route === '/fix-prompt') return this.fixPrompt(res, url);
-    if (method === 'GET' && route === '/audit/prompt') return this.auditPrompt(res, url);
-    if (method === 'POST' && route === '/audit/session') return this.auditSession(req, res, url);
-    if (method === 'POST' && route === '/audit') return this.audit(req, res, url);
-    if (method === 'POST' && route === '/audit/manual') return this.auditManual(req, res, url);
-    if (method === 'POST' && route === '/audit/finalize') return this.auditFinalize(req, res, url);
-    if (method === 'POST' && route === '/audit/release') return this.auditRelease(req, res, url);
-    if (method === 'POST' && route === '/comments') return this.withRepoLock(url, () => this.addComment(req, res, url));
-    if (method === 'POST' && route === '/comments/batch') return this.withRepoLock(url, () => this.addCommentsBatch(req, res, url));
-    if (method === 'POST' && route === '/resume') return this.withRepoLock(url, () => this.resume(req, res, url));
-    if (method === 'POST' && route === '/comment-status') return this.withRepoLock(url, () => this.commentStatus(req, res, url));
-    if (method === 'POST' && route === '/takeover') return this.withRepoLock(url, () => this.takeover(req, res, url));
-    if (method === 'POST' && route === '/reject') return this.withRepoLock(url, () => this.reject(req, res, url));
-    if (method === 'POST' && route === '/archive-stale') return this.withRepoLock(url, () => this.reject(req, res, url, 'stale'));
-    if (method === 'POST' && route === '/reopen') return this.withRepoLock(url, () => this.reopen(req, res, url));
-    if (method === 'POST' && route === '/convert') return this.withRepoLock(url, () => this.convert(req, res, url));
-    if (method === 'POST' && route === '/dismiss-finding') return this.withRepoLock(url, () => this.dismissFinding(req, res, url));
-    if (method === 'POST' && route === '/rebase') return this.withRepoLock(url, () => this.rebase(req, res, url));
-    if (method === 'POST' && route === '/manual-revision') return this.withRepoLock(url, () => this.manualRevision(req, res, url));
-    if (method === 'POST' && route === '/approve') return this.approve(req, res, url);
-    if (method === 'POST' && route === '/ai-fix') return this.aiFix(req, res, url);
-    if (method === 'POST' && route === '/candidate/finalize') return this.withRepoLock(url, () => this.candidateFinalize(req, res, url));
-    if (method === 'POST' && route.startsWith('/jobs/') && route.endsWith('/cancel')) return this.jobCancel(req, res, route.slice('/jobs/'.length, -'/cancel'.length));
-    if (method === 'POST' && route === '/sync') return this.sync(res, url);
-    if (method === 'GET' && route === '/jobs') return this.jobsList(res);
-    if (method === 'GET' && route.startsWith('/jobs/')) return this.jobGet(res, route.slice('/jobs/'.length), url);
-    if (method === 'GET' && route === '/reviewers') return this.reviewers(res, url);
-    if (method === 'GET' && route === '/audits') return this.auditsList(res, url);
-    if (method === 'GET' && route === '/findings') return this.findings(res, url);
-    if (method === 'GET' && route === '/client-entry') {
-      let entry: unknown = null;
-      try {
-        entry = this.deps.clientEntry?.() ?? null;
-      } catch (error) {
-        entry = { error: error instanceof Error ? error.message : String(error) };
-      }
-      sendJson(res, 200, { entry });
-      return;
+    const matched = this.routes.match(method, route);
+    if (!matched) throw new ApiError(404, 'not_found', `未知接口：${method} ${route}`);
+    const { spec, params } = matched;
+    const run = (): void | Promise<void> => spec.handler({ req, res, url, params, route });
+    const locked = (): Promise<void> => this.withRepoLock(url, async () => { await run(); });
+    // §7.7：审查运行中禁止共享写/新审查/sync——必须在受理阶段拒绝，而不是排队到审查结束后放行。
+    // 判定必须先于加锁，否则请求会先进入锁队列而不是得到 409。
+    // 例外：/audit/finalize 与 /audit/release 必须能在租约存在时执行（由 handler 按租约状态判定）。
+    if (blockedByRunningAudit(spec.kind) && !isAuditSelfManaged(route)) {
+      const runtime = await this.runtimeFor(url);
+      this.ensureNoAuditRunning(runtime.root);
+      return holdsRepoLock(spec.kind) ? locked() : run();
     }
-    throw new ApiError(404, 'not_found', `未知接口：${method} ${route}`);
+    return holdsRepoLock(spec.kind) ? locked() : run();
   }
 
   private async health(res: ServerResponse, url: URL): Promise<void> {
@@ -823,10 +909,24 @@ export class ReviewApi {
         approvalCommitLookup = derived.approvalCommitLookup;
       }
     }
+    // §8.2（2026-11-10 澄清）：isBaseBehind 指“业务代码基线是否变化”，不是比较顶层 VCS
+    // 版本号——否则每次评论/状态变更推进 HEAD 都会让候选错误显示为“基线落后”。
+    const currentRevisionEntry = detail.candidate.meta.revisions.find(
+      (revision) => revision.id === detail.candidate.meta.currentRevision,
+    );
+    let isBaseBehind = detail.isBaseBehind;
+    if (!detail.candidate.parseError
+      && currentRevisionEntry
+      && detail.currentBase !== null
+      && currentRevisionEntry.baseRevision !== detail.currentBase) {
+      const business = await this.businessBaselineState(runtime.vcs, currentRevisionEntry.baseRevision, detail.currentBase);
+      // 只有能证明业务代码确有变化才算落后；无法证明时保守地沿用“落后”（提示人工确认）。
+      if (business.state === 'unchanged' || business.state === 'same') isBaseBehind = false;
+    }
     sendJson(res, 200, {
       candidate: detail.candidate,
       currentBase: detail.currentBase,
-      isBaseBehind: detail.isBaseBehind,
+      isBaseBehind,
       patchText,
       patchStats: detail.patchStats,
       patchPaths,
@@ -1080,6 +1180,50 @@ export class ReviewApi {
     });
   }
 
+  /**
+   * §7.7：审查启动的互斥检查 + 工作区前置条件必须与租约写入处于同一临界区，
+   * 否则两个并发审查请求可同时通过检查并各自写入 active 租约（TOCTOU）。
+   * 本方法只在调用方已持有 repo 锁时使用。
+   */
+  private assertAuditStartAllowed(runtime: Runtime, clean: { clean: boolean; message: string }): void {
+    const running = this.jobs.list().find((job) => job.status === 'running');
+    if (running) {
+      throw new ApiError(409, 'conflict', `已有任务在运行（${running.type}），请等待完成后再开始仓库审查。`);
+    }
+    // §7.6/§7.7：任何未释放的执行租约（手动/会话/定时）都必须阻止新的审查。
+    this.ensureNoAuditRunning(runtime.root);
+    if (!clean.clean) {
+      throw new ApiError(409, 'conflict', `仓库审查要求业务工作区干净。\n${clean.message}`);
+    }
+  }
+
+  /** §7.7：在 repo 锁内完成“互斥判定 → auditId 分配 → 写入 active 租约”。 */
+  private async beginAuditLease(
+    runtime: Runtime,
+    input: { targetPath: string; baseRevision: string; owner: string; now: Date; trigger: 'manual' | 'scheduled' },
+    clean: { clean: boolean; message: string },
+  ): Promise<{ auditId: string; reportPath: string }> {
+    const archive = new AuditArchive(runtime.root);
+    let auditId = '';
+    await this.withWriteLock(runtime.root, async () => {
+      this.assertAuditStartAllowed(runtime, clean);
+      auditId = await archive.nextAuditId(input.targetPath, input.now);
+      const candidateIdsBefore = await runtime.store.listCandidateIds();
+      await this.upsertLease({
+        auditId,
+        root: runtime.root,
+        targetPath: input.targetPath,
+        trigger: input.trigger,
+        baseRevision: input.baseRevision,
+        owner: input.owner,
+        createdAt: input.now.toISOString(),
+        candidateIdsBefore,
+        state: 'active',
+      });
+    });
+    return { auditId, reportPath: `.ai-review/audits/${auditId}/audit.md` };
+  }
+
   private async auditSession(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const runtime = await this.runtimeFor(url);
     const ownerSessionId = url.searchParams.get('sessionId') ?? '';
@@ -1087,29 +1231,22 @@ export class ReviewApi {
     const targetPath = stringField(body, 'targetPath');
     const note = stringField(body, 'note');
     const target = await resolveAuditTarget(runtime.root, targetPath);
-    const running = this.jobs.list().find((job) => job.status === 'running');
-    if (running) {
-      throw new ApiError(409, 'conflict', `已有任务在运行（${running.type}），请等待完成后再开始仓库审查。`);
-    }
-    // §7.6/§7.7：任何未释放的执行租约（手动/会话/定时）都必须阻止新的工作区事务。
-    this.ensureNoAuditRunning(runtime.root);
     const baseRevision = await runtime.vcs.getCurrentBase();
     if (!baseRevision) {
       throw new ApiError(412, 'not_configured', '当前仓库没有可用的基线提交（Git HEAD / SVN revision），无法开始仓库审查。');
     }
     const clean = await runtime.vcs.ensureCleanWorkspace();
-    if (!clean.clean) {
-      throw new ApiError(409, 'conflict', `仓库审查要求业务工作区干净。\n${clean.message}`);
-    }
     if (!this.deps.createAuditSession) {
       throw new ApiError(500, 'internal', '当前 Host 不支持创建 DSH 审查会话（sessionController 未挂载）。');
     }
     const owner = await this.ownerFor(runtime.root);
     const now = new Date();
     // §7.6：会话审查同样持有执行租约 + 跟踪 audit Job；turn 结束后由 /audit/finalize 收尾。
-    const archive = new AuditArchive(runtime.root);
-    const auditId = await archive.nextAuditId(target.targetPath, now);
-    const reportPath = `.ai-review/audits/${auditId}/audit.md`;
+    const { auditId, reportPath } = await this.beginAuditLease(
+      runtime,
+      { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'manual' },
+      clean,
+    );
     const sharedSource = await sharedSourceFor(runtime);
     const userPrompt = await buildAuditPrompt({
       repoRoot: runtime.root,
@@ -1125,19 +1262,14 @@ export class ReviewApi {
     });
     const prompt = composeSessionPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root)}`);
     const title = `仓库审查 · ${target.targetPath || '全仓库'}`.slice(0, 60);
-    const created = await this.deps.createAuditSession({ cwd: runtime.root, title, prompt, ownerSessionId });
-    const candidateIdsBefore = await runtime.store.listCandidateIds();
-    await this.upsertLease({
-      auditId,
-      root: runtime.root,
-      targetPath: target.targetPath,
-      trigger: 'manual',
-      baseRevision,
-      owner,
-      createdAt: now.toISOString(),
-      candidateIdsBefore,
-      state: 'active',
-    });
+    let created: { sessionId: string };
+    try {
+      created = await this.deps.createAuditSession({ cwd: runtime.root, title, prompt, ownerSessionId });
+    } catch (error) {
+      // 会话创建失败：租约不得残留，否则仓库会被阻塞到人工 release。
+      await this.releaseLeaseById(auditId).catch(() => undefined);
+      throw error;
+    }
     // 跟踪 Job 保持 running，直到 /audit/finalize（或 release / 取消）完成它。
     const job = this.startAuditTrackingJob(auditId);
     this.armAuditLeaseTimeout(auditId);
@@ -1159,40 +1291,45 @@ export class ReviewApi {
     const targetPath = stringField(body, 'targetPath');
     const note = stringField(body, 'note');
     const target = await resolveAuditTarget(runtime.root, targetPath);
-    const running = this.jobs.list().find((job) => job.status === 'running');
-    if (running) {
-      throw new ApiError(409, 'conflict', `已有任务在运行（${running.type}），请等待完成后再开始仓库审查。`);
-    }
-    // §7.6/§7.7：未释放的执行租约同样阻塞新的 headless 审查。
-    this.ensureNoAuditRunning(runtime.root);
     const baseRevision = await runtime.vcs.getCurrentBase();
     if (!baseRevision) {
       throw new ApiError(412, 'not_configured', '当前仓库没有可用的基线提交（Git HEAD / SVN revision），无法开始仓库审查。');
     }
     const clean = await runtime.vcs.ensureCleanWorkspace();
-    if (!clean.clean) {
-      throw new ApiError(409, 'conflict', `仓库审查要求业务工作区干净。\n${clean.message}`);
-    }
     const owner = await this.ownerFor(runtime.root);
+    // §7.6/§7.7：headless 审查持有一条与手动/会话模式同语义的执行租约，
+    // 保证审查期间其他共享写在受理阶段被 409 拒绝。互斥判定与租约写入在同一 repo 锁内。
+    const now = new Date();
+    const { auditId } = await this.beginAuditLease(
+      runtime,
+      { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'scheduled' },
+      clean,
+    );
     // §7.7：headless Runner 的工作区事务必须与其他共享写经同一 repo 锁串行。
     const job = this.jobs.start('audit', (log, _jobId, signal) => this.withWriteLock(runtime.root, async () => {
-      const sharedSource = await sharedSourceFor(runtime);
-      const auditor = new Auditor({
-        store: runtime.store,
-        vcs: runtime.vcs,
-        settings: this.settings,
-        owner,
-        targetPath: target.targetPath,
-        note,
-        log,
-        ...(sharedSource ? { candidateSource: sharedSource } : {}),
-        ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
-        signal,
-      });
-      const outcome = await auditor.run();
-      log(`结果：${outcome.status} — ${outcome.message}`);
-      return outcome;
+      try {
+        const sharedSource = await sharedSourceFor(runtime);
+        const auditor = new Auditor({
+          store: runtime.store,
+          vcs: runtime.vcs,
+          settings: this.settings,
+          owner,
+          targetPath: target.targetPath,
+          note,
+          log,
+          ...(sharedSource ? { candidateSource: sharedSource } : {}),
+          ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
+          signal,
+        });
+        const outcome = await auditor.run();
+        log(`结果：${outcome.status} — ${outcome.message}`);
+        return outcome;
+      } finally {
+        // Job 的 task 返回前执行：此刻审查已结束，可安全释放本次执行租约（review 期间保持 active）。
+        await this.releaseLeaseById(auditId).catch(() => undefined);
+      }
     }));
+    this.auditJobLeases.set(job.id, auditId);
     sendJson(res, 202, { jobId: job.id, job });
   }
 
@@ -1207,18 +1344,17 @@ export class ReviewApi {
     const targetPath = stringField(body, 'targetPath');
     const note = stringField(body, 'note');
     const target = await resolveAuditTarget(runtime.root, targetPath);
-    const running = this.jobs.list().find((job) => job.status === 'running');
-    if (running) throw new ApiError(409, 'conflict', `已有任务在运行（${running.type}），请等待完成后再开始仓库审查。`);
-    this.ensureNoAuditRunning(runtime.root);
     const baseRevision = await runtime.vcs.getCurrentBase();
     if (!baseRevision) throw new ApiError(412, 'not_configured', '当前仓库没有可用的基线提交，无法开始仓库审查。');
     const clean = await runtime.vcs.ensureCleanWorkspace();
-    if (!clean.clean) throw new ApiError(409, 'conflict', `仓库审查要求业务工作区干净。\n${clean.message}`);
     const owner = await this.ownerFor(runtime.root);
     const now = new Date();
-    const archive = new AuditArchive(runtime.root);
-    const auditId = await archive.nextAuditId(target.targetPath, now);
-    const reportPath = `.ai-review/audits/${auditId}/audit.md`;
+    // §7.7：互斥判定、auditId 分配与 active 租约写入在同一 repo 锁内（消除 TOCTOU）。
+    const { auditId, reportPath } = await this.beginAuditLease(
+      runtime,
+      { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'manual' },
+      clean,
+    );
     const sharedSource = await sharedSourceFor(runtime);
     const userPrompt = await buildAuditPrompt({
       repoRoot: runtime.root,
@@ -1233,18 +1369,6 @@ export class ReviewApi {
       ...(sharedSource ? { source: sharedSource } : {}),
     });
     const prompt = wrapAgentPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root)}`);
-    const candidateIdsBefore = await runtime.store.listCandidateIds();
-    await this.upsertLease({
-      auditId,
-      root: runtime.root,
-      targetPath: target.targetPath,
-      trigger: 'manual',
-      baseRevision,
-      owner,
-      createdAt: now.toISOString(),
-      candidateIdsBefore,
-      state: 'active',
-    });
     // §7.6/§8.3：手动模式同样创建可追踪的 audit Job，并受 1 小时执行上限约束。
     const job = this.startAuditTrackingJob(auditId);
     this.armAuditLeaseTimeout(auditId);
@@ -1269,7 +1393,7 @@ export class ReviewApi {
     const body = await readJson(req);
     const auditId = stringField(body, 'auditId');
     if (!auditId) throw new ApiError(400, 'bad_request', '缺少 auditId');
-    const lease = this.auditLeases.find((entry) => entry.auditId === auditId);
+    const lease = this.auditLifecycle.find(auditId);
     if (!lease) throw new ApiError(404, 'not_found', `审查租约不存在：${auditId}`);
     if (lease.root !== runtime.root) throw new ApiError(409, 'conflict', '租约属于另一个仓库检出');
     if (lease.state === 'released') throw new ApiError(409, 'conflict', `租约 ${auditId} 已释放，不能重复收尾`);
@@ -1313,8 +1437,7 @@ export class ReviewApi {
       // ABORTED 或结果不明（RECOVERY_REQUIRED）必须保留租约，让仓库继续处于互斥状态，
       // 等待人工核对后重试 finalize 或显式 release。
       if (result.status === 'COMMITTED' || result.status === 'VALIDATION_FAILED') {
-        lease.state = 'released';
-        await this.saveAuditLeases();
+        await this.auditLifecycle.transition(lease.auditId, 'released');
         this.auditJobFinishes.get(lease.auditId)?.({
           status: result.status,
           auditId: lease.auditId,
@@ -1348,7 +1471,7 @@ export class ReviewApi {
     const confirmStopped = body['confirmStopped'] === true;
     if (!auditId) throw new ApiError(400, 'bad_request', '缺少 auditId');
     if (!confirmStopped) throw new ApiError(409, 'conflict', '必须显式确认外部执行已停止（confirmStopped: true）');
-    const lease = this.auditLeases.find((entry) => entry.auditId === auditId);
+    const lease = this.auditLifecycle.find(auditId);
     if (!lease) throw new ApiError(404, 'not_found', `审查租约不存在：${auditId}`);
     if (lease.root !== runtime.root) throw new ApiError(409, 'conflict', '租约属于另一个仓库检出');
     if (lease.state === 'released') throw new ApiError(409, 'conflict', `租约 ${auditId} 已释放`);
@@ -1361,8 +1484,7 @@ export class ReviewApi {
     if (!clean.clean) {
       throw new ApiError(409, 'conflict', `工作区仍有未还原改动，不能释放租约。\n${clean.message}`);
     }
-    lease.state = 'released';
-    await this.saveAuditLeases();
+    await this.auditLifecycle.transition(auditId, 'released');
     this.auditJobFinishes.get(lease.auditId)?.({
       status: 'ABORTED',
       auditId: lease.auditId,
@@ -1370,6 +1492,102 @@ export class ReviewApi {
     });
     this.auditJobFinishes.delete(lease.auditId);
     sendJson(res, 200, { released: true });
+  }
+
+  /**
+   * §7.7：构造 `ai_fix` Job 的 `ABORTED` 业务结果。
+   *
+   * 类型边界：这里用的是 `AiFixOutcome`，**不是** §7.5 的 `ApprovalOutcome`——
+   * 批准流程的 ABORTED 原因表是封闭枚举（G16 要求批准冲突/门禁失败必须走
+   * FALLBACK_TO_PENDING），REBASE_CONFLICT / BASE_UNCHANGED 只属于 ai_fix。
+   *
+   * `reason` 是必填参数——刻意的类型设计：历史上多处取消/失败路径漏写 reason，
+   * 调用方无法稳定判别业务结果。新增中止分支必须在这里给出 reason。
+   */
+  private aborted(
+    reason: AiFixAbortReason,
+    message: string,
+    jobId: string,
+    detail?: string,
+    manualPrompt?: string,
+  ): AiFixOutcome {
+    return {
+      status: 'ABORTED',
+      reason,
+      message,
+      jobId,
+      ...(detail !== undefined ? { detail } : {}),
+      ...(manualPrompt !== undefined && manualPrompt.length > 0 ? { manualPrompt } : {}),
+    };
+  }
+
+  /** §7.7：构造 ai_fix Job 的 `RECOVERY_REQUIRED`；SPEC 要求必含 reason 与非空 detail。 */
+  private recoveryRequired(reason: AiFixRecoveryReason, message: string, jobId: string, detail: string): AiFixOutcome {
+    return { status: 'RECOVERY_REQUIRED', reason, message, detail, jobId };
+  }
+
+  /** §7.7：构造 ai_fix Job 的 `COMMITTED`；`commitRevision` 必须来自本次提交结果或派生值。 */
+  private committed(
+    message: string,
+    jobId: string,
+    input: { commitRevision: string | null; newRevision?: number },
+  ): AiFixOutcome {
+    return {
+      status: 'COMMITTED',
+      message,
+      commitRevision: input.commitRevision,
+      ...(input.newRevision !== undefined ? { newRevision: input.newRevision } : {}),
+      jobId,
+    };
+  }
+
+  /** §7.7：构造 ai_fix Job 的 `VALIDATION_FAILED`（候选不合法但流程本身成功结束）。 */
+  private validationFailed(message: string, jobId: string, errors: string[]): AiFixOutcome {
+    return { status: 'VALIDATION_FAILED', message, errors, jobId };
+  }
+
+  /**
+   * §7.7/§8.2：判定“有效业务基线”是否变化（排除 `.ai-review/` 评审元数据）。
+   *
+   * - `same`：两个版本号相同；
+   * - `unchanged`：版本号不同，但业务代码零变化（只有 .ai-review/ 提交）——**等同于基线未变**；
+   * - `changed`：业务代码确有变化（附带变化路径）；
+   * - `unknown`：无法证明（浅克隆/非法版本/日志不可读），调用方必须按“无法确定”处理。
+   */
+  private async businessBaselineState(
+    vcs: VcsAdapter,
+    fromRevision: string,
+    toRevision: string,
+  ): Promise<
+    | { state: 'same' }
+    | { state: 'unchanged' }
+    | { state: 'changed'; paths: string[] }
+    | { state: 'unknown'; detail: string }
+  > {
+    const from = fromRevision.trim();
+    const to = toRevision.trim();
+    if (!from || !to) return { state: 'unknown', detail: '候选基线或当前基线为空' };
+    if (from === to) return { state: 'same' };
+    const changes = await vcs.businessChangesBetween(from, to).catch(() => null);
+    if (changes === null) return { state: 'unknown', detail: `无法比较 ${from.slice(0, 12)} 与 ${to.slice(0, 12)} 的业务变更` };
+    return changes.length === 0 ? { state: 'unchanged' } : { state: 'changed', paths: changes };
+  }
+
+  /**
+   * §7.3/§7.4/§7.5：把补丁文本物化到仓库外临时文件后应用（git/svn apply 需要文件输入）。
+   * 临时目录用 `mkdtemp` 隔离并在 finally 中整体删除，避免 pid+时间戳命名在高并发下撞名。
+   */
+  private async applyPatchText(vcs: VcsAdapter, text: string, threeWay: boolean): Promise<{ ok: boolean; message: string }> {
+    const { mkdtemp, writeFile: writeTmp, rm: rmTmp } = await import('node:fs/promises');
+    const os = await import('node:os');
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'dcr-patch-'));
+    try {
+      const file = path.join(dir, 'change.patch');
+      await writeTmp(file, text, 'utf8');
+      return await vcs.applyPatch(file, threeWay);
+    } finally {
+      await rmTmp(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   /**
@@ -1397,14 +1615,25 @@ export class ReviewApi {
     const paths = [...new Set(input.paths.filter((item) => item.trim().length > 0))];
     const probePaths = [...new Set((input.probePaths ?? paths).filter((item) => item.trim().length > 0))];
     const probeBefore = await runtime.vcs.getCommitProbe(probePaths).catch(() => null);
+    // §7.5 步骤 9（B1）：展开完整提交集合（目录 → 全部文件）后核对，防止目录内夹带未审核文件。
+    // expectedFiles 中被调方写入/核对过的文本优先采信（它们是“已审核内容”），
+    // 其余条目按当前落盘内容计算 blob。
+    const { entries: collected } = await collectCommitEntries(runtime.store.repoRoot, paths);
+    // deletePaths 中的文件不会出现在提交树里（已在 atomicCommit 中删除并暂存为删除），
+    // 必须从核对集合剔除，否则会被误判为“缺少暂存条目”。
+    const deleting = new Set((input.deletePaths ?? []).map((item) => item.replaceAll('\\', '/')));
+    const auditedTexts = new Map((input.expectedFiles ?? []).map((file) => [file.relPath, file.text]));
+    const verifyEntries = collected
+      .filter((entry) => !deleting.has(entry.path))
+      .map((entry) => ({
+        ...entry,
+        blobHash: auditedTexts.has(entry.path) ? gitBlobHash(auditedTexts.get(entry.path) ?? '') : entry.blobHash,
+      }));
     const commit = await runtime.vcs.atomicCommit({
       message: input.message,
       paths,
       ...(input.deletePaths && input.deletePaths.length > 0 ? { deletePaths: input.deletePaths } : {}),
-      // §7.5 步骤 9：内容核对——暂存 blob 必须等于调用方写入/核对过的文本。
-      ...((input.expectedFiles?.length ?? 0) > 0
-        ? { verifyEntries: input.expectedFiles?.map((expected) => ({ path: expected.relPath, blobHash: gitBlobHash(expected.text) })) }
-        : {}),
+      verifyEntries,
       ...(input.deletePaths && input.deletePaths.length > 0 ? { verifyDeletions: input.deletePaths } : {}),
     });
     if (commit.success) {
@@ -1732,7 +1961,7 @@ export class ReviewApi {
   private async rebase(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const runtime = await this.runtimeFor(url);
     const { store, vcs } = runtime;
-    this.ensureNoAuditRunning(store.repoRoot);
+    // §7.7 审查互斥与 repo 锁由 routes.ts 的 RouteKind 统一套用。
     const body = await readJson(req);
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
@@ -1740,25 +1969,75 @@ export class ReviewApi {
     await this.requireSharedCandidate(runtime, id); // §7.1
     const detail = await store.get(id, null);
     await store.ensureWriteAllowed(detail.candidate, guard);
-    const job = this.jobs.start('ai_fix', (log, jobId) => this.withWriteLock(store.repoRoot, async () => {
-      const candidate = detail.candidate;
+    const job = this.jobs.start('ai_fix', (log, jobId): Promise<AiFixOutcome> => this.withWriteLock(store.repoRoot, async () => {
+      // §7.1：锁内重新绑定共享快照并重读候选——不得使用锁外接受的 detail（C4 同类缺陷）。
+      const source = await sharedSourceFor(runtime);
+      if (!source) return this.aborted('INVALID_CANDIDATE', '当前仓库没有可用的共享快照（Git HEAD / SVN BASE），无法 Rebase', jobId);
+      const fresh = await store.get(id, null, source);
+      if (fresh.candidate.parseError) return this.aborted('INVALID_CANDIDATE', `候选数据无效：${fresh.candidate.parseError}`, jobId);
+      if (fresh.candidate.meta.currentRevision !== guard.expectedRevision
+        || fresh.candidate.meta.owner !== guard.expectedOwner
+        || new Date(fresh.candidate.meta.updatedAt).getTime() !== new Date(guard.expectedUpdatedAt).getTime()) {
+        return this.aborted('CONCURRENCY_MISMATCH', '候选已在排队期间被更新，请重新加载后再 Rebase', jobId);
+      }
+      const candidate = fresh.candidate;
+      if (candidate.meta.status !== 'pending') {
+        return this.aborted('STATE_CONFLICT', `候选状态不是 pending（当前 ${candidate.meta.status}），不能 Rebase`, jobId);
+      }
       const base = await vcs.getCurrentBase().catch(() => null);
-      if (!base) return { status: 'ABORTED', message: '无法读取最新基线', jobId };
+      if (!base) return this.aborted('SYNC_FAILED', '无法读取最新基线', jobId);
       const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
-      if (!current) return { status: 'ABORTED', message: '当前版本缺失', jobId };
-      if (current.baseRevision === base) {
-        return { status: 'ABORTED', message: '基线已是最新，无需 Rebase', jobId };
+      if (!current) return this.aborted('INVALID_CANDIDATE', '当前版本缺失', jobId);
+      // §7.7（2026-11-10 澄清）：只比较同值不足以判定“基线未变”。候选元数据存放在
+      // `.ai-review/` 并随仓库提交，任何评论/状态/收尾提交都会推进 HEAD。必须比较
+      // **业务代码**是否变化：两基线之间只有 .ai-review/ 变更时视为业务基线未变。
+      const business = await this.businessBaselineState(vcs, current.baseRevision, base);
+      if (business.state === 'unchanged') {
+        return this.aborted(
+          'BASE_UNCHANGED',
+          `业务基线未变（候选基线 ${current.baseRevision.slice(0, 12)} → 当前 ${base.slice(0, 12)} 之间只有 .ai-review/ 评审元数据提交），无需 Rebase`,
+          jobId,
+        );
+      }
+      if (business.state === 'unknown') {
+        return this.aborted('SYNC_FAILED', `无法判定业务基线是否变化，已中止：${business.detail}`, jobId);
       }
       const clean = await vcs.ensureCleanWorkspace();
-      if (!clean.clean) return { status: 'ABORTED', message: `工作区不干净：${clean.message}`, jobId };
-      log(`在最新基线 ${base.slice(0, 12)} 上应用补丁`);
-      const patchPath = path.join(store.repoRoot, '.ai-review', id, current.patch);
-      const oldPatchText = await readFile(patchPath, 'utf8');
+      if (!clean.clean) return this.aborted('DIRTY_WORKSPACE', `工作区不干净：${clean.message}`, jobId);
+      // §7.1/§7.7：补丁必须来自与 review.md 同一共享快照，不得读取工作区本地补丁（历史缺陷 B2）。
+      const sharedPatch = await store.readSharedPatch(candidate, source);
+      const oldPatchText = sharedPatch.text;
       const touchedPaths = parsePatch(oldPatchText).paths.filter((file) => !isAiReviewPath(file));
-      const applied = await vcs.applyPatch(patchPath, true);
+      if (touchedPaths.length === 0) return this.aborted('INVALID_CANDIDATE', '当前补丁没有业务文件路径', jobId);
+      log(`在最新基线 ${base.slice(0, 12)} 上应用补丁 ${sharedPatch.patchName}`);
+      const applied = await this.applyPatchText(vcs, oldPatchText, true);
       if (!applied.ok) {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
-        return { status: 'ABORTED', message: `Rebase 冲突：${applied.message}`, jobId };
+        // §7.7：manual Runner 不自动调用，返回 REBASE_CONFLICT 并携带人工修复提示词。
+        if (this.settings.runner === 'manual') {
+          const manualPrompt = [
+            `# Rebase 人工修复请求（候选 ${id}，版本 ${String(candidate.meta.currentRevision)}）`,
+            '',
+            `新基线：${base}`,
+            `旧基线：${current.baseRevision}`,
+            '',
+            '请在干净的新基线上重新生成完整补丁，保证：',
+            '1. 只改动业务文件，不得包含 .ai-review/、.tmp/、node_modules/、.git/、.svn/；',
+            '2. 补丁必须能在该基线上严格应用（threeWay=false）；',
+            '3. 通过候选的全部门禁命令。',
+            '',
+            '冲突详情：',
+            applied.message,
+          ].join('\n');
+          return this.aborted(
+            'REBASE_CONFLICT',
+            `Rebase 冲突：补丁无法在最新基线 ${base.slice(0, 12)} 上干净三方应用。请按以下提示人工修复。\n\n${applied.message}`,
+            jobId,
+            applied.message,
+            manualPrompt,
+          );
+        }
+        return this.aborted('REBASE_CONFLICT', `Rebase 冲突：补丁无法在最新基线 ${base.slice(0, 12)} 上干净三方应用。`, jobId, applied.message);
       }
       log('重跑门禁');
       const report = await runGateChecks(candidate.meta.gateChecks, {
@@ -1767,7 +2046,7 @@ export class ReviewApi {
       });
       if (!report.allPassed) {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
-        return { status: 'ABORTED', message: `门禁未通过，Rebase 未产生新版本：\n${report.formattedEvidenceMarkdown}`, jobId };
+        return this.aborted('GATE_CHECK_FAILED', `门禁未通过，Rebase 未产生新版本：\n${report.formattedEvidenceMarkdown}`, jobId);
       }
       // §7.7：门禁通过后必须基于新基线导出包含实际冲突解决结果的完整 diff，不得复用旧补丁文本。
       let newPatchText = '';
@@ -1775,26 +2054,18 @@ export class ReviewApi {
         newPatchText = await vcs.exportWorkingTreeDiff(base, touchedPaths);
       } catch (error) {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
-        return { status: 'ABORTED', message: `Rebase 无法导出新基线补丁：${error instanceof Error ? error.message : String(error)}`, jobId };
+        return this.aborted('COMMIT_FAILED', `Rebase 无法导出新基线补丁：${error instanceof Error ? error.message : String(error)}`, jobId);
       }
       await vcs.revertBusinessWorkspace().catch(() => undefined);
       if (!newPatchText.trim() || patchTouchesReviewData(newPatchText)) {
-        return { status: 'ABORTED', message: 'Rebase 导出的新补丁为空或包含禁止路径，未产生新版本', jobId };
+        return this.aborted('INVALID_CANDIDATE', 'Rebase 导出的新补丁为空或包含禁止路径，未产生新版本', jobId);
       }
       // 新补丁必须能在新基线干净应用，验证后立即还原。
-      const { writeFile: writeTmp, rm: rmTmp, readFile: readFs, readdir } = await import('node:fs/promises');
-      const os = await import('node:os');
-      const tmpNewPatch = path.join(os.tmpdir(), `dcr-rebase-${String(process.pid)}-${String(Date.now())}.patch`);
-      await writeTmp(tmpNewPatch, newPatchText, 'utf8');
-      let verifyApply;
-      try {
-        verifyApply = await vcs.applyPatch(tmpNewPatch, false);
-      } finally {
-        await rmTmp(tmpNewPatch, { force: true }).catch(() => undefined);
-      }
+      const { readFile: readFs, readdir } = await import('node:fs/promises');
+      const verifyApply = await this.applyPatchText(vcs, newPatchText, false);
       await vcs.revertBusinessWorkspace().catch(() => undefined);
       if (!verifyApply.ok) {
-        return { status: 'ABORTED', message: `Rebase 新补丁无法在新基线干净应用：${verifyApply.message}`, jobId };
+        return this.aborted('COMMIT_FAILED', `Rebase 新补丁无法在新基线干净应用：${verifyApply.message}`, jobId);
       }
       const reviewBackup = await readFs(candidate.reviewPath, 'utf8');
       const entriesBefore = new Set(await readdir(candidate.dirPath).catch(() => [] as string[]));
@@ -1813,19 +2084,20 @@ export class ReviewApi {
       });
       if (!result.landed) {
         if (result.outcome === 'RECOVERY_REQUIRED') {
-          return {
-            status: 'RECOVERY_REQUIRED',
-            reason: 'COMMIT_OUTCOME_UNKNOWN',
-            detail: result.detail,
-            commitRevision: null,
-            message: `Rebase 新版本提交结果无法确定，现场保留待人工核对：${result.detail}`,
+          return this.recoveryRequired(
+            'COMMIT_OUTCOME_UNKNOWN',
+            `Rebase 新版本提交结果无法确定，现场保留待人工核对：${result.detail}`,
             jobId,
-          };
+            result.detail,
+          );
         }
         await this.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
-        return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: `提交失败，已恢复操作前版本：${result.detail}`, jobId };
+        return this.aborted('COMMIT_FAILED', `提交失败，已恢复操作前版本：${result.detail}`, jobId, result.detail);
       }
-      return { status: 'COMMITTED', newRevision: updated.meta.currentRevision, commitRevision: result.commitRevision, message: `已 Rebase 到基线 ${base.slice(0, 12)}，新版本 ${String(updated.meta.currentRevision)}`, jobId };
+      return this.committed(`已 Rebase 到基线 ${base.slice(0, 12)}，新版本 ${String(updated.meta.currentRevision)}`, jobId, {
+        commitRevision: result.commitRevision,
+        newRevision: updated.meta.currentRevision,
+      });
     }));
     sendJson(res, 202, { jobId: job.id, job });
   }
@@ -1837,7 +2109,7 @@ export class ReviewApi {
   private async manualRevision(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const runtime = await this.runtimeFor(url);
     const { store, vcs } = runtime;
-    this.ensureNoAuditRunning(store.repoRoot);
+    // §7.7 审查互斥与 repo 锁由 routes.ts 的 RouteKind 统一套用。
     const body = await readJson(req);
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
@@ -1847,63 +2119,56 @@ export class ReviewApi {
     await this.requireSharedCandidate(runtime, id); // §7.1
     const detail = await store.get(id, null);
     await store.ensureWriteAllowed(detail.candidate, guard);
-    const job = this.jobs.start('ai_fix', (log, jobId) => this.withWriteLock(store.repoRoot, async () => {
+    const job = this.jobs.start('ai_fix', (log, jobId): Promise<AiFixOutcome> => this.withWriteLock(store.repoRoot, async () => {
       const candidate = detail.candidate;
       const clean = await vcs.ensureCleanWorkspace();
-      if (!clean.clean) return { status: 'ABORTED', message: `工作区不干净：${clean.message}`, jobId };
+      if (!clean.clean) return this.aborted('DIRTY_WORKSPACE', `工作区不干净：${clean.message}`, jobId);
       const base = await vcs.getCurrentBase().catch(() => null);
-      if (!base) return { status: 'ABORTED', message: '无法读取当前基线', jobId };
-      const { writeFile: writeTmp, rm: rmTmp } = await import('node:fs/promises');
-      const os = await import('node:os');
-      const tmpPath = path.join(os.tmpdir(), `dcr-tweak-${String(process.pid)}.patch`);
-      await writeTmp(tmpPath, patchText, 'utf8');
-      try {
-        const applied = await vcs.applyPatch(tmpPath, false);
-        if (!applied.ok) {
-          await vcs.revertBusinessWorkspace().catch(() => undefined);
-          return { status: 'ABORTED', message: `补丁无法应用：${applied.message}`, jobId };
-        }
-        log('重跑门禁');
-        const report = await runGateChecks(candidate.meta.gateChecks, {
-          cwd: store.repoRoot, baseRevision: base, timeoutMs: this.settings.gateTimeoutMs,
-          onLine: (line) => { if (line.trim()) log(`  ${line.slice(0, 300)}`); },
-        });
+      if (!base) return this.aborted('SYNC_FAILED', '无法读取当前基线', jobId);
+      const applied = await this.applyPatchText(vcs, patchText, false);
+      if (!applied.ok) {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
-        if (!report.allPassed) {
-          return { status: 'ABORTED', message: `门禁未通过，未产生新版本：\n${report.formattedEvidenceMarkdown}`, jobId };
-        }
-        const { readFile: readFs, readdir } = await import('node:fs/promises');
-        const reviewBackup = await readFs(candidate.reviewPath, 'utf8');
-        const entriesBefore = new Set(await readdir(candidate.dirPath).catch(() => [] as string[]));
-        const updated = await store.appendRevision(id, { author: 'human', baseRevision: base, patchText }, guard);
-        const writtenReview = await readFs(updated.reviewPath, 'utf8').catch(() => null);
-        const result = await this.commitAndClassify({
-          runtime,
-          message: `review(${id}): manual tweak (rev ${String(updated.meta.currentRevision)})`,
-          paths: [relative(store.repoRoot, updated.dirPath)],
-          probePaths: [relative(store.repoRoot, updated.reviewPath)],
-          ...(writtenReview !== null
-            ? { expectedFiles: [{ relPath: relative(store.repoRoot, updated.reviewPath), text: writtenReview }] }
-            : {}),
-        });
-        if (!result.landed) {
-          if (result.outcome === 'RECOVERY_REQUIRED') {
-            return {
-              status: 'RECOVERY_REQUIRED',
-              reason: 'COMMIT_OUTCOME_UNKNOWN',
-              detail: result.detail,
-              commitRevision: null,
-              message: `人工微调新版本提交结果无法确定，现场保留待人工核对：${result.detail}`,
-              jobId,
-            };
-          }
-          await this.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
-          return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: `提交失败，已恢复操作前版本：${result.detail}`, jobId };
-        }
-        return { status: 'COMMITTED', newRevision: updated.meta.currentRevision, commitRevision: result.commitRevision, message: `人工微调完成，新版本 ${String(updated.meta.currentRevision)}`, jobId };
-      } finally {
-        await rmTmp(tmpPath, { force: true }).catch(() => undefined);
+        return this.aborted('INVALID_CANDIDATE', `补丁无法应用：${applied.message}`, jobId);
       }
+      log('重跑门禁');
+      const report = await runGateChecks(candidate.meta.gateChecks, {
+        cwd: store.repoRoot, baseRevision: base, timeoutMs: this.settings.gateTimeoutMs,
+        onLine: (line) => { if (line.trim()) log(`  ${line.slice(0, 300)}`); },
+      });
+      await vcs.revertBusinessWorkspace().catch(() => undefined);
+      if (!report.allPassed) {
+        return this.aborted('GATE_CHECK_FAILED', `门禁未通过，未产生新版本：\n${report.formattedEvidenceMarkdown}`, jobId);
+      }
+      const { readFile: readFs, readdir } = await import('node:fs/promises');
+      const reviewBackup = await readFs(candidate.reviewPath, 'utf8');
+      const entriesBefore = new Set(await readdir(candidate.dirPath).catch(() => [] as string[]));
+      const updated = await store.appendRevision(id, { author: 'human', baseRevision: base, patchText }, guard);
+      const writtenReview = await readFs(updated.reviewPath, 'utf8').catch(() => null);
+      const result = await this.commitAndClassify({
+        runtime,
+        message: `review(${id}): manual tweak (rev ${String(updated.meta.currentRevision)})`,
+        paths: [relative(store.repoRoot, updated.dirPath)],
+        probePaths: [relative(store.repoRoot, updated.reviewPath)],
+        ...(writtenReview !== null
+          ? { expectedFiles: [{ relPath: relative(store.repoRoot, updated.reviewPath), text: writtenReview }] }
+          : {}),
+      });
+      if (!result.landed) {
+        if (result.outcome === 'RECOVERY_REQUIRED') {
+          return this.recoveryRequired(
+            'COMMIT_OUTCOME_UNKNOWN',
+            `人工微调新版本提交结果无法确定，现场保留待人工核对：${result.detail}`,
+            jobId,
+            result.detail,
+          );
+        }
+        await this.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
+        return this.aborted('COMMIT_FAILED', `提交失败，已恢复操作前版本：${result.detail}`, jobId, result.detail);
+      }
+      return this.committed(`人工微调完成，新版本 ${String(updated.meta.currentRevision)}`, jobId, {
+        commitRevision: result.commitRevision,
+        newRevision: updated.meta.currentRevision,
+      });
     }));
     sendJson(res, 202, { jobId: job.id, job });
   }
@@ -2078,7 +2343,7 @@ export class ReviewApi {
   private async approve(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const runtime = await this.runtimeFor(url);
     const { store, vcs } = runtime;
-    this.ensureNoAuditRunning(store.repoRoot);
+    // §7.7 审查互斥由 routes.ts（kind: job-start）在受理阶段统一检查。
     const body = await readJson(req);
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
@@ -2177,7 +2442,8 @@ export class ReviewApi {
    * overall opinion, so both paths validate and run identically.
    */
   private async startAiFixJob(runtime: Runtime, id: string, guard: ConcurrencyGuard): Promise<JobRecord> {
-    this.ensureNoAuditRunning(runtime.root);
+    // §7.7 审查互斥由 routes.ts 统一检查（/ai-fix 为 job-start；/comments 附带 autoFix 时
+    // 已在 candidate-write 类别下受理，其后的 Job 启动沿用同一次受理结论）。
     const { store, vcs } = runtime;
     const detail = await store.get(id, null);
     await this.requireOwnerOf(store, id); // §12.2：非 Owner 403（takeover 除外）
@@ -2196,7 +2462,7 @@ export class ReviewApi {
     }
     const clean = await vcs.ensureCleanWorkspace();
     if (!clean.clean) throw new ApiError(409, 'conflict', clean.message);
-    return this.jobs.start('ai_fix', (log, _jobId, signal) => this.withWriteLock(runtime.root, async () => {
+    return this.jobs.start('ai_fix', (log, jobId, signal): Promise<AiFixOutcome> => this.withWriteLock(runtime.root, async () => {
       const comments = detail.candidate.meta.comments.filter((comment) => comment.status !== 'resolved');
       const patch = await store.currentPatch(detail.candidate);
       const { readFile: readFs, readdir } = await import('node:fs/promises');
@@ -2228,17 +2494,17 @@ export class ReviewApi {
       } finally {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
       }
-      if (result.manual) return { manual: true, prompt: result.prompt ?? '' };
+      if (result.manual) return { status: 'MANUAL_REQUIRED', message: 'AI 修复生成了人工执行提示', manualPrompt: result.prompt ?? '', jobId } satisfies AiFixOutcome;
       if (!result.success) {
         await this.restoreAppendedRevision(detail.candidate, reviewBackup, entriesBefore);
         if (result.aborted) {
-          return {
-            status: 'ABORTED',
-            reason: 'RUNNER_FAILED',
-            message: 'AI 修复已取消（未产生共享提交）',
-          };
+          return this.aborted('CANCELLED', 'AI 修复已取消（未产生共享提交）', jobId);
         }
-        throw new Error(result.errorMessage ?? 'AI 修复失败');
+        return this.aborted(
+          'RUNNER_FAILED',
+          `AI 修复失败：${result.errorMessage ?? '未知错误'}${result.outputTail ? `\n\n${result.outputTail.slice(-4000)}` : ''}`,
+          jobId,
+        );
       }
       const latest = await store.get(id, null);
       const writtenReview = await readFs(latest.candidate.reviewPath, 'utf8').catch(() => null);
@@ -2253,23 +2519,20 @@ export class ReviewApi {
       });
       if (!outcome.landed) {
         if (outcome.outcome === 'RECOVERY_REQUIRED') {
-          return {
-            status: 'RECOVERY_REQUIRED',
-            reason: 'COMMIT_OUTCOME_UNKNOWN',
-            detail: outcome.detail,
-            commitRevision: null,
-            message: `AI 修复新版本提交结果无法确定，现场保留待人工核对：${outcome.detail}`,
-          };
+          return this.recoveryRequired(
+            'COMMIT_OUTCOME_UNKNOWN',
+            `AI 修复新版本提交结果无法确定，现场保留待人工核对：${outcome.detail}`,
+            jobId,
+            outcome.detail,
+          );
         }
         await this.restoreAppendedRevision(detail.candidate, reviewBackup, entriesBefore);
-        return {
-          status: 'ABORTED',
-          reason: 'COMMIT_FAILED',
-          commitRevision: null,
-          message: `AI 已生成新版本，但提交 .ai-review 失败（已恢复）：${outcome.detail}`,
-        };
+        return this.aborted('COMMIT_FAILED', `AI 已生成新版本，但提交 .ai-review 失败（已恢复）：${outcome.detail}`, jobId, outcome.detail);
       }
-      return { manual: false, result, status: 'COMMITTED', commitRevision: outcome.commitRevision };
+      return this.committed(`AI 修复完成，版本 ${String(result.newRevisionId ?? latest.candidate.meta.currentRevision)}`, jobId, {
+        commitRevision: outcome.commitRevision,
+        ...(result.newRevisionId !== undefined ? { newRevision: Number(result.newRevisionId) } : {}),
+      });
     }));
   }
 
@@ -2281,7 +2544,7 @@ export class ReviewApi {
   private async candidateFinalize(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const runtime = await this.runtimeFor(url);
     const { store, vcs } = runtime;
-    this.ensureNoAuditRunning(store.repoRoot);
+    // §7.7 审查互斥与 repo 锁由 routes.ts 的 RouteKind 统一套用。
     const body = await readJson(req);
     const id = stringField(body, 'id');
     if (!id) throw new ApiError(400, 'bad_request', '缺少候选 id');
@@ -2289,7 +2552,7 @@ export class ReviewApi {
     const sharedSource = await sharedSourceFor(runtime);
     const shared = sharedSource ? await sharedSource.readReviewText(...splitId(id)) : null;
     if (shared !== null) throw new ApiError(409, 'conflict', `候选 ${id} 已是共享事实，独立收尾仅适用于本地候选`);
-    const job = this.jobs.start('ai_fix', (log, jobId) => this.withWriteLock(store.repoRoot, async () => {
+    const job = this.jobs.start('ai_fix', (log, jobId): Promise<AiFixOutcome> => this.withWriteLock(store.repoRoot, async () => {
       const detail = await store.get(id, null);
       const meta = detail.candidate.meta;
       const errors: string[] = [];
@@ -2318,7 +2581,7 @@ export class ReviewApi {
       }
       await vcs.revertBusinessWorkspace().catch(() => undefined);
       if (errors.length > 0) {
-        return { status: 'VALIDATION_FAILED', errors, message: `候选 ${id} 未通过收尾校验`, jobId };
+        return this.validationFailed(`候选 ${id} 未通过收尾校验`, jobId, errors);
       }
       // §4.3：提交前规范化序列化（tags trim/小写/去重、键序、未知键保留），不改 updated_at。
       const { readFile: readFs } = await import('node:fs/promises');
@@ -2336,20 +2599,19 @@ export class ReviewApi {
       });
       if (!outcome.landed) {
         if (outcome.outcome === 'RECOVERY_REQUIRED') {
-          return {
-            status: 'RECOVERY_REQUIRED',
-            reason: 'COMMIT_OUTCOME_UNKNOWN',
-            detail: outcome.detail,
-            message: `独立候选 ${id} 提交结果无法确定，现场保留待人工核对：${outcome.detail}`,
+          return this.recoveryRequired(
+            'COMMIT_OUTCOME_UNKNOWN',
+            `独立候选 ${id} 提交结果无法确定，现场保留待人工核对：${outcome.detail}`,
             jobId,
-          };
+            outcome.detail,
+          );
         }
         const { writeFile: restoreWrite } = await import('node:fs/promises');
         await restoreWrite(detail.candidate.reviewPath, reviewBackup, 'utf8').catch(() => undefined);
-        return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: `提交候选目录失败（已恢复）：${outcome.detail}`, jobId };
+        return this.aborted('COMMIT_FAILED', `提交候选目录失败（已恢复）：${outcome.detail}`, jobId, outcome.detail);
       }
       log(`独立候选 ${id} 已提交：${outcome.commitRevision?.slice(0, 12) ?? ''}`);
-      return { status: 'COMMITTED', commitRevision: outcome.commitRevision, message: `独立候选 ${id} 已完成收尾提交`, jobId };
+      return this.committed(`独立候选 ${id} 已完成收尾提交`, jobId, { commitRevision: outcome.commitRevision });
     }));
     sendJson(res, 202, { jobId: job.id, job });
   }
@@ -2374,11 +2636,8 @@ export class ReviewApi {
     // 租约仍阻塞自动写，必须人工确认外部执行停止后 /audit/release。
     const auditId = this.auditJobLeases.get(job.id);
     if (auditId) {
-      const lease = this.auditLeases.find((entry) => entry.auditId === auditId);
-      if (lease && lease.state === 'active') {
-        lease.state = 'releasable';
-        await this.saveAuditLeases();
-      }
+      // §7.6：取消只迁到 releasable（仍阻塞），绝不自动释放；状态迁移走唯一入口。
+      await this.auditLifecycle.markReleasable(auditId).catch(() => false);
       this.auditJobFinishes.get(auditId)?.({
         status: 'ABORTED',
         auditId,
@@ -2406,7 +2665,7 @@ export class ReviewApi {
     }
     const lease = root !== undefined
       ? this.activeLeaseFor(root)
-      : this.auditLeases.find((entry) => entry.state !== 'released');
+      : this.auditLifecycle.anyBlocking();
     if (lease) {
       throw new ApiError(409, 'conflict', `审查执行租约 ${lease.auditId}（${lease.state}）仍在占用仓库；请先 /audit/finalize 收尾，或确认外部执行已停止后 /audit/release。`);
     }

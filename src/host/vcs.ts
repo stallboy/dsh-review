@@ -1,4 +1,4 @@
-import { mkdir, rm } from 'node:fs/promises';
+import { mkdir, readFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -101,6 +101,18 @@ export interface VcsAdapter {
   atomicCommit(input: CommitInput): Promise<CommitResult>;
   /** §8.2 patchCheck 派生预检：只 dry-run 检查补丁能否应用到当前工作区/基线，不实际应用。 */
   checkPatch(patchPath: string): Promise<ApplyPatchResult>;
+  /**
+   * §7.7/§8.2：比较两个版本之间的**业务代码**变化，排除 `.ai-review/` 评审元数据路径。
+   *
+   * 为什么必须排除：候选元数据（review.md / 补丁 / 档案）本身就存放在 `.ai-review/` 并
+   * 随仓库提交，任何一次评论、状态变更、拒绝或审查收尾都会推进 HEAD / revision。
+   * 若直接用 `base_revision === currentBase` 判断“基线未变”，任何已共享的候选都会永远
+   * 被判为“落后”，从而让 Rebase 无限空转、并让一切候选集体显示“基线落后”。
+   *
+   * 返回两个版本的业务路径差异（新增/修改/删除/重命名，仓库相对、正斜杠）。
+   * 无法读取时返回 null——调用方必须按“无法证明”处理，不得猜测为“无变化”。
+   */
+  businessChangesBetween(fromRevision: string, toRevision: string): Promise<string[] | null>;
   /** §5.5：从 VCS 历史派生批准业务提交版本；三态 found/ambiguous/unknown。 */
   deriveApprovalCommit(input: ApprovalDeriveInput): Promise<ApprovalCommitLookup>;
 }
@@ -143,6 +155,54 @@ function normalizeCommitPath(root: string, value: string): string {
   return toRepoRelative(relativePath);
 }
 
+/**
+ * §7.5 步骤 9：把“本次要提交的路径集合”展开为完整的 `verifyEntries`。
+ *
+ * 背景（缺陷 B1）：`verifyEntries` 只声明“这些条目必须存在且内容一致”，并不能阻止
+ * 目录中多出未审核文件。为了让 atomicCommit 能做集合相等核对，调用方必须给出**完整**
+ * 的文件清单；本函数把目录路径展开为其中全部文件，并读取当前内容计算 blob 与模式。
+ *
+ * 用法：提交前先算出 entries，写入/核对过程中任何内容变化都会被 atomicCommit 发现。
+ */
+export async function collectCommitEntries(
+  root: string,
+  paths: string[],
+): Promise<{ entries: ExpectedCommitEntry[]; missing: string[] }> {
+  const { readdir, stat } = await import('node:fs/promises');
+  const entries: ExpectedCommitEntry[] = [];
+  const missing: string[] = [];
+  const seen = new Set<string>();
+  const visit = async (absolute: string, relative: string): Promise<void> => {
+    const stats = await stat(absolute).catch(() => null);
+    if (!stats) {
+      missing.push(relative);
+      return;
+    }
+    if (stats.isDirectory()) {
+      const names = (await readdir(absolute).catch(() => [] as string[])).sort();
+      for (const name of names) {
+        await visit(path.join(absolute, name), `${relative}/${name}`);
+      }
+      return;
+    }
+    if (!stats.isFile()) return;
+    if (seen.has(relative)) return;
+    seen.add(relative);
+    const buffer = await readFile(absolute);
+    entries.push({
+      path: relative,
+      blobHash: gitBlobHash(buffer),
+      mode: (stats.mode & 0o111) !== 0 ? '100755' : '100644',
+    });
+  };
+  for (const input of paths) {
+    const relative = normalizeCommitPath(root, input).replace(/\/+$/, '');
+    if (!relative) continue;
+    await visit(path.join(root, relative), relative);
+  }
+  return { entries, missing };
+}
+
 /** §7.5 步骤 9：解析 `git ls-files -s -z` 输出，得到索引中 stage 0 条目的模式与 blob 哈希。 */
 function parseStagedIndex(output: string): Map<string, { mode: string; hash: string }> {
   const entries = new Map<string, { mode: string; hash: string }>();
@@ -174,6 +234,22 @@ function svnRepoPath(prefix: string, relPath: string): string {
   const rel = toRepoRelative(relPath);
   const joined = `${base}/${rel}`.replace(/\/{2,}/g, '/');
   return joined.length > 1 ? joined.replace(/\/+$/, '') : '/';
+}
+
+/**
+ * `svnRepoPath` 的逆运算：仓库绝对路径 `/trunk/src/a.js` + 前缀 `^/trunk`
+ * → 工作副本相对路径 `src/a.js`。不在该前缀下时返回 null（另一个分支/标签的变更不相关）。
+ */
+function svnRepoPathToRelative(prefix: string, repoPath: string): string | null {
+  const base = decodeSvnPath(prefix.trim().replace(/^\^/, '')).replace(/\/+$/, '');
+  const target = decodeSvnPath(repoPath.trim());
+  if (base === '' || base === '/') {
+    const trimmedRoot = target.replace(/^\/+/, '');
+    return trimmedRoot.length > 0 ? trimmedRoot : null;
+  }
+  if (target === base) return '.';
+  if (!target.startsWith(`${base}/`)) return null;
+  return target.slice(base.length + 1);
 }
 
 async function git(root: string, args: string[], timeoutMs = VCS_TIMEOUT_MS): Promise<ProcessResult> {
@@ -236,6 +312,26 @@ export class GitAdapter implements VcsAdapter {
     if (target.length === 0) return null;
     const result = await git(this.root, ['show', `${rev}:${target}`]);
     return result.code === 0 ? result.stdout : null;
+  }
+
+  /**
+   * §7.7/§8.2：业务代码差异（排除 `.ai-review/`）。
+   *
+   * 用 `git diff --name-only -z <from> <to> -- . ":(exclude).ai-review"`：
+   * - 只列路径，不读内容，成本低；
+   * - pathspec `:(exclude)` 精确排除评审元数据目录，不影响业务路径中的同名子串；
+   * - 任一版本不可读（浅克隆、非法 hash）时返回 null，调用方按“无法证明”处理。
+   */
+  async businessChangesBetween(fromRevision: string, toRevision: string): Promise<string[] | null> {
+    const from = fromRevision.trim();
+    const to = toRevision.trim();
+    if (!/^[0-9a-fA-F]+$/.test(from) || !/^[0-9a-fA-F]+$/.test(to)) return null;
+    if (from === to) return [];
+    const result = await git(this.root, [
+      'diff', '--name-only', '-z', from, to, '--', '.', ':(exclude).ai-review',
+    ]);
+    if (result.code !== 0) return null;
+    return result.stdout.split('\0').map((line) => line.trim()).filter((line) => line.length > 0);
   }
 
   /**
@@ -570,6 +666,43 @@ export class GitAdapter implements VcsAdapter {
       const rel = normalizeCommitPath(this.root, deleted);
       if (index.has(rel)) problems.push(`删除未在暂存区生效：${rel}`);
     }
+    // §7.5 步骤 9（B1）：verifyEntries 只核对“列出的条目必须存在且内容一致”，
+    // 这不覆盖“集合相等”。当调用方给出核对集合时，暂存集合中任何未列入的条目都视为
+    // 夹带（clean filter、门禁额外产物、门禁写出的同名变体等）并拒绝提交。
+    if ((input.verifyEntries?.length ?? 0) > 0 || (input.verifyDeletions?.length ?? 0) > 0) {
+      const verified = new Set([
+        ...(input.verifyEntries ?? []).map((entry) => normalizeCommitPath(this.root, entry.path)),
+      ]);
+      const deletedSet = new Set((input.verifyDeletions ?? []).map((entry) => normalizeCommitPath(this.root, entry)));
+      // `git diff --cached --name-status -z`：状态与路径也是交替的 NUL 记录；
+      // 重命名/复制记录形如 `R100\0旧\0新\0`，因此必须按状态前缀消费变长字段。
+      const changed = await git(this.root, ['diff', '--cached', '--name-status', '-z']);
+      if (changed.code !== 0) {
+        return fail(`无法读取暂存变更，拒绝提交：${describe(changed)}`);
+      }
+      const tokens = changed.stdout.split('\0');
+      for (let index = 0; index < tokens.length;) {
+        const status = tokens[index] ?? '';
+        index += 1;
+        if (!status) continue;
+        const takesTwoPaths = status.startsWith('R') || status.startsWith('C');
+        const first = tokens[index] ?? '';
+        index += 1;
+        const second = takesTwoPaths ? (tokens[index] ?? '') : '';
+        if (takesTwoPaths) index += 1;
+        if (status.startsWith('D')) {
+          if (first && !deletedSet.has(first)) problems.push(`暂存删除未列入核对集合：${first}`);
+          continue;
+        }
+        if (takesTwoPaths) {
+          // 旧路径被移走：必须声明确认；新路径按普通条目核对。
+          if (first && !deletedSet.has(first)) problems.push(`重命名旧路径未列入删除核对集合：${first}`);
+          if (second && !verified.has(second)) problems.push(`暂存条目未列入核对集合（疑似夹带）：${second}`);
+          continue;
+        }
+        if (first && !verified.has(first)) problems.push(`暂存条目未列入核对集合（疑似夹带）：${first}`);
+      }
+    }
     if (problems.length > 0) {
       return fail(`已审核内容与暂存区不一致，已拒绝提交：\n${problems.slice(0, 20).join('\n')}`);
     }
@@ -672,6 +805,40 @@ export class SvnAdapter implements VcsAdapter {
     if (target.length === 0) return null;
     const result = await svn(this.root, ['cat', '-r', rev, '--', target]);
     return result.code === 0 ? result.stdout : null;
+  }
+
+  /**
+   * §7.7/§8.2：业务代码差异（排除 `.ai-review/`）。
+   *
+   * SVN 没有两版本 diff 的便捷命令，改用 `svn log -v -r (from:to]` 收集区间内
+   * 所有变更路径：`A/M/D/R` 行格式为 `   M /trunk/path`。排除 `.ai-review/`
+   * 以及 SVN 元数据路径（`svn:` 属性变更行）。任一 revision 非法或日志不可读返回 null。
+   */
+  async businessChangesBetween(fromRevision: string, toRevision: string): Promise<string[] | null> {
+    const from = fromRevision.trim();
+    const to = toRevision.trim();
+    if (!/^\d+$/.test(from) || !/^\d+$/.test(to)) return null;
+    const fromNumber = Number(from);
+    const toNumber = Number(to);
+    if (!Number.isSafeInteger(fromNumber) || !Number.isSafeInteger(toNumber)) return null;
+    if (fromNumber === toNumber) return [];
+    if (toNumber < fromNumber) return null;
+    const result = await svn(this.root, ['log', '-v', '--xml', '-r', `${String(fromNumber + 1)}:${String(toNumber)}`]);
+    if (result.code !== 0) return null;
+    const prefix = await svn(this.root, ['info', '--show-item', 'relative-url', '--', '.']);
+    if (prefix.code !== 0) return null;
+    const changes = new Set<string>();
+    // <path action="M" kind="file">/trunk/src/a.js</path>
+    for (const match of result.stdout.matchAll(/<path\b[^>]*\baction="([^"]+)"[^>]*>([^<]+)<\/path>/g)) {
+      const action = (match[1] ?? '').toUpperCase();
+      const repoPath = (match[2] ?? '').trim();
+      // 属性变更（action=M 且路径以 svn: 开头）不是业务代码变化。
+      if (action === 'M' && repoPath.startsWith('svn:')) continue;
+      const relative = svnRepoPathToRelative(prefix.stdout, repoPath);
+      if (relative === null || relative === '.') continue;
+      changes.add(relative);
+    }
+    return [...changes].filter((relative) => !relative.startsWith('.ai-review/') && relative !== '.ai-review');
   }
 
   private async lastChangedRevision(target: string): Promise<number | null> {

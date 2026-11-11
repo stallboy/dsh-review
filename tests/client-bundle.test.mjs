@@ -215,3 +215,15 @@ test('plugin unload disposes the view, its styles and its dictionaries', () => {
   assert.equal(client.locales.length, 0, 'the locale dictionary must be released');
   assert.equal(page.styles.length, 0, 'the injected stylesheet must be removed');
 });
+
+test('§10.2（A9）：详情页 id/detail/stale/guard 由单一 reducer 驱动，且不再用裸 ref 手工同步 guard', () => {
+  // 结构断言：reducer 化后，详情页状态只能通过 dispatchDetail 迁移。
+  // 若有人重新引入 guardRef 手工赋值或独立 setStale，这里会立即失败——
+  // 历史缺陷正是“刷新解锁”与“过期判定”分散在多处赋值里而漏改。
+  assert.match(bundleSource, /function detailReducer\(state, action\)/, '详情页状态机必须存在');
+  assert.match(bundleSource, /dispatchDetail\(\{\s*type: 'loaded',\s*detail: value\s*\}\)/);
+  assert.match(bundleSource, /dispatchDetail\(\{\s*type: 'rebind'\s*\}\)/);
+  assert.match(bundleSource, /dispatchDetail\(\{\s*type: 'open',\s*id\s*\}\)/);
+  assert.doesNotMatch(bundleSource, /guardRef\.current\s*=/, '不得再用裸 ref 手工同步 guard');
+  assert.doesNotMatch(bundleSource, /setStale\(/, 'stale 只能由 reducer 迁移');
+});
