@@ -568,7 +568,8 @@
       const [auditLaunching, setAuditLaunching] = useState(false);
       const [auditCopied, setAuditCopied] = useState(false);
       const [auditSessionId, setAuditSessionId] = useState('');
-      const [filter, setFilter] = useState({ owner: '', statuses: '', text: '', tag: '' });
+      const [auditLeaseId, setAuditLeaseId] = useState('');
+      const [filter, setFilter] = useState({ owner: '', statuses: '', text: '', tag: '', dir: '', createdAfter: '', createdBefore: '' });
       const diffFiles = useMemo(() => parseDiff(diff?.unifiedDiff ?? ''), [diff]);
 
       const refreshHealth = useCallback(async (): Promise<Health | null> => {
@@ -592,13 +593,19 @@
       const loadQueue = useCallback(async (): Promise<void> => {
         setLoading(true);
         try {
-          const value = await api.get<Queue>('/queue');
+          const query = new URLSearchParams();
+          if (filter.owner) query.set('owner', filter.owner);
+          for (const key of ['statuses', 'tag', 'dir', 'text'] as const) {
+            if (filter[key]) query.set(key, filter[key]);
+          }
+          if (filter.createdAfter) query.set('createdAfter', new Date(filter.createdAfter).toISOString());
+          if (filter.createdBefore) query.set('createdBefore', new Date(filter.createdBefore).toISOString());
+          const value = await api.get<Queue>(`/queue${query.size > 0 ? `?${query.toString()}` : ''}`);
           setQueue(value);
-          setFilter((prev) => ({ ...prev, owner: prev.owner || value.me }));
           setError('');
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
         finally { setLoading(false); }
-      }, [api]);
+      }, [api, filter]);
 
       const loadDetail = useCallback(async (id: string): Promise<void> => {
         setLoading(true);
@@ -933,10 +940,15 @@
         setAuditLaunching(true);
         setError('');
         try {
-          const value = await api.post<{ sessionId: string }>('/audit/session', {
+          const value = await api.post<{ sessionId: string; auditId: string; job: Job }>('/audit/session', {
             targetPath: auditTarget, note: auditNote,
           });
           setAuditSessionId(value.sessionId);
+          setAuditLeaseId(value.auditId);
+          jobLogRef.current = [];
+          jobLogOffsetRef.current = null;
+          setJob(value.job);
+          setBusy(value.job.status === 'running');
           setAuditOpen(false);
           setAuditPrompt('');
           setAuditCopied(false);
@@ -945,6 +957,80 @@
         } finally {
           setAuditLaunching(false);
         }
+      };
+
+      const startManualAudit = async (): Promise<void> => {
+        setAuditLaunching(true);
+        setError('');
+        try {
+          const value = await api.post<{ auditId: string; prompt: string; job: Job }>('/audit/manual', {
+            targetPath: auditTarget, note: auditNote,
+          });
+          setAuditLeaseId(value.auditId);
+          setAuditPrompt(value.prompt);
+          setAuditCopied(false);
+          jobLogRef.current = [];
+          jobLogOffsetRef.current = null;
+          setJob(value.job);
+          setBusy(true);
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+        } finally {
+          setAuditLaunching(false);
+        }
+      };
+
+      const releaseAuditLease = async (): Promise<void> => {
+        if (!auditLeaseId) return;
+        setBusy(true);
+        try {
+          await api.post('/audit/release', { auditId: auditLeaseId, confirmStopped: true });
+          setAuditLeaseId('');
+          setJob(null);
+          await loadQueue();
+        } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+        finally { setBusy(false); }
+      };
+
+      const runWrite = async (path: string, body: unknown): Promise<void> => {
+        setBusy(true);
+        setError('');
+        try {
+          await api.post(path, body);
+          await loadQueue();
+          if (selectedId) await loadDetail(selectedId);
+        } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+        finally { setBusy(false); }
+      };
+
+      const manualRevision = async (): Promise<void> => {
+        if (!detail) return;
+        const patchText = window.prompt('粘贴相对当前基线的完整 Unified Diff（人工补丁）');
+        if (patchText?.trim()) await startJob('/manual-revision', { id: detail.candidate.id, ...guard(), patchText });
+      };
+      const archiveStale = async (): Promise<void> => {
+        if (detail && window.confirm('确认按 reviewers.yml 的 stale_days 归档此候选？')) {
+          await runWrite('/archive-stale', { id: detail.candidate.id, ...guard() });
+        }
+      };
+      const reopenCandidate = async (): Promise<void> => {
+        if (!detail) return;
+        const from = window.prompt('输入真实的 rejected 来源候选 id（YYYY-MM/slug）');
+        if (!from) return;
+        const reason = window.prompt('重开理由（必填）');
+        if (reason?.trim()) await runWrite('/reopen', { id: detail.candidate.id, ...guard(), from, reason });
+      };
+      const convertFinding = async (): Promise<void> => {
+        const auditId = window.prompt('最新有效观察的 auditId');
+        const findingId = auditId ? window.prompt('findingId') : null;
+        const candidateId = findingId ? window.prompt('要绑定的已存在候选 id') : null;
+        if (auditId && findingId && candidateId) await runWrite('/convert', { auditId, findingId, candidateId });
+      };
+      const dismissFinding = async (): Promise<void> => {
+        const auditId = window.prompt('最新有效观察的 auditId');
+        const findingId = auditId ? window.prompt('findingId') : null;
+        const reason = findingId ? window.prompt('忽略理由（必填）') : null;
+        if (auditId && findingId && reason?.trim()) await runWrite('/dismiss-finding', { auditId, findingId, reason });
       };
 
       const openCandidate = (id: string): void => {
@@ -956,20 +1042,7 @@
 
       const auditReady = Boolean(queue?.currentBase ?? health?.currentBase);
 
-      const filteredItems = useMemo(() => {
-        const items = queue?.items ?? [];
-        const statuses = filter.statuses ? filter.statuses.split(',') : [];
-        return items.filter((item) => {
-          if (filter.owner && item.owner !== filter.owner) return false;
-          if (statuses.length > 0 && !statuses.includes(item.status)) return false;
-          if (filter.tag && !item.tags.some((tag) => tag.toLowerCase() === filter.tag.toLowerCase())) return false;
-          if (filter.text) {
-            const needle = filter.text.toLowerCase();
-            if (!`${item.title} ${item.id} ${item.ticket ?? ''}`.toLowerCase().includes(needle)) return false;
-          }
-          return true;
-        });
-      }, [queue, filter]);
+      const filteredItems = useMemo(() => queue?.items ?? [], [queue]);
 
       const renderSettings = (): any => {
         if (!settings) return h('div', { className: 'dcr-empty' }, '加载设置…');
@@ -1039,6 +1112,11 @@
               h('button', { className: 'dcr-btn', disabled: loading, onClick: () => { void loadQueue(); } }, loading ? '加载中…' : '刷新'),
               h('button', { className: 'dcr-btn p', disabled: busy, onClick: toggleAudit }, auditOpen ? '收起审查' : '审查仓库'),
             ),
+            h('div', { className: 'dcr-row', style: { marginTop: 8 } },
+              h('input', { className: 'dcr-input', placeholder: '目录包含', value: filter.dir, onChange: (e: any) => setFilter({ ...filter, dir: e.target.value }) }),
+              h('input', { className: 'dcr-input', type: 'datetime-local', title: '创建时间起（含边界）', value: filter.createdAfter, onChange: (e: any) => setFilter({ ...filter, createdAfter: e.target.value }) }),
+              h('input', { className: 'dcr-input', type: 'datetime-local', title: '创建时间止（含边界）', value: filter.createdBefore, onChange: (e: any) => setFilter({ ...filter, createdBefore: e.target.value }) }),
+            ),
             h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 8 } }, `当前基线 ${short(queue?.currentBase)} · 共 ${String(filteredItems.length)} 项`),
           ),
           auditOpen ? h('div', { className: 'dcr-card' },
@@ -1056,16 +1134,22 @@
             ),
             h('div', { className: 'dcr-row' },
               h('button', { className: 'dcr-btn p', disabled: busy || auditLaunching || auditPromptLoading || !auditReady, onClick: () => { void launchAuditSession(); } }, auditLaunching ? '正在创建会话…' : '启动审查会话'),
-              h('button', { className: 'dcr-btn', disabled: auditPromptLoading || !auditReady, onClick: () => { void exportAuditPrompt(); } }, auditPromptLoading ? '生成中…' : '导出提示词'),
+              h('button', { className: 'dcr-btn', disabled: auditPromptLoading || !auditReady, onClick: () => { void exportAuditPrompt(); } }, auditPromptLoading ? '生成中…' : '仅预览提示词'),
+              h('button', { className: 'dcr-btn', disabled: auditLaunching || !auditReady, onClick: () => { void startManualAudit(); } }, '创建外部执行租约'),
+              auditLeaseId ? h('button', { className: 'dcr-btn', disabled: auditLaunching, onClick: () => { void startJob('/audit/finalize', { auditId: auditLeaseId }); } }, '收尾并提交') : null,
+              auditLeaseId ? h('button', { className: 'dcr-btn g', disabled: busy, onClick: () => { void releaseAuditLease(); } }, '确认停止并释放') : null,
+              h('button', { className: 'dcr-btn', onClick: () => { void convertFinding(); } }, '转换 finding'),
+              h('button', { className: 'dcr-btn', onClick: () => { void dismissFinding(); } }, '忽略 finding'),
               h('button', { className: 'dcr-btn g', onClick: () => setAuditOpen(false) }, '取消'),
               h('span', { className: 'dcr-grow' }),
               h('span', { className: 'dcr-small dcr-muted' }, `基线 ${short(queue?.currentBase ?? health?.currentBase)} · 使用当前 DSH 会话模型`),
             ),
+            auditLeaseId ? h('div', { className: 'dcr-banner info', style: { marginTop: 10 } }, `执行租约 ${auditLeaseId} 正在参与互斥；外部 Agent 停止后按实际状态选择收尾或确认释放。`) : null,
             auditSessionId ? h('div', { className: 'dcr-banner info', style: { marginTop: 10 } }, `审查会话已创建（${short(auditSessionId)}）。请在侧边栏打开「仓库审查 · ${auditTarget.trim() || '全仓库'}」查看实时过程；当前页面不会被遮挡。`) : null,
             auditPrompt ? h('div', { className: 'dcr-field', style: { marginTop: 10 } },
               h('div', { className: 'dcr-row' },
-                h('label', { className: 'dcr-grow' }, '审查提示词（可复制到任意外部 Agent）'),
-                h('button', { className: 'dcr-btn', onClick: () => { void copyAuditPrompt(); } }, auditCopied ? '已复制' : '复制'),
+                h('label', { className: 'dcr-grow' }, auditLeaseId ? '审查提示词（租约已创建，可供外部 Agent 执行）' : '预览提示词（执行前必须创建手动租约）'),
+                h('button', { className: 'dcr-btn', disabled: !auditLeaseId, title: auditLeaseId ? '复制执行提示词' : '先创建外部执行租约', onClick: () => { void copyAuditPrompt(); } }, auditCopied ? '已复制' : '复制'),
               ),
               h('textarea', { className: 'dcr-textarea', style: { minHeight: 220 }, readOnly: true, value: auditPrompt }),
             ) : null,
@@ -1231,6 +1315,9 @@
                   !detail.canAct ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void takeover(); } }, '接管审核') : null,
                   canAct && candidate.meta.status === 'changes_requested'
                     ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void resumeCandidate(); } }, '转回待审核') : null,
+                  canAct && (candidate.meta.status === 'pending' || candidate.meta.status === 'changes_requested') ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void manualRevision(); } }, '上传人工补丁') : null,
+                  canAct && (candidate.meta.status === 'pending' || candidate.meta.status === 'changes_requested') ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void archiveStale(); } }, '超时归档') : null,
+                  canAct && (candidate.meta.status === 'pending' || candidate.meta.status === 'changes_requested') ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void reopenCandidate(); } }, '从重开来源恢复') : null,
                   canAct ? h('button', { className: 'dcr-btn d', disabled: busy, onClick: () => setPanel(panel === 'reject' ? '' : 'reject') }, panel === 'reject' ? '收起放弃' : '放弃') : null,
                   canAct ? h('button', {
                     className: 'dcr-btn p',
@@ -1509,6 +1596,11 @@
               running ? '执行中' : outcome ? (outcomeText[outcome] ?? outcome) : job.status === 'succeeded' ? '完成' : '失败'),
             h('span', { className: 'dcr-small dcr-muted' }, dateText(job.startedAt)),
             h('span', { className: 'dcr-grow' }),
+            running ? h('button', { className: 'dcr-btn d', onClick: () => {
+              void api.post<{ job: Job }>(`/jobs/${encodeURIComponent(job.id)}/cancel`, {})
+                .then((value) => setJob(value.job))
+                .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+            } }, '取消任务') : null,
             !running ? h('button', { className: 'dcr-btn g', onClick: () => setJob(null) }, '关闭') : null,
           ),
           running ? h('div', { className: 'dcr-small dcr-muted dcr-mono', style: { marginTop: 6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, lastLine) : null,

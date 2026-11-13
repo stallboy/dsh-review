@@ -60,7 +60,7 @@ async function writeCandidate(root, slug, extra = {}) {
     '    author: ai',
     'gate_checks: ["node --version"]',
     'comments: []',
-    'human_decisions:',
+    ...((extra.decisions ?? []).length > 0 ? ['human_decisions:'] : ['human_decisions: []']),
     ...(extra.decisions ?? []).map((d) => `  - id: ${d.id}\n    question: "${d.q}"`),
     'approval: null',
     'rejection: null',
@@ -164,6 +164,7 @@ test('P5: 判断项未全覆盖 / 知悉缺理由 / 标题不一致 —— 批�
     expectedOwner: 'tester',
     expectedUpdatedAt: '2026-11-01T10:00:00+08:00',
   });
+  assert.ok(mismatch.job, JSON.stringify(mismatch));
   assert.equal(mismatch.job.result.reason, 'COMMIT_MESSAGE_MISMATCH');
 });
 

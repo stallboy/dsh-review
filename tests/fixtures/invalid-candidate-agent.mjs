@@ -18,19 +18,27 @@ writeFileSync(
   `---
 schema_version: 1
 title: "math: 无效候选"
+module: math
+audit_type: bugfix
 created_at: "2026-10-31T21:00:00+08:00"
+updated_at: "2026-10-31T21:00:00+08:00"
 owner: tester
 tags: [math]
 status: pending
 ticket: null
+target_files: [src/math.js]
 current_revision: 1
 revisions:
   - id: 1
     base_revision: "${base}"
     patch: "001.patch"
+    author: ai
 gate_checks: []
 comments: []
+human_decisions: []
 approval: null
+rejection: null
+commit_message: "math: 无效候选"
 ---
 
 # 问题与影响

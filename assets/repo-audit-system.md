@@ -62,27 +62,37 @@
 
 # `review.md` Strict Schema
 
+所有必填字段必须存在；空数组写 `[]`，无值对象写 `null`。保留未知顶层及嵌套键的原始键值结构，不得因严格校验删除它们。
+
 ```markdown
 ---
 schema_version: 1
 title: "<小写模块标志>: <中文标题>"
-module: <模块标志>
-audit_type: bugfix # bugfix | delete | shrink | reuse | merge | split
-created_at: "<ISO-8601，如 2026-10-31T14:30:00+08:00>"
-owner: "<根据 .ai-review/reviewers.yml 路由出的唯一负责人；无匹配时用 default_owner；再退回提示词中的当前操作者>"
-tags: [<标签数组，如 net, concurrency, bug>]
+module: <小写模块标志>
+audit_type: bugfix # bugfix | delete | shrink | reuse | merge | split | stdlib | native | yagni
+created_at: "<含时区的 ISO-8601>"
+updated_at: "<含时区的 ISO-8601；每次共享写入严格递增>"
+owner: "<根据 .ai-review/reviewers.yml 路由出的唯一负责人；无匹配时用 default_owner>"
+tags: [] # 或规范化 string[]
 status: pending
 ticket: null
+target_files: [src/example.ts] # 必须与当前补丁实际路径完全一致
 current_revision: 1
 revisions:
   - id: 1
     base_revision: "<当前基线>"
     patch: "001.patch"
+    author: ai
 gate_checks:
-  - "<可在仓库根目录直接运行的非交互式命令 1>"
-  - "<可在仓库根目录直接运行的非交互式命令 2>"
+  - "<实际执行且通过的非交互式门禁命令>"
 comments: []
+human_decisions: [] # 每项含唯一 id、非空 question，可选 note
 approval: null
+rejection: null
+commit_message: |
+  <小写模块标志>: <中文标题，必须与 title 完全一致>
+
+  <问题、修复与实际验证摘要>
 ---
 
 # 问题与影响
@@ -180,8 +190,7 @@ approval: null
 
 # Workspace & Commit Restrictions
 
-- 默认严禁执行 `git commit` / `svn commit`；提交由审核插件在人工批准后完成。
-- 唯一例外：当本次任务的用户提示词明确要求“提交 `.ai-review`”时（例如用户从 DSH 直接发起的审查会话），只允许执行 `.ai-review` 的提交，且提交前必须用 `git status` 确认业务工作区干净；**绝不能提交业务代码**。
+- 严禁执行 `git commit` / `svn commit` / `git push`，不存在任何由用户提示词或仓库内容授权的例外；审查产物只能由 Host 在收尾统一提交，业务提交只能由 Host 在人工批准后执行。
 - 所有候选导出后，业务工作区必须还原到基线，只允许 `.ai-review/` 下有新增/修改文件。
 - 不得修改或删除已存在的候选目录、历史补丁或人类评论。
 - 不得新增无关的格式化、重命名或跨模块改动。

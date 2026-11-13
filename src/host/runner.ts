@@ -24,6 +24,8 @@ export interface RunnerRequest {
   mode: RunnerMode;
   comments: ReviewComment[];
   failureDetail?: string;
+  /** Mode C 的批准时/ Rebase 最新基线；不得回退到旧 revision 基线。 */
+  baseRevision?: string;
   /** What the caller left in the business working tree before invoking the fixer. */
   workingTree?: 'current_patch_applied' | 'clean_base';
   log: (line: string) => void;
@@ -101,6 +103,7 @@ export async function buildFixPrompt(request: RunnerRequest): Promise<string> {
   const { candidate } = request;
   const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
   const nextRevision = candidate.meta.currentRevision + 1;
+  const baseRevision = request.baseRevision ?? current?.baseRevision ?? '未知';
   const month = candidate.month;
   const slug = candidate.slug;
   const lines = [
@@ -110,7 +113,7 @@ export async function buildFixPrompt(request: RunnerRequest): Promise<string> {
     '## 环境与仓库',
     `- VCS 类型: ${request.settings.vcsType === 'auto' ? 'auto（读取仓库）' : request.settings.vcsType}`,
     `- 仓库根目录: ${request.store.repoRoot}`,
-    `- 当前最新基线 base_revision: ${current?.baseRevision ?? '未知'}`,
+    `- 当前最新基线 base_revision: ${baseRevision}`,
     `- 目标候选目录: .ai-review/${month}/${slug}/ （绝对路径: ${candidate.dirPath}）`,
     `- review.md: ${candidate.reviewPath}`,
     `- 当前版本: ${String(candidate.meta.currentRevision)}，当前补丁: ${current?.patch ?? '无'}`,
@@ -127,11 +130,11 @@ export async function buildFixPrompt(request: RunnerRequest): Promise<string> {
     '',
     '## 工作区状态',
     request.workingTree === 'current_patch_applied'
-      ? `当前版本补丁 ${current?.patch ?? ''} 已经应用到业务工作区。请在这个已有改动的基础上继续修改，最终生成的补丁必须相对基线 ${current?.baseRevision ?? '<base>'} 包含已有改动和本次新增改动。`
-      : '业务工作区是干净的基线状态，当前版本补丁尚未应用。请阅读现有补丁并在基线之上重建/修复，最终生成相对基线的全量补丁。',
+      ? `当前版本补丁 ${current?.patch ?? ''} 已经应用到业务工作区。请在这个已有改动的基础上继续修改，最终生成的补丁必须相对基线 ${baseRevision} 包含已有改动和本次新增改动。`
+      : `业务工作区是干净的基线状态。请阅读现有补丁并在基线 ${baseRevision} 之上重建/修复，最终生成相对该基线的全量补丁。`,
     '',
     '## 硬性要求',
-    `1. 生成 ${String(nextRevision).padStart(3, '0')}.patch，内容必须是相对当前基线 ${current?.baseRevision ?? '<base>'} 的全量 diff，不得包含 .ai-review/ 自身。若新增了未跟踪文件，先执行 \`git add -N <新文件>\` 再生成 \`git diff <base_revision> --binary\`，否则新文件不会进入补丁。`,
+    `1. 生成 ${String(nextRevision).padStart(3, '0')}.patch，内容必须是相对当前基线 ${baseRevision} 的全量 diff，不得包含 .ai-review/ 自身。若新增了未跟踪文件，先执行 \`git add -N <新文件>\` 再生成 \`git diff <base_revision> --binary\`，否则新文件不会进入补丁。`,
     `2. 更新 review.md：current_revision 改为 ${String(nextRevision)}，revisions 追加对应条目，status 改为 pending，approval 置空；补充审核记录、验证证据、需人工判断项。`,
     '3. gate_checks 里的每条命令必须实际运行并在验证证据中如实记录结果；不要把失败写成通过。',
     '4. 不得执行 git commit / svn commit；完成后业务代码工作区必须还原干净，只允许 .ai-review/ 下有改动。',

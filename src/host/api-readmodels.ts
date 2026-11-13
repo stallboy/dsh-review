@@ -5,9 +5,8 @@ import { loadReviewers } from './reviewers.js';
 import { Runner } from './runner.js';
 import { AuditArchive, projectFindings } from './audit-archive.js';
 import { matchesReviewFilter } from './store.js';
-import type { ReviewStatus } from './types.js';
+import type { ReviewStatus, ApprovalCommitLookup, PatchCheckDiagnostic } from './types.js';
 import { ApiError } from './types.js';
-import type { ApprovalCommitLookup } from './types.js';
 import type { VcsAdapter } from './vcs.js';
 import {
   filterFrom,
@@ -21,20 +20,84 @@ import {
 
 /** 本模块持有的缓存（原 ReviewApi 私有字段），迁移后由同一个实例共享。 */
 interface ReadModelState {
-  /** §5.5：派生定位内存缓存（repoRoot|candidateId|VCS 快照 → 结果）；不持久化。 */
   approvalLookupCache: Map<string, ApprovalCommitLookup>;
-  /** §4.8/G41：投影内存缓存（键 repoRoot|VCS 快照）；不持久化、不跨快照复用。 */
   projectionCache: Map<string, { findings: ReturnType<typeof projectFindings>['findings']; errors: string[]; snapshot: string }>;
+  patchCheckCache: Map<string, PatchCheckDiagnostic>;
+  patchCheckPending: Set<string>;
 }
 
 const state: ReadModelState = {
   approvalLookupCache: new Map(),
   projectionCache: new Map(),
+  patchCheckCache: new Map(),
+  patchCheckPending: new Set(),
 };
 
-/** 属主类：只持有 ApiHost，不再反向 import api.ts。 */
 export class ReadModels {
   constructor(private readonly host: ApiHost) {}
+
+  private patchCheckKey(runtime: Runtime, id: string, revision: number, base: string): string {
+    return `${runtime.root}|${id}|${String(revision)}|${base}`;
+  }
+
+  private async computePatchCheck(
+    runtime: Runtime,
+    id: string,
+    revision: number,
+    base: string,
+    sharedText?: string,
+  ): Promise<PatchCheckDiagnostic> {
+    const checkedAt = new Date().toISOString();
+    const unknown = (): PatchCheckDiagnostic => ({ state: 'unknown', checkedBase: base, checkedAt });
+    const currentBase = await runtime.vcs.getCurrentBase().catch(() => null);
+    if (currentBase !== base) return unknown();
+    let text = sharedText;
+    if (text === undefined) {
+      const source = await sharedSourceFor(runtime);
+      if (!source) return unknown();
+      const { month, slug } = runtime.store.resolveCandidateDir(id);
+      const detail = await runtime.store.get(id, null, source).catch(() => null);
+      const revisionEntry = detail?.candidate.meta.revisions.find((entry) => entry.id === revision);
+      if (!revisionEntry || detail?.candidate.meta.currentRevision !== revision) return unknown();
+      text = (await source.readPatchText(month, slug, revisionEntry.patch)) ?? undefined;
+    }
+    if (text === undefined) return unknown();
+    const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+    const os = await import('node:os');
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'dcr-patch-check-'));
+    try {
+      const patchPath = path.join(dir, 'change.patch');
+      await writeFile(patchPath, text, 'utf8');
+      const checked = await runtime.vcs.checkPatch(patchPath).catch(() => null);
+      return {
+        state: checked === null ? 'unknown' : checked.ok ? 'clean' : checked.conflict ? 'conflicted' : 'unknown',
+        checkedBase: base,
+        checkedAt,
+      };
+    } finally {
+      await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  private storePatchCheck(key: string, value: PatchCheckDiagnostic): void {
+    state.patchCheckCache.set(key, value);
+    if (state.patchCheckCache.size > 256) {
+      const first = state.patchCheckCache.keys().next().value;
+      if (first !== undefined) state.patchCheckCache.delete(first);
+    }
+  }
+
+  private schedulePatchCheck(runtime: Runtime, id: string, revision: number, base: string): void {
+    const key = this.patchCheckKey(runtime, id, revision, base);
+    if (state.patchCheckCache.has(key) || state.patchCheckPending.has(key)) return;
+    state.patchCheckPending.add(key);
+    setImmediate(() => {
+      void this.computePatchCheck(runtime, id, revision, base)
+        .then((result) => this.storePatchCheck(key, result))
+        .catch(() => undefined)
+        .finally(() => state.patchCheckPending.delete(key));
+    });
+  }
 
   async queue(res: ServerResponse, url: URL): Promise<void> {
     let runtime: Runtime;
@@ -60,12 +123,24 @@ export class ReadModels {
     const view = await sharedViewFor(runtime);
     const base = view?.snapshot ?? await runtime.vcs.getCurrentBase().catch(() => null);
     // §18.1：stale_days 决定队列的过期提示（只读，不产生共享写入）。
-    const reviewers = await loadReviewers(runtime.root);
+    const reviewers = await loadReviewers(runtime.root, view?.source);
     // One scan for both the filtered page and the owner-wide status counts: the
     // filtered items are always a subset of the owner's candidates.
     // §7.1：共享读取绑定同一 HEAD 快照（Git），本地视图只作 local 诊断。
     const all = await runtime.store.list({ owner }, base, reviewers.staleDays, reviewers.rejectionMemoryDays, view?.source);
+    for (const item of all.items) {
+      if (item.local || item.parseError || item.status === 'approved' || item.status === 'rejected' || !base || !item.baseRevision) continue;
+      const business = await this.businessBaselineState(runtime.vcs, item.baseRevision, base);
+      item.isBaseBehind = business.state === 'changed' || business.state === 'unknown';
+    }
     const items = all.items.filter((item) => matchesReviewFilter(item, filter));
+    for (const item of items) {
+      if (item.local || item.parseError || item.status === 'approved' || item.status === 'rejected' || !base) continue;
+      const key = this.patchCheckKey(runtime, item.id, item.currentRevision, base);
+      const cached = state.patchCheckCache.get(key);
+      if (cached) item.patchCheck = cached;
+      else this.schedulePatchCheck(runtime, item.id, item.currentRevision, base);
+    }
     const counts: Record<ReviewStatus, number> = { pending: 0, changes_requested: 0, approved: 0, rejected: 0 };
     // §10.1：local 候选不计入共享 KPI。
     for (const item of all.items) {
@@ -99,7 +174,7 @@ export class ReadModels {
     const view = await sharedViewFor(runtime);
     const currentBase = view?.snapshot ?? await vcs.getCurrentBase().catch(() => null);
     const detail = await store.get(id, currentBase, view?.source);
-    const validation = await store.validateFullCandidate(detail.candidate);
+    const validation = await store.validateFullCandidate(detail.candidate, view?.source);
     const revisionStats: Record<number, unknown> = {};
     for (const revision of detail.candidate.meta.revisions) {
       try {
@@ -113,18 +188,15 @@ export class ReadModels {
     const patchPaths = parsePatch(patchText).paths.filter((file) => !isAiReviewPath(file));
     // §8.2/G40：patchCheck 派生预检——clean/conflicted 只表示补丁能否应用到 checkedBase，
     // 不构成批准证据；批准 Job 仍会重新严格应用。
-    let patchCheck: { state: 'clean' | 'conflicted' | 'unknown'; checkedBase: string; checkedAt: string } | undefined;
+    let patchCheck: PatchCheckDiagnostic | undefined;
     if (!detail.candidate.parseError && detail.candidate.meta.status !== 'approved' && detail.candidate.meta.status !== 'rejected' && currentBase) {
-      const currentPatchName = detail.candidate.meta.revisions.find(
-        (revision) => revision.id === detail.candidate.meta.currentRevision,
-      )?.patch;
-      if (currentPatchName) {
-        const checked = await vcs.checkPatch(path.join(detail.candidate.dirPath, currentPatchName)).catch(() => null);
-        patchCheck = {
-          state: checked === null ? 'unknown' : checked.ok ? 'clean' : 'conflicted',
-          checkedBase: currentBase,
-          checkedAt: new Date().toISOString(),
-        };
+      const revision = detail.candidate.meta.currentRevision;
+      const key = this.patchCheckKey(runtime, id, revision, currentBase);
+      const cached = state.patchCheckCache.get(key);
+      if (cached) patchCheck = cached;
+      else {
+        patchCheck = await this.computePatchCheck(runtime, id, revision, currentBase, detail.patchText);
+        this.storePatchCheck(key, patchCheck);
       }
     }
     const comments = [...detail.candidate.meta.comments].sort((left, right) => {
@@ -264,8 +336,8 @@ export class ReadModels {
   }
 
   async reviewers(res: ServerResponse, url: URL): Promise<void> {
-    const { store } = await this.host.runtimeFor(url);
-    const config = await loadReviewers(store.repoRoot);
+    const runtime = await this.host.runtimeFor(url);
+    const config = await loadReviewers(runtime.root, await sharedSourceFor(runtime));
     sendJson(res, 200, { config });
   }
 
@@ -312,11 +384,11 @@ export class ReadModels {
     }
     const records = await archive.list(view?.source);
     const queue = await runtime.store.list({}, null, undefined, undefined, view?.source);
-    // §7.1/§4.8：投影只使用共享事实；local/broken 候选不进入重开链。
-    const sharedItems = queue.items.filter((item) => !item.local && !item.parseError);
+    const sharedItems = queue.items.filter((item) => !item.local);
     const infoById = new Map(sharedItems.map((item) => [item.id, {
       status: item.status,
       reopenedFrom: item.reopenedFrom ?? null,
+      broken: item.parseError !== undefined,
     } as import('./audit-archive.js').CandidateChainInfo]));
     const projected = projectFindings(
       records,

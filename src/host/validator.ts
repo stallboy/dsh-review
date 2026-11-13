@@ -7,6 +7,7 @@ export interface GateOptions {
   baseRevision: string;
   timeoutMs: number;
   onLine?: (line: string, stream: 'stdout' | 'stderr', command: string) => void;
+  signal?: AbortSignal;
 }
 
 function formatDuration(ms: number): string {
@@ -29,9 +30,10 @@ export async function runGateChecks(commands: string[], options: GateOptions): P
       cwd: options.cwd,
       timeoutMs: options.timeoutMs,
       onLine: (line, stream) => options.onLine?.(line, stream, command),
+      ...(options.signal ? { signal: options.signal } : {}),
     });
     const durationMs = Date.now() - startedAt;
-    const passed = result.code === 0 && !result.timedOut && !result.error;
+    const passed = result.code === 0 && !result.timedOut && !result.aborted && !result.error;
     results.push({
       command,
       exitCode: result.code,
@@ -40,6 +42,7 @@ export async function runGateChecks(commands: string[], options: GateOptions): P
       durationMs,
       outputTail: tailLines([result.stdout, result.stderr].filter(Boolean).join('\n'), 120),
     });
+    if (result.aborted) break;
   }
 
   const environmentSummary = [

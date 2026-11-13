@@ -28,31 +28,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function asString(value: unknown, field: string, fallback?: string): string {
-  // §2.2：解析器必须同时接受 YAML 裸 ISO 时间对象（js-yaml 解析为 Date）并规范化为 UTC（Z）ISO 字符串。
-  if (value instanceof Date) return value.toISOString();
+function requiredField(doc: Record<string, unknown>, key: string): unknown {
+  if (!Object.hasOwn(doc, key)) throw new ReviewFormatError(`${key} 是必填字段，不得缺省`);
+  return doc[key];
+}
+
+function asString(value: unknown, field: string, allowDate = false): string {
+  if (allowDate && value instanceof Date) return value.toISOString();
   if (typeof value === 'string') return value;
-  if (value === null || value === undefined) {
-    if (fallback !== undefined) return fallback;
-    return '';
-  }
+  if (value === null) throw new ReviewFormatError(`${field} 不得为 null`);
   throw new ReviewFormatError(`${field} 必须是字符串`);
 }
 
 function asNullableString(value: unknown, field: string): string | null {
-  if (value === null || value === undefined) return null;
+  if (value === null) return null;
   if (typeof value === 'string') return value;
   throw new ReviewFormatError(`${field} 必须是字符串或 null`);
 }
 
 function asNumber(value: unknown, field: string): number {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
-  if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) return Number(value);
-  throw new ReviewFormatError(`${field} 必须是数字`);
+  throw new ReviewFormatError(`${field} 必须是数字，不得使用字符串或 null`);
 }
 
-function asArray(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
+function asArray(value: unknown, field: string): unknown[] {
+  if (!Array.isArray(value)) throw new ReviewFormatError(`${field} 必须是数组，不得缺省或为 null`);
+  return value;
+}
+
+function asStringArray(value: unknown, field: string): string[] {
+  return asArray(value, field).map((item, index) => asString(item, `${field}[${String(index)}]`));
 }
 
 /** 嵌套对象中未建模的键原样收集（I14：未知嵌套键保留，避免任何一次写入丢字段）。 */
@@ -66,23 +71,25 @@ function collectExtra(value: Record<string, unknown>, known: Set<string>): Recor
 
 function parseRevision(value: unknown, index: number): RevisionEntry {
   if (!isRecord(value)) throw new ReviewFormatError(`revisions[${String(index)}] 必须是对象`);
-  const author = value['author'];
-  if (author !== undefined && author !== 'ai' && author !== 'human') {
+  const field = (key: string): unknown => requiredField(value, key);
+  const author = field('author');
+  if (author !== 'ai' && author !== 'human') {
     throw new ReviewFormatError(`revisions[${String(index)}].author 只能是 ai | human`);
   }
   const extra = collectExtra(value, new Set(['id', 'base_revision', 'patch', 'author']));
   return {
-    id: asNumber(value['id'], `revisions[${String(index)}].id`),
-    baseRevision: asString(value['base_revision'], `revisions[${String(index)}].base_revision`),
-    patch: asString(value['patch'], `revisions[${String(index)}].patch`),
-    ...(author ? { author: author as 'ai' | 'human' } : {}),
+    id: asNumber(field('id'), `revisions[${String(index)}].id`),
+    baseRevision: asString(field('base_revision'), `revisions[${String(index)}].base_revision`),
+    patch: asString(field('patch'), `revisions[${String(index)}].patch`),
+    author,
     ...(Object.keys(extra).length > 0 ? { extra } : {}),
   };
 }
 
 function parseComment(value: unknown, index: number): ReviewComment {
   if (!isRecord(value)) throw new ReviewFormatError(`comments[${String(index)}] 必须是对象`);
-  const status = asString(value['status'], `comments[${String(index)}].status`, 'unresolved');
+  const field = (key: string): unknown => requiredField(value, key);
+  const status = asString(field('status'), `comments[${String(index)}].status`);
   if (!COMMENT_STATUSES.includes(status as CommentStatus)) {
     throw new ReviewFormatError(`comments[${String(index)}].status 只能是 ${COMMENT_STATUSES.join(' | ')}`);
   }
@@ -92,20 +99,20 @@ function parseComment(value: unknown, index: number): ReviewComment {
   }
   const extraComment = collectExtra(value, new Set(['id', 'revision', 'file', 'line', 'side', 'author', 'content', 'status', 'created_at', 'anchor']));
   const comment: ReviewComment = {
-    id: asString(value['id'], `comments[${String(index)}].id`),
-    revision: asNumber(value['revision'], `comments[${String(index)}].revision`),
-    file: asString(value['file'], `comments[${String(index)}].file`, ''),
-    line: asNumber(value['line'] ?? 0, `comments[${String(index)}].line`),
+    id: asString(field('id'), `comments[${String(index)}].id`),
+    revision: asNumber(field('revision'), `comments[${String(index)}].revision`),
+    file: asString(field('file'), `comments[${String(index)}].file`),
+    line: asNumber(field('line'), `comments[${String(index)}].line`),
     ...(side ? { side: side as 'LEFT' | 'RIGHT' } : {}),
-    author: asString(value['author'], `comments[${String(index)}].author`),
-    content: asString(value['content'], `comments[${String(index)}].content`),
+    author: asString(field('author'), `comments[${String(index)}].author`),
+    content: asString(field('content'), `comments[${String(index)}].content`),
     status: status as CommentStatus,
     ...(Object.keys(extraComment).length > 0 ? { extra: extraComment } : {}),
   };
-  // §4.3/G39：anchor 仅行内评论可带，snippet 非空；原 revision/file/line/side 仍是权威锚点。
   const anchorRaw = value['anchor'];
-  if (isRecord(anchorRaw)) {
-    const snippet = asString(anchorRaw['snippet'], `comments[${String(index)}].anchor.snippet`, '');
+  if (anchorRaw !== undefined) {
+    if (!isRecord(anchorRaw)) throw new ReviewFormatError(`comments[${String(index)}].anchor 必须是对象`);
+    const snippet = asString(requiredField(anchorRaw, 'snippet'), `comments[${String(index)}].anchor.snippet`);
     if (!snippet) throw new ReviewFormatError(`comments[${String(index)}].anchor.snippet 不能为空`);
     if (comment.file === '' && comment.line === 0) {
       throw new ReviewFormatError(`comments[${String(index)}].anchor 仅行内评论可携带`);
@@ -113,28 +120,32 @@ function parseComment(value: unknown, index: number): ReviewComment {
     const anchor: { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> } = { snippet };
     const before = anchorRaw['before'];
     const after = anchorRaw['after'];
-    if (typeof before === 'string' && before) anchor.before = before;
-    if (typeof after === 'string' && after) anchor.after = after;
+    if (before !== undefined && typeof before !== 'string') throw new ReviewFormatError(`comments[${String(index)}].anchor.before 必须是字符串`);
+    if (after !== undefined && typeof after !== 'string') throw new ReviewFormatError(`comments[${String(index)}].anchor.after 必须是字符串`);
+    if (typeof before === 'string') anchor.before = before;
+    if (typeof after === 'string') anchor.after = after;
     const extra = collectExtra(anchorRaw, new Set(['snippet', 'before', 'after']));
     if (Object.keys(extra).length > 0) anchor.extra = extra;
     comment.anchor = anchor;
   }
   if (!comment.id) throw new ReviewFormatError(`comments[${String(index)}].id 不能为空`);
+  if (!comment.author.trim()) throw new ReviewFormatError(`comments[${String(index)}].author 不能为空`);
   if (!comment.content.trim()) throw new ReviewFormatError(`comments[${String(index)}].content 不能为空`);
   const createdAt = value['created_at'];
-  if (typeof createdAt === 'string' && createdAt) comment.createdAt = createdAt;
+  if (createdAt !== undefined) comment.createdAt = asString(createdAt, `comments[${String(index)}].created_at`, true);
   return comment;
 }
 
 function parseHumanDecision(value: unknown, index: number): HumanDecision {
   if (!isRecord(value)) throw new ReviewFormatError(`human_decisions[${String(index)}] 必须是对象`);
   const item: HumanDecision = {
-    id: asString(value['id'], `human_decisions[${String(index)}].id`),
-    question: asString(value['question'], `human_decisions[${String(index)}].question`),
+    id: asString(requiredField(value, 'id'), `human_decisions[${String(index)}].id`),
+    question: asString(requiredField(value, 'question'), `human_decisions[${String(index)}].question`),
   };
   if (!item.id) throw new ReviewFormatError(`human_decisions[${String(index)}].id 不能为空`);
   if (!item.question.trim()) throw new ReviewFormatError(`human_decisions[${String(index)}].question 不能为空`);
   const note = value['note'];
+  if (note !== undefined && typeof note !== 'string') throw new ReviewFormatError(`human_decisions[${String(index)}].note 必须是字符串`);
   if (typeof note === 'string' && note.trim()) item.note = note;
   const extra = collectExtra(value, new Set(['id', 'question', 'note']));
   if (Object.keys(extra).length > 0) item.extra = extra;
@@ -142,50 +153,54 @@ function parseHumanDecision(value: unknown, index: number): HumanDecision {
 }
 
 function parseRejection(value: unknown): RejectionMeta | null {
-  if (value === null || value === undefined) return null;
+  if (value === null) return null;
   if (!isRecord(value)) throw new ReviewFormatError('rejection 必须是对象或 null');
   const extra = collectExtra(value, new Set(['rejected_by', 'rejected_at', 'reason']));
   return {
-    rejectedBy: asString(value['rejected_by'], 'rejection.rejected_by'),
-    rejectedAt: asString(value['rejected_at'], 'rejection.rejected_at'),
-    reason: asString(value['reason'], 'rejection.reason'),
+    rejectedBy: asString(requiredField(value, 'rejected_by'), 'rejection.rejected_by'),
+    rejectedAt: asString(requiredField(value, 'rejected_at'), 'rejection.rejected_at', true),
+    reason: asString(requiredField(value, 'reason'), 'rejection.reason'),
     ...(Object.keys(extra).length > 0 ? { extra } : {}),
   };
 }
 
 function parseApproval(value: unknown): ApprovalMeta | null {
-  if (value === null || value === undefined) return null;
+  if (value === null) return null;
   if (!isRecord(value)) throw new ReviewFormatError('approval 必须是对象或 null');
-  const approvedBy = asString(value['approved_by'], 'approval.approved_by', '');
-  const approvedAt = asString(value['approved_at'], 'approval.approved_at', '');
+  const approvedBy = asString(requiredField(value, 'approved_by'), 'approval.approved_by');
+  const approvedAt = asString(requiredField(value, 'approved_at'), 'approval.approved_at', true);
   if (!approvedBy.trim() || !approvedAt.trim()) {
-    // §4.7：approval 存在但关键字段缺失属于格式错误，不得伪装成"未批准"。
     throw new ReviewFormatError('approval.approved_by / approval.approved_at 不能为空');
   }
-  const gateChecksRaw = Array.isArray(value['gate_checks']) ? value['gate_checks'].map((item) => String(item)) : undefined;
-  const gateResultsRaw = Array.isArray(value['gate_results'])
-    ? value['gate_results'].filter((item): item is Record<string, unknown> => isRecord(item)).map((item) => {
+  const gateChecksRaw = value['gate_checks'] === undefined
+    ? undefined
+    : asStringArray(value['gate_checks'], 'approval.gate_checks');
+  const gateResultsRaw = value['gate_results'] === undefined
+    ? undefined
+    : asArray(value['gate_results'], 'approval.gate_results').map((item) => {
+        if (!isRecord(item)) throw new ReviewFormatError('approval.gate_results[] 必须是对象');
         const extra = collectExtra(item, new Set(['command', 'exit_code', 'duration_ms']));
         return {
-          command: asString(item['command'], 'approval.gate_results[].command'),
-          exit_code: asNumber(item['exit_code'], 'approval.gate_results[].exit_code'),
-          duration_ms: asNumber(item['duration_ms'], 'approval.gate_results[].duration_ms'),
+          command: asString(requiredField(item, 'command'), 'approval.gate_results[].command'),
+          exit_code: asNumber(requiredField(item, 'exit_code'), 'approval.gate_results[].exit_code'),
+          duration_ms: asNumber(requiredField(item, 'duration_ms'), 'approval.gate_results[].duration_ms'),
           ...(Object.keys(extra).length > 0 ? { extra } : {}),
         };
-      })
-    : undefined;
-  const confirmedRaw = Array.isArray(value['confirmed_decisions']) ? value['confirmed_decisions'].map((item) => String(item)) : undefined;
-  const waivedRaw = Array.isArray(value['waived_decisions'])
-    ? value['waived_decisions'].filter((item): item is Record<string, unknown> => isRecord(item)).map((item) => {
+      });
+  const confirmedRaw = value['confirmed_decisions'] === undefined
+    ? undefined
+    : asStringArray(value['confirmed_decisions'], 'approval.confirmed_decisions');
+  const waivedRaw = value['waived_decisions'] === undefined
+    ? undefined
+    : asArray(value['waived_decisions'], 'approval.waived_decisions').map((item) => {
+        if (!isRecord(item)) throw new ReviewFormatError('approval.waived_decisions[] 必须是对象');
         const extra = collectExtra(item, new Set(['id', 'reason']));
         return {
-          id: asString(item['id'], 'approval.waived_decisions[].id'),
-          reason: asString(item['reason'], 'approval.waived_decisions[].reason'),
+          id: asString(requiredField(item, 'id'), 'approval.waived_decisions[].id'),
+          reason: asString(requiredField(item, 'reason'), 'approval.waived_decisions[].reason'),
           ...(Object.keys(extra).length > 0 ? { extra } : {}),
         };
-      })
-    : undefined;
-  // §4.3（2026-11-09 修订）：commit_revision 已从 approval 契约移除；旧数据落入 extra 原样保留（I14）。
+      });
   const extra = collectExtra(value, new Set(['approved_by', 'approved_at', 'gate_checks', 'gate_results', 'confirmed_decisions', 'waived_decisions']));
   return {
     approvedBy,
@@ -241,47 +256,45 @@ export function parseReviewMarkdown(text: string): ParsedReview {
   }
   if (!isRecord(doc)) throw new ReviewFormatError('review.md Frontmatter 必须是 YAML 对象');
 
-  const schemaVersion = asNumber(doc['schema_version'], 'schema_version');
+  const field = (key: string): unknown => requiredField(doc, key);
+  const schemaVersion = asNumber(field('schema_version'), 'schema_version');
   if (schemaVersion !== 1) throw new ReviewFormatError(`不支持的 schema_version：${String(schemaVersion)}（当前仅支持 1）`);
-  const status = asString(doc['status'], 'status');
+  const status = asString(field('status'), 'status');
   if (!STATUSES.includes(status as ReviewStatus)) {
     throw new ReviewFormatError(`status 只能是 ${STATUSES.join(' | ')}`);
   }
-  const revisions = asArray(doc['revisions']).map(parseRevision);
+  const revisions = asArray(field('revisions'), 'revisions').map(parseRevision);
   if (revisions.length === 0) throw new ReviewFormatError('revisions 不能为空');
-  const currentRevision = asNumber(doc['current_revision'], 'current_revision');
+  const currentRevision = asNumber(field('current_revision'), 'current_revision');
   const current = revisions.find((revision) => revision.id === currentRevision);
   if (!current) throw new ReviewFormatError(`current_revision=${String(currentRevision)} 在 revisions 中不存在`);
   if (!current.patch.trim()) throw new ReviewFormatError(`revision ${String(currentRevision)} 缺少 patch 文件名`);
 
-  const tagsRaw = asArray(doc['tags']);
-  // §4.3：tags 逐项 trim 后转 ASCII 小写，空项丢弃，再按规范化值去重。
-  const tags = [...new Set(tagsRaw.map((tag) => String(tag).trim().toLowerCase()).filter((tag) => tag.length > 0))];
-  const gateRaw = asArray(doc['gate_checks']);
-  const gateChecks = gateRaw.map((check) => String(check)).map((check) => check.trim()).filter((check) => check.length > 0);
-  const comments = asArray(doc['comments']).map(parseComment);
-  const humanDecisions = asArray(doc['human_decisions']).map(parseHumanDecision);
-  const ticket = asNullableString(doc['ticket'], 'ticket');
-  const title = asString(doc['title'], 'title').trim();
+  const tags = [...new Set(asStringArray(field('tags'), 'tags')
+    .map((tag) => tag.trim().toLowerCase())
+    .filter((tag) => tag.length > 0))];
+  const gateChecks = asStringArray(field('gate_checks'), 'gate_checks').map((check) => check.trim());
+  const comments = asArray(field('comments'), 'comments').map(parseComment);
+  const humanDecisions = asArray(field('human_decisions'), 'human_decisions').map(parseHumanDecision);
+  const ticket = asNullableString(field('ticket'), 'ticket');
+  const title = asString(field('title'), 'title').trim();
   if (!title) throw new ReviewFormatError('title 不能为空');
-  const owner = asString(doc['owner'], 'owner').trim();
+  const owner = asString(field('owner'), 'owner').trim();
   if (!owner) throw new ReviewFormatError('owner 不能为空');
-  const createdAt = asString(doc['created_at'], 'created_at').trim();
-  // 开发期旧数据可能缺少新契约字段：解析宽松取默认值，新写入一律按契约补全。
-  const moduleField = asString(doc['module'], 'module', '').trim().toLowerCase();
-  const auditTypeRaw = asString(doc['audit_type'], 'audit_type', '').trim();
-  if (auditTypeRaw && !AUDIT_TYPES.includes(auditTypeRaw as AuditType)) {
+  const createdAt = asString(field('created_at'), 'created_at', true).trim();
+  const moduleField = asString(field('module'), 'module').trim().toLowerCase();
+  if (!moduleField) throw new ReviewFormatError('module 不能为空');
+  const auditTypeRaw = asString(field('audit_type'), 'audit_type').trim();
+  if (!AUDIT_TYPES.includes(auditTypeRaw as AuditType)) {
     throw new ReviewFormatError(`audit_type 只能是 ${AUDIT_TYPES.join(' | ')}`);
   }
-  const updatedAt = asString(doc['updated_at'], 'updated_at', createdAt).trim();
-  const targetFiles = asArray(doc['target_files'])
-    .map((item) => String(item))
-    .map((item) => item.replaceAll('\\', '/'))
-    .filter((item) => item.trim().length > 0);
-  const commitMessage = asString(doc['commit_message'], 'commit_message', '');
-  const reopenedFrom = asNullableString(doc['reopened_from'], 'reopened_from');
-  const reopenedReason = asNullableString(doc['reopen_reason'], 'reopen_reason');
-  const rejection = parseRejection(doc['rejection']);
+  const updatedAt = asString(field('updated_at'), 'updated_at', true).trim();
+  const targetFiles = asStringArray(field('target_files'), 'target_files');
+  const commitMessage = asString(field('commit_message'), 'commit_message');
+  if (!commitMessage.trim()) throw new ReviewFormatError('commit_message 不能为空');
+  const reopenedFrom = doc['reopened_from'] === undefined ? null : asNullableString(doc['reopened_from'], 'reopened_from');
+  const reopenedReason = doc['reopen_reason'] === undefined ? null : asNullableString(doc['reopen_reason'], 'reopen_reason');
+  const rejection = parseRejection(field('rejection'));
 
   const extra: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(doc)) {
@@ -306,7 +319,7 @@ export function parseReviewMarkdown(text: string): ParsedReview {
       gateChecks,
       comments,
       humanDecisions,
-      approval: parseApproval(doc['approval']),
+      approval: parseApproval(field('approval')),
       rejection,
       commitMessage,
       ...(reopenedFrom !== null || reopenedReason !== null
@@ -325,7 +338,7 @@ export function serializeReviewMarkdown(meta: ReviewFrontmatter, body: string): 
     module: meta.module,
     audit_type: meta.auditType,
     created_at: meta.createdAt,
-    updated_at: meta.updatedAt || meta.createdAt,
+    updated_at: meta.updatedAt,
     owner: meta.owner,
     tags: meta.tags,
     ticket: meta.ticket,
@@ -336,7 +349,7 @@ export function serializeReviewMarkdown(meta: ReviewFrontmatter, body: string): 
       id: revision.id,
       base_revision: revision.baseRevision,
       patch: revision.patch,
-      ...(revision.author ? { author: revision.author } : {}),
+      author: revision.author,
       ...(revision.extra ?? {}),
     })),
     gate_checks: meta.gateChecks,

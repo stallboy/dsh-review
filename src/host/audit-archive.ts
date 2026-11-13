@@ -384,6 +384,7 @@ export interface CandidateChainInfo {
   status: 'pending' | 'changes_requested' | 'approved' | 'rejected';
   /** §4.8：该候选的 reopened_from 指向（null 表示非重开）。 */
   reopenedFrom: string | null;
+  broken?: boolean;
 }
 
 export interface FindingProjection {
@@ -460,8 +461,8 @@ export function projectFindings(
     if (item.status !== 'converted') { pushBase(findingId, entry, 'open'); continue; }
     if (!item.candidate) { pushBase(findingId, entry, 'open'); continue; }
     const start = candidateInfoById(item.candidate);
-    if (start === null) {
-      errors.push(`finding ${findingId}：converted 候选 ${item.candidate} 缺失或状态不可读，不参与正常投影`);
+    if (start === null || start.broken) {
+      errors.push(`finding ${findingId}：converted 候选 ${item.candidate} 缺失、broken 或状态不可读，不参与正常投影`);
       continue;
     }
     let currentId = item.candidate;
@@ -472,7 +473,6 @@ export function projectFindings(
       if (current.status === 'pending' || current.status === 'changes_requested') { pushBase(findingId, entry, 'open', { id: currentId, status: current.status }); break; }
       // rejected：查找 reopened_from 指向它的直接替代候选（应最多一个）。
       const replacements = candidateIds
-        .filter((id) => !visited.has(id))
         .map((id) => ({ id, info: candidateInfoById(id) }))
         .filter((next): next is { id: string; info: CandidateChainInfo } => next.info !== null && next.info.reopenedFrom === currentId);
       if (replacements.length === 0) { pushBase(findingId, entry, 'reopened', { id: currentId, status: current.status }); break; }
@@ -482,6 +482,14 @@ export function projectFindings(
       }
       const next = replacements[0];
       if (!next) break;
+      if (next.info.broken) {
+        errors.push(`finding ${findingId}：重开替代候选 ${next.id} 为 broken，不参与正常投影`);
+        break;
+      }
+      if (visited.has(next.id)) {
+        errors.push(`finding ${findingId}：重开链在 ${currentId} 与 ${next.id} 之间形成环，不参与正常投影`);
+        break;
+      }
       visited.add(next.id);
       currentId = next.id;
       current = next.info;

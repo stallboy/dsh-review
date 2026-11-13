@@ -96,8 +96,14 @@ export class AuditLifecycle {
     if (!TRANSITIONS[lease.state].includes(next)) {
       throw new LeaseTransitionError(`非法租约迁移：${lease.state} → ${next}（${auditId}）`);
     }
+    const previous = lease.state;
     lease.state = next;
-    await this.store.save(this.leases);
+    try {
+      await this.store.save(this.leases);
+    } catch (error) {
+      lease.state = previous;
+      throw error;
+    }
     return { changed: true, lease };
   }
 

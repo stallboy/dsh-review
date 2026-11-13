@@ -34,6 +34,8 @@ export interface ApiDeps {
     /** Session that owns the review tab; its permission/approval policy is inherited. */
     ownerSessionId?: string;
   }) => Promise<{ sessionId: string }>;
+  /** Host 的真实 turn 结束通知；不得用文件/状态轮询模拟。 */
+  onAuditTurnEnd?: (sessionId: string, callback: () => void) => () => void;
   /** Diagnostic: the live client-module graph entry for this package, if any. */
   clientEntry?: () => unknown;
   /** §7.6 审查租约持久化文件；缺省为 DSH_HOME/dsh-code-review/runtime-state.json（测试可注入临时路径）。 */
@@ -86,7 +88,7 @@ export async function sharedViewFor(runtime: Runtime): Promise<SharedView | unde
   return undefined;
 }
 
-export async function sharedSourceFor(runtime: Runtime): Promise<CandidateSource | undefined> {
+export async function sharedSourceFor(runtime: Runtime): Promise<SharedCandidateSource | undefined> {
   return (await sharedViewFor(runtime))?.source;
 }
 

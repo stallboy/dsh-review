@@ -51,7 +51,7 @@ async function writeCandidate(root, base) {
     'revisions:', `  - id: 1`, `    base_revision: "${base}"`, '    patch: 001.patch', '    author: ai',
     'gate_checks: ["node --version"]', 'comments: []', 'human_decisions: []', 'approval: null', 'rejection: null',
     'commit_message: "net: 修复加法"',
-    '---', '', '# 问题与影响', '',
+    '---', '', '# 问题与影响', '', '# 需人工判断项', '- 无', '',
   ].join('\n'), 'utf8');
   await writeFile(path.join(dir, '001.patch'), PATCH('+'), 'utf8');
 }

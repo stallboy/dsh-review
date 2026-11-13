@@ -129,7 +129,8 @@ test('P10: approved 无可派生提交 → lookup unknown 仅诊断；遗留 com
     'tags: []', 'status: approved', 'ticket: null', 'target_files: [src/math.js]', 'current_revision: 1',
     'revisions:', '  - id: 1', '    base_revision: "1"', '    patch: 001.patch', '    author: ai',
     'gate_checks: []', 'comments: []', 'human_decisions: []',
-    'approval:', '  approved_by: tester', '  approved_at: "2026-11-05T10:00:00+08:00"', '  commit_revision: null',
+    'approval:', '  approved_by: tester', '  approved_at: "2026-11-05T10:00:00+08:00"',
+    '  gate_checks: []', '  gate_results: []', '  confirmed_decisions: []', '  waived_decisions: []', '  commit_revision: null',
     'rejection: null', 'commit_message: "net: bf"', '---', '', '# 问题与影响', '',
   ].join('\n'), 'utf8');
   runCommand('git', ['add', '.ai-review'], root);

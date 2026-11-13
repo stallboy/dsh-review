@@ -35,15 +35,16 @@ async function writeCandidate(root, slug, status = 'pending') {
   const dir = path.join(root, '.ai-review', '2026-11', slug);
   await mkdir(dir, { recursive: true });
   const approval = status === 'approved'
-    ? ['rejection: null', 'approval:', '  approved_by: tester', '  approved_at: "2026-11-04T10:00:00+08:00"', '  commit_revision: null'].join('\n')
+    ? ['rejection: null', 'approval:', '  approved_by: tester', '  approved_at: "2026-11-04T10:00:00+08:00"', '  gate_checks: []', '  gate_results: []', '  confirmed_decisions: []', '  waived_decisions: []', '  commit_revision: null'].join('\n')
     : ['approval: null', 'rejection: null'].join('\n');
   await writeFile(path.join(dir, 'review.md'), [
     '---', 'schema_version: 1', `title: "net: ${slug}"`, 'module: net', 'audit_type: bugfix',
     'created_at: "2026-11-04T09:00:00+08:00"', 'updated_at: "2026-11-04T09:00:00+08:00"', 'owner: tester',
     'tags: []', `status: ${status}`, 'ticket: null', 'target_files: [src/host/api.ts]', 'current_revision: 1',
     'revisions:', '  - id: 1', '    base_revision: "1"', '    patch: 001.patch', '    author: ai',
-    'gate_checks: []', 'comments: []', 'human_decisions: []', approval, 'commit_message: "net: x"',
-    '---', '', '# 问题与影响', '',
+    status === 'pending' ? 'gate_checks: ["node --version"]' : 'gate_checks: []',
+    'comments: []', 'human_decisions: []', approval, 'commit_message: "net: x"',
+    '---', '', '# 问题与影响', '', '# 需人工判断项', '- 无', '',
   ].join('\n'), 'utf8');
   if (status === 'pending') {
     await writeFile(path.join(dir, '001.patch'), 'diff --git a/src/host/api.ts b/src/host/api.ts\n', 'utf8');

@@ -44,42 +44,45 @@
 
 ## Mode C：批准前冲突修复或门禁修复
 当人类点击“批准”后，因基线推进产生补丁冲突或 `gate_checks` 失败而唤醒你时执行：
-1. 在最新基线上解决冲突或修复导致测试失败的问题。
-2. 生成下一版本补丁（`NNN.patch`），将 `current_revision` 加 1，追加 `revisions` 记录。
+1. 必须使用输入中“当前最新基线 base_revision”的批准时/Rebase 基线，从干净工作区解决冲突或门禁失败；不得复用旧 revision 的基线或旧补丁文本。
+2. 生成下一版本完整补丁（`NNN.patch`），将 `current_revision` 加 1，追加 `author: ai` 的 `revisions` 记录。
 3. 将 `status` 重置为 `pending`，清空 `approval` 字段（置回 `null`），并在最新版本的审核记录中重点说明“因基线迁移（旧基线 -> 新基线）解决冲突/修复测试所做的调整”。
 
 ---
 
 # `review.md` Strict Schema Specification
 
-输出的 `review.md` 必须严格遵循以下结构与格式：
+输出的 `review.md` 必须严格遵循以下结构与格式。所有必填字段都必须存在；空数组写 `[]`，无值对象写 `null`，不得省略字段或把 null/类型错误当作空值。保留所有未知顶层键和嵌套键的原始键值结构，不得为“严格校验”删除它们。历史版本、评论原文和未知字段均不得篡改。
 
 ```markdown
 ---
 schema_version: 1
-title: "<简明语义标题，动词开头，不超过 30 字>"
-created_at: "<ISO-8601 2026-10-31T14:30:00+08:00，迭代时保持初始值不变 时间戳，如>"
+title: "<小写模块标志>: <中文标题>"
+module: <小写模块标志>
+audit_type: bugfix # bugfix | delete | shrink | reuse | merge | split | stdlib | native | yagni
+created_at: "<含时区的 ISO-8601；创建后不变>"
+updated_at: "<含时区的 ISO-8601；每次共享写入严格递增>"
 owner: "<根据 .ai-review/reviewers.yml 匹配出的唯一负责人账号>"
-tags: [<标签数组，如 client, network, bug>]
+tags: [] # string[]；有标签时写规范化字符串数组
 status: pending
-ticket: "<关联单号，如 PROJ-1234；若无则填 null>"
-current_revision: <当前整数版本号，如 1, 2>
+ticket: null # string | null；不得缺省
+target_files: [src/example.ts] # 必须与当前补丁实际路径完全一致
+current_revision: 1
 revisions:
   - id: 1
-    base_revision: "<生成版本 1 时的 VCS 基线版本号或 commit hash 字符串>"
+    base_revision: "<生成该版本时的 VCS 基线字符串>"
     patch: "001.patch"
+    author: ai # AI 修复/Rebase 为 ai；人工补丁为 human
 gate_checks:
-  - "<可在仓库根目录直接运行的非交互式检验/测试命令 1>"
-  - "<可在仓库根目录直接运行的非交互式检验/测试命令 2>"
-comments:
-  - id: "<评论唯一ID，初始生成时若无评论则写 comments: []>"
-    revision: <评论针对的版本号>
-    file: "<相对仓库根目录的文件路径>"
-    line: <行号整数>
-    author: "<评论人>"
-    content: "<评论原文>"
-    status: resolved # 只能是 unresolved | partial | resolved
+  - "<实际执行且通过的非交互式门禁命令>"
+comments: []
+human_decisions: [] # 每项含唯一 id、非空 question，可选 note
 approval: null
+rejection: null
+commit_message: |
+  <小写模块标志>: <中文标题，必须与 title 完全一致>
+
+  <问题、修复与实际验证摘要>
 ---
 
 # 问题与影响

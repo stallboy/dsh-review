@@ -112,7 +112,10 @@ test('§7.7/AC-RETRY-01：基线落后时 Rebase 产生新版本，且新补丁�
   const root = await createGitFixture();
   const baseHead = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   const candidate = await commitCandidate(root, '20261110-rebase-lag', {
-    review: { baseRevision: JSON.stringify(baseHead) },
+    review: {
+      baseRevision: JSON.stringify(baseHead),
+      bodyLines: ['# 需人工判断项', '', '- 无'],
+    },
   });
   // 基线前进：让候选基线落后。
   await writeFile(path.join(root, 'src', 'other.js'), 'export const x = 1;\n', 'utf8');

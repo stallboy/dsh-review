@@ -31,6 +31,7 @@ export interface AuditSnapshotSource {
 export interface SharedCandidateSource extends CandidateSource, AuditSnapshotSource {
   /** 该源实际绑定的 VCS 快照标识；无法证明快照时可返回 null（调用方不得缓存）。 */
   snapshotId(): Promise<string | null>;
+  readReviewersText(): Promise<string | null>;
 }
 
 /**
@@ -89,13 +90,13 @@ export class GitHeadCandidateSource implements SharedCandidateSource {
 
   async hasLocalChanges(month: string, slug: string): Promise<boolean> {
     const result = await git(this.root, ['status', '--porcelain', '--', `.ai-review/${month}/${slug}`]);
-    return result.code === 0 && result.stdout.trim().length > 0;
+    if (result.code !== 0) throw new Error(`无法证明候选本地状态：${result.stderr.trim()}`);
+    return result.stdout.trim().length > 0;
   }
 
   async listLocalOnlyDirs(): Promise<string[]> {
-    // 未进入 HEAD 的候选目录（未跟踪/新增）：仅作 local 诊断展示，不进入共享流程。
     const result = await git(this.root, ['status', '--porcelain', '--', '.ai-review']);
-    if (result.code !== 0) return [];
+    if (result.code !== 0) throw new Error(`无法读取本地候选状态：${result.stderr.trim()}`);
     const dirs = new Set<string>();
     for (const line of result.stdout.split(/\r?\n/)) {
       const file = line.slice(3).trim().replaceAll('\\', '/');
@@ -107,7 +108,7 @@ export class GitHeadCandidateSource implements SharedCandidateSource {
 
   async listAuditDirs(): Promise<string[]> {
     const result = await git(this.root, ['ls-tree', '--name-only', this.snapshot, '--', '.ai-review/audits/']);
-    if (result.code !== 0) return [];
+    if (result.code !== 0) throw new Error(`无法读取共享审查档案：${result.stderr.trim()}`);
     const prefix = '.ai-review/audits/';
     return result.stdout
       .split(/\r?\n/)
@@ -121,9 +122,16 @@ export class GitHeadCandidateSource implements SharedCandidateSource {
     return this.show(`.ai-review/audits/${dirName}/audit.md`);
   }
 
+  async readReviewersText(): Promise<string | null> {
+    return this.show('.ai-review/reviewers.yml');
+  }
+
   private async show(relPath: string): Promise<string | null> {
     const result = await git(this.root, ['show', `${this.snapshot}:${relPath}`]);
-    return result.code === 0 ? result.stdout : null;
+    if (result.code === 0) return result.stdout;
+    const diagnostic = result.stderr.trim();
+    if (/does not exist|exists on disk, but not in|not in .*snapshot/i.test(diagnostic)) return null;
+    throw new Error(`无法读取共享文件 ${relPath}：${diagnostic}`);
   }
 }
 
@@ -168,8 +176,9 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
   }
 
   async hasLocalChanges(month: string, slug: string): Promise<boolean> {
-    const result = await svn(this.root, ['status', `.ai-review/${month}/${slug}`]);
-    return result.code === 0 && result.stdout.trim().length > 0;
+    const result = await svn(this.root, ['status', '--xml', `.ai-review/${month}/${slug}`]);
+    if (result.code !== 0) throw new Error(`无法证明候选本地状态：${result.stderr.trim()}`);
+    return /<entry\b/.test(result.stdout);
   }
 
   async listLocalOnlyDirs(): Promise<string[]> {
@@ -196,6 +205,10 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
 
   async readAuditText(dirName: string): Promise<string | null> {
     return this.readSharedFile(`.ai-review/audits/${dirName}/audit.md`);
+  }
+
+  async readReviewersText(): Promise<string | null> {
+    return this.readSharedFile('.ai-review/reviewers.yml');
   }
 
   /**

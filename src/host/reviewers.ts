@@ -45,45 +45,56 @@ function asStringArray(value: unknown): string[] {
   return value.map((item) => String(item)).filter((item) => item.trim().length > 0);
 }
 
-export async function loadReviewers(repoRoot: string): Promise<ReviewersConfig> {
-  try {
-    const text = await readFile(reviewersPath(repoRoot), 'utf8');
-    const doc = load(text, { json: true });
-    if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) return { ...EMPTY_REVIEWERS };
-    const record = doc as Record<string, unknown>;
-    const rulesRaw = Array.isArray(record['rules']) ? record['rules'] : [];
-    const rules: ReviewerRule[] = [];
-    for (const item of rulesRaw) {
-      if (typeof item !== 'object' || item === null || Array.isArray(item)) continue;
-      const rule = item as Record<string, unknown>;
-      const owner = typeof rule['owner'] === 'string' ? rule['owner'].trim() : '';
-      if (!owner) continue;
-      rules.push({
-        owner,
-        paths: asStringArray(rule['paths']),
-        tags: asStringArray(rule['tags']),
-      });
+export interface ReviewersSnapshotSource {
+  readReviewersText(): Promise<string | null>;
+}
+
+export async function loadReviewers(repoRoot: string, source?: ReviewersSnapshotSource): Promise<ReviewersConfig> {
+  let text: string | null;
+  if (source) {
+    text = await source.readReviewersText();
+  } else {
+    try {
+      text = await readFile(reviewersPath(repoRoot), 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ...EMPTY_REVIEWERS };
+      throw error;
     }
-    const asPositiveInt = (value: unknown): number | null => {
-      const num = typeof value === 'number' && Number.isFinite(value) ? value : Number(value);
-      return Number.isInteger(num) && num > 0 ? num : null;
-    };
-    return {
-      defaultOwner: typeof record['default_owner'] === 'string' ? record['default_owner'].trim() : '',
-      rules,
-      allowedGateCommands: asStringArray(record['allowed_gate_commands']),
-      staleDays: asPositiveInt(record['stale_days']),
-      rejectionMemoryDays: asPositiveInt(record['rejection_memory_days']) ?? EMPTY_REVIEWERS.rejectionMemoryDays,
-      maxAntiPatterns: asPositiveInt(record['max_anti_patterns']) ?? EMPTY_REVIEWERS.maxAntiPatterns,
-      verifyGateOnAuditFinalize:
-        record['verify_gate_on_audit_finalize'] === 'smoke' || record['verify_gate_on_audit_finalize'] === 'declared'
-          ? record['verify_gate_on_audit_finalize']
-          : 'none',
-      auditSmokeCommands: asStringArray(record['audit_smoke_commands']),
-    };
-  } catch {
-    return { ...EMPTY_REVIEWERS };
   }
+  if (text === null) return { ...EMPTY_REVIEWERS };
+  const doc = load(text, { json: true });
+  if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) throw new Error('reviewers.yml 必须是 YAML 对象');
+  const record = doc as Record<string, unknown>;
+  const rulesRaw = Array.isArray(record['rules']) ? record['rules'] : [];
+  const rules: ReviewerRule[] = [];
+  for (const item of rulesRaw) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) continue;
+    const rule = item as Record<string, unknown>;
+    const owner = typeof rule['owner'] === 'string' ? rule['owner'].trim() : '';
+    if (!owner) continue;
+    rules.push({
+      owner,
+      paths: asStringArray(rule['paths']),
+      tags: asStringArray(rule['tags']),
+    });
+  }
+  const asPositiveInt = (value: unknown): number | null => {
+    const num = typeof value === 'number' && Number.isFinite(value) ? value : Number(value);
+    return Number.isInteger(num) && num > 0 ? num : null;
+  };
+  return {
+    defaultOwner: typeof record['default_owner'] === 'string' ? record['default_owner'].trim() : '',
+    rules,
+    allowedGateCommands: asStringArray(record['allowed_gate_commands']),
+    staleDays: asPositiveInt(record['stale_days']),
+    rejectionMemoryDays: asPositiveInt(record['rejection_memory_days']) ?? EMPTY_REVIEWERS.rejectionMemoryDays,
+    maxAntiPatterns: asPositiveInt(record['max_anti_patterns']) ?? EMPTY_REVIEWERS.maxAntiPatterns,
+    verifyGateOnAuditFinalize:
+      record['verify_gate_on_audit_finalize'] === 'smoke' || record['verify_gate_on_audit_finalize'] === 'declared'
+        ? record['verify_gate_on_audit_finalize']
+        : 'none',
+    auditSmokeCommands: asStringArray(record['audit_smoke_commands']),
+  };
 }
 
 function globToRegExp(glob: string): RegExp {

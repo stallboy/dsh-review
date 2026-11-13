@@ -6,6 +6,7 @@ import { AUDIT_TYPES } from '../dist/types.js';
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { reviewFixture } from './fixtures/contract.mjs';
 
 /** P1 验收：契约 §2.3 键序、全字段往返、未知键保留、reviewers.yml 扩展配置。 */
 
@@ -132,7 +133,7 @@ test('P1: audit_type 非法值与 author 非法值报格式错误（I2/枚举）
   assert.ok(AUDIT_TYPES.includes('yagni'));
 });
 
-test('P1: 开发期旧数据（缺新字段）解析不崩溃且写侧补全', () => {
+test('P1/§4.3: 开发期旧数据缺少必填字段时必须标记格式错误，不得静默补全', () => {
   const legacy = [
     '---',
     'schema_version: 1',
@@ -155,17 +156,13 @@ test('P1: 开发期旧数据（缺新字段）解析不崩溃且写侧补全', (
     '# 问题与影响',
     '',
   ].join('\n');
-  const parsed = parseReviewMarkdown(legacy);
-  assert.equal(parsed.meta.module, '');
-  assert.equal(parsed.meta.updatedAt, parsed.meta.createdAt);
-  assert.deepEqual(parsed.meta.targetFiles, []);
-  assert.equal(parsed.meta.rejection, null);
-  const out = serializeReviewMarkdown(parsed.meta, parsed.body);
-  const reparsed = parseReviewMarkdown(out);
-  assert.equal(reparsed.meta.module, '');
-  // 写侧补全：序列化结果包含契约新键。
-  for (const key of ['module:', 'audit_type:', 'updated_at:', 'target_files:', 'human_decisions:', 'rejection:', 'commit_message:']) {
-    assert.ok(out.includes(`\n${key}`) || out.startsWith(key), `缺少契约键 ${key}`);
+  assert.throws(() => parseReviewMarkdown(legacy), ReviewFormatError);
+  for (const field of ['module', 'audit_type', 'updated_at', 'target_files', 'human_decisions', 'rejection', 'commit_message']) {
+    const complete = reviewFixture('legacy-required');
+    assert.throws(
+      () => parseReviewMarkdown(complete.split('\n').filter((line) => !line.startsWith(`${field}:`)).join('\n')),
+      new RegExp(field),
+    );
   }
 });
 

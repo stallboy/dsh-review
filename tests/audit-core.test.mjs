@@ -98,7 +98,10 @@ test('buildAuditPrompt includes scope, owner routing and existing candidates', a
     `---
 schema_version: 1
 title: "existing: 已有候选"
+module: existing
+audit_type: bugfix
 created_at: "2026-10-31T20:00:00+08:00"
+updated_at: "2026-10-31T20:00:00+08:00"
 owner: tester
 tags: [math]
 status: pending
@@ -109,10 +112,14 @@ revisions:
   - id: 1
     base_revision: "${base}"
     patch: "001.patch"
+    author: ai
 gate_checks:
   - "node --version"
 comments: []
+human_decisions: []
 approval: null
+rejection: null
+commit_message: "existing: 已有候选"
 ---
 
 # 问题与影响

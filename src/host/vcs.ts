@@ -93,6 +93,8 @@ export interface VcsAdapter {
   getCommitProbe(paths: string[]): Promise<string | null>;
   /** §5.6 分支 1：读取指定 VCS 版本下的仓库相对文件内容；不存在或不可读时返回 null。 */
   readFileAt(revision: string, relPath: string): Promise<string | null>;
+  /** 列出提交实际改动的完整仓库相对路径；无法证明时返回 null。 */
+  listCommitPaths?(revision: string): Promise<string[] | null>;
   applyPatch(patchPath: string, threeWay: boolean): Promise<ApplyPatchResult>;
   /** §7.7：把当前工作区相对 base 的完整改动导出为 Unified Diff（Rebase 新基线补丁）。 */
   exportWorkingTreeDiff(base: string, paths: string[]): Promise<string>;
@@ -312,6 +314,14 @@ export class GitAdapter implements VcsAdapter {
     if (target.length === 0) return null;
     const result = await git(this.root, ['show', `${rev}:${target}`]);
     return result.code === 0 ? result.stdout : null;
+  }
+
+  async listCommitPaths(revision: string): Promise<string[] | null> {
+    const rev = revision.trim();
+    if (!/^[0-9a-fA-F]+$/.test(rev)) return null;
+    const result = await git(this.root, ['diff-tree', '-m', '-r', '--root', '--no-commit-id', '--name-only', '-z', rev]);
+    if (result.code !== 0) return null;
+    return result.stdout.split('\0').map((item) => item.trim()).filter((item) => item.length > 0).map(toRepoRelative);
   }
 
   /**

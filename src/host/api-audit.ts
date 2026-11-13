@@ -59,13 +59,21 @@ export class AuditRuntime {
   async loadAuditLeases(): Promise<void> {
     this.lifecycle = new AuditLifecycle({
       load: async () => {
+        let text: string;
         try {
-          const text = await readFile(this.leaseStatePath, 'utf8');
-          const parsed = JSON.parse(text) as { leases?: AuditLeaseRecord[] };
-          return Array.isArray(parsed.leases) ? parsed.leases : [];
-        } catch {
-          return [];
+          text = await readFile(this.leaseStatePath, 'utf8');
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+          throw new Error(`审查租约读取失败，互斥状态不可证明：${error instanceof Error ? error.message : String(error)}`);
         }
+        let parsed: { leases?: AuditLeaseRecord[] };
+        try {
+          parsed = JSON.parse(text) as { leases?: AuditLeaseRecord[] };
+        } catch (error) {
+          throw new Error(`审查租约解析失败，互斥状态不可证明：${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (!Array.isArray(parsed.leases)) throw new Error('审查租约文件缺少 leases 数组，互斥状态不可证明');
+        return parsed.leases;
       },
       save: async (leases) => {
         const file = this.leaseStatePath;
@@ -133,53 +141,60 @@ export class AuditRuntime {
     return job;
   }
 
-  /**
-   * §7.7：审查启动的互斥检查 + 工作区前置条件必须与租约写入处于同一临界区，
-   * 否则两个并发审查请求可同时通过检查并各自写入 active 租约（TOCTOU）。
-   * 本方法只在调用方已持有 repo 锁时使用。
-   */
+  trackAuditSession(runtime: Runtime, auditId: string, sessionId: string): JobRecord {
+    const job = this.startAuditTrackingJob(auditId);
+    this.followAuditTurn(runtime, auditId, sessionId);
+    this.armAuditLeaseTimeout(auditId);
+    return job;
+  }
+
   private assertAuditStartAllowed(runtime: Runtime, clean: { clean: boolean; message: string }): void {
     const running = this.host.jobManager.list().find((job) => job.status === 'running');
     if (running) {
       throw new ApiError(409, 'conflict', `已有任务在运行（${running.type}），请等待完成后再开始仓库审查。`);
     }
-    // §7.6/§7.7：任何未释放的执行租约（手动/会话/定时）都必须阻止新的审查。
     this.host.ensureNoAuditRunning(runtime.root);
     if (!clean.clean) {
       throw new ApiError(409, 'conflict', `仓库审查要求业务工作区干净。\n${clean.message}`);
     }
   }
 
-  /** §7.7：在 repo 锁内完成“互斥判定 → auditId 分配 → 写入 active 租约”。 */
+  async beginAuditLeaseUnderLock(
+    runtime: Runtime,
+    input: { targetPath: string; baseRevision: string; owner: string; now: Date; trigger: 'manual' | 'scheduled' },
+    clean: { clean: boolean; message: string },
+  ): Promise<{ auditId: string; reportPath: string }> {
+    this.assertAuditStartAllowed(runtime, clean);
+    const auditId = await new AuditArchive(runtime.root).nextAuditId(input.targetPath, input.now);
+    const candidateIdsBefore = await runtime.store.listCandidateIds();
+    await this.upsertLease({
+      auditId,
+      root: runtime.root,
+      targetPath: input.targetPath,
+      trigger: input.trigger,
+      baseRevision: input.baseRevision,
+      owner: input.owner,
+      createdAt: input.now.toISOString(),
+      candidateIdsBefore,
+      state: 'active',
+    });
+    return { auditId, reportPath: `.ai-review/audits/${auditId}/audit.md` };
+  }
+
   private async beginAuditLease(
     runtime: Runtime,
     input: { targetPath: string; baseRevision: string; owner: string; now: Date; trigger: 'manual' | 'scheduled' },
     clean: { clean: boolean; message: string },
   ): Promise<{ auditId: string; reportPath: string }> {
-    const archive = new AuditArchive(runtime.root);
-    let auditId = '';
-    await this.host.withWriteLock(runtime.root, async () => {
-      this.assertAuditStartAllowed(runtime, clean);
-      auditId = await archive.nextAuditId(input.targetPath, input.now);
-      const candidateIdsBefore = await runtime.store.listCandidateIds();
-      await this.upsertLease({
-        auditId,
-        root: runtime.root,
-        targetPath: input.targetPath,
-        trigger: input.trigger,
-        baseRevision: input.baseRevision,
-        owner: input.owner,
-        createdAt: input.now.toISOString(),
-        candidateIdsBefore,
-        state: 'active',
-      });
-    });
-    return { auditId, reportPath: `.ai-review/audits/${auditId}/audit.md` };
+    return this.host.withWriteLock(runtime.root, () => this.beginAuditLeaseUnderLock(runtime, input, clean));
   }
 
   /** §18.2：把 reviewers.yml 解析结果作为提示词参数传入审查会话。 */
-  async ownerRoutingBlock(repoRoot: string): Promise<string> {
-    const config = await loadReviewers(repoRoot);
+  async ownerRoutingBlock(
+    repoRoot: string,
+    source?: import('./shared-facts.js').SharedCandidateSource,
+  ): Promise<string> {
+    const config = await loadReviewers(repoRoot, source);
     const lines = [
       '## Owner 路由（reviewers.yml 解析结果，创建候选时按此写 owner）',
       `- default_owner: ${config.defaultOwner || '(未配置，由当前操作者兜底)'}`,
@@ -222,7 +237,7 @@ export class AuditRuntime {
       ...(sharedSource ? { source: sharedSource } : {}),
     });
     const systemPrompt = await loadAuditSystemPrompt();
-    const promptWithRouting = `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root)}`;
+    const promptWithRouting = `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root, sharedSource)}`;
     const prompt = mode === 'session'
       ? composeSessionPrompt(systemPrompt, promptWithRouting)
       : wrapAgentPrompt(systemPrompt, promptWithRouting);
@@ -273,7 +288,7 @@ export class AuditRuntime {
       now,
       ...(sharedSource ? { source: sharedSource } : {}),
     });
-    const prompt = composeSessionPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root)}`);
+    const prompt = composeSessionPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root, sharedSource)}`);
     const title = `仓库审查 · ${target.targetPath || '全仓库'}`.slice(0, 60);
     let created: { sessionId: string };
     try {
@@ -283,9 +298,7 @@ export class AuditRuntime {
       await this.releaseLeaseById(auditId).catch(() => undefined);
       throw error;
     }
-    // 跟踪 Job 保持 running，直到 /audit/finalize（或 release / 取消）完成它。
-    const job = this.startAuditTrackingJob(auditId);
-    this.armAuditLeaseTimeout(auditId);
+    const job = this.trackAuditSession(runtime, auditId, created.sessionId);
     sendJson(res, 202, {
       sessionId: created.sessionId,
       jobId: job.id,
@@ -381,7 +394,7 @@ export class AuditRuntime {
       now,
       ...(sharedSource ? { source: sharedSource } : {}),
     });
-    const prompt = wrapAgentPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root)}`);
+    const prompt = wrapAgentPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root, sharedSource)}`);
     // §7.6/§8.3：手动模式同样创建可追踪的 audit Job，并受 1 小时执行上限约束。
     const job = this.startAuditTrackingJob(auditId);
     this.armAuditLeaseTimeout(auditId);
@@ -401,6 +414,82 @@ export class AuditRuntime {
    * §7.6 手动/会话审查收尾：以 lease 中保存的开始快照执行 Host 收尾与共享提交，
    * 正常完成后释放租约。外部写入的候选按全部校验（含 owner 路由复核）验收。
    */
+  private startAuditFinalizeJob(runtime: Runtime, lease: AuditLeaseRecord): JobRecord {
+    const job = this.host.jobManager.start('audit', async (log, _jobId, signal) => {
+      try {
+        return await this.host.withWriteLock(runtime.root, async () => {
+      const current = this.auditLifecycle.find(lease.auditId);
+      if (!current || current.state === 'released') {
+        return {
+          status: 'ABORTED', auditId: lease.auditId, commitRevision: null, created: [],
+          reportPath: `.ai-review/audits/${lease.auditId}/audit.md`, message: '租约已释放或不存在，未重复收尾',
+        };
+      }
+      const sharedSource = await sharedSourceFor(runtime);
+      const auditor = new Auditor({
+        store: runtime.store,
+        vcs: runtime.vcs,
+        settings: this.host.currentSettings(),
+        owner: current.owner,
+        targetPath: current.targetPath,
+        note: '',
+        log,
+        ...(sharedSource ? { candidateSource: sharedSource } : {}),
+        ...(this.host.deps.resolveCredential ? { resolveCredential: this.host.deps.resolveCredential } : {}),
+        signal,
+      });
+      const result = await auditor.finalize({
+        auditId: current.auditId,
+        beforeIds: new Set(current.candidateIdsBefore),
+        baseRevision: current.baseRevision,
+        targetPath: current.targetPath,
+        trigger: current.trigger,
+        runError: null,
+        startedAt: new Date(current.createdAt).getTime(),
+        now: new Date(),
+      });
+      if (result.status === 'COMMITTED' || result.status === 'VALIDATION_FAILED') {
+        await this.auditLifecycle.transition(current.auditId, 'released');
+      } else {
+        log(`收尾未完成（${result.status}），租约 ${current.auditId} 保持占用`);
+      }
+      const outcome = {
+        status: result.status,
+        auditId: current.auditId,
+        commitRevision: result.commitRevision,
+        created: result.created,
+        reportPath: result.reportPath,
+        ...(result.reason ? { reason: result.reason } : {}),
+        ...(result.detail ? { detail: result.detail } : {}),
+        message: result.message,
+      };
+      log(`结果：${result.status} — ${result.message}`);
+      this.host.auditJobFinishes.get(current.auditId)?.(outcome);
+      this.host.auditJobFinishes.delete(current.auditId);
+      return outcome;
+        });
+      } finally {
+        this.host.auditJobLeases.delete(_jobId);
+      }
+    });
+    this.host.auditJobLeases.set(job.id, lease.auditId);
+    return job;
+  }
+
+  private followAuditTurn(runtime: Runtime, auditId: string, sessionId: string): void {
+    const subscribe = this.host.deps.onAuditTurnEnd;
+    if (!subscribe) return;
+    let finished = false;
+    let dispose = (): void => undefined;
+    dispose = subscribe(sessionId, () => {
+      if (finished) return;
+      finished = true;
+      queueMicrotask(dispose);
+      const lease = this.auditLifecycle.find(auditId);
+      if (lease?.state === 'active') this.startAuditFinalizeJob(runtime, lease);
+    });
+  }
+
   async auditFinalize(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const body = await readJson(req);
@@ -412,67 +501,7 @@ export class AuditRuntime {
     if (lease.state === 'released') throw new ApiError(409, 'conflict', `租约 ${auditId} 已释放，不能重复收尾`);
     const running = this.host.jobManager.list().find((job) => job.status === 'running' && job.type !== 'audit');
     if (running) throw new ApiError(409, 'conflict', `已有任务在运行（${running.type}），请等待完成后再收尾。`);
-    const job = this.host.jobManager.start('audit', async (log) => this.host.withWriteLock(runtime.root, async () => {
-      // §7.7：收尾提交与全部共享写/工作区事务经同一 repo 锁串行。
-      // 锁内重新检查租约状态：并发 finalize 的第二个请求不得重复提交。
-      if (lease.state === 'released') {
-        log(`租约 ${lease.auditId} 已被另一次收尾释放，跳过重复收尾`);
-        return {
-          status: 'ABORTED',
-          auditId: lease.auditId,
-          commitRevision: null,
-          created: [],
-          reportPath: `.ai-review/audits/${lease.auditId}/audit.md`,
-          message: '租约已释放，未重复收尾',
-        };
-      }
-      const auditor = new Auditor({
-        store: runtime.store,
-        vcs: runtime.vcs,
-        settings: this.host.currentSettings(),
-        owner: lease.owner,
-        targetPath: lease.targetPath,
-        note: '',
-        log,
-        ...(this.host.deps.resolveCredential ? { resolveCredential: this.host.deps.resolveCredential } : {}),
-      });
-      const result = await auditor.finalize({
-        auditId: lease.auditId,
-        beforeIds: new Set(lease.candidateIdsBefore),
-        baseRevision: lease.baseRevision,
-        targetPath: lease.targetPath,
-        trigger: lease.trigger,
-        runError: null,
-        startedAt: new Date(lease.createdAt).getTime(),
-        now: new Date(),
-      });
-      // §7.6：只有收尾正常完成（COMMITTED / VALIDATION_FAILED）才释放租约；
-      // ABORTED 或结果不明（RECOVERY_REQUIRED）必须保留租约，让仓库继续处于互斥状态，
-      // 等待人工核对后重试 finalize 或显式 release。
-      if (result.status === 'COMMITTED' || result.status === 'VALIDATION_FAILED') {
-        await this.auditLifecycle.transition(lease.auditId, 'released');
-        this.host.auditJobFinishes.get(lease.auditId)?.({
-          status: result.status,
-          auditId: lease.auditId,
-          commitRevision: result.commitRevision,
-          message: result.message,
-        });
-        this.host.auditJobFinishes.delete(lease.auditId);
-      } else {
-        log(`收尾未完成（${result.status}），租约 ${lease.auditId} 保持占用，请核对后重试 finalize 或 /audit/release`);
-      }
-      log(`结果：${result.status} — ${result.message}`);
-      return {
-        status: result.status,
-        auditId: lease.auditId,
-        commitRevision: result.commitRevision,
-        created: result.created,
-        reportPath: result.reportPath,
-        ...(result.reason ? { reason: result.reason } : {}),
-        ...(result.detail ? { detail: result.detail } : {}),
-        message: result.message,
-      };
-    }));
+    const job = this.startAuditFinalizeJob(runtime, lease);
     sendJson(res, 202, { jobId: job.id, job });
   }
 
@@ -513,6 +542,13 @@ export class AuditRuntime {
     this.host.ensureNoAuditRunning(runtime.root);
     // §7.7：/sync 与其他工作区事务在同一 repo 锁内串行，不得改变其基线。
     const result = await this.host.withWriteLock(runtime.root, () => vcs.syncAndGetLatestBase());
+    if (result.uncertain) {
+      throw new ApiError(409, 'conflict', `同步状态无法确定，禁止自动重试：${result.message}`, {
+        status: 'RECOVERY_REQUIRED',
+        reason: 'SYNC_STATE_UNKNOWN',
+        detail: result.message,
+      });
+    }
     sendJson(res, 200, result);
   }
 

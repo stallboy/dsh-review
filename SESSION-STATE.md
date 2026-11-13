@@ -107,3 +107,13 @@
 - **测试**：新增 `contract-round3.test.mjs`（评论字段/anchor、manual Job/租约、Owner AND、记忆摘要、提交树核对、取消终止 Runner）；更新 `contract-p4/p5/p6/p8`、`contract-audit-finalize`、`contract-round2`、`audit-api` 中固化旧行为的断言。
 - **验证**：`npm run typecheck` / `npm run build` 通过；全量 **145 项测试通过**（`node --test --test-concurrency=1 --test-reporter=tap tests/*.test.mjs`，输出落盘）。
 - **仍开（已记录，非本轮目标）**：audit 报告“历史问题复查”未解析为 `items[]`；审计档案未知 Frontmatter 键未保留（I14 的 audit 侧）；SVN 共享源/派生仍缺真机自动测试（实现已按 §7.1 调整）；会话 turn 结束自动收尾仍依赖手动 `/audit/finalize`。
+
+## 8. SPEC 工作流程闭环修复（2026-11-11，worktree 待审查）
+
+- 本轮变更位于 `worktree-spec-workflow-closure`，未合并到 master；以上历史章节的测试数量与“已合并”声明不代表本轮状态。
+- 已补独立候选脏工作区保护、锁内 AI 修复重读与完整提交前校验、同快照补丁/配置/关联候选读取、Mode C 新基线、门禁取消、严格必填与批准快照、重开环、业务基线、预检缓存、手动租约及 Client 入口。
+- 验证：`npm run typecheck`、`npm run build` 通过；`node --test --test-concurrency=1 --test-reporter=tap tests/*.test.mjs` 为 199 通过、0 失败。后续对抗性复核补充了 finalize 取消不提交、Client finalize 不死锁、历史补丁不可改写、门禁期间本地 review 变化中止、租约保存失败回滚和 broken 重开替代报错。
+- 独立对抗性审查曾确认 4 项 P1（finalize 完整提交核对、历史/重开与嵌套未知键、手动 reviewers 回退、broken 替代唯一性）；逐项修复并新增行为测试后，原审查代理复核确认全部关闭，复核范围内无新增 P0/P1。
+- `npm run verify:audit` 已实际尝试，但环境没有 `DSH_SESSION_ID`，脚本在创建真实会话前退出；因此本轮没有完成真实 DSH 会话验收。
+- Host 目前只接线 `sessionController.create/rename/prompt`，没有真实 turn 结束订阅。代码提供 `onAuditTurnEnd` 注入并由行为测试验证通知后自动 finalize，但生产 Host 没有绑定该通知，不能宣称真实自动收尾已验收，也未使用轮询伪装。
+- 契约歧义：SPEC §7.5 的 approve `ABORTED.reason` 封闭枚举没有取消原因。本轮未修改枚举或 SPEC，提交前取消兼容映射为 `COMMIT_FAILED`；ai_fix 的 `CANCELLED` 与 approve 类型保持分离。

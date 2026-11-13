@@ -215,12 +215,13 @@ export class ReviewStore {
       // §13.2：读取候选时执行只读不变量校验，违反者标记 broken，不参与批准/投影。
       const invariantErrors = quickReviewInvariants(candidate);
       if (invariantErrors.length > 0) {
-        return this.brokenCandidate(month, slug, dir, reviewPath, invariantErrors.join('；'));
+        return this.brokenCandidate(month, slug, dir, reviewPath, invariantErrors.join('；'), candidate.meta.reopenedFrom);
       }
       return candidate;
     } catch (error) {
       if (!(error instanceof ReviewFormatError)) throw error;
-      return this.brokenCandidate(month, slug, dir, reviewPath, error.message);
+      const reopenedFrom = /^reopened_from:\s*["']?([^\s"']+)["']?\s*$/m.exec(text)?.[1] ?? null;
+      return this.brokenCandidate(month, slug, dir, reviewPath, error.message, reopenedFrom);
     }
   }
 
@@ -238,6 +239,7 @@ export class ReviewStore {
     dir: string,
     reviewPath: string,
     message: string,
+    reopenedFrom?: string | null,
   ): ReviewCandidate {
     const meta: ReviewFrontmatter = {
       schemaVersion: 1,
@@ -259,6 +261,7 @@ export class ReviewStore {
       approval: null,
       rejection: null,
       commitMessage: '',
+      ...(reopenedFrom !== undefined ? { reopenedFrom } : {}),
       extra: {},
     };
     return {
@@ -340,13 +343,14 @@ export class ReviewStore {
               this.brokenCandidate(month, slug, path.join(this.aiReviewRoot, month, slug), path.join(this.aiReviewRoot, month, slug, 'review.md'), invariantErrors.join('；')),
               stats, currentBase, staleDays,
             );
-            summary.local = isLocalOnly || (await src.hasLocalChanges(month, slug).catch(() => false)) || undefined;
+            summary.reopenedFrom = candidate.meta.reopenedFrom ?? null;
+            summary.local = isLocalOnly || (await src.hasLocalChanges(month, slug).catch(() => true)) || undefined;
             if (matchesReviewFilter(summary, filter)) items.push(summary);
             continue;
           }
         }
         const summary = this.toSummary(candidate, stats, currentBase, staleDays);
-        summary.local = isLocalOnly || (await src.hasLocalChanges(month, slug).catch(() => false)) || undefined;
+        summary.local = isLocalOnly || (await src.hasLocalChanges(month, slug).catch(() => true)) || undefined;
         if (!summary.local) {
           chainInfo.set(candidate.id, { reopenedFrom: candidate.meta.reopenedFrom ?? null, status: candidate.meta.status });
           // §7.1：local 候选不进入共享流程——不作负向记忆来源。
@@ -380,7 +384,7 @@ export class ReviewStore {
           parseError: message,
         };
         // §7.1：错误路径同样必须标记本地视图，否则 local 草稿会被误当作共享事实。
-        summary.local = isLocalOnly || (await src.hasLocalChanges(month, slug).catch(() => false)) || undefined;
+        summary.local = isLocalOnly || (await src.hasLocalChanges(month, slug).catch(() => true)) || undefined;
         if (matchesReviewFilter(summary, filter)) items.push(summary);
       }
     }
@@ -793,23 +797,31 @@ export class ReviewStore {
    * §4.8/§18.6：人工重开被拒方案——在活跃候选上标记 reopened_from/reopen_reason。
    * 仅 Owner 人工操作（API 层保证不由 AI 路径触发）；目标必须是真实存在的 rejected 候选。
    */
-  async reopen(id: string, fromId: string, reason: string, guard: ConcurrencyGuard): Promise<ReviewCandidate> {
-    const { month, slug } = this.resolveCandidateDir(id);
-    const candidate = await this.readCandidate(month, slug);
+  async reopen(
+    id: string,
+    fromId: string,
+    reason: string,
+    guard: ConcurrencyGuard,
+    source?: CandidateSource,
+  ): Promise<ReviewCandidate> {
+    const readShared = async (candidateKey: string): Promise<ReviewCandidate> => {
+      const resolved = this.resolveCandidateDir(candidateKey);
+      if (!source) return this.readCandidate(resolved.month, resolved.slug);
+      const text = await source.readReviewText(resolved.month, resolved.slug);
+      if (text === null) throw new ApiError(404, 'not_found', `共享候选不存在：${candidateKey}`);
+      return this.parseCandidateText(resolved.month, resolved.slug, text);
+    };
+    const candidate = await readShared(id);
     if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
     await this.ensureWriteAllowed(candidate, guard);
     const trimmedReason = reason.trim();
     if (!trimmedReason) throw new ApiError(422, 'bad_request', '重开理由不能为空');
-    const { month: fromMonth, slug: fromSlug } = this.resolveCandidateDir(fromId);
-    const fromPath = path.join(this.aiReviewRoot, fromMonth, fromSlug, 'review.md');
-    if (!existsSync(fromPath)) throw new ApiError(404, 'not_found', `被拒候选不存在：${fromId}`);
-    const fromCandidate = await this.readCandidate(fromMonth, fromSlug);
+    const fromCandidate = await readShared(fromId);
     if (fromCandidate.parseError) throw new ApiError(422, 'bad_request', `被拒候选无法解析：${fromCandidate.parseError}`);
     if (fromCandidate.meta.status !== 'rejected' || !fromCandidate.meta.rejection) {
       throw new ApiError(409, 'conflict', `reopened_from 必须指向 rejected 候选：${fromId}`);
     }
-    // §8.3/I16：每个 rejected 候选最多一个直接替代候选，/reopen 必须在锁内强制。
-    if (await this.hasDirectReplacement(fromId, candidate.id)) {
+    if (await this.hasDirectReplacement(fromId, candidate.id, source)) {
       throw new ApiError(409, 'conflict', `被拒候选 ${fromId} 已有直接替代候选，不能再重开（I16）`);
     }
     candidate.meta.reopenedFrom = fromId;
@@ -818,8 +830,18 @@ export class ReviewStore {
     return candidate;
   }
 
-  /** §8.3/I16：扫描现有候选，判断某个 rejected 候选是否已有直接替代。 */
-  private async hasDirectReplacement(fromId: string, excludeId: string): Promise<boolean> {
+  private async hasDirectReplacement(fromId: string, excludeId: string, source?: CandidateSource): Promise<boolean> {
+    if (source) {
+      for (const id of await source.listCandidateDirs()) {
+        if (id === excludeId) continue;
+        const { month, slug } = this.resolveCandidateDir(id);
+        const text = await source.readReviewText(month, slug);
+        if (text === null) throw new Error(`无法读取共享候选 ${id}，不能证明重开唯一性`);
+        const candidate = this.parseCandidateText(month, slug, text);
+        if (candidate.meta.reopenedFrom === fromId) return true;
+      }
+      return false;
+    }
     const months = await readdir(this.aiReviewRoot, { withFileTypes: true }).catch(() => []);
     for (const monthEntry of months) {
       if (!monthEntry.isDirectory() || !MONTH_PATTERN.test(monthEntry.name)) continue;
@@ -829,12 +851,8 @@ export class ReviewStore {
         if (!slugEntry.isDirectory()) continue;
         const slug = slugEntry.name;
         if (candidateId(month, slug) === excludeId) continue;
-        try {
-          const candidate = await this.readCandidate(month, slug);
-          if (candidate.meta.reopenedFrom === fromId) return true;
-        } catch {
-          // 不可读候选不影响唯一性判断。
-        }
+        const candidate = await this.readCandidate(month, slug);
+        if (candidate.meta.reopenedFrom === fromId) return true;
       }
     }
     return false;
@@ -959,26 +977,43 @@ export class ReviewStore {
   }
 
   /** §7.5 步骤 4 / §7.6：批准与收尾必须通过的完整不变量（含 I4/I5/I16 引用目标）。 */
-  async validateFullCandidate(candidate: ReviewCandidate, source?: CandidateSource): Promise<string[]> {
+  async validateFullCandidate(
+    candidate: ReviewCandidate,
+    source?: CandidateSource,
+    associationSource?: CandidateSource,
+  ): Promise<string[]> {
     const errors = await this.validateCandidate(candidate);
     const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
     if (!current) return errors;
+    const entries = source
+      ? await source.listDirEntries(candidate.month, candidate.slug).catch(() => null)
+      : await readdir(candidate.dirPath).catch(() => null);
+    const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
     let currentPatchPaths: string[] | null = null;
-    try {
-      // §7.1：共享流程的完整性校验必须与提交内容来自同一快照。
-      const text = source
-        ? await source.readPatchText(candidate.month, candidate.slug, current.patch)
-        : await readFile(this.patchPathFor(candidate, current.patch), 'utf8');
-      currentPatchPaths = text === null ? null : parsePatch(text).paths.filter((file) => !isAiReviewPath(file));
-    } catch {
-      currentPatchPaths = null;
+    if (!archived) {
+      try {
+        const text = source
+          ? await source.readPatchText(candidate.month, candidate.slug, current.patch)
+          : await readFile(this.patchPathFor(candidate, current.patch), 'utf8');
+        if (text === null) errors.push(`I5: 无法读取当前补丁 ${current.patch}，不能证明 target_files 一致`);
+        else currentPatchPaths = parsePatch(text).paths.filter((file) => !isAiReviewPath(file));
+      } catch {
+        errors.push(`I5: 无法读取当前补丁 ${current.patch}，不能证明 target_files 一致`);
+      }
     }
+    const linkedSource = associationSource ?? source;
     const reopenedTargetRejected = candidate.meta.reopenedFrom
       ? await (async (): Promise<((target: string) => boolean | null) | undefined> => {
           try {
             const { month, slug } = this.resolveCandidateDir(candidate.meta.reopenedFrom ?? '');
-            const targetCandidate = await this.readCandidate(month, slug);
-            const rejected = targetCandidate.meta.status === 'rejected' && targetCandidate.meta.rejection !== null;
+            const targetCandidate = linkedSource
+              ? await (async () => {
+                  const text = await linkedSource.readReviewText(month, slug);
+                  return text === null ? null : this.parseCandidateText(month, slug, text);
+                })()
+              : await this.readCandidate(month, slug);
+            const rejected = targetCandidate !== null && targetCandidate.parseError === undefined
+              && targetCandidate.meta.status === 'rejected' && targetCandidate.meta.rejection !== null;
             return () => rejected;
           } catch {
             return () => false;
@@ -987,22 +1022,22 @@ export class ReviewStore {
       : undefined;
     errors.push(...fullReviewInvariants({
       candidate,
-      patchExists: (revision) => existsSync(this.patchPathFor(candidate, revision.patch)),
+      patchExists: (revision) => entries?.includes(revision.patch) ?? false,
       currentPatchPaths,
       ...(reopenedTargetRejected ? { reopenedTargetRejected } : {}),
     }));
-    return errors;
+    return [...new Set(errors)];
   }
 
-  async listStatusCounts(owner: string): Promise<Record<ReviewStatus, number>> {
+  async listStatusCounts(owner: string, source?: CandidateSource): Promise<Record<ReviewStatus, number>> {
     const counts: Record<ReviewStatus, number> = {
       pending: 0,
       changes_requested: 0,
       approved: 0,
       rejected: 0,
     };
-    const { items } = await this.list({ owner }, null);
-    for (const item of items) counts[item.status] += 1;
+    const { items } = await this.list({ owner }, null, undefined, undefined, source);
+    for (const item of items) if (!item.local) counts[item.status] += 1;
     return counts;
   }
 

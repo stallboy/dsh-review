@@ -124,7 +124,10 @@ test('§7.7：业务代码确有变化时 /rebase 正常产生新版本（不是
   const root = await createGitFixture();
   const realBase = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   const candidate = await commitCandidate(root, '20261111-rebase-business-changed', {
-    review: { baseRevision: JSON.stringify(realBase) },
+    review: {
+      baseRevision: JSON.stringify(realBase),
+      bodyLines: ['# 需人工判断项', '', '- 无'],
+    },
   });
   await writeFile(path.join(root, 'src', 'other.js'), 'export const x = 1;\n', 'utf8');
   runCommand('git', ['add', 'src'], root);

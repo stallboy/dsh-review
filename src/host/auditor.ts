@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { patchTouchesReviewData, collectCommitEntries, type VcsAdapter } from './vcs.js';
+import { patchTouchesReviewData, collectCommitEntries, gitBlobHash, type VcsAdapter } from './vcs.js';
 import { reviewersPath } from './reviewers.js';
 import { runAgent, wrapAgentPrompt } from './runner.js';
 import { ReviewStore } from './store.js';
@@ -161,17 +161,27 @@ export function auditReportPath(targetPath: string, now: Date): string {
   return `.ai-review/audits/${stamp}-${slug}/audit.md`;
 }
 
-async function readReviewersText(repoRoot: string, owner: string): Promise<string> {
-  try {
-    const text = await readFile(reviewersPath(repoRoot), 'utf8');
-    return text.trim().slice(0, 6000);
-  } catch {
-    return [
-      '# reviewers.yml 尚不存在；直接执行审查时插件会创建它。',
-      `default_owner: ${JSON.stringify(owner || '')}`,
-      'rules: []',
-    ].join('\n');
+async function readReviewersText(
+  repoRoot: string,
+  owner: string,
+  source?: import('./shared-facts.js').SharedCandidateSource,
+): Promise<string> {
+  let text: string | null = null;
+  if (source) {
+    text = await source.readReviewersText();
+  } else {
+    try {
+      text = await readFile(reviewersPath(repoRoot), 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
   }
+  if (text !== null) return text.trim().slice(0, 6000);
+  return [
+    '# reviewers.yml 尚不存在；直接执行审查时插件会创建它。',
+    `default_owner: ${JSON.stringify(owner || '')}`,
+    'rules: []',
+  ].join('\n');
 }
 
 async function collectOutline(repoRoot: string, targetAbsolute: string, limit = OUTLINE_LIMIT): Promise<string> {
@@ -250,12 +260,15 @@ async function existingCandidateLines(
 }
 
 /** §7.5/§7.6：负向记忆注入——窗口内 rejected 摘要（每模块上限 max_anti_patterns，按 rejected_at 倒序）。 */
-async function negativeMemoryLines(repoRoot: string, source?: CandidateSource): Promise<string> {
+async function negativeMemoryLines(
+  repoRoot: string,
+  source?: import('./shared-facts.js').SharedCandidateSource,
+): Promise<string> {
   try {
     const store = new ReviewStore(repoRoot);
     const { loadReviewers } = await import('./reviewers.js');
     const { entryFromCandidate, topPerModule, formatMemorySummary, withinWindow } = await import('./memory.js');
-    const config = await loadReviewers(repoRoot);
+    const config = await loadReviewers(repoRoot, source);
     // §7.1/G10：负向记忆同样只能来自同一共享快照，避免本地未提交内容被当作共享事实。
     const { items } = await store.list({}, null, undefined, undefined, source);
     const full = [];
@@ -285,10 +298,9 @@ export interface BuildAuditPromptInput {
   note: string;
   baseRevision: string;
   reportPath: string;
-  /** `session` lets the agent commit `.ai-review` itself; `headless` forbids commits. */
   mode?: 'headless' | 'session';
   /** §7.1/G10：提示词中的已存在候选与负向记忆必须读取同一 VCS 共享快照。 */
-  source?: CandidateSource;
+  source?: import('./shared-facts.js').SharedCandidateSource;
   now?: Date;
 }
 
@@ -296,7 +308,7 @@ export interface BuildAuditPromptInput {
 export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<string> {
   const target = await resolveAuditTarget(input.repoRoot, input.targetPath);
   const now = input.now ?? new Date();
-  const reviewersText = await readReviewersText(input.repoRoot, input.owner);
+  const reviewersText = await readReviewersText(input.repoRoot, input.owner, input.source);
   const outline = await collectOutline(input.repoRoot, target.absolutePath);
   const existing = await existingCandidateLines(new ReviewStore(input.repoRoot), input.baseRevision, input.source);
   const negativeMemory = await negativeMemoryLines(input.repoRoot, input.source);
@@ -306,7 +318,7 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
   // §11.4（2026-11-10 修订）：任何模式都严禁 Agent 自行 commit——审查产物由 Host 在收尾统一提交。
   const commitRule = '5. 严禁执行 `git commit` / `svn commit` / `git push` / `svn add`。审查产物由插件在收尾统一提交；结束前 `git status` / `svn status` 除 `.ai-review/` 外必须干净，不得在业务工作区留下未导出的改动或临时文件。';
   const completionRule = sessionMode
-    ? '10. 完成时用简体中文输出最终摘要：新增候选、B/Deferred、报告路径。随后等待用户在审核面板执行「收尾」（finalize），不要自行提交。'
+    ? '10. 完成时用简体中文输出最终摘要：新增候选、B/Deferred、报告路径，然后停止；Host 负责收尾与提交，不要自行提交。'
     : '10. 完成时输出一行 `DONE` 和本次新增候选/报告的简短摘要。';
   const lines: string[] = [
     '# 任务',
@@ -348,7 +360,7 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
       '你正在一个独立的 DSH 会话中执行本任务，用户可以在侧边栏看到完整过程，也可以随时切换到其他会话。',
       '- 在关键节点输出简短进度：建立地图、候选 N 已生成、验证结果；不要只埋头执行。',
       '- 不要中途等待用户确认；遇到 B 类或需要人工拍板的事项，写入审查报告后继续。',
-      '- 完成全部候选后按规则输出摘要并停止；插件（Host）会在用户执行收尾时统一校验并提交 `.ai-review/`。',
+      '- 完成全部候选后按规则输出摘要并停止；Host 在会话 turn 结束后统一校验并提交 `.ai-review/`。',
       '',
     ] : []),
     '## 硬性执行规则',
@@ -364,29 +376,39 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
     '10. 补丁生成方式：Git 使用 `git diff <base_revision> --binary`（新增业务文件先 `git add -N <文件>`，绝不能把 `.ai-review/` 加入索引）；SVN 在工作区为对应 revision 时使用 `svn diff`。',
     completionRule,
     '',
-    '## review.md 最小字段（必须严格满足）',
+    '## review.md 完整必填字段（不得缺省；空数组写 []，无值对象写 null）',
     '```markdown',
     '---',
     'schema_version: 1',
     'title: "<小写模块标志>: <中文标题>"',
-    'module: <模块标志>',
-    'audit_type: bugfix # bugfix | delete | shrink | reuse | merge | split',
-    'created_at: "<ISO-8601>"',
+    'module: <小写模块标志>',
+    'audit_type: bugfix # bugfix | delete | shrink | reuse | merge | split | stdlib | native | yagni',
+    'created_at: "<含时区的 ISO-8601>"',
+    'updated_at: "<含时区的 ISO-8601；共享写入严格递增>"',
     'owner: "<按 reviewers.yml 解析后的负责人>"',
-    'tags: [<标签>]',
+    'tags: []',
     'status: pending',
     'ticket: null',
+    'target_files: [src/example.ts] # 必须与当前补丁路径一致',
     'current_revision: 1',
     'revisions:',
     '  - id: 1',
     '    base_revision: "' + input.baseRevision + '"',
     '    patch: "001.patch"',
+    '    author: ai',
     'gate_checks:',
     '  - "<实际执行且通过的命令>"',
     'comments: []',
+    'human_decisions: [] # 每项含 id/question，可选 note',
     'approval: null',
+    'rejection: null',
+    'commit_message: |',
+    '  <与 title 完全一致的首行>',
+    '',
+    '  <问题、修复与实际验证摘要>',
     '---',
     '```',
+    '保留所有未知顶层及嵌套键；不得为严格校验丢弃它们。',
     '正文按审查准则的章节结构生成：`# 问题与影响`、`# 根因`、`# 当前修复方案`、`# 需人工判断项`、`# 验证证据`、`# 审核记录`。',
     '',
     '## 审查报告模板',
@@ -621,15 +643,14 @@ export function buildAuditItems(deferred: AuditDeferredItem[], warnings: string[
   for (const item of deferred) {
     if (item.category !== 'deferred') continue;
     let dependsOn: string | null = null;
+    const explicit = /depends_on\s*[:：]?\s*`?([a-z0-9][a-z0-9-]{0,63})`?/i.exec(item.text);
+    if (explicit?.[1]) dependsOn = explicit[1];
     for (const [title, id] of confirmIds) {
-      if (item.text && item.text.includes(title)) {
-        dependsOn = id;
-        break;
-      }
+      if (!dependsOn && item.text && item.text.includes(title)) dependsOn = id;
     }
     if (!dependsOn) {
-      dependsOn = 'pending-external-prerequisite';
-      warnings.push(`Deferred 项「${item.label}」未能从文本解析出依赖 finding，已用占位依赖（转换前需先出现对应 finding）`);
+      dependsOn = findingIdOf('deferred', item.text || item.label);
+      warnings.push(`Deferred 项「${item.label}」的依赖 ${dependsOn} 尚无对应 finding 观察；转换前必须证明该前置已闭合`);
     }
     const id = findingIdOf('deferred', item.label);
     const targetFiles = extractTargetFiles([item.text, item.label]);
@@ -680,7 +701,7 @@ export interface AuditDeps {
   log: (line: string) => void;
   resolveCredential?: (reference: string) => Promise<string | undefined>;
   /** §7.1/G10：审查提示词中的共享事实读取源（绑定同一 VCS 快照）；缺省为工作区视图。 */
-  candidateSource?: CandidateSource;
+  candidateSource?: import('./shared-facts.js').SharedCandidateSource;
   /** §7.7：Job 取消信号，用于终止 headless Runner。 */
   signal?: AbortSignal;
 }
@@ -803,7 +824,7 @@ export class Auditor {
       };
     }
 
-    const created = await this.verifyCandidates(before, base, warnings);
+    const created = await this.verifyCandidates(before, base, warnings, reviewersCreated);
     this.log(`新增候选 ${String(created.length)} 个，校验问题 ${String(created.filter((item) => item.errors.length > 0).length)} 个`);
 
     const result = await this.finalize({
@@ -853,11 +874,21 @@ export class Auditor {
   async finalize(input: AuditFinalizeInput): Promise<AuditFinalizeResult> {
     const { store, vcs } = this.deps;
     const warnings = [...(input.extraWarnings ?? [])];
-    const created = await this.verifyCandidates(input.beforeIds, input.baseRevision, warnings);
+    const reportPath = `.ai-review/audits/${input.auditId}/audit.md`;
+    const aborted = (): AuditFinalizeResult => ({
+      created: [],
+      deferred: [],
+      reportPath,
+      body: '',
+      commitRevision: null,
+      status: 'ABORTED',
+      warnings: [...warnings, '审查收尾已取消，未产生共享提交'],
+      message: '审查收尾已取消，未产生共享提交',
+    });
+    if (this.deps.signal?.aborted) return aborted();
+    const created = await this.verifyCandidates(input.beforeIds, input.baseRevision, warnings, input.reviewersCreated === true);
     this.log(`收尾：新增候选 ${String(created.length)} 个，校验问题 ${String(created.filter((item) => item.errors.length > 0).length)} 个`);
 
-    // 读取 Agent 写入的报告正文（audit.md 仅正文；剥离可能误写的 frontmatter）。
-    const reportPath = `.ai-review/audits/${input.auditId}/audit.md`;
     const absolute = path.join(store.repoRoot, reportPath);
     let body = await readFile(absolute, 'utf8').catch(() => null);
     if (body === null) {
@@ -880,11 +911,13 @@ export class Auditor {
     // 注意：复核块必须在门禁复算之后渲染，否则失败错误不会出现在块内。
     const { loadReviewers } = await import('./reviewers.js');
     const { runGateChecks } = await import('./validator.js');
-    const reviewersConfig = await loadReviewers(store.repoRoot);
-    let gateMode: 'none' | 'smoke' | 'declared' = reviewersConfig.verifyGateOnAuditFinalize;
+    const reviewersConfig = await loadReviewers(store.repoRoot, this.deps.candidateSource);
+    const gateMode: 'none' | 'smoke' | 'declared' = reviewersConfig.verifyGateOnAuditFinalize;
     if (gateMode === 'smoke' && reviewersConfig.auditSmokeCommands.length === 0) {
-      warnings.push('verify_gate_on_audit_finalize=smoke 但 audit_smoke_commands 为空，跳过收尾门禁复算');
-      gateMode = 'none';
+      warnings.push('verify_gate_on_audit_finalize=smoke 但 audit_smoke_commands 为空；相关候选不得提交');
+      for (const candidate of created) {
+        if (candidate.errors.length === 0) candidate.errors.push('smoke 模式必须配置非空 audit_smoke_commands');
+      }
     }
     const gateRechecked: string[] = [];
     if (gateMode !== 'none') {
@@ -908,6 +941,7 @@ export class Auditor {
             onLine: (line: string, _stream: 'stdout' | 'stderr', command: string) => {
               if (line.trim()) this.log(`  [${candidate.id}] ${command.slice(0, 80)}: ${line.slice(0, 300)}`);
             },
+            ...(this.deps.signal ? { signal: this.deps.signal } : {}),
           });
           if (!report.allPassed) {
             candidate.errors.push(`收尾门禁（${gateMode}）未通过：\n${report.formattedEvidenceMarkdown}`);
@@ -921,6 +955,7 @@ export class Auditor {
         }
       }
     }
+    if (this.deps.signal?.aborted) return aborted();
     const validAfterGates = created.filter((item) => item.errors.length === 0).map((item) => item.id);
     // §7.6：复核块在门禁复算之后渲染，失败候选及其错误会进入块内；正文 A 类列表同步过滤。
     const block = renderVerificationBlock({
@@ -971,10 +1006,9 @@ export class Auditor {
     let recoveryReason: AuditFinalizeResult['reason'];
     let recoveryDetail: string | undefined;
     if (validAfterGates.length > 0 || input.runError === null) {
+      if (this.deps.signal?.aborted) return aborted();
       const scopeLabel = input.targetPath || 'repo';
-      // §5.6 三分支：按路径级提交探针判定（Git=HEAD；SVN=相关路径 last-changed-revision），
-      // 提交报错时用提交版本中的 audit.md 内容核对，避免把并发提交误当成本次收尾。
-      const writtenAudit = await readFile(path.join(store.repoRoot, reportPath), 'utf8').catch(() => null);
+      // §5.6 三分支：按路径级提交探针判定；探针前进后必须核对完整路径集合与逐文件内容。
       // SVN 下目录 revision 不随子文件修改前进：探针至少覆盖 audit.md 本身。
       const probePaths = [reportPath, ...validAfterGates.map((id) => `.ai-review/${id}`)];
       const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
@@ -985,7 +1019,6 @@ export class Auditor {
         paths: commitPaths,
         verifyEntries: commitEntries,
       });
-      void writtenAudit;
       if (commit.success) {
         commitRevision = commit.commitRevision;
         this.log(`已提交审查收尾：${commitRevision?.slice(0, 12) ?? '(无版本号)'}`);
@@ -994,8 +1027,17 @@ export class Auditor {
         const probeAfter = await vcs.getCommitProbe(probePaths).catch(() => null);
         let landed = false;
         if (probeBefore !== null && probeAfter !== null && probeAfter !== probeBefore) {
-          const atCommit = writtenAudit === null ? null : await vcs.readFileAt(probeAfter, reportPath).catch(() => null);
-          landed = atCommit !== null && atCommit === writtenAudit;
+          let complete = true;
+          const actualPaths = await vcs.listCommitPaths?.(probeAfter);
+          const expectedSet = new Set(commitEntries.map((entry) => entry.path));
+          if (!actualPaths || actualPaths.length !== expectedSet.size || actualPaths.some((item) => !expectedSet.has(item))) {
+            complete = false;
+          }
+          for (const entry of commitEntries) {
+            const actual = await vcs.readFileAt(probeAfter, entry.path).catch(() => null);
+            if (actual === null || gitBlobHash(actual) !== entry.blobHash) complete = false;
+          }
+          landed = complete;
         }
         if (landed && probeAfter !== null) {
           commitRevision = probeAfter;
@@ -1053,11 +1095,15 @@ export class Auditor {
     before: Set<string>,
     baseRevision: string,
     warnings: string[],
+    allowNewReviewers = false,
   ): Promise<AuditCandidateResult[]> {
     const { store, vcs } = this.deps;
     // §4.2/G3：owner 路由是 Host 强制规则——Agent 填错 owner 的候选不得进入共享提交。
     const { loadReviewers, resolveOwner } = await import('./reviewers.js');
-    const reviewers = await loadReviewers(store.repoRoot);
+    let reviewers = await loadReviewers(store.repoRoot, this.deps.candidateSource);
+    if (allowNewReviewers && this.deps.candidateSource && await this.deps.candidateSource.readReviewersText() === null) {
+      reviewers = await loadReviewers(store.repoRoot);
+    }
     const after = await store.listCandidateIds();
     const removed = [...before].filter((id) => !after.includes(id));
     for (const id of removed) {

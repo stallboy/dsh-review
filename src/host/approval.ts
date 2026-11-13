@@ -2,7 +2,6 @@ import { readFile, writeFile, rm, stat, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parsePatch, isAiReviewPath } from './patch.js';
-import { parseReviewMarkdown } from './frontmatter.js';
 import { runGateChecks } from './validator.js';
 import { gitBlobHash } from './vcs.js';
 import type { Runner, RunnerRequest } from './runner.js';
@@ -86,20 +85,11 @@ export interface ApprovalDeps {
   sharedSource?: () => Promise<CandidateSource | undefined>;
   /** §7.5 重复候选复检：返回窗口内同指纹被拒候选 id（duplicateOf），无重复返回 null。 */
   checkDuplicate?: () => Promise<string | null>;
+  validateNewRevision?: (previous: ReviewCandidate, latest: ReviewCandidate) => Promise<string[]>;
   /** §7.7/G30：取消请求轮询；在安全检查点（未产生共享提交前）读取并中止。 */
   shouldCancel?: () => boolean;
   /** §7.7：取消信号，用于终止批准回退中的 Runner。 */
   signal?: AbortSignal;
-}
-
-/** §5.5：commit 内容核对用——指定版本中的 review.md 是否为 approved 且 approval 非空。 */
-function isApprovedReviewText(text: string): boolean {
-  try {
-    const parsed = parseReviewMarkdown(text);
-    return parsed.meta.status === 'approved' && parsed.meta.approval !== null;
-  } catch {
-    return false;
-  }
 }
 
 interface Backup {
@@ -158,7 +148,7 @@ export class ApprovalOrchestrator {
       log(`批准流程开始（第 ${String(attempt)}/${String(maxAttempts)} 次）`);
       // §7.7：取消请求在安全检查点读取——尚未产生任何共享提交，可安全中止。
       if (this.deps.shouldCancel?.()) {
-        return { status: 'ABORTED', message: '已按取消请求中止（未产生共享提交）', jobId };
+        return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: '已按取消请求中止（未产生共享提交）', jobId };
       }
       // §7.5 步骤 1-4：重读共享事实 → guard/状态 → 判断项 → 提交信息 → 完整性；重复候选 ①。
       const pre = await this.runPrechecks(id, guard, decisions, jobId, log, commitMessage);
@@ -255,6 +245,7 @@ export class ApprovalOrchestrator {
           candidate,
           jobId,
           log,
+          base,
         );
       }
       // §7.5 步骤 7：记录目标业务文件的内容（blob）与模式快照。
@@ -268,11 +259,16 @@ export class ApprovalOrchestrator {
         onLine: (line) => {
           if (line.trim().length > 0) log(`  ${line.slice(0, 500)}`);
         },
+        ...(this.deps.signal ? { signal: this.deps.signal } : {}),
       });
       log(report.allPassed ? '门禁检查全部通过' : '门禁检查存在失败项');
+      if (this.deps.signal?.aborted) {
+        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: '门禁已按取消请求终止，未产生共享提交', jobId };
+      }
       if (!report.allPassed) {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
-        return this.fixOrFallback('GATE_CHECK_FAILED', report.formattedEvidenceMarkdown, candidate, jobId, log);
+        return this.fixOrFallback('GATE_CHECK_FAILED', report.formattedEvidenceMarkdown, candidate, jobId, log, base);
       }
       // §7.5 步骤 9：门禁后重新校验 guard、重复候选（③）与业务内容快照，防止门禁期间夹带未审核代码。
       // 先确认门禁期间基线未漂移（HEAD/相关事实未变化）。
@@ -288,7 +284,7 @@ export class ApprovalOrchestrator {
       }
       if (this.deps.shouldCancel?.()) {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
-        return { status: 'ABORTED', message: '已按取消请求中止（提交前，未产生共享提交）', jobId };
+        return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: '已按取消请求中止（提交前，未产生共享提交）', jobId };
       }
       const duplicate3 = await this.deps.checkDuplicate?.();
       if (duplicate3) {
@@ -384,6 +380,9 @@ export class ApprovalOrchestrator {
           probeBefore,
           probePaths,
           reviewRelPath,
+          expectedReviewText: reviewText,
+          expectedEntries: verifyEntries,
+          expectedDeletions: verifyDeletions,
           backup,
           outOfDate: commit.outOfDate,
           errorOutput: commit.errorOutput,
@@ -435,6 +434,9 @@ export class ApprovalOrchestrator {
     probeBefore: string | null;
     probePaths: string[];
     reviewRelPath: string;
+    expectedReviewText: string;
+    expectedEntries: { path: string; blobHash: string }[];
+    expectedDeletions: string[];
     backup: Backup;
     outOfDate: boolean;
     errorOutput: string;
@@ -455,14 +457,21 @@ export class ApprovalOrchestrator {
       };
     }
     if (probeAfter !== input.probeBefore) {
-      // 探针前进：按提交内容核对——该版本中的 review.md 必须是本次写入的 approved 内容。
-      // （§5.5；不再用可伪造/可能被并发使用的提交主题字符串判定。）
       const text = await vcs.readFileAt(probeAfter, input.reviewRelPath).catch(() => null);
-      if (text !== null && isApprovedReviewText(text)) {
-        input.log(`提交命令报错但提交已落地且内容匹配（${probeAfter.slice(0, 12)}），按成功继续`);
+      let complete = text === input.expectedReviewText;
+      for (const entry of input.expectedEntries) {
+        const actual = await vcs.readFileAt(probeAfter, entry.path).catch(() => null);
+        if (actual === null || gitBlobHash(actual) !== entry.blobHash) complete = false;
+      }
+      for (const relPath of input.expectedDeletions) {
+        const actual = await vcs.readFileAt(probeAfter, relPath).catch(() => null);
+        if (actual !== null) complete = false;
+      }
+      if (complete) {
+        input.log(`提交命令报错但提交已落地且完整内容匹配（${probeAfter.slice(0, 12)}），按成功继续`);
         return {
           status: 'COMMITTED',
-          message: '提交命令超时/报错，但 VCS 中提交已存在且内容匹配，按成功处理。',
+          message: '提交命令超时/报错，但 VCS 中提交已存在且完整内容匹配，按成功处理。',
           commitRevision: probeAfter,
           jobId: input.jobId,
         };
@@ -470,8 +479,8 @@ export class ApprovalOrchestrator {
       return {
         status: 'RECOVERY_REQUIRED',
         reason: 'COMMIT_OUTCOME_UNKNOWN',
-        message: '提交失败但提交探针已前进且提交内容不匹配，无法确认提交归属；禁止回滚，请人工核对。',
-        detail: `probe=${probeAfter.slice(0, 12)}，${input.reviewRelPath} 在该版本不是 approved 或不可读`,
+        message: '提交失败但提交探针已前进且本次预期完整内容不匹配，无法确认提交归属；禁止回滚，请人工核对。',
+        detail: `probe=${probeAfter.slice(0, 12)}，review/业务内容/删除集合中至少一项不匹配或不可读`,
         jobId: input.jobId,
       };
     }
@@ -500,6 +509,13 @@ export class ApprovalOrchestrator {
     try {
       // §7.1：批准流程重读候选必须使用共享快照源（本地未提交改动不得参与 guard/状态判定）。
       const source = this.deps.sharedSource ? await this.deps.sharedSource() : undefined;
+      if (source) {
+        const { month, slug } = this.deps.store.resolveCandidateDir(id);
+        if (await source.hasLocalChanges(month, slug)) {
+          log('候选存在本地或暂存改动，共享/本地边界无法证明');
+          return { candidate: null, conflict: 'guard', status: 'local' };
+        }
+      }
       const detail = await this.deps.store.get(id, null, source);
       const candidate = detail.candidate;
       if (candidate.parseError) {
@@ -583,7 +599,7 @@ export class ApprovalOrchestrator {
     if (messageError) {
       return { outcome: { status: 'ABORTED', reason: 'COMMIT_MESSAGE_MISMATCH', message: messageError, jobId } };
     }
-    const validation = await store.validateFullCandidate(candidate);
+    const validation = await store.validateFullCandidate(candidate, reload.source);
     if (validation.length > 0) {
       return {
         outcome: {
@@ -651,6 +667,7 @@ export class ApprovalOrchestrator {
     candidate: ReviewCandidate,
     jobId: string,
     log: (line: string) => void,
+    baseRevision: string,
   ): Promise<ApprovalOutcome> {
     const { store, vcs, settings } = this.deps;
     if (!settings.autoFixOnFailure) {
@@ -672,6 +689,7 @@ export class ApprovalOrchestrator {
       mode: 'RESOLVE_CONFLICT',
       comments: candidate.meta.comments.filter((comment) => comment.status !== 'resolved'),
       failureDetail: detail,
+      baseRevision,
       workingTree: 'clean_base',
       log,
       ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
@@ -708,16 +726,9 @@ export class ApprovalOrchestrator {
     try {
       const { store } = this.deps;
       const latest = await store.get(candidate.id, null);
-      const validationErrors: string[] = [];
-      if (latest.candidate.parseError) validationErrors.push(latest.candidate.parseError);
-      if (latest.candidate.meta.status !== 'pending') {
-        validationErrors.push(`AI 新版本状态必须是 pending，当前为 ${latest.candidate.meta.status}`);
-      }
-      if (latest.candidate.meta.approval !== null) validationErrors.push('AI 新版本的 approval 必须为 null');
-      if (latest.candidate.meta.currentRevision <= candidate.meta.currentRevision) {
-        validationErrors.push(`AI 未推进版本：current_revision 仍为 ${String(latest.candidate.meta.currentRevision)}`);
-      }
-      validationErrors.push(...await store.validateFullCandidate(latest.candidate));
+      const validationErrors: string[] = this.deps.validateNewRevision
+        ? await this.deps.validateNewRevision(candidate, latest.candidate)
+        : [];
       const current = latest.candidate.meta.revisions.find(
         (revision) => revision.id === latest.candidate.meta.currentRevision,
       );
@@ -728,22 +739,28 @@ export class ApprovalOrchestrator {
         } catch {
           validationErrors.push(`新补丁不存在：${current.patch}`);
         }
-        if (patchText !== null && parsePatch(patchText).paths.some((file) => isAiReviewPath(file))) {
-          validationErrors.push('新补丁包含禁止路径（.ai-review/.tmp/node_modules/.git/.svn）');
-        }
       }
-      if (validationErrors.length === 0 && patchText !== null) {
-        // §7.4：补丁必须能在干净基线上应用；验证后立即还原。
-        const tempFixPatch = path.join(tmpdir(), `dcr-fix-${String(process.pid)}-${String(Date.now())}.patch`);
-        await writeFile(tempFixPatch, patchText, 'utf8');
-        let applied;
-        try {
-          applied = await this.deps.vcs.applyPatch(tempFixPatch, false);
-        } finally {
-          await rm(tempFixPatch, { force: true }).catch(() => undefined);
+      if (!this.deps.validateNewRevision) {
+        if (latest.candidate.parseError) validationErrors.push(latest.candidate.parseError);
+        if (latest.candidate.meta.status !== 'pending') validationErrors.push('AI 新版本状态必须是 pending');
+        if (latest.candidate.meta.approval !== null) validationErrors.push('AI 新版本的 approval 必须为 null');
+        if (latest.candidate.meta.currentRevision <= candidate.meta.currentRevision) validationErrors.push('AI 未推进版本');
+        validationErrors.push(...await store.validateFullCandidate(latest.candidate));
+        if (patchText !== null && parsePatch(patchText).paths.some((file) => isAiReviewPath(file))) {
+          validationErrors.push('新补丁包含禁止路径');
         }
-        await this.deps.vcs.revertBusinessWorkspace().catch(() => undefined);
-        if (!applied.ok) validationErrors.push(`AI 新补丁无法在基线干净应用：${applied.message}`);
+        if (validationErrors.length === 0 && patchText !== null) {
+          const tempFixPatch = path.join(tmpdir(), `dcr-fix-${String(process.pid)}-${String(Date.now())}.patch`);
+          await writeFile(tempFixPatch, patchText, 'utf8');
+          let applied;
+          try {
+            applied = await this.deps.vcs.applyPatch(tempFixPatch, false);
+          } finally {
+            await rm(tempFixPatch, { force: true }).catch(() => undefined);
+          }
+          await this.deps.vcs.revertBusinessWorkspace().catch(() => undefined);
+          if (!applied.ok) validationErrors.push(`AI 新补丁无法在基线干净应用：${applied.message}`);
+        }
       }
       if (validationErrors.length > 0 || !current || patchText === null) {
         await this.restoreWithCleanup(backup, candidate.dirPath, entriesBefore);

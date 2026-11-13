@@ -83,6 +83,8 @@ export function quickReviewInvariants(candidate: ReviewInvariantInput['candidate
     if (!comment.id) errors.push(`I11: ${at}.id 不能为空`);
     else if (commentIds.has(comment.id)) errors.push(`I11: 评论 id 重复：${comment.id}`);
     commentIds.add(comment.id);
+    if (!comment.author.trim()) errors.push(`I11: ${at}.author 不能为空`);
+    if (comment.createdAt !== undefined) parseTime(comment.createdAt, `${at}.created_at`, errors);
     if (!knownIds.has(comment.revision)) errors.push(`I11: ${at}.revision=${String(comment.revision)} 指向不存在的版本`);
     const inline = comment.file !== '' || comment.line !== 0;
     if (inline) {
@@ -107,29 +109,40 @@ export function quickReviewInvariants(candidate: ReviewInvariantInput['candidate
 
   // I13：时间可解析且含时区偏移。
   parseTime(meta.createdAt, 'created_at', errors);
-  if (meta.updatedAt) parseTime(meta.updatedAt, 'updated_at', errors);
+  parseTime(meta.updatedAt, 'updated_at', errors);
   if (meta.rejection) parseTime(meta.rejection.rejectedAt, 'rejection.rejected_at', errors);
   if (meta.approval) parseTime(meta.approval.approvedAt, 'approval.approved_at', errors);
 
-  // I7：approval.gate_checks 快照等于批准时顶层 gate_checks；gate_results 一一对应且全通过。
-  if (meta.approval?.gateChecks) {
-    const snapshot = meta.approval.gateChecks;
-    const top = [...meta.gateChecks];
-    if (JSON.stringify(snapshot) !== JSON.stringify(top)) {
+  // I7：批准快照的所有字段必填，门禁逐条对应且数值非负。
+  if (meta.approval) {
+    if (!meta.approval.gateChecks) errors.push('I7: approval.gate_checks 是必填快照');
+    if (!meta.approval.gateResults) errors.push('I7: approval.gate_results 是必填逐条结果');
+    const snapshot = meta.approval.gateChecks ?? [];
+    if (meta.approval.gateChecks && JSON.stringify(snapshot) !== JSON.stringify(meta.gateChecks)) {
       errors.push('I7: approval.gate_checks 快照与顶层 gate_checks 不一致（疑似外部改写）');
     }
     const results = meta.approval.gateResults ?? [];
-    if (results.length !== snapshot.length) {
+    if (meta.approval.gateResults && results.length !== snapshot.length) {
       errors.push(`I7: gate_results 数量（${String(results.length)}）与快照（${String(snapshot.length)}）不一致`);
-    } else if (results.some((result, index) => result.command !== snapshot[index] || result.exit_code !== 0)) {
-      errors.push('I7: gate_results 与快照不一一对应或存在未通过项');
     }
+    results.forEach((result, index) => {
+      if (result.command !== snapshot[index]) errors.push(`I7: gate_results[${String(index)}].command 与快照不一致`);
+      if (!Number.isInteger(result.exit_code) || result.exit_code < 0 || result.exit_code !== 0) {
+        errors.push(`I7: gate_results[${String(index)}].exit_code 必须为非负整数，批准时还必须为 0`);
+      }
+      if (!Number.isFinite(result.duration_ms) || result.duration_ms < 0) {
+        errors.push(`I7: gate_results[${String(index)}].duration_ms 必须为非负有限数`);
+      }
+    });
   }
 
-  // I8：human_decisions[].id 唯一；批准快照的 confirmed/waived 必须是精确集合。
+  // I8：human_decisions[].id 唯一且非空；批准快照的 confirmed/waived 必须是精确集合。
   const decisionIds = meta.humanDecisions.map((decision) => decision.id);
+  if (decisionIds.some((id) => !id)) errors.push('I8: human_decisions.id 不能为空');
   if (new Set(decisionIds).size !== decisionIds.length) errors.push('I8: human_decisions 存在重复 id');
   if (meta.approval) {
+    if (!meta.approval.confirmedDecisions) errors.push('I8: approval.confirmed_decisions 是必填数组（无项时为 []）');
+    if (!meta.approval.waivedDecisions) errors.push('I8: approval.waived_decisions 是必填数组（无项时为 []）');
     const valid = new Set(decisionIds);
     const confirmed = meta.approval.confirmedDecisions ?? [];
     const waived = meta.approval.waivedDecisions ?? [];

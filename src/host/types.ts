@@ -168,6 +168,12 @@ export interface PatchStats {
   entries: PatchFileStat[];
 }
 
+export interface PatchCheckDiagnostic {
+  state: 'clean' | 'conflicted' | 'unknown';
+  checkedBase: string;
+  checkedAt: string;
+}
+
 export interface CandidateSummary {
   id: string;
   title: string;
@@ -198,6 +204,7 @@ export interface CandidateSummary {
   approvalCommitRevision?: string;
   /** §5.5：派生定位三态诊断；ambiguous/unknown 不得阻塞队列或显示为失败。 */
   approvalCommitLookup?: 'found' | 'ambiguous' | 'unknown';
+  patchCheck?: PatchCheckDiagnostic;
   /** §7.1：候选存在未提交/本地改动——仅诊断展示，不参与共享流程、不计入共享 KPI。 */
   local?: boolean;
   parseError?: string;

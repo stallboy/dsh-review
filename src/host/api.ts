@@ -9,7 +9,6 @@ import { JobManager } from './jobs.js';
 import { RouteTable, blockedByRunningAudit, holdsRepoLock, isAuditSelfManaged } from './routes.js';
 import { Runner } from './runner.js';
 import { loadReviewers } from './reviewers.js';
-import { AuditArchive } from './audit-archive.js';
 import { ReviewStore } from './store.js';
 import { detectVcs, suggestOwner, validateSettings } from './settings.js';
 import type {
@@ -162,51 +161,42 @@ export class ReviewApi implements ApiHost {
   private async runScheduledAuditOnce(): Promise<void> {
     const runtime = await this.runtimeFor(new URL('http://local/')).catch(() => null);
     if (!runtime || !this.deps.createAuditSession) return;
-    const running = this.jobs.list().find((job) => job.status === 'running');
-    if (running) return;
-    // §7.6/§7.7：执行租约参与全部互斥——有未释放租约时跳过本次定时审查。
-    if (this.auditLifecycle.blockingLeaseFor(runtime.root)) return;
-    const baseRevision = await runtime.vcs.getCurrentBase().catch(() => null);
-    if (!baseRevision) return;
-    const clean = await runtime.vcs.ensureCleanWorkspace().catch(() => ({ clean: false, message: 'unknown' }));
-    if (!clean.clean) return;
-    const owner = await this.ownerFor(runtime.root);
-    const now = new Date();
-    // §4.7：定時审查同样由 Host 生成 audit_id 与报告路径，并创建可追踪 Job + 执行租约。
-    const archive = new AuditArchive(runtime.root);
-    const auditId = await archive.nextAuditId('', now);
-    const reportPath = `.ai-review/audits/${auditId}/audit.md`;
-    const sharedSource = await sharedSourceFor(runtime);
-    const userPrompt = await buildAuditPrompt({
-      repoRoot: runtime.root,
-      vcsType: runtime.vcsType,
-      owner,
-      targetPath: '',
-      note: '定时审查（trigger: scheduled）',
-      baseRevision,
-      reportPath,
-      mode: 'session',
-      now,
-      ...(sharedSource ? { source: sharedSource } : {}),
+    await this.withWriteLock(runtime.root, async () => {
+      if (this.jobs.list().some((job) => job.status === 'running')) return;
+      if (this.auditLifecycle.blockingLeaseFor(runtime.root)) return;
+      const baseRevision = await runtime.vcs.getCurrentBase().catch(() => null);
+      if (!baseRevision) return;
+      const clean = await runtime.vcs.ensureCleanWorkspace().catch(() => ({ clean: false, message: 'unknown' }));
+      const owner = await this.ownerFor(runtime.root);
+      const now = new Date();
+      const { auditId, reportPath } = await this.auditRuntime.beginAuditLeaseUnderLock(
+        runtime,
+        { targetPath: '', baseRevision, owner, now, trigger: 'scheduled' },
+        clean,
+      );
+      try {
+        const sharedSource = await sharedSourceFor(runtime);
+        const userPrompt = await buildAuditPrompt({
+          repoRoot: runtime.root,
+          vcsType: runtime.vcsType,
+          owner,
+          targetPath: '',
+          note: '定时审查（trigger: scheduled）',
+          baseRevision,
+          reportPath,
+          mode: 'session',
+          now,
+          ...(sharedSource ? { source: sharedSource } : {}),
+        });
+        const prompt = composeSessionPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.auditRuntime.ownerRoutingBlock(runtime.root, sharedSource)}`);
+        const created = await this.deps.createAuditSession?.({ cwd: runtime.root, title: '定时仓库审查', prompt, ownerSessionId: '' });
+        if (!created) throw new Error('定时审查会话创建未返回结果');
+        this.auditRuntime.trackAuditSession(runtime, auditId, created.sessionId);
+      } catch (error) {
+        await this.auditRuntime.releaseLeaseById(auditId);
+        throw error;
+      }
     });
-    const prompt = composeSessionPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.auditRuntime.ownerRoutingBlock(runtime.root)}`);
-    const candidateIdsBefore = await runtime.store.listCandidateIds();
-    const created = await this.deps.createAuditSession({ cwd: runtime.root, title: '定时仓库审查', prompt, ownerSessionId: '' });
-    await this.auditRuntime.upsertLease({
-      auditId,
-      root: runtime.root,
-      targetPath: '',
-      trigger: 'scheduled',
-      baseRevision,
-      owner,
-      createdAt: now.toISOString(),
-      candidateIdsBefore,
-      state: 'active',
-    });
-    // 跟踪 Job 保持 running，直到 /audit/finalize（或 release / 取消）完成它。
-    this.auditRuntime.startAuditTrackingJob(auditId);
-    this.auditRuntime.armAuditLeaseTimeout(auditId);
-    void created;
   }
 
   withWriteLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
@@ -401,7 +391,7 @@ export class ReviewApi implements ApiHost {
         diagnostics.push('仓库缺少 .ai-review 目录');
       }
       try {
-        counts = await runtime.store.listStatusCounts(owner);
+        counts = await runtime.store.listStatusCounts(owner, await sharedSourceFor(runtime));
       } catch (error) {
         diagnostics.push(`无法统计队列：${error instanceof Error ? error.message : String(error)}`);
       }
@@ -534,7 +524,7 @@ export class ReviewApi implements ApiHost {
     }
     // §7.4：窗口内与被拒候选完全重复的候选被阻止批准；人工重开（/reopen）可豁免。
     {
-      const reviewersCfg = await loadReviewers(store.repoRoot);
+      const reviewersCfg = await loadReviewers(store.repoRoot, await sharedSourceFor(runtime));
       if (reviewersCfg.rejectionMemoryDays > 0) {
         const queue = await store.list({}, null, null, reviewersCfg.rejectionMemoryDays, await sharedSourceFor(runtime));
         const duplicate = queue.items.find((item) => item.id === id);
@@ -546,7 +536,7 @@ export class ReviewApi implements ApiHost {
     const job = this.jobs.start('approve', async (log, jobId, signal) => {
       // §6/§7.5 重复候选复检闭包：供受理后、同步后、门禁后三处复检（G35）。
       const checkDuplicate = async (): Promise<string | null> => {
-        const reviewersCfg = await loadReviewers(store.repoRoot);
+        const reviewersCfg = await loadReviewers(store.repoRoot, await sharedSourceFor(runtime));
         if (reviewersCfg.rejectionMemoryDays <= 0) return null;
         const queue = await store.list({}, null, null, reviewersCfg.rejectionMemoryDays, await sharedSourceFor(runtime));
         return queue.items.find((item) => item.id === id && !item.local)?.duplicateOf ?? null;
@@ -557,6 +547,7 @@ export class ReviewApi implements ApiHost {
         settings: this.settings,
         makeRunner: (request) => new Runner(request),
         checkDuplicate,
+        validateNewRevision: (previous, latest) => this.writers.validateNewRevision(runtime, previous, latest, 'ai'),
         // §7.1：批准流程内部重读候选必须绑定共享快照（每次重建，同步后重绑）。
         sharedSource: () => sharedSourceFor(runtime),
         // §7.7/G30：批准流程在安全检查点读取取消标志；Runner 由取消信号终止。
@@ -588,13 +579,14 @@ export class ReviewApi implements ApiHost {
    * overall opinion, so both paths validate and run identically.
    */
   async startAiFixJob(runtime: Runtime, id: string, guard: ConcurrencyGuard): Promise<JobRecord> {
-    // §7.7 审查互斥由 routes.ts 统一检查（/ai-fix 为 job-start；/comments 附带 autoFix 时
-    // 已在 candidate-write 类别下受理，其后的 Job 启动沿用同一次受理结论）。
     const { store, vcs } = runtime;
-    const detail = await store.get(id, null);
-    await this.writers.requireOwnerOf(store, id); // §12.2：非 Owner 403（takeover 除外）
-    await this.writers.requireSharedCandidate(runtime, id); // §7.1：AI 修复只能作用于共享事实
-    // §7.4/G23：显式 ai-fix 必须至少有一条 unresolved/partial 评论作为输入。
+    const acceptedSource = await sharedSourceFor(runtime);
+    if (!acceptedSource) throw new ApiError(409, 'conflict', '无法建立共享 VCS 快照，AI 修复已中止');
+    const detail = await store.get(id, null, acceptedSource);
+    if (detail.candidate.parseError) throw new ApiError(422, 'bad_request', detail.candidate.parseError);
+    const me = await this.ownerFor(store.repoRoot);
+    if (detail.candidate.meta.owner !== me) throw new ApiError(403, 'forbidden', `当前操作者 ${me} 不是候选 Owner`);
+    await this.writers.requireSharedCandidate(runtime, id);
     const actionable = detail.candidate.meta.comments.filter((comment) => comment.status !== 'resolved');
     if (actionable.length === 0) {
       throw new ApiError(409, 'conflict', '没有未解决的评论可作为 AI 修复输入；请先提出具体意见');
@@ -609,24 +601,45 @@ export class ReviewApi implements ApiHost {
     const clean = await vcs.ensureCleanWorkspace();
     if (!clean.clean) throw new ApiError(409, 'conflict', clean.message);
     return this.jobs.start('ai_fix', (log, jobId, signal): Promise<AiFixOutcome> => this.withWriteLock(runtime.root, async () => {
-      const comments = detail.candidate.meta.comments.filter((comment) => comment.status !== 'resolved');
-      const patch = await store.currentPatch(detail.candidate);
+      const source = await sharedSourceFor(runtime);
+      if (!source) return this.writers.aborted('INVALID_CANDIDATE', '无法重新建立共享 VCS 快照', jobId);
+      const { month, slug } = store.resolveCandidateDir(id);
+      if (await source.hasLocalChanges(month, slug)) {
+        return this.writers.aborted('CONCURRENCY_MISMATCH', '候选存在本地或暂存改动，共享/本地边界无法证明', jobId);
+      }
+      const fresh = await store.get(id, null, source);
+      const candidate = fresh.candidate;
+      if (candidate.parseError) return this.writers.aborted('INVALID_CANDIDATE', candidate.parseError, jobId);
+      if (candidate.meta.currentRevision !== guard.expectedRevision || candidate.meta.owner !== guard.expectedOwner
+        || new Date(candidate.meta.updatedAt).getTime() !== new Date(guard.expectedUpdatedAt).getTime()) {
+        return this.writers.aborted('CONCURRENCY_MISMATCH', '候选已在排队期间更新，旧 guard 不得继续使用', jobId);
+      }
+      if (candidate.meta.status !== 'pending' && candidate.meta.status !== 'changes_requested') {
+        return this.writers.aborted('STATE_CONFLICT', `当前状态 ${candidate.meta.status} 不允许 AI 修复`, jobId);
+      }
+      const comments = candidate.meta.comments.filter((comment) => comment.status !== 'resolved');
+      if (comments.length === 0) return this.writers.aborted('STATE_CONFLICT', '锁内复核时没有未解决评论', jobId);
+      const cleanNow = await vcs.ensureCleanWorkspace();
+      if (!cleanNow.clean) return this.writers.aborted('DIRTY_WORKSPACE', `锁内复核发现业务工作区不干净：${cleanNow.message}`, jobId);
+      const patch = await store.currentPatch(candidate, source);
       const { readFile: readFs, readdir } = await import('node:fs/promises');
-      // §5.6：提交前快照候选目录，AI 修复失败或提交被证明不存在时恢复。
-      const reviewBackup = await readFs(detail.candidate.reviewPath, 'utf8');
-      const entriesBefore = new Set(await readdir(detail.candidate.dirPath).catch(() => [] as string[]));
+      const reviewBackup = await readFs(candidate.reviewPath, 'utf8');
+      const entriesBefore = new Set(await readdir(candidate.dirPath).catch(() => [] as string[]));
       let workingTree: 'clean_base' | 'current_patch_applied' = 'clean_base';
       if (this.settings.runner !== 'manual') {
-        const applied = await vcs.applyPatch(patch.path, false);
-        if (!applied.ok) throw new Error(`当前版本补丁无法应用到工作区，无法继续 AI 修复：${applied.message}`);
+        const applied = await this.writers.applyPatchText(vcs, patch.text, false);
+        if (!applied.ok) {
+          await vcs.revertBusinessWorkspace().catch(() => undefined);
+          return this.writers.aborted('INVALID_CANDIDATE', `当前共享补丁无法严格应用：${applied.message}`, jobId);
+        }
         workingTree = 'current_patch_applied';
-        log(`已把当前版本补丁 ${patch.path.split(/[\\/]/).pop() ?? ''} 应用到工作区`);
+        log(`已应用共享快照中的当前补丁 ${patch.path.split(/[\\/]/).pop() ?? ''}`);
       }
       const runner = new Runner({
         kind: this.settings.runner,
         settings: this.settings,
         store,
-        candidate: detail.candidate,
+        candidate,
         mode: 'ADDRESS_FEEDBACK',
         comments,
         workingTree,
@@ -642,10 +655,8 @@ export class ReviewApi implements ApiHost {
       }
       if (result.manual) return { status: 'MANUAL_REQUIRED', message: 'AI 修复生成了人工执行提示', manualPrompt: result.prompt ?? '', jobId } satisfies AiFixOutcome;
       if (!result.success) {
-        await this.writers.restoreAppendedRevision(detail.candidate, reviewBackup, entriesBefore);
-        if (result.aborted) {
-          return this.writers.aborted('CANCELLED', 'AI 修复已取消（未产生共享提交）', jobId);
-        }
+        await this.writers.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
+        if (result.aborted) return this.writers.aborted('CANCELLED', 'AI 修复已取消（未产生共享提交）', jobId);
         return this.writers.aborted(
           'RUNNER_FAILED',
           `AI 修复失败：${result.errorMessage ?? '未知错误'}${result.outputTail ? `\n\n${result.outputTail.slice(-4000)}` : ''}`,
@@ -653,31 +664,41 @@ export class ReviewApi implements ApiHost {
         );
       }
       const latest = await store.get(id, null);
+      const validationErrors = await this.writers.validateNewRevision(runtime, candidate, latest.candidate, 'ai');
+      if (validationErrors.length > 0) {
+        await this.writers.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
+        return this.writers.aborted('INVALID_CANDIDATE', `AI 新版本未通过提交前校验，已恢复：\n${validationErrors.join('\n')}`, jobId);
+      }
+      const currentSnapshot = await sharedSourceFor(runtime);
+      const beforeSnapshot = await source.snapshotId();
+      const afterSnapshot = await currentSnapshot?.snapshotId();
+      if (beforeSnapshot !== null && afterSnapshot !== beforeSnapshot) {
+        return this.writers.recoveryRequired('COMMIT_OUTCOME_UNKNOWN', 'Runner 期间 VCS 快照发生变化，禁止覆盖或猜测恢复', jobId, `before=${beforeSnapshot}; after=${afterSnapshot ?? 'unknown'}`);
+      }
+      const current = latest.candidate.meta.revisions.find((revision) => revision.id === latest.candidate.meta.currentRevision);
       const writtenReview = await readFs(latest.candidate.reviewPath, 'utf8').catch(() => null);
+      const writtenPatch = current ? await readFs(path.join(latest.candidate.dirPath, current.patch), 'utf8').catch(() => null) : null;
+      const expectedFiles = [
+        ...(writtenReview !== null ? [{ relPath: relative(store.repoRoot, latest.candidate.reviewPath), text: writtenReview }] : []),
+        ...(current && writtenPatch !== null ? [{ relPath: relative(store.repoRoot, path.join(latest.candidate.dirPath, current.patch)), text: writtenPatch }] : []),
+      ];
       const outcome = await this.writers.commitAndClassify({
         runtime,
-        message: `review(${id}): AI 修复生成版本 ${String(result.newRevisionId ?? latest.candidate.meta.currentRevision)}`,
+        message: `review(${id}): AI 修复生成版本 ${String(latest.candidate.meta.currentRevision)}`,
         paths: [relative(store.repoRoot, latest.candidate.dirPath)],
         probePaths: [relative(store.repoRoot, latest.candidate.reviewPath)],
-        ...(writtenReview !== null
-          ? { expectedFiles: [{ relPath: relative(store.repoRoot, latest.candidate.reviewPath), text: writtenReview }] }
-          : {}),
+        expectedFiles,
       });
       if (!outcome.landed) {
         if (outcome.outcome === 'RECOVERY_REQUIRED') {
-          return this.writers.recoveryRequired(
-            'COMMIT_OUTCOME_UNKNOWN',
-            `AI 修复新版本提交结果无法确定，现场保留待人工核对：${outcome.detail}`,
-            jobId,
-            outcome.detail,
-          );
+          return this.writers.recoveryRequired('COMMIT_OUTCOME_UNKNOWN', `AI 修复新版本提交结果无法确定，现场保留待人工核对：${outcome.detail}`, jobId, outcome.detail);
         }
-        await this.writers.restoreAppendedRevision(detail.candidate, reviewBackup, entriesBefore);
+        await this.writers.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
         return this.writers.aborted('COMMIT_FAILED', `AI 已生成新版本，但提交 .ai-review 失败（已恢复）：${outcome.detail}`, jobId, outcome.detail);
       }
-      return this.writers.committed(`AI 修复完成，版本 ${String(result.newRevisionId ?? latest.candidate.meta.currentRevision)}`, jobId, {
+      return this.writers.committed(`AI 修复完成，版本 ${String(latest.candidate.meta.currentRevision)}`, jobId, {
         commitRevision: outcome.commitRevision,
-        ...(result.newRevisionId !== undefined ? { newRevision: Number(result.newRevisionId) } : {}),
+        newRevision: latest.candidate.meta.currentRevision,
       });
     }));
   }

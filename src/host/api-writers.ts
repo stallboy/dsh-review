@@ -6,6 +6,7 @@ import { AuditArchive } from './audit-archive.js';
 import { isAiReviewPath, parsePatch } from './patch.js';
 import { loadReviewers, resolveOwner } from './reviewers.js';
 import { runGateChecks } from './validator.js';
+import { Runner } from './runner.js';
 import type { ReviewStore } from './store.js';
 import type { AiFixAbortReason, AiFixOutcome, AiFixRecoveryReason, JobRecord, ReviewCandidate } from './types.js';
 import { ApiError } from './types.js';
@@ -87,7 +88,7 @@ export class Writers {
    * §7.3/§7.4/§7.5：把补丁文本物化到仓库外临时文件后应用（git/svn apply 需要文件输入）。
    * 临时目录用 `mkdtemp` 隔离并在 finally 中整体删除，避免 pid+时间戳命名在高并发下撞名。
    */
-  private async applyPatchText(vcs: VcsAdapter, text: string, threeWay: boolean): Promise<{ ok: boolean; message: string }> {
+  async applyPatchText(vcs: VcsAdapter, text: string, threeWay: boolean): Promise<{ ok: boolean; message: string }> {
     const { mkdtemp, writeFile: writeTmp, rm: rmTmp } = await import('node:fs/promises');
     const os = await import('node:os');
     const dir = await mkdtemp(path.join(os.tmpdir(), 'dcr-patch-'));
@@ -98,6 +99,111 @@ export class Writers {
     } finally {
       await rmTmp(dir, { recursive: true, force: true }).catch(() => undefined);
     }
+  }
+
+  async validateNewRevision(
+    runtime: Runtime,
+    previous: ReviewCandidate,
+    latest: ReviewCandidate,
+    author: 'ai' | 'human',
+  ): Promise<string[]> {
+    const errors: string[] = [];
+    if (latest.parseError) errors.push(latest.parseError);
+    const expectedRevision = previous.meta.currentRevision + 1;
+    if (latest.meta.currentRevision !== expectedRevision) {
+      errors.push(`版本必须恰好推进到 ${String(expectedRevision)}，实际为 ${String(latest.meta.currentRevision)}`);
+    }
+    if (latest.meta.revisions.length !== previous.meta.revisions.length + 1) {
+      errors.push('revisions 必须恰好追加一个版本，不得覆盖或删除历史版本');
+    }
+    const preserves = (before: Record<string, unknown> | undefined, after: Record<string, unknown> | undefined): boolean =>
+      Object.entries(before ?? {}).every(([key, value]) => JSON.stringify(after?.[key]) === JSON.stringify(value));
+    if (latest.meta.createdAt !== previous.meta.createdAt) errors.push('created_at 在迭代中必须保持不变');
+    previous.meta.revisions.forEach((oldRevision, index) => {
+      if (latest.meta.revisions[index]?.id !== oldRevision.id) errors.push('历史 revisions 顺序必须保持，只能在末尾追加');
+    });
+    if (latest.meta.reopenedFrom !== previous.meta.reopenedFrom
+      || latest.meta.reopenedReason !== previous.meta.reopenedReason) {
+      errors.push('reopened_from/reopen_reason 只能由人工 /reopen 写入，Runner 不得改写');
+    }
+    for (const oldDecision of previous.meta.humanDecisions) {
+      const nextDecision = latest.meta.humanDecisions.find((decision) => decision.id === oldDecision.id);
+      if (!nextDecision || !preserves(oldDecision.extra, nextDecision.extra)) {
+        errors.push(`human_decisions[${oldDecision.id}] 的既有未知嵌套键被删除或改写`);
+      }
+    }
+    const sharedSource = await sharedSourceFor(runtime);
+    if (!sharedSource) errors.push('无法建立历史共享快照，不能证明历史补丁未被改写');
+    for (const oldRevision of previous.meta.revisions) {
+      const currentRevision = latest.meta.revisions.find((revision) => revision.id === oldRevision.id);
+      if (!currentRevision
+        || currentRevision.baseRevision !== oldRevision.baseRevision
+        || currentRevision.patch !== oldRevision.patch
+        || currentRevision.author !== oldRevision.author
+        || !preserves(oldRevision.extra, currentRevision.extra)) {
+        errors.push(`历史 revision ${String(oldRevision.id)} 的元数据被改写`);
+      }
+      if (sharedSource) {
+        const oldText = await sharedSource.readPatchText(previous.month, previous.slug, oldRevision.patch);
+        const localText = await readFile(path.join(latest.dirPath, oldRevision.patch), 'utf8').catch(() => null);
+        if (oldText === null || localText !== oldText) errors.push(`历史补丁 ${oldRevision.patch} 被改写或不可证明`);
+      }
+    }
+    const oldHistory = previous.sections.history.trim();
+    if (oldHistory && !latest.sections.history.trimStart().startsWith(oldHistory)) {
+      errors.push('历史审核记录被删改');
+    }
+    for (const oldComment of previous.meta.comments) {
+      const nextComment = latest.meta.comments.find((comment) => comment.id === oldComment.id);
+      if (!nextComment
+        || nextComment.author !== oldComment.author
+        || nextComment.content !== oldComment.content
+        || nextComment.revision !== oldComment.revision
+        || nextComment.file !== oldComment.file
+        || nextComment.line !== oldComment.line
+        || nextComment.side !== oldComment.side
+        || JSON.stringify(nextComment.anchor) !== JSON.stringify(oldComment.anchor)
+        || !preserves(oldComment.extra, nextComment.extra)) {
+        errors.push(`历史评论 ${oldComment.id} 被删除或篡改`);
+      }
+    }
+    if (!preserves(previous.meta.extra, latest.meta.extra)) {
+      errors.push('未知顶层 Frontmatter 键被删改');
+    }
+    if (latest.meta.status !== 'pending') errors.push(`新版本状态必须是 pending，实际为 ${latest.meta.status}`);
+    if (latest.meta.approval !== null) errors.push('新版本 approval 必须为 null');
+    if (latest.meta.rejection !== null) errors.push('新版本 rejection 必须为 null');
+    if (new Date(latest.meta.updatedAt).getTime() <= new Date(previous.meta.updatedAt).getTime()) {
+      errors.push('updated_at 必须严格大于上一共享版本');
+    }
+    if (latest.meta.commitMessage.split(/\r?\n/, 1)[0] !== latest.meta.title) {
+      errors.push('commit_message 首行必须与 title 完全一致');
+    }
+    const current = latest.meta.revisions.find((revision) => revision.id === latest.meta.currentRevision);
+    if (!current) {
+      errors.push('新版本缺少当前 revision 条目');
+      return errors;
+    }
+    if (current.author !== author) errors.push(`新版本 author 必须为 ${author}`);
+    if (!current.baseRevision.trim()) errors.push('新版本 base_revision 不能为空');
+    errors.push(...await runtime.store.validateFullCandidate(latest, undefined, sharedSource));
+    let patchText: string | null = null;
+    try {
+      patchText = await readFile(path.join(latest.dirPath, current.patch), 'utf8');
+    } catch {
+      errors.push(`新补丁不存在或不可读：${current.patch}`);
+    }
+    if (patchText !== null) {
+      const paths = parsePatch(patchText).paths;
+      if (paths.length === 0) errors.push('新补丁没有业务文件');
+      if (patchTouchesReviewData(patchText)) errors.push('新补丁包含禁止路径');
+      if (errors.length === 0) {
+        const applied = await this.applyPatchText(runtime.vcs, patchText, false);
+        await runtime.vcs.revertBusinessWorkspace().catch(() => undefined);
+        if (!applied.ok) errors.push(`新补丁无法在基线上严格应用：${applied.message}`);
+      }
+    }
+    return [...new Set(errors)];
   }
 
   /**
@@ -156,12 +262,14 @@ export class Writers {
       return { landed: false, outcome: 'RECOVERY_REQUIRED', detail: `${commit.errorOutput}（提交探针不可读，无法判定提交是否存在）` };
     }
     if (probeAfter !== probeBefore) {
-      // 探针前进：核对提交内容确实包含本次写入（防止把并发提交误判为本次提交）。
+      // 探针前进：所有预期文件都必须与本次写入完整匹配，不能以任一匹配替代整体核对。
+      let complete = true;
       for (const expected of input.expectedFiles ?? []) {
         const actual = await runtime.vcs.readFileAt(probeAfter, expected.relPath).catch(() => null);
-        if (actual !== null && actual === expected.text) {
-          return { landed: true, commitRevision: probeAfter };
-        }
+        if (actual !== expected.text) complete = false;
+      }
+      if (complete && (input.expectedFiles?.length ?? 0) > 0) {
+        return { landed: true, commitRevision: probeAfter };
       }
       return {
         landed: false,
@@ -234,13 +342,13 @@ export class Writers {
   /** §7.1：候选共享写只能作用于共享事实。 */
   async requireSharedCandidate(runtime: Runtime, id: string): Promise<void> {
     const view = await sharedViewFor(runtime);
-    if (!view?.source) return; // 空仓库/无 HEAD：沿用既有错误路径
+    if (!view?.source) throw new ApiError(409, 'conflict', '无法建立共享 VCS 快照，共享写已中止');
     const { month, slug } = runtime.store.resolveCandidateDir(id);
-    const text = await view.source.readReviewText(month, slug).catch(() => null);
+    const text = await view.source.readReviewText(month, slug);
     if (text === null) {
       throw new ApiError(409, 'conflict', `候选 ${id} 不是共享事实（当前 VCS 快照中不存在），不能执行共享写；请先完成 /candidate/finalize 或审查收尾`);
     }
-    if (await view.source.hasLocalChanges(month, slug).catch(() => false)) {
+    if (await view.source.hasLocalChanges(month, slug)) {
       throw new ApiError(409, 'conflict', `候选 ${id} 存在本地未提交改动，不能执行共享写；请先还原工作区后重试`);
     }
   }
@@ -248,8 +356,8 @@ export class Writers {
   /** §7.1：审查档案写入（convert/dismiss）只能修改共享快照中的档案。 */
   private async requireSharedAudit(runtime: Runtime, auditId: string, localPath: string): Promise<void> {
     const view = await sharedViewFor(runtime);
-    if (!view?.source) return;
-    const sharedText = await view.source.readAuditText(auditId).catch(() => null);
+    if (!view?.source) throw new ApiError(409, 'conflict', '无法建立共享 VCS 快照，档案写已中止');
+    const sharedText = await view.source.readAuditText(auditId);
     if (sharedText === null) {
       throw new ApiError(409, 'conflict', `审查档案 ${auditId} 不是共享事实，不能修改`);
     }
@@ -462,7 +570,7 @@ export class Writers {
         .filter((symbol) => symbol.length > 0)
         .map((symbol) => symbol.slice(0, 120)),
     )].slice(0, 16);
-    const reviewers = await loadReviewers(store.repoRoot);
+    const reviewers = await loadReviewers(store.repoRoot, await sharedSourceFor(runtime));
     if (mode === 'stale' && reviewers.staleDays === null) {
       throw new ApiError(409, 'conflict', 'reviewers.yml 未配置 stale_days，不能按超时归档');
     }
@@ -515,8 +623,14 @@ export class Writers {
     const reason = stringField(body, 'reason');
     await this.requireOwnerOf(store, id); // §12.2：非 Owner 403（takeover 除外）
     await this.requireSharedCandidate(runtime, id); // §7.1
+    const source = await sharedSourceFor(runtime);
+    if (!source) throw new ApiError(409, 'conflict', '无法建立重开共享快照');
+    const { month: fromMonth, slug: fromSlug } = store.resolveCandidateDir(from);
+    if (await source.hasLocalChanges(fromMonth, fromSlug)) {
+      throw new ApiError(409, 'conflict', `重开来源 ${from} 存在本地修改，必须先恢复为干净的共享快照`);
+    }
     const backupText = await this.reviewBackup(store, id); // §5.6：写入前备份
-    const candidate = await store.reopen(id, from, reason, guard);
+    const candidate = await store.reopen(id, from, reason, guard, source);
     const commit = await this.commitSharedWrite(`review(${id}): 人工重开（来自 ${from}）`, candidate, runtime, backupText);
     sendJson(res, 200, { candidate, commit });
   }
@@ -624,9 +738,9 @@ export class Writers {
       const view = await sharedViewFor(runtime);
       if (view?.source) {
         const { month, slug } = store.resolveCandidateDir(candidateId);
-        const sharedText = await view.source.readReviewText(month, slug).catch(() => null);
+        const sharedText = await view.source.readReviewText(month, slug);
         if (sharedText !== null) {
-          if (await view.source.hasLocalChanges(month, slug).catch(() => false)) {
+          if (await view.source.hasLocalChanges(month, slug)) {
             throw new ApiError(409, 'conflict', `候选 ${candidateId} 存在本地未提交改动，不能作为转换目标；请先还原工作区`);
           }
           return store.get(candidateId, null, view.source);
@@ -641,8 +755,16 @@ export class Writers {
     // §7.6：只有当目标候选是本地新生成（尚未共享）时才把候选目录纳入同一提交。
     const sharedView = await sharedViewFor(runtime);
     const targetIsShared = sharedView?.source
-      ? (await sharedView.source.readReviewText(detail.candidate.month, detail.candidate.slug).catch(() => null)) !== null
+      ? (await sharedView.source.readReviewText(detail.candidate.month, detail.candidate.slug)) !== null
       : false;
+    const targetErrors = await store.validateFullCandidate(
+      detail.candidate,
+      targetIsShared ? sharedView?.source : undefined,
+      sharedView?.source,
+    );
+    if (targetErrors.length > 0) {
+      throw new ApiError(422, 'bad_request', `转换目标未通过完整校验：${targetErrors.join('；')}`);
+    }
     const commitPaths = [`.ai-review/audits/${auditId}`, ...(targetIsShared ? [] : [`.ai-review/${candidateId}`])];
     // 两侧同一提交：先备份档案，更新 item，再连同候选目录一起原子提交；失败恢复档案。
     const { readFile, writeFile } = await import('node:fs/promises');
@@ -679,20 +801,21 @@ export class Writers {
   async rebase(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store, vcs } = runtime;
-    // §7.7 审查互斥与 repo 锁由 routes.ts 的 RouteKind 统一套用。
     const body = await readJson(req);
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
-    await this.requireOwnerOf(store, id); // §12.2：非 Owner 403（takeover 除外）
-    await this.requireSharedCandidate(runtime, id); // §7.1
-    const detail = await store.get(id, null);
+    const acceptedSource = await sharedSourceFor(runtime);
+    if (!acceptedSource) throw new ApiError(409, 'conflict', '无法建立共享快照，不能 Rebase');
+    const detail = await store.get(id, null, acceptedSource);
+    const me = await this.host.ownerFor(store.repoRoot);
+    if (detail.candidate.meta.owner !== me) throw new ApiError(403, 'forbidden', '只有候选 Owner 可以 Rebase');
+    await this.requireSharedCandidate(runtime, id);
     await store.ensureWriteAllowed(detail.candidate, guard);
-    const job = this.host.jobManager.start('ai_fix', (log, jobId): Promise<AiFixOutcome> => this.host.withWriteLock(store.repoRoot, async () => {
-      // §7.1：锁内重新绑定共享快照并重读候选——不得使用锁外接受的 detail（C4 同类缺陷）。
+    const job = this.host.jobManager.start('ai_fix', (log, jobId, signal): Promise<AiFixOutcome> => this.host.withWriteLock(store.repoRoot, async () => {
       const source = await sharedSourceFor(runtime);
-      if (!source) return this.aborted('INVALID_CANDIDATE', '当前仓库没有可用的共享快照（Git HEAD / SVN BASE），无法 Rebase', jobId);
+      if (!source) return this.aborted('INVALID_CANDIDATE', '当前仓库没有可用的共享快照，无法 Rebase', jobId);
       const fresh = await store.get(id, null, source);
-      if (fresh.candidate.parseError) return this.aborted('INVALID_CANDIDATE', `候选数据无效：${fresh.candidate.parseError}`, jobId);
+      if (fresh.candidate.parseError) return this.aborted('INVALID_CANDIDATE', fresh.candidate.parseError, jobId);
       if (fresh.candidate.meta.currentRevision !== guard.expectedRevision
         || fresh.candidate.meta.owner !== guard.expectedOwner
         || new Date(fresh.candidate.meta.updatedAt).getTime() !== new Date(guard.expectedUpdatedAt).getTime()) {
@@ -706,108 +829,124 @@ export class Writers {
       if (!base) return this.aborted('SYNC_FAILED', '无法读取最新基线', jobId);
       const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
       if (!current) return this.aborted('INVALID_CANDIDATE', '当前版本缺失', jobId);
-      // §7.7（2026-11-10 澄清）：只比较同值不足以判定“基线未变”。候选元数据存放在
-      // `.ai-review/` 并随仓库提交，任何评论/状态/收尾提交都会推进 HEAD。必须比较
-      // **业务代码**是否变化：两基线之间只有 .ai-review/ 变更时视为业务基线未变。
       const business = await this.readModels.businessBaselineState(vcs, current.baseRevision, base);
-      if (business.state === 'unchanged') {
-        return this.aborted(
-          'BASE_UNCHANGED',
-          `业务基线未变（候选基线 ${current.baseRevision.slice(0, 12)} → 当前 ${base.slice(0, 12)} 之间只有 .ai-review/ 评审元数据提交），无需 Rebase`,
-          jobId,
-        );
+      if (business.state === 'same' || business.state === 'unchanged') {
+        return this.aborted('BASE_UNCHANGED', '有效业务基线未变，无需 Rebase', jobId);
       }
       if (business.state === 'unknown') {
         return this.aborted('SYNC_FAILED', `无法判定业务基线是否变化，已中止：${business.detail}`, jobId);
       }
       const clean = await vcs.ensureCleanWorkspace();
       if (!clean.clean) return this.aborted('DIRTY_WORKSPACE', `工作区不干净：${clean.message}`, jobId);
-      // §7.1/§7.7：补丁必须来自与 review.md 同一共享快照，不得读取工作区本地补丁（历史缺陷 B2）。
       const sharedPatch = await store.readSharedPatch(candidate, source);
-      const oldPatchText = sharedPatch.text;
-      const touchedPaths = parsePatch(oldPatchText).paths.filter((file) => !isAiReviewPath(file));
+      const touchedPaths = parsePatch(sharedPatch.text).paths.filter((file) => !isAiReviewPath(file));
       if (touchedPaths.length === 0) return this.aborted('INVALID_CANDIDATE', '当前补丁没有业务文件路径', jobId);
-      log(`在最新基线 ${base.slice(0, 12)} 上应用补丁 ${sharedPatch.patchName}`);
-      const applied = await this.applyPatchText(vcs, oldPatchText, true);
-      if (!applied.ok) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
-        // §7.7：manual Runner 不自动调用，返回 REBASE_CONFLICT 并携带人工修复提示词。
-        if (this.host.currentSettings().runner === 'manual') {
-          const manualPrompt = [
-            `# Rebase 人工修复请求（候选 ${id}，版本 ${String(candidate.meta.currentRevision)}）`,
-            '',
-            `新基线：${base}`,
-            `旧基线：${current.baseRevision}`,
-            '',
-            '请在干净的新基线上重新生成完整补丁，保证：',
-            '1. 只改动业务文件，不得包含 .ai-review/、.tmp/、node_modules/、.git/、.svn/；',
-            '2. 补丁必须能在该基线上严格应用（threeWay=false）；',
-            '3. 通过候选的全部门禁命令。',
-            '',
-            '冲突详情：',
-            applied.message,
-          ].join('\n');
-          return this.aborted(
-            'REBASE_CONFLICT',
-            `Rebase 冲突：补丁无法在最新基线 ${base.slice(0, 12)} 上干净三方应用。请按以下提示人工修复。\n\n${applied.message}`,
-            jobId,
-            applied.message,
-            manualPrompt,
-          );
-        }
-        return this.aborted('REBASE_CONFLICT', `Rebase 冲突：补丁无法在最新基线 ${base.slice(0, 12)} 上干净三方应用。`, jobId, applied.message);
-      }
-      log('重跑门禁');
-      const report = await runGateChecks(candidate.meta.gateChecks, {
-        cwd: store.repoRoot, baseRevision: base, timeoutMs: this.host.currentSettings().gateTimeoutMs,
-        onLine: (line) => { if (line.trim()) log(`  ${line.slice(0, 300)}`); },
-      });
-      if (!report.allPassed) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
-        return this.aborted('GATE_CHECK_FAILED', `门禁未通过，Rebase 未产生新版本：\n${report.formattedEvidenceMarkdown}`, jobId);
-      }
-      // §7.7：门禁通过后必须基于新基线导出包含实际冲突解决结果的完整 diff，不得复用旧补丁文本。
-      let newPatchText = '';
-      try {
-        newPatchText = await vcs.exportWorkingTreeDiff(base, touchedPaths);
-      } catch (error) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
-        return this.aborted('COMMIT_FAILED', `Rebase 无法导出新基线补丁：${error instanceof Error ? error.message : String(error)}`, jobId);
-      }
-      await vcs.revertBusinessWorkspace().catch(() => undefined);
-      if (!newPatchText.trim() || patchTouchesReviewData(newPatchText)) {
-        return this.aborted('INVALID_CANDIDATE', 'Rebase 导出的新补丁为空或包含禁止路径，未产生新版本', jobId);
-      }
-      // 新补丁必须能在新基线干净应用，验证后立即还原。
       const { readFile: readFs, readdir } = await import('node:fs/promises');
-      const verifyApply = await this.applyPatchText(vcs, newPatchText, false);
-      await vcs.revertBusinessWorkspace().catch(() => undefined);
-      if (!verifyApply.ok) {
-        return this.aborted('COMMIT_FAILED', `Rebase 新补丁无法在新基线干净应用：${verifyApply.message}`, jobId);
-      }
       const reviewBackup = await readFs(candidate.reviewPath, 'utf8');
       const entriesBefore = new Set(await readdir(candidate.dirPath).catch(() => [] as string[]));
-      const updated = await store.appendRevision(id, {
-        author: 'ai', baseRevision: base, patchText: newPatchText,
-      }, guard);
+      let updated: ReviewCandidate;
+      let failureReason: 'REBASE_CONFLICT' | 'GATE_CHECK_FAILED' = 'REBASE_CONFLICT';
+      let failureDetail = '';
+      let deterministicPatch: string | null = null;
+      log(`在最新基线 ${base.slice(0, 12)} 上三方应用 ${sharedPatch.patchName}`);
+      const applied = await this.applyPatchText(vcs, sharedPatch.text, true);
+      if (!applied.ok) {
+        failureDetail = applied.message;
+      } else {
+        log('三方应用成功，重跑门禁');
+        const report = await runGateChecks(candidate.meta.gateChecks, {
+          cwd: store.repoRoot,
+          baseRevision: base,
+          timeoutMs: this.host.currentSettings().gateTimeoutMs,
+          onLine: (line) => { if (line.trim()) log(`  ${line.slice(0, 300)}`); },
+          signal,
+        });
+        if (signal.aborted) {
+          await vcs.revertBusinessWorkspace().catch(() => undefined);
+          return this.aborted('CANCELLED', 'Rebase 门禁已取消，未产生共享提交', jobId);
+        }
+        if (!report.allPassed) {
+          failureReason = 'GATE_CHECK_FAILED';
+          failureDetail = report.formattedEvidenceMarkdown;
+        } else {
+          deterministicPatch = await vcs.exportWorkingTreeDiff(base, touchedPaths);
+        }
+      }
+      if (deterministicPatch === null) {
+        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        const runner = new Runner({
+          kind: this.host.currentSettings().runner,
+          settings: this.host.currentSettings(),
+          store,
+          candidate,
+          mode: 'RESOLVE_CONFLICT',
+          comments: candidate.meta.comments.filter((comment) => comment.status !== 'resolved'),
+          failureDetail,
+          baseRevision: base,
+          workingTree: 'clean_base',
+          log,
+          ...(this.host.deps.resolveCredential ? { resolveCredential: this.host.deps.resolveCredential } : {}),
+          signal,
+        });
+        const result = await runner.run();
+        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        if (result.manual) {
+          return this.aborted(failureReason, 'Rebase 需要人工解决冲突或门禁失败', jobId, failureDetail, result.prompt ?? '');
+        }
+        if (!result.success) {
+          await this.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
+          return result.aborted
+            ? this.aborted('CANCELLED', 'Rebase Runner 已取消，未产生共享提交', jobId)
+            : this.aborted('RUNNER_FAILED', `Rebase Runner 失败：${result.errorMessage ?? '未知错误'}`, jobId, result.outputTail);
+        }
+        const latest = await store.get(id, null);
+        const latestBase = latest.candidate.meta.revisions.find(
+          (revision) => revision.id === latest.candidate.meta.currentRevision,
+        )?.baseRevision;
+        const errors = await this.validateNewRevision(runtime, candidate, latest.candidate, 'ai');
+        if (latestBase !== base) errors.push(`Mode C 新版本必须使用最新基线 ${base}，实际为 ${latestBase ?? '(缺失)'}`);
+        if (errors.length > 0) {
+          await this.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
+          return this.aborted('INVALID_CANDIDATE', `Mode C 新版本未通过提交前校验：\n${errors.join('\n')}`, jobId);
+        }
+        updated = latest.candidate;
+      } else {
+        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        if (!deterministicPatch.trim() || patchTouchesReviewData(deterministicPatch)) {
+          return this.aborted('INVALID_CANDIDATE', 'Rebase 导出的新补丁为空或包含禁止路径', jobId);
+        }
+        const verifyApply = await this.applyPatchText(vcs, deterministicPatch, false);
+        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        if (!verifyApply.ok) return this.aborted('INVALID_CANDIDATE', `新补丁无法在新基线严格应用：${verifyApply.message}`, jobId);
+        updated = await store.appendRevision(id, {
+          author: 'ai', baseRevision: base, patchText: deterministicPatch,
+        }, guard);
+        const errors = await this.validateNewRevision(runtime, candidate, updated, 'ai');
+        if (errors.length > 0) {
+          await this.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
+          return this.aborted('INVALID_CANDIDATE', `Rebase 新版本未通过提交前校验：\n${errors.join('\n')}`, jobId);
+        }
+      }
       const writtenReview = await readFs(updated.reviewPath, 'utf8').catch(() => null);
+      const updatedCurrent = updated.meta.revisions.find((revision) => revision.id === updated.meta.currentRevision);
+      const writtenPatch = updatedCurrent
+        ? await readFs(path.join(updated.dirPath, updatedCurrent.patch), 'utf8').catch(() => null)
+        : null;
       const result = await this.commitAndClassify({
         runtime,
         message: `review(${id}): rebase to ${base.slice(0, 12)} (rev ${String(updated.meta.currentRevision)})`,
         paths: [relative(store.repoRoot, updated.dirPath)],
         probePaths: [relative(store.repoRoot, updated.reviewPath)],
-        ...(writtenReview !== null
-          ? { expectedFiles: [{ relPath: relative(store.repoRoot, updated.reviewPath), text: writtenReview }] }
-          : {}),
+        expectedFiles: [
+          ...(writtenReview !== null ? [{ relPath: relative(store.repoRoot, updated.reviewPath), text: writtenReview }] : []),
+          ...(updatedCurrent && writtenPatch !== null
+            ? [{ relPath: relative(store.repoRoot, path.join(updated.dirPath, updatedCurrent.patch)), text: writtenPatch }]
+            : []),
+        ],
       });
       if (!result.landed) {
         if (result.outcome === 'RECOVERY_REQUIRED') {
-          return this.recoveryRequired(
-            'COMMIT_OUTCOME_UNKNOWN',
-            `Rebase 新版本提交结果无法确定，现场保留待人工核对：${result.detail}`,
-            jobId,
-            result.detail,
-          );
+          return this.recoveryRequired('COMMIT_OUTCOME_UNKNOWN', `Rebase 提交结果无法确定，现场保留：${result.detail}`, jobId, result.detail);
         }
         await this.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
         return this.aborted('COMMIT_FAILED', `提交失败，已恢复操作前版本：${result.detail}`, jobId, result.detail);
@@ -837,8 +976,19 @@ export class Writers {
     await this.requireSharedCandidate(runtime, id); // §7.1
     const detail = await store.get(id, null);
     await store.ensureWriteAllowed(detail.candidate, guard);
-    const job = this.host.jobManager.start('ai_fix', (log, jobId): Promise<AiFixOutcome> => this.host.withWriteLock(store.repoRoot, async () => {
-      const candidate = detail.candidate;
+    const job = this.host.jobManager.start('ai_fix', (log, jobId, signal): Promise<AiFixOutcome> => this.host.withWriteLock(store.repoRoot, async () => {
+      const source = await sharedSourceFor(runtime);
+      if (!source) return this.aborted('INVALID_CANDIDATE', '无法建立共享快照', jobId);
+      const fresh = await store.get(id, null, source);
+      const candidate = fresh.candidate;
+      if (candidate.parseError) return this.aborted('INVALID_CANDIDATE', candidate.parseError, jobId);
+      if (candidate.meta.currentRevision !== guard.expectedRevision || candidate.meta.owner !== guard.expectedOwner
+        || new Date(candidate.meta.updatedAt).getTime() !== new Date(guard.expectedUpdatedAt).getTime()) {
+        return this.aborted('CONCURRENCY_MISMATCH', '候选在排队期间已更新', jobId);
+      }
+      if (candidate.meta.status !== 'pending' && candidate.meta.status !== 'changes_requested') {
+        return this.aborted('STATE_CONFLICT', `当前状态 ${candidate.meta.status} 不允许人工微调`, jobId);
+      }
       const clean = await vcs.ensureCleanWorkspace();
       if (!clean.clean) return this.aborted('DIRTY_WORKSPACE', `工作区不干净：${clean.message}`, jobId);
       const base = await vcs.getCurrentBase().catch(() => null);
@@ -852,8 +1002,10 @@ export class Writers {
       const report = await runGateChecks(candidate.meta.gateChecks, {
         cwd: store.repoRoot, baseRevision: base, timeoutMs: this.host.currentSettings().gateTimeoutMs,
         onLine: (line) => { if (line.trim()) log(`  ${line.slice(0, 300)}`); },
+        signal,
       });
       await vcs.revertBusinessWorkspace().catch(() => undefined);
+      if (signal.aborted) return this.aborted('CANCELLED', '人工微调门禁已取消，未产生共享提交', jobId);
       if (!report.allPassed) {
         return this.aborted('GATE_CHECK_FAILED', `门禁未通过，未产生新版本：\n${report.formattedEvidenceMarkdown}`, jobId);
       }
@@ -861,15 +1013,21 @@ export class Writers {
       const reviewBackup = await readFs(candidate.reviewPath, 'utf8');
       const entriesBefore = new Set(await readdir(candidate.dirPath).catch(() => [] as string[]));
       const updated = await store.appendRevision(id, { author: 'human', baseRevision: base, patchText }, guard);
+      const validationErrors = await this.validateNewRevision(runtime, candidate, updated, 'human');
+      if (validationErrors.length > 0) {
+        await this.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
+        return this.aborted('INVALID_CANDIDATE', `人工微调未通过提交前校验：\n${validationErrors.join('\n')}`, jobId);
+      }
       const writtenReview = await readFs(updated.reviewPath, 'utf8').catch(() => null);
       const result = await this.commitAndClassify({
         runtime,
         message: `review(${id}): manual tweak (rev ${String(updated.meta.currentRevision)})`,
         paths: [relative(store.repoRoot, updated.dirPath)],
         probePaths: [relative(store.repoRoot, updated.reviewPath)],
-        ...(writtenReview !== null
-          ? { expectedFiles: [{ relPath: relative(store.repoRoot, updated.reviewPath), text: writtenReview }] }
-          : {}),
+        expectedFiles: [
+          ...(writtenReview !== null ? [{ relPath: relative(store.repoRoot, updated.reviewPath), text: writtenReview }] : []),
+          { relPath: relative(store.repoRoot, path.join(updated.dirPath, `${String(updated.meta.currentRevision).padStart(3, '0')}.patch`)), text: patchText },
+        ],
       });
       if (!result.landed) {
         if (result.outcome === 'RECOVERY_REQUIRED') {
@@ -908,6 +1066,8 @@ export class Writers {
     const shared = sharedSource ? await sharedSource.readReviewText(...splitId(id)) : null;
     if (shared !== null) throw new ApiError(409, 'conflict', `候选 ${id} 已是共享事实，独立收尾仅适用于本地候选`);
     const job = this.host.jobManager.start('ai_fix', (log, jobId): Promise<AiFixOutcome> => this.host.withWriteLock(store.repoRoot, async () => {
+      const clean = await vcs.ensureCleanWorkspace();
+      if (!clean.clean) return this.aborted('DIRTY_WORKSPACE', `独立候选收尾要求业务工作区干净：${clean.message}`, jobId);
       const detail = await store.get(id, null);
       const meta = detail.candidate.meta;
       const errors: string[] = [];
@@ -918,7 +1078,7 @@ export class Writers {
       errors.push(...await store.validateFullCandidate(detail.candidate));
       if (patchTouchesReviewData(detail.patchText)) errors.push('补丁包含禁止路径（.ai-review/.tmp/node_modules/.git/.svn）');
       // §4.2：owner 路由复核。
-      const reviewers = await loadReviewers(store.repoRoot);
+      const reviewers = await loadReviewers(store.repoRoot, await sharedSourceFor(runtime));
       const routing = resolveOwner(reviewers, { paths: meta.targetFiles, tags: meta.tags });
       if (!routing.owner) {
         errors.push('reviewers.yml 未配置 default_owner，无法完成 owner 路由复核');

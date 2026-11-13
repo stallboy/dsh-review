@@ -21,7 +21,10 @@ writeFileSync(
   `---
 schema_version: 1
 title: "math: 修复加法实现"
+module: math
+audit_type: bugfix
 created_at: "2026-10-31T21:00:00+08:00"
+updated_at: "2026-10-31T21:00:00+08:00"
 owner: tester
 tags: [math, bug]
 status: pending
@@ -32,10 +35,14 @@ revisions:
   - id: 1
     base_revision: "${base}"
     patch: "001.patch"
+    author: ai
 gate_checks:
   - "node --version"
 comments: []
+human_decisions: []
 approval: null
+rejection: null
+commit_message: "math: 修复加法实现"
 ---
 
 # 问题与影响

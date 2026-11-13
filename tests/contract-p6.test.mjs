@@ -143,14 +143,14 @@ test('P6: API /audits 与 /findings——converted 结合候选状态出 closed/
     const dir = path.join(root, '.ai-review', '2026-11', slug);
     await mkdir(dir, { recursive: true });
     const approval = status === 'approved'
-      ? 'approval:\n  approved_by: tester\n  approved_at: "2026-11-04T10:00:00+08:00"\n  commit_revision: null' : 'approval: null';
+      ? 'approval:\n  approved_by: tester\n  approved_at: "2026-11-04T10:00:00+08:00"\n  gate_checks: []\n  gate_results: []\n  confirmed_decisions: []\n  waived_decisions: []\n  commit_revision: null' : 'approval: null';
     const rejection = status === 'rejected'
       ? 'rejection:\n  rejected_by: tester\n  rejected_at: "2026-11-04T10:00:00+08:00"\n  reason: "不采用"' : 'rejection: null';
     await writeFile(path.join(dir, 'review.md'), [
       '---', 'schema_version: 1', `title: "net: ${slug}"`, 'module: net', 'audit_type: bugfix',
       'created_at: "2026-11-04T09:00:00+08:00"', 'updated_at: "2026-11-04T09:00:00+08:00"', 'owner: tester',
       'tags: []', `status: ${status}`, 'ticket: null', 'target_files: [src/host/api.ts]', 'current_revision: 1',
-      'revisions:', '  - id: 1', '    base_revision: "1"', '    patch: 001.patch', 'gate_checks: []',
+      'revisions:', '  - id: 1', '    base_revision: "1"', '    patch: 001.patch', '    author: ai', 'gate_checks: []',
       'comments: []', 'human_decisions: []', approval, rejection, 'commit_message: "x: y"',
       '---', '', '# 问题与影响', '',
     ].join('\n'), 'utf8');
