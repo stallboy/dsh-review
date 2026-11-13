@@ -9,4 +9,6 @@ dist/
 
 out*.txt
 .dsh-acl-reports/
+# DSH 会话工具的本地状态（如 grill-first 记忆），不属于项目内容
+.dsh/
 
