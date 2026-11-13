@@ -1,4 +1,22 @@
-# dsh-code-review 会话状态快照（2026-11-10 终，第二轮契约修补）
+# dsh-code-review 会话状态快照
+
+> **2026-11-13 追加（队列扫描性能优化，已合并 master）**
+> 合并提交 `f2ca829`（分支 worktree-perf-queue-scan：`7bc02f9` + `71659b6`）。
+> 问题：评审页打开慢——`/health`+`/queue` 每请求对每候选串行拉起 4+ 个 git 子进程且无缓存，
+> 审查会话同进程运行时被进一步放大（12 候选仓库空载首屏 6–8s）。
+> 修复：①`store.list` 拆为「共享扫描（按 HEAD sha 缓存，§4.8 模式；含错误条目不缓存、
+> 瞬时失败自愈）+ 本地视图层（local/localOnly 每请求现算）」；②Git/SVN 各一次批量
+> status 代替逐候选 `hasLocalChanges`（失败回退逐候选）；③候选扫描 `mapLimit(6)`；
+> ④`businessBaselineState` 按不可变提交对缓存（unknown 不缓存）；⑤`loadReviewers`
+> 按 `(root|snapshot)` 缓存并全字段深拷贝；⑥`toSummary` 的 tags/patchStats 防御性拷贝。
+> 验证：全量测试 **226/226**（新增 `tests/perf-queue-scan.test.mjs` 4 个回归用例）；
+> 两轮独立审查通过（0 P0，唯一 P1 为流程项并已闭环）；基准 12 候选 /queue 热路径
+> git 调用 4N+2+M → 3，耗时 ~1.2–2.3s → ~350ms。客户端零改动、响应契约不变。
+> 未做：`git cat-file --batch` 常驻进程（方向 5，留后续里程碑）。
+
+---
+
+# （历史）2026-11-10 终，第二轮契约修补
 
 > 本文件如实记录本轮多会话修复工作结束时的仓库状态，供后续审查会话作为基线。
 > 所有结论均以本会话实际执行过的命令与测试输出为依据；未验证之处已明确标注。
