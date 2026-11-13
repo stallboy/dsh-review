@@ -1,7 +1,22 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { CandidateSource } from './store.js';
+import { FilesystemCandidateSource, type CandidateSource } from './store.js';
 import { runProcess, type ProcessResult } from './shell.js';
+
+/**
+ * §7.1 本地视图枚举（Git/SVN 共用）：候选目录"是否只存在于工作区"本质是文件系统
+ * 问题，直接枚举工作区，由调用方（store.list）扣除共享快照集合。
+ *
+ * 为什么不用 `git status --porcelain` / `svn status`（2026-11-12 事故修复）：
+ * - 两者的未跟踪条目都会**折叠到最高的未跟踪祖先目录**——首次审查时整个
+ *   `.ai-review/` 未跟踪，git 只输出一行 `?? .ai-review/`，SVN 同样只报目录本身，
+ *   按月份/候选层级解析的正则匹配不到任何条目，本地候选诊断静默失效；
+ * - git 还会遵守 `.gitignore`：`.ai-review/` 被忽略时 status 输出为空。
+ * 文件系统枚举对两种情况都免疫，且少一次 VCS 子进程。
+ */
+function listWorktreeCandidateDirs(root: string): Promise<string[]> {
+  return new FilesystemCandidateSource(root).listCandidateDirs();
+}
 
 const VCS_TIMEOUT_MS = 180_000;
 
@@ -95,15 +110,11 @@ export class GitHeadCandidateSource implements SharedCandidateSource {
   }
 
   async listLocalOnlyDirs(): Promise<string[]> {
-    const result = await git(this.root, ['status', '--porcelain', '--', '.ai-review']);
-    if (result.code !== 0) throw new Error(`无法读取本地候选状态：${result.stderr.trim()}`);
-    const dirs = new Set<string>();
-    for (const line of result.stdout.split(/\r?\n/)) {
-      const file = line.slice(3).trim().replaceAll('\\', '/');
-      const match = /^\.ai-review\/(\d{4}-\d{2})\/([^/]+)\//.exec(file);
-      if (match && match[1] && match[2]) dirs.add(`${match[1]}/${match[2]}`);
-    }
-    return [...dirs];
+    // 未进入 HEAD 的候选目录（未跟踪/新增）：仅作 local 诊断展示，不进入共享流程。
+    // 实现见文件顶部说明：工作区枚举 + 调用方扣除共享集合（整目录未跟踪时 git status 会折叠失效）。
+    // master 侧曾把 git 失败从 return [] 收紧为 throw；工作区枚举不再发起 git 子进程，
+    // 读取失败由 FilesystemCandidateSource 归一为空列表（store.list 侧本就 catch 兜底）。
+    return listWorktreeCandidateDirs(this.root);
   }
 
   async listAuditDirs(): Promise<string[]> {
@@ -182,16 +193,9 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
   }
 
   async listLocalOnlyDirs(): Promise<string[]> {
-    const result = await svn(this.root, ['status', '.ai-review']);
-    if (result.code !== 0) return [];
-    const dirs = new Set<string>();
-    for (const line of result.stdout.split(/\r?\n/)) {
-      if (!line.startsWith('?')) continue;
-      const file = line.slice(8).trim().replaceAll('\\', '/');
-      const match = /^\.ai-review\/(\d{4}-\d{2})\/([^/]+)(\/|$)/.exec(file);
-      if (match && match[1] && match[2]) dirs.add(`${match[1]}/${match[2]}`);
-    }
-    return [...dirs];
+    // 未版本化的候选目录：仅作 local 诊断。`svn status` 对未版本化目录同样只报
+    // 目录本身（不递归），整目录未跟踪时按层级解析会失效——改用工作区枚举（见文件顶部说明）。
+    return listWorktreeCandidateDirs(this.root);
   }
 
   async listAuditDirs(): Promise<string[]> {

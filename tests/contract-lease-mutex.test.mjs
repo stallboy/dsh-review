@@ -169,3 +169,57 @@ test('AC-SCHEDULE-01：finalize 提交失败保留租约，正常收尾后才释
   const syncOk = await post(base, '/sync', {});
   assert.equal(syncOk.status, 200);
 });
+
+test('§8.2/§10.1：/queue 暴露阻塞审查租约全生命周期（active + sessionId → releasable → 无）', async () => {
+  // 2026-11-12 事故回归：租约 releasable 后仓库被隐形 409 阻塞，面板却无任何提示与收尾入口。
+  const root = await createGitFixture();
+  await ensureReviewers(root);
+  const { base, statePath } = await startApi(root, {
+    createAuditSession: async () => ({ sessionId: 'sess-queue-lease' }),
+  });
+
+  const before = await (await fetch(`${base}/queue`)).json();
+  assert.equal(before.auditLease, undefined, '无阻塞租约时省略诊断字段');
+
+  const session = await (await post(base, '/audit/session', { targetPath: '', note: '' })).json();
+  assert.ok(session.auditId);
+
+  // sessionId 必须持久化进租约，并随 /queue 暴露。
+  const stateJson = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(stateJson.leases[0].sessionId, 'sess-queue-lease', '会话 id 必须写入租约记录');
+
+  const during = await (await fetch(`${base}/queue`)).json();
+  assert.equal(during.auditLease?.auditId, session.auditId);
+  assert.equal(during.auditLease?.state, 'active');
+  assert.equal(during.auditLease?.sessionId, 'sess-queue-lease');
+  assert.equal(during.auditLease?.trigger, 'manual');
+
+  // /health 诊断必须暴露阻塞租约（对只看 health 的调用者解释共享写 409 的原因）。
+  const healthDuring = await (await fetch(`${base}/health`)).json();
+  assert.ok(
+    healthDuring.diagnostics.some((line) => line.includes(session.auditId) && line.includes('active')),
+    `health 诊断应包含 active 租约：${JSON.stringify(healthDuring.diagnostics)}`,
+  );
+
+  // 取消跟踪 Job → 租约 releasable（超时同路径）→ /queue 显示 releasable。
+  const cancelled = await post(base, `/jobs/${encodeURIComponent(session.jobId)}/cancel`, {});
+  assert.equal(cancelled.status, 202);
+  const afterCancel = await (await fetch(`${base}/queue`)).json();
+  assert.equal(afterCancel.auditLease?.state, 'releasable', '超时/取消后租约必须以 releasable 可见');
+  const healthAfterCancel = await (await fetch(`${base}/health`)).json();
+  assert.ok(
+    healthAfterCancel.diagnostics.some((line) => line.includes(session.auditId) && line.includes('releasable')),
+    'health 诊断应包含 releasable 租约',
+  );
+
+  // 确认停止后释放 → 阻塞诊断消失。
+  const released = await post(base, '/audit/release', { auditId: session.auditId, confirmStopped: true });
+  assert.equal(released.status, 200);
+  const afterRelease = await (await fetch(`${base}/queue`)).json();
+  assert.equal(afterRelease.auditLease, undefined);
+  const healthAfterRelease = await (await fetch(`${base}/health`)).json();
+  assert.ok(
+    !healthAfterRelease.diagnostics.some((line) => line.includes(session.auditId)),
+    '释放后 health 诊断不得再出现该租约',
+  );
+});

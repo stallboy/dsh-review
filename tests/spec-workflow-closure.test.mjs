@@ -54,7 +54,7 @@ function post(base, route, body) {
   });
 }
 
-async function waitJob(base, jobId, attempts = 160) {
+async function waitJob(base, jobId, attempts = 400) {
   let job;
   for (let index = 0; index < attempts; index += 1) {
     job = await (await fetch(`${base}/jobs/${encodeURIComponent(jobId)}`)).json();

@@ -124,7 +124,11 @@ export class AuditRuntime {
         this.host.auditJobFinishes.get(auditId)?.({
           status: 'RECOVERY_REQUIRED',
           reason: 'SYNC_STATE_UNKNOWN',
-          detail: '审查执行超过 1 小时上限，租约已置为 releasable，请人工确认后 /audit/release',
+          // 2026-11-12 事故修订：超时最常发生在"审查会话其实已完成、只是没人收尾"的场景，
+          // 提示必须同时给出两条出路，而不是只引导释放（释放不提交本地候选）。
+          detail:
+            '审查执行超过 1 小时上限，租约已置为 releasable。若审查会话已完成，请执行收尾（/audit/finalize）校验并提交候选；'
+            + '确认外部执行已停止且不需要提交时，再人工确认释放（/audit/release）',
         });
         this.host.auditJobFinishes.delete(auditId);
       }).catch(() => undefined);
@@ -298,6 +302,12 @@ export class AuditRuntime {
       await this.releaseLeaseById(auditId).catch(() => undefined);
       throw error;
     }
+    // §7.6/§10.1：把审查会话 id 记入租约（诊断展示与后续自动化定位用；旧租约无此字段）。
+    const leaseForSession = this.auditLifecycle.find(auditId);
+    if (leaseForSession && leaseForSession.sessionId !== created.sessionId) {
+      await this.upsertLease({ ...leaseForSession, sessionId: created.sessionId });
+    }
+    // 跟踪 Job 保持 running 直到 finalize/release/取消；宿主提供 turn-end 钩子时自动收尾。
     const job = this.trackAuditSession(runtime, auditId, created.sessionId);
     sendJson(res, 202, {
       sessionId: created.sessionId,

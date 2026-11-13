@@ -759,7 +759,7 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 审查支持手动与定时触发，以及三种执行方式：
 
 - **Headless Runner 模式**：`POST /audit` 以 audit Job 调用当前设置的进程型 Runner；Runner 结束后由 Host 执行收尾。
-- **DSH 会话模式**：创建真实会话，挂载到 cwd 所属 workspace、命名并以 queue 模式投递提示词，接受超时 60 秒。同时创建 `audit` Job 跟踪该会话，直到真实会话 turn 结束或超时；随后由 Host 执行收尾。优先继承发起会话权限预设；不可继承时回退为审批策略覆盖。定时触发没有发起会话，不执行权限继承。
+- **DSH 会话模式**：创建真实会话，挂载到 cwd 所属 workspace、命名并以 queue 模式投递提示词，接受超时 60 秒。同时创建 `audit` Job 跟踪该会话，直到真实会话 turn 结束或超时；随后由 Host 执行收尾。宿主提供 turn 结束事件时，自动收尾必须在**会话确认空闲**（无排队续轮/goal 自动续轮）后才触发——多轮审查的中间轮结束不得提前收尾；turn 确认结束时必须同时解除执行超时闹钟。租约必须记录会话模式创建的 `sessionId`（其余模式缺省）。在宿主提供 turn 结束事件前（见附录 A G43），收尾由用户经面板触发：阻塞租约通过 `/queue` 的 `auditLease` 诊断暴露，执行超时把租约置 releasable 时，Job 结果与提示必须同时给出两条出路——收尾（`/audit/finalize`）与确认停止后释放（`/audit/release`），不得只引导释放。优先继承发起会话权限预设；不可继承时回退为审批策略覆盖。定时触发没有发起会话，不执行权限继承。
 - **手动提示词模式**：`POST /audit/manual` 创建持续有效的 audit Job/执行租约，记录 auditId、基线与输出目录，并返回完整提示词。外部 Agent 执行期间租约参与全部互斥与定时跳过。只有 `/audit/finalize` 正常完成才自动释放；取消或超时只停止 Job 并进入恢复状态，不得自动解除互斥。必须由人明确确认外部执行已停止，再调用 `/audit/release` 复核工作区并释放租约。仅导出预览不启动执行；实际外部执行必须使用该入口。手动租约与恢复标记必须持久化在本机 DSH_HOME 的运行时状态中，Host 重启后继续阻塞自动写操作，直到 release 或 finalize，不能因内存 Job 丢失而解除互斥。
 
 提示词必须由 Host 展开 §1.5、§3、§4 与 §11 中所有适用规则的最终文本，并附加 owner 路由、负向记忆、目标范围、基线和输出路径；不得只复制带内部章节引用的 §11。提示词文件只能物化本文规则，不得成为规范上游。审查执行超时上限 1 小时。Agent 不负责提交，Host 统一在收尾提交。
@@ -847,7 +847,7 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 | --- | --- | --- |
 | GET | `/health` | 应用、版本、configured、repoRoot、owner、VCS、当前基线、诊断和状态计数。 |
 | GET | `/settings` | `{settings, validation, suggestedOwner, runners}`。 |
-| GET | `/queue?owner=&statuses=&tag=&dir=&text=&createdAfter=&createdBefore=` | `{configured, items, errors, currentBase, counts, owner, me, repoRoot}`；owner 缺省为当前操作者、显式空值表示全部；statuses 为逗号分隔合法状态，缺省/空值为全部；tag 小写比较，dir/text 为大小写不敏感包含匹配；createdAfter/Before 均为含边界的 ISO 时间点。approved 项可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup: found / ambiguous / unknown`；`ambiguous/unknown` 只作诊断，不得阻塞队列。可含缓存字段 `patchCheck`，但必须携带 `checkedBase` 与非空 ISO-8601 `checkedAt`，且不得作为共享事实或批准依据。`patchCheck` 的执行策略：预检内存缓存以 `(candidateId, revision, base)` 为键；`/queue` 只读已有缓存，未命中时该项返回 `state: "unknown"` 或省略，并由 Host 在后台以低优先级异步触发预检填充缓存，严禁在队列请求内同步批量执行补丁检查；`/candidate` 未命中缓存时可同步执行单候选预检并写回缓存。 |
+| GET | `/queue?owner=&statuses=&tag=&dir=&text=&createdAfter=&createdBefore=` | `{configured, items, errors, currentBase, counts, owner, me, repoRoot}`；owner 缺省为当前操作者、显式空值表示全部；statuses 为逗号分隔合法状态，缺省/空值为全部；tag 小写比较，dir/text 为大小写不敏感包含匹配；createdAfter/Before 均为含边界的 ISO 时间点。可含诊断字段 `auditLease`：该仓库当前阻塞中的审查租约 `{auditId, state: active\|releasable, trigger, createdAt, owner, baseRevision, targetPath, sessionId?}`，无阻塞租约时省略；仅用于面板展示与收尾/释放入口，不构成共享事实。items 中整体未进入共享快照的候选携带 `localOnly: true`（详情只读共享事实，共享快照可建立时 `/candidate` 对这类 id 返回 404，Client 不得为其提供详情入口；共享源创建失败的文件系统降级路径除外）。approved 项可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup: found / ambiguous / unknown`；`ambiguous/unknown` 只作诊断，不得阻塞队列。可含缓存字段 `patchCheck`，但必须携带 `checkedBase` 与非空 ISO-8601 `checkedAt`，且不得作为共享事实或批准依据。`patchCheck` 的执行策略：预检内存缓存以 `(candidateId, revision, base)` 为键；`/queue` 只读已有缓存，未命中时该项返回 `state: "unknown"` 或省略，并由 Host 在后台以低优先级异步触发预检填充缓存，严禁在队列请求内同步批量执行补丁检查；`/candidate` 未命中缓存时可同步执行单候选预检并写回缓存。 |
 | GET | `/candidate?id=` | `{candidate, currentBase, isBaseBehind, patchCheck, approvalCommitRevision?, approvalCommitLookup?, patchText, patchStats, patchPaths, comments, validation, revisionStats, canAct, me, jobs}`。approved 候选可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup`，含义同 `/queue`。`patchCheck` 为派生诊断：`{state: clean / conflicted / unknown, checkedBase: string, checkedAt: ISO-8601 string}`；`clean/conflicted` 只表示补丁能否应用到 `checkedBase`，不构成批准证据，批准 Job 必须重新严格应用。**`isBaseBehind`（2026-11-10 澄清）表示“业务代码基线是否变化”**：候选元数据随 `.ai-review/` 提交，会持续推进顶层版本号，因此不得用 `base_revision !== currentBase` 直接判定；两者不同时须比较两版本的变更路径并排除 `.ai-review/`，差异只含评审元数据时 `isBaseBehind = false`，与 `/rebase` 的 `BASE_UNCHANGED` 判定同源（规则见 §7.7「有效业务基线」）。无法证明是否变化时保守返回 `true`。 |
 | GET | `/patch?id=&name=` | `{name, text}`；name 必须是该候选已有 revision 的补丁文件名。 |
 | GET | `/diff?id=&from=&to=` | to 缺省当前版本；from 缺省或等于 to 返回 full，否则返回 incremental、resolutionMode 与 notes。 |
@@ -921,7 +921,7 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 
 默认筛选当前操作者，状态默认全部。卡片显示 ticket、title、revision、变更规模、Owner、人工判断项、未解决评论、基线状态与本地瞬态进度。
 
-stale、duplicate、local 和基线冲突必须使用不同徽标；local 不计入共享 KPI。基线落后时提示批准将在新基线重放（“落后”同样按 §7.7「有效业务基线」判定，排除 `.ai-review/` 评审元数据提交，避免每次评论后所有候选集体显示落后）；`patchCheck.state == conflicted` 时提示可先 Rebase，但不得单独阻止查看或批准；批准 Job 仍须重新严格应用，冲突时按 §7.5 回退。无批量批准，整卡点击进入详情。
+stale、duplicate、local 和基线冲突必须使用不同徽标；local 不计入共享 KPI。local 中的 local-only（候选目录整体未进入共享快照）条目不可进入详情，卡片需提示"审查收尾提交后才可查看详情与批准"；队列头部需汇总本地未提交条目数。`/queue` 返回 `auditLease` 时，队列页必须展示阻塞审查租约横幅：`active` 提示审查执行中并提供收尾入口；`releasable` 额外提供经两段式确认的释放入口，并说明释放不提交本地候选。基线落后时提示批准将在新基线重放（“落后”同样按 §7.7「有效业务基线」判定，排除 `.ai-review/` 评审元数据提交，避免每次评论后所有候选集体显示落后）；`patchCheck.state == conflicted` 时提示可先 Rebase，但不得单独阻止查看或批准；批准 Job 仍须重新严格应用，冲突时按 §7.5 回退。无批量批准，整卡点击进入详情（local-only 卡除外）。
 
 ### 10.2 详情页
 
@@ -1226,6 +1226,7 @@ Agent 结束任务前必须逐项确认：
 | G40 | P2 | 未实现 `patchCheck` 派生预检。 | 批准前才发现冲突的体验问题仍在。 | 按 §8.2 在详情页返回派生诊断，批准仍严格重检。 |
 | G41 | P2 | 未实现投影内存缓存。 | 队列/投影随档案增长线性扫描。 | 按 §4.8 以 VCS 快照为键做内存缓存。 |
 | G42 | P2 | 未实现 `verify_gate_on_audit_finalize` / `audit_smoke_commands`。 | 审计期门禁仍只有 AI 自述。 | 按 §7.6 增加可选收尾复算与 UI 标注。 |
+| G43 | P1 | DSH `sessionController` 没有 turn 结束事件钩子，会话审查无法在 turn 结束时自动收尾；超时触发时审查往往已完成，却以 RECOVERY_REQUIRED 呈现且面板无收尾入口。 | 会话审查的候选停留在本地视图，用户在队列看不到条目、也不知道需手动收尾（2026-11-12 writer-in-dsh 冒烟测试事故）。 | 短期（已做）：`onAuditTurnEnd` 可选依赖已接线（**接线时必须实现 §7.6 的"会话空闲（无排队续轮）才自动收尾 + turn 确认结束即解除超时闹钟"语义**——现有 followAuditTurn 对任何 turn/end 都触发，多轮会话会过早收尾，接线前必须修复）+ 租约暴露 `/queue` `auditLease` + 面板收尾/释放入口；剩余工作在 DSH 侧提供 turn-end 钩子，随后更新本表与 §7.6 正文。 |
 
 G37–G42 为 2026-11-09 契约修订新增差距。
 

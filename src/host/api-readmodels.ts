@@ -153,6 +153,37 @@ export class ReadModels {
         if (derived) Object.assign(item, derived);
       }
     }
+    // §7.6/§10.1：阻塞中的审查租约（active=执行中/待收尾，releasable=超时或取消待处理）。
+    // 仅作诊断展示，为面板的收尾/释放入口提供数据；不是共享事实，无阻塞租约时省略。
+    let auditLease:
+      | {
+        auditId: string;
+        state: 'active' | 'releasable';
+        trigger: 'manual' | 'scheduled';
+        createdAt: string;
+        owner: string;
+        baseRevision: string;
+        targetPath: string;
+        sessionId?: string;
+      }
+      | undefined;
+    try {
+      const lease = this.host.auditLifecycle.blockingLeaseFor(runtime.root);
+      if (lease) {
+        auditLease = {
+          auditId: lease.auditId,
+          state: lease.state,
+          trigger: lease.trigger,
+          createdAt: lease.createdAt,
+          owner: lease.owner,
+          baseRevision: lease.baseRevision,
+          targetPath: lease.targetPath,
+          ...(lease.sessionId ? { sessionId: lease.sessionId } : {}),
+        };
+      }
+    } catch {
+      // 租约状态机未初始化（理论不可达）：省略诊断字段，不影响队列主体。
+    }
     sendJson(res, 200, {
       configured: true,
       items,
@@ -162,6 +193,7 @@ export class ReadModels {
       owner,
       me: owner,
       repoRoot: runtime.root,
+      ...(auditLease ? { auditLease } : {}),
     });
   }
 

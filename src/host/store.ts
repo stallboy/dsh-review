@@ -59,7 +59,12 @@ export interface CandidateSource {
   readPatchText(month: string, slug: string, patchName: string): Promise<string | null>;
   /** 工作区相对共享快照是否存在本地改动（review/补丁任一）。 */
   hasLocalChanges(month: string, slug: string): Promise<boolean>;
-  /** 仅存在于工作区、未进入共享快照的候选目录（local 诊断）。 */
+  /**
+   * 工作区中存在 review.md 的候选目录（'YYYY-MM/slug'），含未进入共享快照者；
+   * 调用方自行与共享集合做差得到 local-only（§7.1 本地诊断）。
+   * 基于文件系统而非 `git/svn status`：status 会把未跟踪目录折叠到最高祖先
+   * 且遵守 ignore 规则，整目录未跟踪（首次审查）时解析会静默失效。
+   */
   listLocalOnlyDirs(): Promise<string[]>;
 }
 
@@ -345,12 +350,14 @@ export class ReviewStore {
             );
             summary.reopenedFrom = candidate.meta.reopenedFrom ?? null;
             summary.local = isLocalOnly || (await src.hasLocalChanges(month, slug).catch(() => true)) || undefined;
+            summary.localOnly = isLocalOnly || undefined;
             if (matchesReviewFilter(summary, filter)) items.push(summary);
             continue;
           }
         }
         const summary = this.toSummary(candidate, stats, currentBase, staleDays);
         summary.local = isLocalOnly || (await src.hasLocalChanges(month, slug).catch(() => true)) || undefined;
+        summary.localOnly = isLocalOnly || undefined;
         if (!summary.local) {
           chainInfo.set(candidate.id, { reopenedFrom: candidate.meta.reopenedFrom ?? null, status: candidate.meta.status });
           // §7.1：local 候选不进入共享流程——不作负向记忆来源。
@@ -385,6 +392,7 @@ export class ReviewStore {
         };
         // §7.1：错误路径同样必须标记本地视图，否则 local 草稿会被误当作共享事实。
         summary.local = isLocalOnly || (await src.hasLocalChanges(month, slug).catch(() => true)) || undefined;
+        summary.localOnly = isLocalOnly || undefined;
         if (matchesReviewFilter(summary, filter)) items.push(summary);
       }
     }

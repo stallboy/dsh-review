@@ -31,7 +31,12 @@ export interface AuditLeaseRecord {
   /** 开始执行时的候选快照：finalize 只校验此后新增的候选。 */
   candidateIdsBefore: string[];
   state: AuditLeaseState;
+  /** 会话模式创建的 DSH 审查会话 id（手动/定时/headless 模式缺省）：诊断展示与后续自动化定位用。 */
+  sessionId?: string;
 }
+
+/** 阻塞中的租约（active/releasable）：released 已被 blockingLeaseFor/anyBlocking 过滤。 */
+export type BlockingLease = AuditLeaseRecord & { state: 'active' | 'releasable' };
 
 /** 合法的状态迁移；表中没有的迁移一律拒绝（fail-closed）。 */
 const TRANSITIONS: Record<AuditLeaseState, AuditLeaseState[]> = {
@@ -67,14 +72,14 @@ export class AuditLifecycle {
     return this.leases.find((lease) => lease.auditId === auditId);
   }
 
-  /** 该仓库是否有**阻塞性**租约（active 或 releasable）。 */
-  blockingLeaseFor(root: string): AuditLeaseRecord | undefined {
-    return this.leases.find((lease) => lease.root === root && lease.state !== 'released');
+  /** 该仓库是否有**阻塞性**租约（active 或 releasable）；released 已在返回类型上排除。 */
+  blockingLeaseFor(root: string): BlockingLease | undefined {
+    return this.leases.find((lease): lease is BlockingLease => lease.root === root && lease.state !== 'released');
   }
 
   /** 是否存在任意未释放租约（跨仓库，用于“新审查要求无任何运行中任务”）。 */
-  anyBlocking(): AuditLeaseRecord | undefined {
-    return this.leases.find((lease) => lease.state !== 'released');
+  anyBlocking(): BlockingLease | undefined {
+    return this.leases.find((lease): lease is BlockingLease => lease.state !== 'released');
   }
 
   async create(record: AuditLeaseRecord): Promise<AuditLeaseRecord> {

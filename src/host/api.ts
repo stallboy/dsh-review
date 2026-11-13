@@ -395,6 +395,17 @@ export class ReviewApi implements ApiHost {
       } catch (error) {
         diagnostics.push(`无法统计队列：${error instanceof Error ? error.message : String(error)}`);
       }
+      // §7.6/§10.1：阻塞租约进入诊断——避免只看 /health 的调用者漏掉"共享写被 409 阻塞"的原因。
+      try {
+        const lease = this.auditLifecycle.blockingLeaseFor(runtime.root);
+        if (lease) {
+          diagnostics.push(
+            `审查租约 ${lease.auditId} 处于 ${lease.state}，共享写被阻塞：请收尾（/audit/finalize）提交候选，或确认外部执行已停止后释放（/audit/release）`,
+          );
+        }
+      } catch {
+        // 租约状态机未初始化：跳过该诊断。
+      }
     } catch (error) {
       diagnostics.push(error instanceof Error ? error.message : String(error));
     }

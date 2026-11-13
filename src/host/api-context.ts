@@ -61,6 +61,8 @@ export interface AuditLease {
   /** 开始执行时的候选快照：finalize 只校验此后新增的候选。 */
   candidateIdsBefore: string[];
   state: 'active' | 'releasable' | 'released';
+  /** 会话模式创建的 DSH 审查会话 id（其余模式缺省）。 */
+  sessionId?: string;
 }
 
 /** §7.1：为一次共享读取创建绑定共享快照的数据源；每次请求重建，不跨快照复用（Git=HEAD、SVN=BASE）。 */

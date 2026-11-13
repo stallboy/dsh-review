@@ -207,6 +207,8 @@ export interface CandidateSummary {
   patchCheck?: PatchCheckDiagnostic;
   /** §7.1：候选存在未提交/本地改动——仅诊断展示，不参与共享流程、不计入共享 KPI。 */
   local?: boolean;
+  /** §7.1/§10.1：候选目录整体未进入共享快照（local-only）——详情只读共享事实，卡片不可进入详情。 */
+  localOnly?: boolean;
   parseError?: string;
 }
 

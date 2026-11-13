@@ -71,11 +71,20 @@
     currentRevision: number; createdAt: string; patchStats: Stats; unresolvedComments: number;
     humanJudgmentCount: number; humanJudgmentDeclared: boolean; isBaseBehind: boolean; baseRevision: string; lastFeedback: string; parseError?: string;
     /** §7.1/§10.1：本地视图（未提交/有本地改动），不计入共享 KPI。 */
-    local?: boolean; isStale?: boolean; duplicateOf?: string;
+    local?: boolean;
+    /** §7.1/§10.1：候选目录整体未进入共享快照——详情只读共享事实，卡片不进入详情。 */
+    localOnly?: boolean;
+    isStale?: boolean; duplicateOf?: string;
+  }
+  /** §7.6/§10.1：阻塞中的审查执行租约（/queue 诊断字段；无阻塞时省略）。 */
+  interface AuditLeaseInfo {
+    auditId: string; state: 'active' | 'releasable'; trigger: string; createdAt: string;
+    owner: string; baseRevision: string; targetPath: string; sessionId?: string;
   }
   interface Queue {
     configured: boolean; items: QueueItem[]; errors: string[]; currentBase: string | null;
     counts: Record<string, number>; owner: string; me: string; repoRoot?: string;
+    auditLease?: AuditLeaseInfo;
   }
   interface CandidateMeta {
     schemaVersion: number; title: string; createdAt: string; updatedAt: string; owner: string; tags: string[]; status: string;
@@ -568,7 +577,11 @@
       const [auditLaunching, setAuditLaunching] = useState(false);
       const [auditCopied, setAuditCopied] = useState(false);
       const [auditSessionId, setAuditSessionId] = useState('');
+      /** master 侧：本面板实例发起的租约 id（内存态；跨会话/刷新后由 /queue 的 auditLease 横幅兜底）。 */
       const [auditLeaseId, setAuditLeaseId] = useState('');
+      /** §7.6/§10.1：释放/收尾的两段式确认（第一击只亮起，第二击才执行）。 */
+      const [releaseArmed, setReleaseArmed] = useState(false);
+      const [finalizeArmed, setFinalizeArmed] = useState(false);
       const [filter, setFilter] = useState({ owner: '', statuses: '', text: '', tag: '', dir: '', createdAfter: '', createdBefore: '' });
       const diffFiles = useMemo(() => parseDiff(diff?.unifiedDiff ?? ''), [diff]);
 
@@ -980,14 +993,22 @@
         }
       };
 
+      /**
+       * §7.6：确认外部执行已停止后释放租约（不提交本地候选）；两段式确认防误触。
+       * 目标租约优先取 /queue 的服务端诊断（跨会话/刷新后仍可见），回退本面板内存 id。
+       */
       const releaseAuditLease = async (): Promise<void> => {
-        if (!auditLeaseId) return;
+        const leaseId = queue?.auditLease?.auditId ?? auditLeaseId;
+        if (!leaseId) return;
+        if (!releaseArmed) { setReleaseArmed(true); return; }
         setBusy(true);
         try {
-          await api.post('/audit/release', { auditId: auditLeaseId, confirmStopped: true });
+          await api.post('/audit/release', { auditId: leaseId, confirmStopped: true });
           setAuditLeaseId('');
+          setReleaseArmed(false);
           setJob(null);
           await loadQueue();
+          await refreshHealth();
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
         finally { setBusy(false); }
       };
@@ -1042,6 +1063,54 @@
 
       const auditReady = Boolean(queue?.currentBase ?? health?.currentBase);
 
+      /** §7.6/§10.1：租约变化或消失时复位两段式确认，避免旧确认态误伤下一轮租约。 */
+      useEffect(() => { setReleaseArmed(false); setFinalizeArmed(false); }, [queue?.auditLease?.auditId, queue?.auditLease?.state]);
+
+      /**
+       * §7.6：收尾把执行租约交回 Host——校验本轮候选并原子提交 .ai-review，
+       * 走标准 audit Job（进度与日志复用 renderJob 卡片）。
+       * active（审查可能仍在执行）时两段式确认防误触；releasable 已停止，单击即收。
+       */
+      const finalizeAuditLease = (): void => {
+        const info = queue?.auditLease;
+        if (!info) return;
+        if (info.state === 'active' && !finalizeArmed) { setFinalizeArmed(true); return; }
+        setReleaseArmed(false);
+        setFinalizeArmed(false);
+        void startJob('/audit/finalize', { auditId: info.auditId });
+      };
+
+      /** §10.1：阻塞审查租约横幅——active 给收尾入口，releasable 额外给释放入口。 */
+      const renderLeaseBanner = (): any => {
+        const info = queue?.auditLease;
+        if (!info) return null;
+        const active = info.state === 'active';
+        return h('div', { className: 'dcr-card' },
+          h('div', { className: 'dcr-row' },
+            h('div', { className: 'dcr-grow' },
+              h('h3', { style: { margin: 0 } }, active ? '仓库审查执行中（待收尾）' : '审查待处理：执行租约已超时或被取消'),
+              h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 4 } },
+                `${info.auditId} · 始于 ${dateText(info.createdAt)} · 基线 ${short(info.baseRevision)}${info.sessionId ? ` · 审查会话 ${short(info.sessionId)}` : ''}`),
+            ),
+            h('button',
+              {
+                className: 'dcr-btn p', disabled: busy, onClick: finalizeAuditLease,
+                ...(active ? { title: '审查会话可能仍在执行：再次点击确认收尾' } : {}),
+              },
+              active
+                ? (finalizeArmed ? '确认收尾（审查仍在执行）' : '收尾并提交候选')
+                : '收尾并提交候选'),
+            active ? null : h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void releaseAuditLease(); } },
+              releaseArmed ? '确认释放（不提交）' : '释放租约'),
+          ),
+          h('div', { className: `dcr-banner ${active ? 'info' : 'warn'}`, style: { marginTop: 8 } },
+            active
+              ? '审查会话结束后请回到这里执行收尾：Host 将校验本轮候选并原子提交 .ai-review，随后候选进入下方队列；收尾前共享写保持互斥。'
+              : '执行租约仍在阻塞共享写（approve / AI 修复 / rebase / sync 均被拒绝）。若审查会话已完成并产出候选，「收尾并提交候选」会校验并提交它们；确认外部执行已停止且不需要提交时，才释放租约（本地候选保持未提交状态）。'),
+        );
+      };
+
+      // master 架构：owner/状态/tag/目录/时间过滤全部由服务端 /queue 完成，客户端直接使用返回集合。
       const filteredItems = useMemo(() => queue?.items ?? [], [queue]);
 
       const renderSettings = (): any => {
@@ -1098,9 +1167,14 @@
         );
       };
 
-      const renderQueue = (): any => h('div', { className: 'dcr-body' },
+      const renderQueue = (): any => {
+        const localTotal = queue?.items.filter((item) => item.local).length ?? 0;
+        // §10.1（P2-4）：区分"仓库真的没有候选"与"被筛选滤空"（本地候选同样受筛选影响）。
+        const hasActiveFilter = Boolean(filter.owner || filter.statuses || filter.text || filter.tag || filter.dir || filter.createdAfter || filter.createdBefore);
+        return h('div', { className: 'dcr-body' },
         h('div', { className: 'dcr-wrap' },
           renderJob(),
+          renderLeaseBanner(),
           h('div', { className: 'dcr-card' },
             h('div', { className: 'dcr-row' },
               h('input', { className: 'dcr-input', style: { width: 140 }, placeholder: '负责人', value: filter.owner, onChange: (e: any) => setFilter({ ...filter, owner: e.target.value }) }),
@@ -1117,7 +1191,9 @@
               h('input', { className: 'dcr-input', type: 'datetime-local', title: '创建时间起（含边界）', value: filter.createdAfter, onChange: (e: any) => setFilter({ ...filter, createdAfter: e.target.value }) }),
               h('input', { className: 'dcr-input', type: 'datetime-local', title: '创建时间止（含边界）', value: filter.createdBefore, onChange: (e: any) => setFilter({ ...filter, createdBefore: e.target.value }) }),
             ),
-            h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 8 } }, `当前基线 ${short(queue?.currentBase)} · 共 ${String(filteredItems.length)} 项`),
+            h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 8 } },
+              `当前基线 ${short(queue?.currentBase)} · 当前筛选下共 ${String(filteredItems.length)} 项`
+              + (localTotal > 0 ? `（含 ${String(localTotal)} 项本地未提交：审查收尾后才进入共享队列）` : '')),
           ),
           auditOpen ? h('div', { className: 'dcr-card' },
             h('h3', null, '在新会话中审查当前仓库'),
@@ -1137,7 +1213,7 @@
               h('button', { className: 'dcr-btn', disabled: auditPromptLoading || !auditReady, onClick: () => { void exportAuditPrompt(); } }, auditPromptLoading ? '生成中…' : '仅预览提示词'),
               h('button', { className: 'dcr-btn', disabled: auditLaunching || !auditReady, onClick: () => { void startManualAudit(); } }, '创建外部执行租约'),
               auditLeaseId ? h('button', { className: 'dcr-btn', disabled: auditLaunching, onClick: () => { void startJob('/audit/finalize', { auditId: auditLeaseId }); } }, '收尾并提交') : null,
-              auditLeaseId ? h('button', { className: 'dcr-btn g', disabled: busy, onClick: () => { void releaseAuditLease(); } }, '确认停止并释放') : null,
+              auditLeaseId ? h('button', { className: 'dcr-btn g', disabled: busy, onClick: () => { void releaseAuditLease(); } }, releaseArmed ? '再次点击确认释放' : '确认停止并释放') : null,
               h('button', { className: 'dcr-btn', onClick: () => { void convertFinding(); } }, '转换 finding'),
               h('button', { className: 'dcr-btn', onClick: () => { void dismissFinding(); } }, '忽略 finding'),
               h('button', { className: 'dcr-btn g', onClick: () => setAuditOpen(false) }, '取消'),
@@ -1156,19 +1232,29 @@
           ) : null,
           error ? h('div', { className: 'dcr-banner err' }, error) : null,
           filteredItems.length === 0 ? h('div', { className: 'dcr-empty' },
-            h('div', null, queue?.items.length === 0 ? '队列为空：仓库 .ai-review 中还没有候选修复。' : '没有符合筛选条件的候选。'),
-            queue?.items.length === 0 ? h('div', { style: { marginTop: 12 } },
+            h('div', null, hasActiveFilter
+              ? '当前筛选条件下没有候选；本地未提交候选同样受筛选影响，可调整或清空上方筛选。'
+              : '队列为空：仓库 .ai-review 中还没有候选修复。'),
+            !hasActiveFilter ? h('div', { style: { marginTop: 12 } },
               h('button', { className: 'dcr-btn p', disabled: busy, onClick: openAudit }, '审查当前仓库并生成候选'),
             ) : null,
           ) :
-            h('div', { className: 'dcr-list' }, ...filteredItems.map((item) => h('div', { key: item.id, className: 'dcr-item', onClick: () => openCandidate(item.id) },
+            h('div', { className: 'dcr-list' }, ...filteredItems.map((item) => h('div',
+              {
+                key: item.id,
+                className: 'dcr-item',
+                // §7.1/§10.1：local-only 候选不在共享快照中，详情只读共享事实——卡片不进入详情。
+                ...(item.localOnly ? { style: { opacity: 0.85 } } : { onClick: () => openCandidate(item.id) }),
+              },
               h('div', { className: 'dcr-row', style: { alignItems: 'flex-start' } },
                 h('div', { className: 'dcr-grow' },
                   h('h2', null, item.title),
                   h('div', { className: 'dcr-meta' },
                     h('span', { className: `dcr-chip ${item.status}` }, statusText(item.status)),
                     // §10.1：stale/duplicate/local 使用不同徽标；local 不计入共享 KPI。
-                    item.local ? h('span', { className: 'dcr-chip rejected' }, '本地视图（未提交）') : null,
+                    item.localOnly
+                      ? h('span', { className: 'dcr-chip rejected' }, '本地草稿（未提交）')
+                      : item.local ? h('span', { className: 'dcr-chip rejected' }, '本地视图（未提交）') : null,
                     item.isStale ? h('span', { className: 'dcr-chip warn' }, '已过期') : null,
                     item.duplicateOf ? h('span', { className: 'dcr-chip rejected' }, `重复候选（${item.duplicateOf}）`) : null,
                     h('span', null, `rev ${String(item.currentRevision)}`),
@@ -1184,6 +1270,7 @@
                     item.unresolvedComments > 0 ? h('span', { className: 'dcr-chip warn' }, `${String(item.unresolvedComments)} 条未处理意见`) : null,
                     ...item.tags.map((tag) => h('span', { key: tag, className: 'dcr-chip' }, tag)),
                   ),
+                  item.localOnly ? h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 6 } }, '本地草稿尚未进入共享快照：审查收尾（finalize）提交后可查看详情与批准。') : null,
                   item.lastFeedback ? h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 6 } }, `最近意见：${item.lastFeedback}`) : null,
                   item.parseError ? h('div', { className: 'dcr-small', style: { color: 'var(--dsw-alias-state-error-primary)', marginTop: 6 } }, item.parseError) : null,
                 ),
@@ -1192,6 +1279,7 @@
           h('div', { className: 'dcr-small dcr-muted', style: { textAlign: 'center' } }, '仅当前 owner 可操作；其他人只读，可先“接管审核”。'),
         ),
       );
+      };
 
       const renderDetail = (): any => {
         if (!detail) return h('div', { className: 'dcr-body' }, error ? h('div', { className: 'dcr-banner err' }, error) : h('div', { className: 'dcr-empty' }, '加载候选…'));

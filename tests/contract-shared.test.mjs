@@ -1,7 +1,7 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../dist/api.js';
 import { DEFAULT_SETTINGS } from '../dist/settings.js';
@@ -129,4 +129,38 @@ test('G8：非 Owner 的候选共享写返回 403；takeover 是唯一例外（A
     content: '接管后的评论',
   });
   assert.equal(commentAfter.status, 200);
+});
+
+test('G10：整个 .ai-review 未跟踪（首次审查）时本地候选仍可见——status 目录折叠不得吞掉 local 诊断', async () => {
+  // 2026-11-12 writer-in-dsh 冒烟测试事故回归：首审仓库没有任何已提交的 .ai-review 内容，
+  // `git status --porcelain -- .ai-review` 只输出一行 `?? .ai-review/`（折叠到最高未跟踪祖先），
+  // 旧的按 月份/候选 层级解析的实现匹配不到任何条目 → 11 个本地候选在队列里完全不可见。
+  const root = await createGitFixture();
+  await writeCandidate(root, '20261112-first-audit');
+  const { base } = await startApi(root);
+
+  const queue = await (await fetch(`${base}/queue`)).json();
+  const item = queue.items.find((entry) => entry.id.endsWith('first-audit'));
+  assert.equal(item?.local, true, '整目录未跟踪的候选必须以 local 诊断出现在队列');
+  assert.equal(item?.localOnly, true, 'local-only 标记必须区分“目录整体未进入共享快照”');
+  assert.equal(queue.counts.pending, 0, 'local 不计入共享 KPI');
+
+  // §8.2：详情只读共享事实——共享快照可建立时，local-only 的 id 请求详情必须 404。
+  const detail = await fetch(`${base}/candidate?id=${encodeURIComponent('2026-11/20261112-first-audit')}`);
+  assert.equal(detail.status, 404, 'local-only 候选不存在于共享快照，详情应 404');
+
+  // .gitignore 忽略 .ai-review 时同样不得吞掉本地诊断（status 输出为空，文件系统枚举不受影响）。
+  await writeFile(path.join(root, '.gitignore'), '.ai-review/\n', 'utf8');
+  const ignored = await (await fetch(`${base}/queue`)).json();
+  assert.equal(ignored.items.find((entry) => entry.id.endsWith('first-audit'))?.localOnly, true,
+    '.ai-review 被 gitignore 时本地候选诊断仍可见');
+
+  // 提交后恢复共享事实，local/localOnly 消失（先移除 ignore，否则 git add 被拒）。
+  await rm(path.join(root, '.gitignore'), { force: true });
+  commitAll(root, 'commit candidates');
+  const shared = await (await fetch(`${base}/queue`)).json();
+  const sharedItem = shared.items.find((entry) => entry.id.endsWith('first-audit'));
+  assert.equal(sharedItem?.local, undefined, '提交后是共享事实');
+  assert.equal(sharedItem?.localOnly, undefined);
+  assert.equal(shared.counts.pending, 1);
 });

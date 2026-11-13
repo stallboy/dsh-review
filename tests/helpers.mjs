@@ -4,6 +4,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// 2026-11-12 事故（见 docs/2026-11-12-writer-in-dsh-smoke-test-incident.md §7）：
+// 本机启用 core.fsmonitor 时，每个临时 fixture 仓库都会驻留一个 fsmonitor 守护进程，
+// 累计数百个后 `git add` 会在 IPC 上无限阻塞——四轮全量测试分别在
+// contract-audit-finalize / contract-fixes 等收尾用例上"挂死"均由此产生。
+// 在测试进程树内统一禁用 fsmonitor：GIT_CONFIG_* 会随 child_process 继承，
+// 同时覆盖测试直调的 git 与被测插件拉起的 git 子进程；不改动任何断言。
+process.env.GIT_CONFIG_COUNT ??= '1';
+process.env.GIT_CONFIG_KEY_0 ??= 'core.fsmonitor';
+process.env.GIT_CONFIG_VALUE_0 ??= 'false';
+
 const fixturesDir = path.dirname(fileURLToPath(import.meta.url));
 
 export function runCommand(command, args, cwd, input) {
