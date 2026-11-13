@@ -47,9 +47,34 @@ function asStringArray(value: unknown): string[] {
 
 export interface ReviewersSnapshotSource {
   readReviewersText(): Promise<string | null>;
+  /** 源绑定的 VCS 快照标识；不可证明快照（SVN）时返回 null，对应读取不缓存。 */
+  snapshotId?(): Promise<string | null>;
+}
+
+/**
+ * 快照键的 reviewers.yml 解析缓存（§4.8 模式）：快照内文件内容不可变，
+ * 缓存只保存解析后的配置；不持久化、不跨快照复用。工作区读取（无 source）永不缓存。
+ */
+const reviewersCache = new Map<string, ReviewersConfig>();
+const REVIEWERS_CACHE_MAX = 32;
+
+/** 防御性深拷贝：缓存对象的所有数组字段与返回值完全脱离引用，调用方改不到缓存。 */
+function cloneReviewersConfig(config: ReviewersConfig): ReviewersConfig {
+  return {
+    ...config,
+    rules: config.rules.map((rule) => ({ ...rule, paths: [...rule.paths], tags: [...rule.tags] })),
+    allowedGateCommands: [...config.allowedGateCommands],
+    auditSmokeCommands: [...config.auditSmokeCommands],
+  };
 }
 
 export async function loadReviewers(repoRoot: string, source?: ReviewersSnapshotSource): Promise<ReviewersConfig> {
+  const snapshot = source?.snapshotId ? await source.snapshotId().catch(() => null) : null;
+  const cacheKey = snapshot !== null && snapshot !== undefined ? `${repoRoot}|${snapshot}` : null;
+  if (cacheKey) {
+    const cached = reviewersCache.get(cacheKey);
+    if (cached) return cloneReviewersConfig(cached);
+  }
   let text: string | null;
   if (source) {
     text = await source.readReviewersText();
@@ -61,7 +86,19 @@ export async function loadReviewers(repoRoot: string, source?: ReviewersSnapshot
       throw error;
     }
   }
-  if (text === null) return { ...EMPTY_REVIEWERS };
+  if (text === null) {
+    // 快照中不存在 reviewers.yml 同样按快照键缓存（内容对该快照不可变）。
+    const empty = { ...EMPTY_REVIEWERS };
+    if (cacheKey) {
+      reviewersCache.set(cacheKey, empty);
+      if (reviewersCache.size > REVIEWERS_CACHE_MAX) {
+        const first = reviewersCache.keys().next().value;
+        if (first !== undefined) reviewersCache.delete(first);
+      }
+      return cloneReviewersConfig(empty);
+    }
+    return empty;
+  }
   const doc = load(text, { json: true });
   if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) throw new Error('reviewers.yml 必须是 YAML 对象');
   const record = doc as Record<string, unknown>;
@@ -82,7 +119,7 @@ export async function loadReviewers(repoRoot: string, source?: ReviewersSnapshot
     const num = typeof value === 'number' && Number.isFinite(value) ? value : Number(value);
     return Number.isInteger(num) && num > 0 ? num : null;
   };
-  return {
+  const config: ReviewersConfig = {
     defaultOwner: typeof record['default_owner'] === 'string' ? record['default_owner'].trim() : '',
     rules,
     allowedGateCommands: asStringArray(record['allowed_gate_commands']),
@@ -95,6 +132,16 @@ export async function loadReviewers(repoRoot: string, source?: ReviewersSnapshot
         : 'none',
     auditSmokeCommands: asStringArray(record['audit_smoke_commands']),
   };
+  if (cacheKey) {
+    // 缓存的是共享快照内容：返回值给调用方前深拷贝，防止调用方意外改到缓存对象。
+    reviewersCache.set(cacheKey, config);
+    if (reviewersCache.size > REVIEWERS_CACHE_MAX) {
+      const first = reviewersCache.keys().next().value;
+      if (first !== undefined) reviewersCache.delete(first);
+    }
+    return cloneReviewersConfig(config);
+  }
+  return config;
 }
 
 function globToRegExp(glob: string): RegExp {

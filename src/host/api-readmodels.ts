@@ -24,6 +24,11 @@ interface ReadModelState {
   projectionCache: Map<string, { findings: ReturnType<typeof projectFindings>['findings']; errors: string[]; snapshot: string }>;
   patchCheckCache: Map<string, PatchCheckDiagnostic>;
   patchCheckPending: Set<string>;
+  /**
+   * 有效业务基线比较（§7.7）的派生缓存：键 = `from|to` 两个不可变提交，
+   * 结果是纯函数，可安全长期缓存；`unknown`（无法证明）不缓存，避免瞬时失败被固化。
+   */
+  baselineCache: Map<string, { state: 'unchanged' } | { state: 'changed'; paths: string[] }>;
 }
 
 const state: ReadModelState = {
@@ -31,6 +36,7 @@ const state: ReadModelState = {
   projectionCache: new Map(),
   patchCheckCache: new Map(),
   patchCheckPending: new Set(),
+  baselineCache: new Map(),
 };
 
 export class ReadModels {
@@ -494,8 +500,18 @@ export class ReadModels {
     const to = toRevision.trim();
     if (!from || !to) return { state: 'unknown', detail: '候选基线或当前基线为空' };
     if (from === to) return { state: 'same' };
+    // 两个不可变提交之间的业务差异是纯函数：命中即返回（仅缓存可证明的结果）。
+    const cacheKey = `${vcs.root}|${from}|${to}`;
+    const cached = state.baselineCache.get(cacheKey);
+    if (cached) return cached;
     const changes = await vcs.businessChangesBetween(from, to).catch(() => null);
     if (changes === null) return { state: 'unknown', detail: `无法比较 ${from.slice(0, 12)} 与 ${to.slice(0, 12)} 的业务变更` };
-    return changes.length === 0 ? { state: 'unchanged' } : { state: 'changed', paths: changes };
+    const result = changes.length === 0 ? { state: 'unchanged' as const } : { state: 'changed' as const, paths: changes };
+    state.baselineCache.set(cacheKey, result);
+    if (state.baselineCache.size > 256) {
+      const first = state.baselineCache.keys().next().value;
+      if (first !== undefined) state.baselineCache.delete(first);
+    }
+    return result;
   }
 }

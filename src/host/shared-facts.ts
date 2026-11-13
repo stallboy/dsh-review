@@ -109,6 +109,26 @@ export class GitHeadCandidateSource implements SharedCandidateSource {
     return result.stdout.trim().length > 0;
   }
 
+  /**
+   * §7.1 批量本地改动检测：一次 `git status --porcelain=v1 -z -uall -- .ai-review` 覆盖所有候选，
+   * 语义与逐候选 hasLocalChanges 等价（同一 porcelain 数据源，只是合并子进程）。
+   * `-uall` 防止已跟踪候选目录内的新文件被目录折叠吞掉；`-z` 关闭路径转义，按 NUL 切分。
+   * 失败返回 null，由调用方回退逐候选检测。结果属本地视图层，不得按快照缓存。
+   */
+  async localChangedCandidateIds(): Promise<Set<string> | null> {
+    const result = await git(this.root, ['status', '--porcelain=v1', '-z', '-uall', '--', '.ai-review']);
+    if (result.code !== 0) return null;
+    const ids = new Set<string>();
+    for (const record of result.stdout.split('\0')) {
+      if (record.length === 0) continue;
+      // porcelain v1 -z 记录形如 "XY <path>"；rename 记录后紧跟一个不带状态前缀的原路径记录。
+      const pathText = record.length > 3 && record[2] === ' ' ? record.slice(3) : record;
+      const match = /^\.ai-review\/(\d{4}-\d{2})\/([^/]+)(?:\/|$)/.exec(pathText);
+      if (match) ids.add(`${match[1]}/${match[2]}`);
+    }
+    return ids;
+  }
+
   async listLocalOnlyDirs(): Promise<string[]> {
     // 未进入 HEAD 的候选目录（未跟踪/新增）：仅作 local 诊断展示，不进入共享流程。
     // 实现见文件顶部说明：工作区枚举 + 调用方扣除共享集合（整目录未跟踪时 git status 会折叠失效）。
@@ -190,6 +210,22 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
     const result = await svn(this.root, ['status', '--xml', `.ai-review/${month}/${slug}`]);
     if (result.code !== 0) throw new Error(`无法证明候选本地状态：${result.stderr.trim()}`);
     return /<entry\b/.test(result.stdout);
+  }
+
+  /**
+   * §7.1 SVN 批量本地改动检测：一次 `svn status --xml -- .ai-review` 覆盖所有候选，
+   * 语义与逐候选 hasLocalChanges 等价。失败返回 null，由调用方回退逐候选检测。
+   */
+  async localChangedCandidateIds(): Promise<Set<string> | null> {
+    const result = await svn(this.root, ['status', '--xml', '--', '.ai-review']);
+    if (result.code !== 0) return null;
+    const ids = new Set<string>();
+    for (const entry of result.stdout.matchAll(/<entry\s+path="([^"]+)"/g)) {
+      const entryPath = (entry[1] ?? '').replaceAll('\\', '/');
+      const match = /(?:^|\/)\.ai-review\/(\d{4}-\d{2})\/([^/]+)(?:\/|$)/.exec(entryPath);
+      if (match) ids.add(`${match[1]}/${match[2]}`);
+    }
+    return ids;
   }
 
   async listLocalOnlyDirs(): Promise<string[]> {

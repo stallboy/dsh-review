@@ -44,6 +44,36 @@ function candidateId(month: string, slug: string): string {
 }
 
 /**
+ * 单候选扫描结果：只含**共享快照内容**的解析产物（解析后的候选、补丁统计、不变量结果），
+ * 不含 local/localOnly 等本地视图判定，也不含补丁全文（§4.8 缓存约束）。
+ * error 非空表示读取/解析失败（走 broken 摘要路径）。
+ */
+interface ScannedCandidate {
+  candidate: ReviewCandidate | null;
+  stats: PatchStats;
+  invariantErrors: string[] | null;
+  error: string | null;
+}
+
+/** 共享扫描的候选间并发上限：只为降低 N 个串行 VCS 子进程的墙钟时间，不改变快照绑定语义。 */
+const SCAN_CONCURRENCY = 6;
+
+/** 有限并发 map：结果按输入下标落位，保证与串行执行完全相同的顺序与确定性。 */
+async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await fn(items[index] as T);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+/**
  * §7.1 候选数据读取源：默认读文件系统（写路径/审计收尾使用）；
  * 共享读取（队列/详情/负向记忆/派生）传入绑定同一 VCS 快照的源（如 GitHeadCandidateSource），
  * 只读已提交内容并标记 local 差异。
@@ -59,6 +89,13 @@ export interface CandidateSource {
   readPatchText(month: string, slug: string, patchName: string): Promise<string | null>;
   /** 工作区相对共享快照是否存在本地改动（review/补丁任一）。 */
   hasLocalChanges(month: string, slug: string): Promise<boolean>;
+  /**
+   * 可选的批量本地改动检测：一次调用返回所有存在本地/暂存改动的候选 id（'YYYY-MM/slug'），
+   * 语义与逐候选 hasLocalChanges 完全等价（§7.1），只把 N 次 VCS 子进程合并为 1 次。
+   * 返回 null 表示无法证明（命令失败等），调用方必须回退逐候选 hasLocalChanges。
+   * 注意：该结果属于**本地视图层**，随工作区实时变化，不得按 VCS 快照缓存。
+   */
+  localChangedCandidateIds?(): Promise<Set<string> | null>;
   /**
    * 工作区中存在 review.md 的候选目录（'YYYY-MM/slug'），含未进入共享快照者；
    * 调用方自行与共享集合做差得到 local-only（§7.1 本地诊断）。
@@ -178,6 +215,13 @@ export function nextUpdatedAt(previous: string): string {
 
 export class ReviewStore {
   private readonly fsSource: FilesystemCandidateSource;
+  /**
+   * 共享扫描内存缓存（§4.8 模式）：键 = 该次读取已证明的 VCS 快照标识（Git HEAD commit）。
+   * 不持久化、不跨快照复用、不缓存补丁全文；本地视图层（local/localOnly）不参与缓存，
+   * 每次请求现算。SVN 快照不可证明（snapshotId=null）时不缓存。
+   */
+  private readonly scanCache = new Map<string, Map<string, ScannedCandidate | null>>();
+  private static readonly SCAN_CACHE_MAX = 8;
 
   constructor(readonly repoRoot: string) {
     this.fsSource = new FilesystemCandidateSource(repoRoot);
@@ -291,6 +335,57 @@ export class ReviewStore {
     };
   }
 
+  /**
+   * 扫描单个候选：读取 review.md、目录条目与当前补丁统计，并执行完整不变量校验。
+   * 返回 null 表示 review.md 在该读取源中不存在（调用方按“跳过”处理，保持原语义）。
+   * 结果只含读取源内容本身：不含 local/localOnly 判定，因此共享源的结果可按快照缓存。
+   */
+  private async scanCandidate(readSource: CandidateSource, month: string, slug: string): Promise<ScannedCandidate | null> {
+    try {
+      const text = await readSource.readReviewText(month, slug);
+      if (text === null) return null;
+      const candidate = this.parseCandidateText(month, slug, text);
+      const entries = await readSource.listDirEntries(month, slug).catch(() => null);
+      const entriesHas = (name: string): boolean => entries?.includes(name) ?? false;
+      const currentPatchName = candidate.meta.revisions.find(
+        (revision) => revision.id === candidate.meta.currentRevision,
+      )?.patch ?? '';
+      let stats = EMPTY_STATS;
+      const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
+      if (candidate.parseError === undefined && currentPatchName) {
+        if (!entriesHas(currentPatchName) && !archived) {
+          throw new Error(`当前版本补丁不存在：${currentPatchName}`);
+        }
+        const patchText = entriesHas(currentPatchName) ? await readSource.readPatchText(month, slug, currentPatchName) : null;
+        // 补丁文本用完即弃：缓存只保留解析后的统计（§4.8：不缓存补丁全文）。
+        if (patchText !== null) stats = parsePatch(patchText).stats;
+      }
+      let invariantErrors: string[] | null = null;
+      // I5/I4 的补丁上下文校验（声明非空时强制路径一致）。
+      if (candidate.parseError === undefined) {
+        const violations = fullReviewInvariants({
+          candidate,
+          patchExists: (revision) => archived || entriesHas(revision.patch),
+          currentPatchPaths: stats === EMPTY_STATS ? null : stats.entries.map((entry) => entry.path),
+        });
+        if (violations.length > 0) invariantErrors = violations;
+      }
+      return { candidate, stats, invariantErrors, error: null };
+    } catch (error) {
+      const message = `${month}/${slug}: ${error instanceof Error ? error.message : String(error)}`;
+      return { candidate: null, stats: EMPTY_STATS, invariantErrors: null, error: message };
+    }
+  }
+
+  /** 候选间有限并发扫描；结果按键索引，与串行扫描同序同内容。 */
+  private async scanCandidates(src: CandidateSource, ids: string[]): Promise<Map<string, ScannedCandidate | null>> {
+    const entries = await mapLimit(ids, SCAN_CONCURRENCY, async (id) => {
+      const [month = '', slug = ''] = id.split('/');
+      return [id, await this.scanCandidate(src, month, slug)] as const;
+    });
+    return new Map(entries);
+  }
+
   async list(
     filter: ReviewFilter,
     currentBase: string | null,
@@ -298,7 +393,7 @@ export class ReviewStore {
     rejectionMemoryWindow?: number | null,
     source?: CandidateSource,
   ): Promise<{ items: CandidateSummary[]; errors: string[] }> {
-    const src = source ?? this.fsSource;
+    const src: CandidateSource = source ?? this.fsSource;
     const items: CandidateSummary[] = [];
     const errors: string[] = [];
     const memoryEntries: import('./memory.js').RejectionMemoryEntry[] = [];
@@ -314,63 +409,55 @@ export class ReviewStore {
     const shared = new Set(sharedDirs);
     const localOnly = new Set((await src.listLocalOnlyDirs().catch(() => [] as string[])).filter((id) => !shared.has(id)));
     const allDirs = [...new Set([...sharedDirs, ...localOnly])].sort((left, right) => right.localeCompare(left));
+
+    // 共享部分扫描：按 VCS 快照缓存（§4.8 模式）。快照标识来自本请求刚建立的源，
+    // 命中即已证明快照未变化；SVN（snapshotId=null）与工作区源（无 snapshotId）不缓存。
+    const snapshotReader = (src as { snapshotId?: () => Promise<string | null> }).snapshotId;
+    const snapshot = typeof snapshotReader === 'function' ? await snapshotReader.call(src).catch(() => null) : null;
+    const cachedScan = snapshot !== null ? this.scanCache.get(snapshot) ?? null : null;
+    let scannedShared: Map<string, ScannedCandidate | null>;
+    if (cachedScan) {
+      // 缓存只含无错误条目：缺失键（上次扫描失败的候选）每请求重扫，瞬时 VCS 失败自愈。
+      const missing = sharedDirs.filter((id) => !cachedScan.has(id));
+      scannedShared = missing.length > 0
+        ? new Map([...cachedScan, ...await this.scanCandidates(src, missing)])
+        : cachedScan;
+    } else {
+      scannedShared = await this.scanCandidates(src, sharedDirs);
+      if (snapshot !== null) {
+        // 含错误的条目不写入缓存：瞬时失败不得随快照键固化（与 baselineCache
+        // 「unknown 不缓存」同理）；确定性 broken 候选的重扫成本可忽略。
+        const cacheable = new Map<string, ScannedCandidate | null>();
+        for (const [id, entry] of scannedShared) {
+          if (entry?.error) continue;
+          cacheable.set(id, entry);
+        }
+        this.scanCache.set(snapshot, cacheable);
+        if (this.scanCache.size > ReviewStore.SCAN_CACHE_MAX) {
+          const first = this.scanCache.keys().next().value;
+          if (first !== undefined) this.scanCache.delete(first);
+        }
+      }
+    }
+    // 本地视图层（§7.1）：local-only 目录读工作区，永远现算，不进缓存。
+    const scannedLocal = await this.scanCandidates(this.fsSource, [...localOnly]);
+
+    // 本地改动检测：优先一次批量调用（语义与逐候选等价），失败回退逐候选（保守视为 local）。
+    const changedIds = typeof src.localChangedCandidateIds === 'function'
+      ? await src.localChangedCandidateIds().catch(() => null)
+      : null;
+    const localOf = async (month: string, slug: string): Promise<boolean> => {
+      if (changedIds) return changedIds.has(candidateId(month, slug));
+      return src.hasLocalChanges(month, slug).catch(() => true);
+    };
+
     for (const id of allDirs) {
       const [month = '', slug = ''] = id.split('/');
       const isLocalOnly = localOnly.has(id);
-      const readSource = isLocalOnly ? this.fsSource : src;
-      try {
-        const text = await readSource.readReviewText(month, slug);
-        if (text === null) continue;
-        const candidate = this.parseCandidateText(month, slug, text);
-        const entries = await readSource.listDirEntries(month, slug).catch(() => null);
-        const entriesHas = (name: string): boolean => entries?.includes(name) ?? false;
-        const currentPatchName = candidate.meta.revisions.find(
-          (revision) => revision.id === candidate.meta.currentRevision,
-        )?.patch ?? '';
-        let stats = EMPTY_STATS;
-        const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
-        if (candidate.parseError === undefined && currentPatchName) {
-          if (!entriesHas(currentPatchName) && !archived) {
-            throw new Error(`当前版本补丁不存在：${currentPatchName}`);
-          }
-          const patchText = entriesHas(currentPatchName) ? await readSource.readPatchText(month, slug, currentPatchName) : null;
-          if (patchText !== null) stats = parsePatch(patchText).stats;
-        }
-        // I5/I4 的补丁上下文校验（声明非空时强制路径一致）。
-        if (candidate.parseError === undefined) {
-          const invariantErrors = fullReviewInvariants({
-            candidate,
-            patchExists: (revision) => archived || entriesHas(revision.patch),
-            currentPatchPaths: stats === EMPTY_STATS ? null : stats.entries.map((entry) => entry.path),
-          });
-          if (invariantErrors.length > 0) {
-            const summary = this.toSummary(
-              this.brokenCandidate(month, slug, path.join(this.aiReviewRoot, month, slug), path.join(this.aiReviewRoot, month, slug, 'review.md'), invariantErrors.join('；')),
-              stats, currentBase, staleDays,
-            );
-            summary.reopenedFrom = candidate.meta.reopenedFrom ?? null;
-            summary.local = isLocalOnly || (await src.hasLocalChanges(month, slug).catch(() => true)) || undefined;
-            summary.localOnly = isLocalOnly || undefined;
-            if (matchesReviewFilter(summary, filter)) items.push(summary);
-            continue;
-          }
-        }
-        const summary = this.toSummary(candidate, stats, currentBase, staleDays);
-        summary.local = isLocalOnly || (await src.hasLocalChanges(month, slug).catch(() => true)) || undefined;
-        summary.localOnly = isLocalOnly || undefined;
-        if (!summary.local) {
-          chainInfo.set(candidate.id, { reopenedFrom: candidate.meta.reopenedFrom ?? null, status: candidate.meta.status });
-          // §7.1：local 候选不进入共享流程——不作负向记忆来源。
-          if (candidate.meta.status === 'rejected') {
-            const entry = entryFromCandidate({ candidateId: candidate.id, meta: candidate.meta });
-            if (entry) memoryEntries.push(entry);
-          }
-        }
-        if (!matchesReviewFilter(summary, filter)) continue;
-        items.push(summary);
-      } catch (error) {
-        const message = `${month}/${slug}: ${error instanceof Error ? error.message : String(error)}`;
-        errors.push(message);
+      const scanned = (isLocalOnly ? scannedLocal : scannedShared).get(id);
+      if (!scanned) continue; // review.md 在对应读取源中不可读：保持原“跳过”语义
+      if (scanned.error !== null) {
+        errors.push(scanned.error);
         const summary: CandidateSummary = {
           id: candidateId(month, slug),
           title: slug,
@@ -388,13 +475,40 @@ export class ReviewStore {
           isBaseBehind: false,
           baseRevision: '',
           lastFeedback: '',
-          parseError: message,
+          parseError: scanned.error,
         };
         // §7.1：错误路径同样必须标记本地视图，否则 local 草稿会被误当作共享事实。
-        summary.local = isLocalOnly || (await src.hasLocalChanges(month, slug).catch(() => true)) || undefined;
+        summary.local = isLocalOnly || (await localOf(month, slug)) || undefined;
         summary.localOnly = isLocalOnly || undefined;
         if (matchesReviewFilter(summary, filter)) items.push(summary);
+        continue;
       }
+      const candidate = scanned.candidate;
+      if (!candidate) continue;
+      if (scanned.invariantErrors) {
+        const summary = this.toSummary(
+          this.brokenCandidate(month, slug, path.join(this.aiReviewRoot, month, slug), path.join(this.aiReviewRoot, month, slug, 'review.md'), scanned.invariantErrors.join('；')),
+          scanned.stats, currentBase, staleDays,
+        );
+        summary.reopenedFrom = candidate.meta.reopenedFrom ?? null;
+        summary.local = isLocalOnly || (await localOf(month, slug)) || undefined;
+        summary.localOnly = isLocalOnly || undefined;
+        if (matchesReviewFilter(summary, filter)) items.push(summary);
+        continue;
+      }
+      const summary = this.toSummary(candidate, scanned.stats, currentBase, staleDays);
+      summary.local = isLocalOnly || (await localOf(month, slug)) || undefined;
+      summary.localOnly = isLocalOnly || undefined;
+      if (!summary.local) {
+        chainInfo.set(candidate.id, { reopenedFrom: candidate.meta.reopenedFrom ?? null, status: candidate.meta.status });
+        // §7.1：local 候选不进入共享流程——不作负向记忆来源。
+        if (candidate.meta.status === 'rejected') {
+          const entry = entryFromCandidate({ candidateId: candidate.id, meta: candidate.meta });
+          if (entry) memoryEntries.push(entry);
+        }
+      }
+      if (!matchesReviewFilter(summary, filter)) continue;
+      items.push(summary);
     }
     // §4.8/I16：每个 rejected 候选最多一个直接替代候选——重复替代属链异常，报告为队列错误。
     const replacementCount = new Map<string, number>();
@@ -456,12 +570,14 @@ export class ReviewStore {
       title: candidate.meta.title,
       owner: candidate.meta.owner,
       status: candidate.meta.status,
-      tags: candidate.meta.tags,
+      // 候选/统计可能来自扫描缓存（跨请求共享）：数组与对象字段防御性拷贝，
+      // 防止任何调用方改写 summary 时污染缓存（恢复缓存前每请求独立解析的隔离语义）。
+      tags: [...candidate.meta.tags],
       ticket: candidate.meta.ticket,
       currentRevision: candidate.meta.currentRevision,
       createdAt: candidate.meta.createdAt,
       dirPath: candidate.dirPath,
-      patchStats: stats,
+      patchStats: { files: stats.files, additions: stats.additions, deletions: stats.deletions, entries: stats.entries.map((entry) => ({ ...entry })) },
       unresolvedComments: unresolved,
       humanJudgmentCount: candidate.humanJudgment.length,
       humanJudgmentDeclared: candidate.humanJudgmentDeclared,
