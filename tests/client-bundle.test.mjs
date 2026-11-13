@@ -202,6 +202,25 @@ test('materialized plugin registers the review view, its styles and its dictiona
   assert.equal(page.styles[0].tagName, 'style');
 });
 
+test('评审标签的底部区带（任务条 + 输入框）靠评审页根标记隐藏，切回即恢复', () => {
+  const page = createPage();
+  page.execute();
+  const plugin = materialize(page);
+  const client = createClientContext();
+  plugin.apply(client.ctx);
+
+  // 只认宿主公开的 data 锚点与插槽名：不依赖宿主 CSS Modules 的哈希 class。
+  const style = page.styles[0]?.textContent ?? '';
+  assert.match(style, /\[data-conversation-content\]:has\(\[data-dcr-view\]\) \[data-slot="conversation\.input\.dock"\]/, '任务条必须随评审页出现而收起');
+  assert.match(style, /\[data-conversation-content\]:has\(\[data-dcr-view\]\) \[data-slot="conversation\.composer\.bar"\]/, '常驻输入框必须随评审页出现而收起');
+  assert.doesNotMatch(style, /composerStack|composerSeat/, '不得依赖宿主 CSS Modules 的哈希 class');
+
+  // 评审页根节点必须带标记；槽位接口仍是单一的评审视图。
+  assert.equal(client.slots.length, 1);
+  assert.equal(client.slots[0].options.id, 'code-review');
+  assert.match(bundleSource, /\[VIEW_ATTR\]: 'code-review'/, '评审页根节点必须带 data-dcr-view');
+});
+
 test('plugin unload disposes the view, its styles and its dictionaries', () => {
   const page = createPage();
   page.execute();

@@ -91,7 +91,7 @@
     ticket: string | null; currentRevision: number;
     /** §4.3/§10.2：人工判断项的唯一机器数据源（正文只作人类可读呈现）。 */
     humanDecisions?: { id: string; question: string; note?: string }[];
-    revisions: { id: number; baseRevision: string; patch: string }[];
+    revisions: { id: number; baseRevision: string; patch: string; author?: 'ai' | 'human' }[];
     gateChecks: string[]; comments: Comment[];
     approval: { approvedBy: string; approvedAt: string } | null;
   }
@@ -122,6 +122,11 @@
   }
   interface DiffLine { kind: 'context' | 'add' | 'del' | 'meta'; oldNo: number | null; newNo: number | null; text: string }
   interface DiffFile { path: string; lines: DiffLine[]; binary: boolean }
+  /** 并排视图的行对：meta 行整宽；pair 行左右各一格（null 表示该侧留空占位）。 */
+  interface SplitRow { kind: 'meta' | 'pair'; meta: DiffLine | null; left: DiffLine | null; right: DiffLine | null }
+
+  /** 并排视图的自动阈值：容器宽度低于该值时回退单列（按差异滚动容器实测宽度判定）。 */
+  const SPLIT_MIN_WIDTH = 900;
 
   const EMPTY_STATS: Stats = { files: 0, additions: 0, deletions: 0, entries: [] };
 
@@ -283,19 +288,21 @@
       const index = /^Index: (.+)$/.exec(raw);
       if (index) { current = { path: pathOf(index[1] ?? ''), lines: [], binary: false }; files.push(current); hunk = false; continue; }
       const minus = /^--- (.+)$/.exec(raw);
-      if (minus) {
+      if (!hunk && minus) {
         const path = pathOf(minus[1] ?? '');
         if (path !== '/dev/null' && current === null) { current = { path, lines: [], binary: false }; files.push(current); }
         continue;
       }
       const plus = /^\+\+\+ (.+)$/.exec(raw);
-      if (plus) {
+      if (!hunk && plus) {
         const path = pathOf(plus[1] ?? '');
         if (path !== '/dev/null' && current === null) { current = { path, lines: [], binary: false }; files.push(current); }
         else if (current && current.path.length === 0) current.path = path;
         continue;
       }
       if (!current) continue;
+      // 统一差异以 \n 结尾，split 出的最后一个 '' 不是行内容；合法空上下文行原文是单个空格。
+      if (raw === '') continue;
       if (raw.startsWith('Binary files ') || raw.startsWith('GIT binary patch') || raw.startsWith('Cannot display: file marked as a binary type')) { current.binary = true; current.lines.push({ kind: 'meta', oldNo: null, newNo: null, text: raw }); continue; }
       if (/^(index |new file |deleted file |similarity |rename )/.test(raw)) continue;
       const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
@@ -309,10 +316,47 @@
     return files;
   }
 
+  /**
+   * 并排展示用行对：hunk 内连续删除块与随后新增块按行序对齐，多出的一侧留空占位；
+   * 上下文行左右同显；hunk 头与二进制提示等 meta 行整宽。
+   * 纯展示辅助：评论定位仍只认 parseDiff 产出的 side + 行号，不读这里的配对结果。
+   */
+  function buildSplitRows(lines: DiffLine[]): SplitRow[] {
+    const rows: SplitRow[] = [];
+    const pendingDeletions: DiffLine[] = [];
+    // 游标消费而不是 shift()：超大删除/新增替换块下保持线性。
+    let deletionCursor = 0;
+    const flushDeletions = (): void => {
+      for (let index = deletionCursor; index < pendingDeletions.length; index += 1) {
+        const line = pendingDeletions[index];
+        if (line) rows.push({ kind: 'pair', meta: null, left: line, right: null });
+      }
+      pendingDeletions.length = 0;
+      deletionCursor = 0;
+    };
+    for (const line of lines) {
+      if (line.kind === 'del') { pendingDeletions.push(line); continue; }
+      if (line.kind === 'add') {
+        const left = pendingDeletions[deletionCursor] ?? null;
+        if (left) deletionCursor += 1;
+        rows.push({ kind: 'pair', meta: null, left, right: line });
+        continue;
+      }
+      flushDeletions();
+      if (line.kind === 'meta') rows.push({ kind: 'meta', meta: line, left: null, right: null });
+      else rows.push({ kind: 'pair', meta: null, left: line, right: line });
+    }
+    flushDeletions();
+    return rows;
+  }
+
   function createPlugin(requireModule: (id: string) => any) {
     const React = requireModule('react') as ReactLike;
     const h = React.createElement;
     const { useState, useEffect, useMemo, useRef, useCallback, useReducer } = React;
+    // 布局测量要在绘制前完成，避免先画单列再跳成并排；React 缺失时退回 useEffect。
+    const useLayoutEffect: typeof useEffect =
+      (React as unknown as { useLayoutEffect?: typeof useEffect }).useLayoutEffect ?? useEffect;
 
     const CSS = `
 .dcr{display:flex;flex-direction:column;height:100%;min-height:0;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-size:13px}
@@ -321,7 +365,7 @@
 .dcr-top h1{margin:0;font-size:16px;font-weight:650}
 .dcr-sub{font-size:12px;color:var(--dsw-alias-label-secondary);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dcr-grow{flex:1;min-width:0}
-.dcr-body{flex:1;min-height:0;overflow:auto;padding:18px}
+.dcr-body{flex:1;min-height:0;overflow:auto;padding:18px;scrollbar-gutter:stable}
 .dcr-wrap{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
 .dcr-btn{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-radius:6px;padding:5px 11px;font:inherit;cursor:pointer;line-height:18px;white-space:nowrap}
 .dcr-btn:hover{border-color:var(--dsw-alias-brand-primary)}
@@ -376,6 +420,20 @@
 .dcr-line.meta{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary)}
 .dcr-plus{opacity:0;color:var(--dsw-alias-brand-primary);cursor:pointer;font-weight:700;text-align:center}
 .dcr-line:hover .dcr-plus{opacity:1}
+.dcr-srow:hover .dcr-plus{opacity:1}
+.dcr-srows{display:flex;flex-direction:column}
+.dcr-srow{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:stretch}
+.dcr-shalf{display:grid;grid-template-columns:44px 14px minmax(0,1fr) 16px;align-items:stretch;min-width:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:20px;min-height:20px}
+.dcr-shalf + .dcr-shalf{border-left:1px solid var(--dsw-alias-border-l1)}
+.dcr-shalf.add{background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 10%,transparent)}
+.dcr-shalf.del{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 9%,transparent)}
+.dcr-shalf.empty{background:var(--dsw-alias-bg-base)}
+.dcr-shalf.add .dcr-sign{color:var(--dsw-alias-state-success-primary)}
+.dcr-shalf.del .dcr-sign{color:var(--dsw-alias-state-error-primary)}
+.dcr-shalf .dcr-code{padding-right:6px}
+.dcr-srow:hover .dcr-shalf{background:var(--dsw-alias-bg-layer-2)}
+.dcr-smeta{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);padding:0 10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;line-height:20px;white-space:pre-wrap;word-break:break-all}
+.dcr-thread.split{margin-left:10px;margin-right:10px}
 .dcr-thread{margin:2px 10px 6px 106px;padding:7px 10px;border-left:2px solid var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-2);border-radius:0 6px 6px 0}
 .dcr-thread-head{display:flex;gap:8px;align-items:center;font-size:11px;color:var(--dsw-alias-label-secondary);margin-bottom:3px}
 .dcr-st-unresolved{color:var(--dsw-alias-state-error-primary)}.dcr-st-partial{color:var(--dsw-alias-state-warn-primary)}.dcr-st-resolved{color:var(--dsw-alias-state-success-primary)}
@@ -383,6 +441,11 @@
 .dcr-approve-acks{display:flex;flex-direction:column;gap:4px;margin:8px 0 4px;border:1px dashed color-mix(in srgb,var(--dsw-alias-brand-primary) 35%,transparent);border-radius:8px;padding:8px 10px;background:var(--dsw-alias-bg-base)}
 .dcr-approve-acks .dcr-small{margin-bottom:2px}
 .dcr-approve-steps{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}
+.dcr-commit{margin-top:10px;border:1px dashed color-mix(in srgb,var(--dsw-alias-brand-primary) 35%,transparent);border-radius:8px;padding:9px 11px;background:var(--dsw-alias-bg-base)}
+.dcr-seg{display:inline-flex;gap:0;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;overflow:hidden}
+.dcr-seg .dcr-btn{border:0;border-radius:0;border-right:1px solid var(--dsw-alias-border-l2)}
+.dcr-seg .dcr-btn:last-child{border-right:0}
+.dcr-commit-preview{margin:0;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.5;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-2);border-radius:6px;padding:8px 10px}
 .dcr-step{display:flex;gap:8px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:8px 10px;background:var(--dsw-alias-bg-base)}
 .dcr-step-no{flex:none;width:18px;height:18px;border-radius:50%;background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base);font-size:11px;display:flex;align-items:center;justify-content:center;font-weight:700}
 .dcr-step-title{font-weight:600;font-size:12px}
@@ -422,8 +485,21 @@
 .dcr-hist{border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:9px 11px;margin-bottom:7px}
 .dcr-raw{white-space:pre-wrap;word-break:break-word;max-height:280px;overflow:auto;background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.5}
 .dcr-sep{height:1px;background:var(--dsw-alias-border-l1);margin:8px 0}
-@media(max-width:760px){.dcr-grid{grid-template-columns:1fr}.dcr-line{grid-template-columns:32px 32px 14px 1fr 18px}.dcr-thread{margin-left:80px}}
+/*
+ * 评审标签的沉浸布局：任务条（conversation.input.dock）与常驻输入框
+ * （conversation.composer.bar）都由宿主渲染在会话正文的底部区带里，评审页用不到它们。
+ * 评审页在自己的根节点带 data-dcr-view；只要会话正文里出现评审页，就让这两个宿主插槽
+ * 不占位——插槽锚点本身就是宿主声明过的显示区域，隐藏它等于隐藏整块内容。
+ * 切回聊天等视图时标记消失，规则立即失效、宿主布局恢复。
+ * 只认宿主公开的 data 锚点与插槽名，不读宿主 CSS Modules 的哈希 class。
+ */
+[data-conversation-content]:has([data-dcr-view]) [data-slot="conversation.input.dock"],
+[data-conversation-content]:has([data-dcr-view]) [data-slot="conversation.composer.bar"]{display:none}
+@media(max-width:760px){.dcr-grid{grid-template-columns:1fr}.dcr-line{grid-template-columns:32px 32px 14px 1fr 18px}.dcr-shalf{grid-template-columns:30px 12px minmax(0,1fr) 16px}.dcr-thread{margin-left:80px}.dcr-thread.split{margin-left:10px}}
 `;
+
+    /** 评审页根节点上的 DOM 标记：CSS 据此让宿主底部区带（任务条 + 输入框）不占位。 */
+    const VIEW_ATTR = 'data-dcr-view';
 
     /** Inline markdown-lite: bold, code spans and links; everything stays a React node. */
     function inlineNodes(text: string, keyPrefix: string): any[] {
@@ -544,6 +620,11 @@
       const [diffMode, setDiffMode] = useState<'full' | 'incremental'>('full');
       const [diffFrom, setDiffFrom] = useState(1);
       const [diffLoading, setDiffLoading] = useState(false);
+      /** §10.2：差异布局偏好——auto 按容器宽度自动切换，split/unified 为用户手动覆盖（仅本会话内存态）。 */
+      const [diffLayout, setDiffLayout] = useState<'auto' | 'split' | 'unified'>('auto');
+      /** 差异卡片的实测宽度；用容器而不是 window，面板宽度随宿主布局变化。 */
+      const [diffWidth, setDiffWidth] = useState<number | null>(null);
+      const diffCardRef = useRef<any>(null);
       const [loading, setLoading] = useState(false);
       const [error, setError] = useState('');
       const [busy, setBusy] = useState(false);
@@ -561,6 +642,22 @@
       const jobLogOffsetRef = useRef<number | null>(null);
       const jobLogRef = useRef<string[]>([]);
       const [general, setGeneral] = useState('');
+      /**
+       * §7.4（2026-11-12）：「提交并让 AI 修复」后由谁启动解决方案。
+       * - session：新建独立 DSH 会话（可见、可交互），由 /fix-session 投递提示词；
+       * - export：不启动任何执行器，只导出提示词，手动粘贴到外部 Agent（codex 等）。
+       */
+      const [fixTarget, setFixTarget] = useState<'session' | 'export'>('session');
+      const [fixLaunching, setFixLaunching] = useState(false);
+      const [fixSession, setFixSession] = useState<{ sessionId: string; title: string; revision: number } | null>(null);
+      const [fixPrompt, setFixPrompt] = useState<{ text: string; revision: number } | null>(null);
+      const [fixPromptLoading, setFixPromptLoading] = useState(false);
+      const [fixCopied, setFixCopied] = useState(false);
+      /**
+       * §5.6（2026-11-12）：批准提交信息详略。detailed = 规范单行 + 空行 + Host 生成的事实正文；
+       * simple = 只写规范单行。缺省 detailed（信息量更完整，但仍以单行综述打头）。
+       */
+      const [commitDetail, setCommitDetail] = useState<'simple' | 'detailed'>('detailed');
       /** §8.3/G37：多条总体评论草稿，一次批量提交（全有或全无，一次共享写入）。 */
       const [batchDrafts, setBatchDrafts] = useState<string[]>([]);
       /** §10.2/G34/G39：行类型 → side；行号（LEFT=oldNo，RIGHT=newNo）。 */
@@ -584,6 +681,19 @@
       const [finalizeArmed, setFinalizeArmed] = useState(false);
       const [filter, setFilter] = useState({ owner: '', statuses: '', text: '', tag: '', dir: '', createdAfter: '', createdBefore: '' });
       const diffFiles = useMemo(() => parseDiff(diff?.unifiedDiff ?? ''), [diff]);
+
+      // 并排/单列自动切换只看差异卡片的真实宽度；窗口宽度与面板宽度并不等价。
+      // 卡片本身不滚动（滚动条在 .dcr-diff-body 内），避免滚动条出现/消失让测量值来回跳。
+      useLayoutEffect(() => {
+        const element = diffCardRef.current as { clientWidth?: number } | null;
+        if (!element) { setDiffWidth(null); return; }
+        const update = (): void => { setDiffWidth(element.clientWidth ?? 0); };
+        update();
+        if (typeof ResizeObserver === 'undefined') return;
+        const observer = new ResizeObserver(update);
+        observer.observe(element as unknown as Element);
+        return () => { observer.disconnect(); };
+      }, [screen, selectedId, detail?.candidate.id, diffFiles, diffMode, diffFrom]);
 
       const refreshHealth = useCallback(async (): Promise<Health | null> => {
         try {
@@ -691,6 +801,10 @@
         setGeneral('');
         setDraft(null);
         setPanel('');
+        // 修复会话/导出的提示词绑定具体版本：候选换版本后必须重新生成，不能沿用旧提示词。
+        setFixSession(null);
+        setFixPrompt(null);
+        setFixCopied(false);
       }, [detail?.candidate.id, detail?.candidate.meta.currentRevision]);
 
       useEffect(() => {
@@ -799,12 +913,13 @@
       };
 
       // §8.3/G37：批量草稿一次提交（全有或全无；状态只在批次内转换一次）。
-      const submitBatch = async (drafts: string[], autoFix: boolean): Promise<void> => {
+      // 「提交并 AI 修复」不再走这里的 autoFix 分支——修复改由 /fix-session 或导出提示词启动（见 submitFeedbackAndFix）。
+      const submitBatch = async (drafts: string[]): Promise<void> => {
         if (!detail || drafts.length === 0) return;
         setBusy(true); setError('');
         try {
           const response = await api.post<{ job?: Job; autoFixError?: string }>('/comments/batch', {
-            id: detail.candidate.id, ...guard(), comments: drafts.map((content) => ({ content })), autoFix,
+            id: detail.candidate.id, ...guard(), comments: drafts.map((content) => ({ content })), autoFix: false,
           });
           dispatchDetail({ type: 'rebind' });
           await afterWrite();
@@ -889,7 +1004,84 @@
         const waivedDecisions = decisions
           .filter((item) => !ack[item.id] && (waiveReason[item.id] ?? '').trim().length > 0)
           .map((item) => ({ id: item.id, reason: (waiveReason[item.id] ?? '').trim() }));
-        void startJob('/approve', { id: detail.candidate.id, ...guard(), confirmedDecisions, waivedDecisions });
+        void startJob('/approve', {
+          id: detail.candidate.id, ...guard(), confirmedDecisions, waivedDecisions,
+          // §5.6（2026-11-12）：提交信息详略——detailed 由 Host 生成「单行 + 空行 + 正文」。
+          commitDetail,
+        });
+      };
+
+      /**
+       * §7.4（2026-11-12）：「提交并让 AI 修复」的总入口。
+       *
+       * 选择「新会话」时先保存意见（不触发 headless 修复），再调 `/fix-session` 创建独立
+       * 会话投递修复提示词；选择「导出提示词」时只保存意见并生成可复制的提示词，
+       * 由用户粘贴到外部 Agent（codex 等）手动执行。两条路径都不自行提交候选版本。
+       */
+      const submitFeedbackAndFix = async (drafts: string[]): Promise<void> => {
+        if (!detail || drafts.length === 0) return;
+        setBusy(true); setError('');
+        try {
+          if (drafts.length > 1) await api.post('/comments/batch', {
+            id: detail.candidate.id, ...guard(), comments: drafts.map((content) => ({ content })), autoFix: false,
+          });
+          else await api.post('/comments', {
+            id: detail.candidate.id, ...guard(), content: drafts[0], autoFix: false,
+          });
+          dispatchDetail({ type: 'rebind' });
+          await afterWrite();
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+          setBusy(false);
+          return;
+        }
+        setBusy(false);
+        setFixCopied(false);
+        if (fixTarget === 'session') await launchFixSession();
+        else await exportFixPrompt();
+      };
+
+      /** 在当前候选/版本上新建 DSH 修复会话（可见于侧边栏），不自行提交候选。 */
+      const launchFixSession = async (): Promise<void> => {
+        if (!detail) return;
+        setFixLaunching(true); setError('');
+        try {
+          const value = await api.post<{ sessionId: string; title: string; revision: number }>('/fix-session', {
+            id: detail.candidate.id,
+          });
+          setFixSession({ sessionId: value.sessionId, title: value.title, revision: value.revision });
+          setFixPrompt(null);
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+        } finally {
+          setFixLaunching(false);
+        }
+      };
+
+      /** 导出当前候选的修复提示词（新会话口径），供手动粘贴到外部 Agent。 */
+      const exportFixPrompt = async (): Promise<void> => {
+        if (!detail) return;
+        setFixPromptLoading(true); setError('');
+        try {
+          const query = new URLSearchParams({ id: detail.candidate.id, mode: 'session' });
+          const value = await api.get<{ prompt: string }>(`/fix-prompt?${query.toString()}`);
+          setFixPrompt({ text: value.prompt, revision: detail.candidate.meta.currentRevision });
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+        } finally {
+          setFixPromptLoading(false);
+        }
+      };
+
+      const copyFixPrompt = async (): Promise<void> => {
+        if (!fixPrompt) return;
+        try {
+          await navigator.clipboard.writeText(fixPrompt.text);
+          setFixCopied(true);
+        } catch {
+          setFixCopied(false);
+          setError('复制失败，请手动选择提示词文本');
+        }
       };
 
       // §5.1/G12：Owner 显式把 changes_requested 转回 pending（不产生新版本）。
@@ -1024,23 +1216,6 @@
         finally { setBusy(false); }
       };
 
-      const manualRevision = async (): Promise<void> => {
-        if (!detail) return;
-        const patchText = window.prompt('粘贴相对当前基线的完整 Unified Diff（人工补丁）');
-        if (patchText?.trim()) await startJob('/manual-revision', { id: detail.candidate.id, ...guard(), patchText });
-      };
-      const archiveStale = async (): Promise<void> => {
-        if (detail && window.confirm('确认按 reviewers.yml 的 stale_days 归档此候选？')) {
-          await runWrite('/archive-stale', { id: detail.candidate.id, ...guard() });
-        }
-      };
-      const reopenCandidate = async (): Promise<void> => {
-        if (!detail) return;
-        const from = window.prompt('输入真实的 rejected 来源候选 id（YYYY-MM/slug）');
-        if (!from) return;
-        const reason = window.prompt('重开理由（必填）');
-        if (reason?.trim()) await runWrite('/reopen', { id: detail.candidate.id, ...guard(), from, reason });
-      };
       const convertFinding = async (): Promise<void> => {
         const auditId = window.prompt('最新有效观察的 auditId');
         const findingId = auditId ? window.prompt('findingId') : null;
@@ -1298,8 +1473,59 @@
           { title: '执行门禁', desc: `${String(candidate.meta.gateChecks.length)} 条命令逐条执行，任一失败即回滚。` },
           { title: '原子提交', desc: '业务代码、review.md 状态与补丁清理进入同一个提交。' },
         ];
-        const approvalPanel = (): any => h('div', { className: 'dcr-card dcr-approve' },
+        /**
+         * §5.6（2026-11-12）：提交信息详略选择。
+         * 首行综述由 Host 生成（与 title 一致，保证 §4.9/§5.6 校验必然成立），
+         * 这里只展示将要提交的结构，避免用户写出会被批准流程拒绝的信息。
+         */
+        const commitPreview = (): string => {
+          // 与 Host `buildCommitSubject` 同规则：标题折叠为单行（空白压缩 + 去首尾），
+          // 有 author=human 的历史版本时追加 @ rev <最新人工版本号>。
+          const revHuman = candidate.meta.revisions.filter((revision) => revision.author === 'human');
+          const latestHuman = revHuman.reduce((max, revision) => Math.max(max, revision.id), 0);
+          const title = candidate.meta.title.replace(/\s+/g, ' ').trim();
+          const subject = `review(${candidate.id}): ${title}${latestHuman > 0 ? ` @ rev ${String(latestHuman)}` : ''}`;
+          if (commitDetail === 'simple') return subject;
+          return [
+            subject,
+            '',
+            '作者统计（候选触及文件）：…',
+            '',
+            '改动摘要：N 个文件，+X / -Y 行',
+            '',
+            '修复方案：',
+            '…',
+            '',
+            '来源候选：',
+            `- .ai-review/${candidate.id}（rev ${String(candidate.meta.currentRevision)}）`,
+            '',
+            `门禁（本次批准重新执行 ${String(candidate.meta.gateChecks.length)} 条）：`,
+            ...(candidate.meta.gateChecks.length > 0 ? candidate.meta.gateChecks.map((command) => `- ${command}`) : ['- （无）']),
+          ].join('\n');
+        };
+        const commitMessagePanel = (): any => h('div', { className: 'dcr-commit' },
           h('div', { className: 'dcr-row' },
+            h('strong', { className: 'dcr-grow' }, '提交信息'),
+            h('span', { className: 'dcr-small dcr-muted' }, '首行自动取候选 title（§5.6 要求首行与 title 一致）'),
+          ),
+          h('div', { className: 'dcr-seg', role: 'group', 'aria-label': '提交信息详略' },
+            h('button', {
+              className: `dcr-btn ${commitDetail === 'simple' ? 'p' : ''}`, type: 'button', 'aria-pressed': commitDetail === 'simple',
+              onClick: () => setCommitDetail('simple'),
+            }, '简略信息'),
+            h('button', {
+              className: `dcr-btn ${commitDetail === 'detailed' ? 'p' : ''}`, type: 'button', 'aria-pressed': commitDetail === 'detailed',
+              onClick: () => setCommitDetail('detailed'),
+            }, '详细信息'),
+          ),
+          h('div', { className: 'dcr-small dcr-muted', style: { margin: '6px 0' } },
+            commitDetail === 'detailed'
+              ? '详细信息：一句简单描述单行综述 → 空行 → 作者统计、改动摘要、修复方案、来源候选、门禁与人工判断项（正文由 Host 在批准提交时按实际应用的补丁生成，下面的预览中以 … 表示）。'
+              : '简略信息：只提交一行 `review(<候选>): <标题>`，正文留空。'),
+          h('div', { className: 'dcr-small dcr-muted' }, '预览'),
+          h('pre', { className: 'dcr-commit-preview' }, commitPreview()),
+        );
+        const approvalPanel = (): any => h('div', { className: 'dcr-card dcr-approve' },          h('div', { className: 'dcr-row' },
             h('h3', { className: 'dcr-grow', style: { margin: 0 } }, '确认批准并提交'),
             h('button', { className: 'dcr-btn g', onClick: () => setPanel('') }, '取消'),
           ),
@@ -1339,6 +1565,7 @@
               ? h('div', { className: 'dcr-banner warn' }, '门禁为空，无法批准；请在总体意见中要求 AI 补全 gate_checks 后再提交。')
               : h('div', null, ...candidate.meta.gateChecks.map((command, index) => h('div', { key: index, className: 'dcr-gate-item dcr-mono dcr-small' }, command))),
           ),
+          commitMessagePanel(),
           h('div', { className: 'dcr-row', style: { marginTop: 12 } },
             h('button', { className: 'dcr-btn p', disabled: busy || !allAck || candidate.meta.gateChecks.length === 0, onClick: approve }, busy ? '执行中…' : '确认批准并提交'),
             h('button', { className: 'dcr-btn', onClick: () => setPanel('') }, '再想想'),
@@ -1359,6 +1586,83 @@
             h('button', { className: 'dcr-btn', onClick: () => setPanel('') }, '取消'),
           ),
         );
+        // §10.2（并排展示）：跨基线 Hunk 级降级仍是原始文本，不参与并排；手动/自动布局只影响结构化差异。
+        const crossBaseFallback = diff?.resolutionMode === 'cross_base_hunk_fallback' || /^# 跨基线 Hunk 对比/m.test(diff?.unifiedDiff ?? '');
+        const splitView = !crossBaseFallback
+          && (diffLayout === 'split' || (diffLayout === 'auto' && diffWidth !== null && diffWidth >= SPLIT_MIN_WIDTH));
+
+        // 评论线程：并排/统一共用同一份节点，避免两套渲染漂移。
+        const threadNode = (comment: Comment): any => h('div', { key: comment.id, className: `dcr-thread${splitView ? ' split' : ''}` },
+          h('div', { className: 'dcr-thread-head' },
+            h('span', null, comment.author),
+            h('span', null, `rev ${String(comment.revision)}`),
+            h('span', { className: comment.status === 'resolved' ? 'dcr-st-resolved' : comment.status === 'partial' ? 'dcr-st-partial' : 'dcr-st-unresolved' }, commentText(comment.status)),
+            h('span', { className: 'dcr-grow' }),
+            canAct ? h('select', { className: 'dcr-select', style: { padding: '0 3px', fontSize: 11 }, value: comment.status, onChange: (e: any) => { void setCommentStatus(comment.id, e.target.value); } },
+              h('option', { value: 'unresolved' }, '未处理'), h('option', { value: 'partial' }, '部分处理'), h('option', { value: 'resolved' }, '已处理')) : null,
+          ),
+          h(RichText, { text: comment.content }),
+        );
+
+        // §10.2/G39：先按 file + line + side 精确匹配，再用 anchor.snippet 在当前差异里重定位（不改写评论）。
+        const commentsForRow = (
+          file: DiffFile,
+          relocated: Map<string, { side: 'LEFT' | 'RIGHT'; line: number }>,
+          side: 'LEFT' | 'RIGHT',
+          rowNo: number | null,
+        ): Comment[] => rowNo === null ? [] : detail.comments.filter((comment) => {
+          if (comment.file !== file.path) return false;
+          const exact = comment.line === rowNo && (comment.side ?? 'RIGHT') === side;
+          const re = relocated.get(comment.id);
+          const relocatedHere = re !== undefined && re.line === rowNo && re.side === side;
+          return exact || relocatedHere;
+        });
+
+        // 行内意见入口只出现在该行真正所属的那一侧：删除行=LEFT，新增/上下文=RIGHT。
+        const plusNode = (file: DiffFile, side: 'LEFT' | 'RIGHT', rowNo: number | null): any =>
+          canAct && rowNo !== null
+            ? h('span', {
+                className: 'dcr-plus',
+                title: side === 'LEFT' ? '对基线侧该行添加意见（LEFT）' : '添加行内意见（RIGHT）',
+                onClick: () => setDraft({ file: file.path, line: rowNo, text: '', side }),
+              }, '+')
+            : null;
+
+        const renderSplitFile = (file: DiffFile, relocated: Map<string, { side: 'LEFT' | 'RIGHT'; line: number }>): any => {
+          const half = (line: DiffLine | null, side: 'LEFT' | 'RIGHT'): any => {
+            if (!line) {
+              return h('div', { className: 'dcr-shalf empty' },
+                h('span', { className: 'dcr-num' }), h('span', { className: 'dcr-sign' }), h('span', { className: 'dcr-code' }));
+            }
+            const no = side === 'LEFT' ? line.oldNo : line.newNo;
+            const commentSide = side === 'LEFT' ? line.kind === 'del' : line.kind !== 'del';
+            return h('div', { className: `dcr-shalf ${line.kind}` },
+              h('span', { className: 'dcr-num' }, no === null ? '' : String(no)),
+              h('span', { className: 'dcr-sign' }, line.kind === 'add' ? '+' : line.kind === 'del' ? '-' : ''),
+              h('span', { className: 'dcr-code' }, line.text),
+              commentSide ? plusNode(file, side, no) : null,
+            );
+          };
+          return h('div', { key: file.path },
+            h('div', { className: 'dcr-file' }, file.path),
+            h('div', { className: 'dcr-srows' }, ...buildSplitRows(file.lines).map((row, index) => {
+              const key = `${file.path}-${String(index)}`;
+              if (row.kind === 'meta') return h('div', { key, className: 'dcr-smeta' }, row.meta?.text ?? '');
+              // 上下文行左右是同一个 DiffLine：只按 RIGHT 匹配，保持与单列视图一致的 side 语义。
+              const context = row.left !== null && row.right !== null && row.left === row.right;
+              const rowComments = context
+                ? commentsForRow(file, relocated, 'RIGHT', row.right?.newNo ?? null)
+                : [
+                    ...commentsForRow(file, relocated, 'LEFT', row.left?.oldNo ?? null),
+                    ...commentsForRow(file, relocated, 'RIGHT', row.right?.newNo ?? null),
+                  ];
+              return h('div', { key },
+                h('div', { className: 'dcr-srow' }, half(row.left, 'LEFT'), half(row.right, 'RIGHT')),
+                ...rowComments.map(threadNode),
+              );
+            })),
+          );
+        };
         return h('div', { className: 'dcr-body' },
           h('div', { className: 'dcr-wrap' },
             renderJob(),
@@ -1403,9 +1707,9 @@
                   !detail.canAct ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void takeover(); } }, '接管审核') : null,
                   canAct && candidate.meta.status === 'changes_requested'
                     ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void resumeCandidate(); } }, '转回待审核') : null,
-                  canAct && (candidate.meta.status === 'pending' || candidate.meta.status === 'changes_requested') ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void manualRevision(); } }, '上传人工补丁') : null,
-                  canAct && (candidate.meta.status === 'pending' || candidate.meta.status === 'changes_requested') ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void archiveStale(); } }, '超时归档') : null,
-                  canAct && (candidate.meta.status === 'pending' || candidate.meta.status === 'changes_requested') ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void reopenCandidate(); } }, '从重开来源恢复') : null,
+                  // 2026-11-12：移除三个低频人工入口（人工补丁上传 / 过期归档 / 重开来源恢复）。
+                  // 后端端点（/manual-revision、/archive-stale、/reopen）与 SPEC 语义保持不变，
+                  // 只是不在面板上提供按钮（这些操作需要手输候选 id 与理由，误触后果重）。
                   canAct ? h('button', { className: 'dcr-btn d', disabled: busy, onClick: () => setPanel(panel === 'reject' ? '' : 'reject') }, panel === 'reject' ? '收起放弃' : '放弃') : null,
                   canAct ? h('button', {
                     className: 'dcr-btn p',
@@ -1472,8 +1776,26 @@
             h('div', { className: 'dcr-card' },
               h('h3', null, '总体意见'),
               h('div', { className: 'dcr-small dcr-muted', style: { marginBottom: 6 } },
-                '提交后默认立即让 AI 读取这条意见和所有未解决的行内意见，生成下一版；只想记录意见时点「仅提交意见」。想再修一版，直接在意见里写清要求再提交即可。'),
+                '提交后按下方「修复执行方式」保存意见并启动下一版：新建 DSH 会话可直接观察/追问，导出提示词可交给 codex 等外部 Agent；只想记录意见时点「仅提交意见」。'),
               h('textarea', { className: 'dcr-textarea', value: general, disabled: !canAct, placeholder: canAct ? '写给 AI/作者的整体意见（可加入草稿批量提交）…' : '仅 owner 可提交意见', onChange: (e: any) => setGeneral(e.target.value) }),
+              // §7.4（2026-11-12）：修复执行方式——新建会话 / 导出提示词到外部 Agent。
+              h('div', { className: 'dcr-row', style: { marginTop: 8, alignItems: 'center' } },
+                h('span', { className: 'dcr-small dcr-muted' }, '修复执行方式'),
+                h('div', { className: 'dcr-seg', role: 'group', 'aria-label': '修复执行方式' },
+                  h('button', {
+                    className: `dcr-btn ${fixTarget === 'session' ? 'p' : ''}`, type: 'button', disabled: !canAct,
+                    'aria-pressed': fixTarget === 'session', onClick: () => setFixTarget('session'),
+                  }, '新建 DSH 会话'),
+                  h('button', {
+                    className: `dcr-btn ${fixTarget === 'export' ? 'p' : ''}`, type: 'button', disabled: !canAct,
+                    'aria-pressed': fixTarget === 'export', onClick: () => setFixTarget('export'),
+                  }, '导出提示词'),
+                ),
+                h('span', { className: 'dcr-small dcr-muted' },
+                  fixTarget === 'session'
+                    ? '新建一个可见的 DSH 会话并投递修复提示词；会话只产出候选新版本，`.ai-review/` 仍由你在面板上收尾提交。'
+                    : '生成新会话口径的修复提示词，复制后粘贴到外部 Agent（如 codex exec）；完成后回到这里收尾。'),
+              ),
               batchDrafts.length > 0 ? h('div', { className: 'dcr-banner info', style: { marginTop: 6 } },
                 h('div', { className: 'dcr-small' }, `草稿 ${String(batchDrafts.length)} 条：`),
                 ...batchDrafts.map((draft, index) => h('div', { key: index, className: 'dcr-row', style: { alignItems: 'center', marginTop: 2 } },
@@ -1482,24 +1804,23 @@
                 )),
               ) : null,
               h('div', { className: 'dcr-row', style: { marginTop: 8 } },
+                // §10.2：存在本地草稿时一次 /comments/batch 完成提交；随后按所选执行方式启动修复。
                 h('button', {
                   className: 'dcr-btn p',
-                  disabled: !canAct || busy || (batchDrafts.length === 0 && !general.trim()),
+                  disabled: !canAct || busy || fixLaunching || fixPromptLoading || (batchDrafts.length === 0 && !general.trim()),
                   onClick: () => {
-                    // §10.2：存在本地草稿时一次 /comments/batch(autoFix) 完成提交与修复触发。
                     const drafts = [...batchDrafts, ...(general.trim() ? [general.trim()] : [])];
                     setBatchDrafts([]); setGeneral('');
-                    if (drafts.length > 1) void submitBatch(drafts, true);
-                    else if (drafts[0]) void addComment('', 0, drafts[0], true);
+                    void submitFeedbackAndFix(drafts);
                   },
-                }, busy ? '执行中…' : '提交意见并让 AI 修复'),
+                }, fixLaunching ? '正在创建会话…' : fixPromptLoading ? '生成提示词…' : fixTarget === 'session' ? '提交意见并新建修复会话' : '提交意见并导出修复提示词'),
                 h('button', {
                   className: 'dcr-btn',
                   disabled: !canAct || busy || (batchDrafts.length === 0 && !general.trim()),
                   onClick: () => {
                     const drafts = [...batchDrafts, ...(general.trim() ? [general.trim()] : [])];
                     setBatchDrafts([]); setGeneral('');
-                    if (drafts.length > 1) void submitBatch(drafts, false);
+                    if (drafts.length > 1) void submitBatch(drafts);
                     else if (drafts[0]) void addComment('', 0, drafts[0], false);
                   },
                 }, '仅提交意见'),
@@ -1510,20 +1831,35 @@
                   onClick: () => { if (general.trim()) { setBatchDrafts([...batchDrafts, general.trim()]); setGeneral(''); } },
                 }, '加入草稿'),
                 batchDrafts.length > 0 ? h('button', {
-                  className: 'dcr-btn p',
+                  className: 'dcr-btn',
                   disabled: !canAct || busy,
-                  onClick: () => { const drafts = batchDrafts; setBatchDrafts([]); void submitBatch(drafts, false); },
+                  onClick: () => { const drafts = batchDrafts; setBatchDrafts([]); void submitBatch(drafts); },
                 }, `批量提交 ${String(batchDrafts.length)} 条`) : null,
                 batchDrafts.length > 0 ? h('button', {
                   className: 'dcr-btn',
-                  disabled: !canAct || busy,
-                  onClick: () => { const drafts = batchDrafts; setBatchDrafts([]); void submitBatch(drafts, true); },
-                }, `批量提交并让 AI 修复`) : null,
+                  disabled: !canAct || busy || fixLaunching || fixPromptLoading,
+                  onClick: () => {
+                    // 批量路径也必须带上已输入的总体意见，否则用户刚写的文字会被静默丢弃。
+                    const drafts = [...batchDrafts, ...(general.trim() ? [general.trim()] : [])];
+                    setBatchDrafts([]); setGeneral('');
+                    void submitFeedbackAndFix(drafts);
+                  },
+                }, fixTarget === 'session' ? '批量提交并新建修复会话' : '批量提交并导出提示词') : null,
                 h('span', { className: 'dcr-grow' }),
                 h('span', { className: 'dcr-small dcr-muted' }, '提交后状态变为“待修改”，并写入仓库 review.md。'),
               ),
+              fixSession ? h('div', { className: 'dcr-banner info', style: { marginTop: 8 } },
+                `已创建修复会话（rev ${String(fixSession.revision)}）：${fixSession.title}。请在侧边栏打开该会话查看过程；它产出新版本后回到这里刷新队列并收尾提交。`,
+              ) : null,
+              fixPrompt && fixPrompt.revision === candidate.meta.currentRevision ? h('div', { className: 'dcr-field', style: { marginTop: 10 } },
+                h('div', { className: 'dcr-row' },
+                  h('label', { className: 'dcr-grow' }, '修复提示词（新会话口径，可整段粘贴到外部 Agent）'),
+                  h('button', { className: 'dcr-btn', onClick: () => { void copyFixPrompt(); } }, fixCopied ? '已复制' : '复制'),
+                ),
+                h('textarea', { className: 'dcr-textarea', style: { minHeight: 220 }, readOnly: true, value: fixPrompt.text }),
+              ) : null,
             ),
-            h('div', { className: 'dcr-diff' },
+            h('div', { className: 'dcr-diff', ref: diffCardRef },
               h('div', { className: 'dcr-diff-bar' },
                 h('strong', null, '代码差异'),
                 h('button', { className: `dcr-btn ${diffMode === 'full' ? 'p' : ''}`, onClick: () => setDiffMode('full') }, '完整差异'),
@@ -1533,10 +1869,19 @@
                 ) : null,
                 diffMode === 'incremental' ? h('span', { className: 'dcr-small dcr-muted' }, `→ rev ${String(candidate.meta.currentRevision)}`) : null,
                 h('span', { className: 'dcr-grow' }),
+                crossBaseFallback ? null : h('span', { className: 'dcr-small dcr-muted' }, '布局'),
+                crossBaseFallback ? null : h('button', {
+                  className: `dcr-btn ${diffLayout === 'auto' ? 'p' : ''}`,
+                  title: `自动：差异区宽度 ≥ ${String(SPLIT_MIN_WIDTH)}px 时并排，否则单列`,
+                  onClick: () => setDiffLayout('auto'),
+                }, '自动'),
+                crossBaseFallback ? null : h('button', { className: `dcr-btn ${diffLayout === 'split' ? 'p' : ''}`, onClick: () => setDiffLayout('split') }, '并排'),
+                crossBaseFallback ? null : h('button', { className: `dcr-btn ${diffLayout === 'unified' ? 'p' : ''}`, onClick: () => setDiffLayout('unified') }, '统一'),
+                splitView ? h('span', { className: 'dcr-small dcr-muted' }, '左：基线 · 右：补丁') : null,
                 diffLoading ? h('span', { className: 'dcr-small dcr-muted' }, '加载差异…') : null,
               ),
               diff?.notes?.length ? h('div', { className: 'dcr-banner info', style: { margin: 8 } }, diff.notes.join(' ')) : null,
-              diff?.resolutionMode === 'cross_base_hunk_fallback' || /^# 跨基线 Hunk 对比/m.test(diff?.unifiedDiff ?? '') ?
+              crossBaseFallback ?
                 h('div', { style: { padding: 10 } },
                   h('div', { className: 'dcr-banner warn', style: { marginBottom: 8 } }, '跨基线且旧补丁无法三方应用：当前为 Hunk 级近似对比，不代表逐行真实 diff。'),
                   h('pre', { className: 'dcr-raw' }, diff?.unifiedDiff || '（无差异）'),
@@ -1557,43 +1902,26 @@
                       if (line !== null) relocated.set(comment.id, { side, line });
                     }
                   }
+                  if (splitView) return renderSplitFile(file, relocated);
                   return h('div', { key: file.path },
-                  h('div', { className: 'dcr-file' }, file.path),
-                  ...file.lines.map((line, index) => {
-                    const lineNo = line.newNo ?? line.oldNo;
-                    // §10.2/G34：行类型决定 side 与行号——删除行用 oldNo/LEFT，其余用 newNo/RIGHT。
-                    const rowSide: 'LEFT' | 'RIGHT' = line.kind === 'del' ? 'LEFT' : 'RIGHT';
-                    const rowNo = rowSide === 'LEFT' ? line.oldNo : line.newNo;
-                    const comments = rowNo === null ? [] : detail.comments.filter((c) => {
-                      if (c.file !== file.path) return false;
-                      const exact = c.line === rowNo && (c.side ?? 'RIGHT') === rowSide;
-                      const re = relocated.get(c.id);
-                      const relocatedHere = re !== undefined && re.line === rowNo && re.side === rowSide;
-                      return exact || relocatedHere;
-                    });
-                    return h('div', { key: `${file.path}-${String(index)}` },
-                      h('div', { className: `dcr-line ${line.kind}` },
-                        h('span', { className: 'dcr-num' }, line.oldNo === null ? '' : String(line.oldNo)),
-                        h('span', { className: 'dcr-num' }, line.newNo === null ? '' : String(line.newNo)),
-                        h('span', { className: 'dcr-sign' }, line.kind === 'add' ? '+' : line.kind === 'del' ? '-' : ''),
-                        h('span', { className: 'dcr-code' }, line.text),
-                        canAct && line.kind !== 'meta' && rowNo !== null
-                          ? h('span', { className: 'dcr-plus', title: rowSide === 'LEFT' ? '对基线侧该行添加意见（LEFT）' : '添加行内意见（RIGHT）', onClick: () => setDraft({ file: file.path, line: rowNo ?? 0, text: '', side: rowSide }) }, '+') : null,
-                      ),
-                      ...comments.map((comment) => h('div', { key: comment.id, className: 'dcr-thread' },
-                        h('div', { className: 'dcr-thread-head' },
-                          h('span', null, comment.author),
-                          h('span', null, `rev ${String(comment.revision)}`),
-                          h('span', { className: comment.status === 'resolved' ? 'dcr-st-resolved' : comment.status === 'partial' ? 'dcr-st-partial' : 'dcr-st-unresolved' }, commentText(comment.status)),
-                          h('span', { className: 'dcr-grow' }),
-                          canAct ? h('select', { className: 'dcr-select', style: { padding: '0 3px', fontSize: 11 }, value: comment.status, onChange: (e: any) => { void setCommentStatus(comment.id, e.target.value); } },
-                            h('option', { value: 'unresolved' }, '未处理'), h('option', { value: 'partial' }, '部分处理'), h('option', { value: 'resolved' }, '已处理')) : null,
+                    h('div', { className: 'dcr-file' }, file.path),
+                    ...file.lines.map((line, index) => {
+                      // §10.2/G34：行类型决定 side 与行号——删除行用 oldNo/LEFT，其余用 newNo/RIGHT。
+                      const rowSide: 'LEFT' | 'RIGHT' = line.kind === 'del' ? 'LEFT' : 'RIGHT';
+                      const rowNo = rowSide === 'LEFT' ? line.oldNo : line.newNo;
+                      const comments = commentsForRow(file, relocated, rowSide, rowNo);
+                      return h('div', { key: `${file.path}-${String(index)}` },
+                        h('div', { className: `dcr-line ${line.kind}` },
+                          h('span', { className: 'dcr-num' }, line.oldNo === null ? '' : String(line.oldNo)),
+                          h('span', { className: 'dcr-num' }, line.newNo === null ? '' : String(line.newNo)),
+                          h('span', { className: 'dcr-sign' }, line.kind === 'add' ? '+' : line.kind === 'del' ? '-' : ''),
+                          h('span', { className: 'dcr-code' }, line.text),
+                          line.kind !== 'meta' ? plusNode(file, rowSide, rowNo) : null,
                         ),
-                        h(RichText, { text: comment.content }),
-                      )),
-                    );
-                  }),
-                );
+                        ...comments.map(threadNode),
+                      );
+                    }),
+                  );
                 }),
               ),
               draft ? h('div', { style: { padding: '0 10px 10px' } },
@@ -1714,7 +2042,7 @@
       else if (screen === 'queue') content = renderQueue();
       else content = renderDetail();
 
-      return h('div', { className: 'dcr' },
+      return h('div', { className: 'dcr', [VIEW_ATTR]: 'code-review' },
         h('div', { className: 'dcr-top' },
           h('div', { className: 'dcr-grow' },
             h('div', { className: 'dcr-row' },

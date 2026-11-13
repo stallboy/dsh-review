@@ -6,7 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { buildHunkFallbackDiff, isAiReviewPath, parsePatch } from './patch.js';
 import { parseReviewMarkdown } from './frontmatter.js';
 import { runProcess, tailLines, type ProcessResult } from './shell.js';
-import type { ApplyPatchResult, ApprovalCommitLookup, InterRevisionDiff, VcsType } from './types.js';
+import type { ApplyPatchResult, ApprovalCommitLookup, AuthorStatBucket, AuthorStats, InterRevisionDiff, VcsType } from './types.js';
 
 const VCS_TIMEOUT_MS = 180_000;
 const IGNORED_PREFIXES = ['.ai-review/', '.tmp/', 'node_modules/'];
@@ -117,6 +117,14 @@ export interface VcsAdapter {
   businessChangesBetween(fromRevision: string, toRevision: string): Promise<string[] | null>;
   /** §5.5：从 VCS 历史派生批准业务提交版本；三态 found/ambiguous/unknown。 */
   deriveApprovalCommit(input: ApprovalDeriveInput): Promise<ApprovalCommitLookup>;
+  /**
+   * §5.6/§10.2（2026-11-12 修订）：作者统计，供「详细」提交信息使用。
+   *
+   * 统计范围是本候选补丁触及的业务路径；`paths` 为空时统计整个仓库。
+   * 实现必须 fail-open：无法读取（浅克隆、命令失败）时返回带 `diagnostic` 的结果，
+   * 由调用方在正文写「统计不可用」，绝不猜测数字。
+   */
+  authorStats(paths: string[], limit?: number): Promise<AuthorStats>;
 }
 
 function acceptedDirtyPath(value: string): boolean {
@@ -269,6 +277,27 @@ function describe(result: ProcessResult): string {
   return output || `退出码 ${String(result.code ?? 'null')}`;
 }
 
+/**
+ * §5.6：把 `--format=%aN%x1f%aE` 的逐行输出按「姓名 + 邮箱」聚合，按提交数倒序。
+ * 邮箱做小写归一化（Git 邮箱大小写不敏感），姓名保留首次出现的原文。
+ */
+function tallyAuthors(output: string): AuthorStatBucket[] {
+  const buckets = new Map<string, AuthorStatBucket>();
+  for (const raw of output.split(/\r?\n/)) {
+    const line = raw.replace(/\r$/, '');
+    if (!line.trim()) continue;
+    const separator = line.indexOf('\x1f');
+    const name = (separator >= 0 ? line.slice(0, separator) : line).trim();
+    const email = (separator >= 0 ? line.slice(separator + 1) : '').trim();
+    const key = `${name.toLowerCase()}\u0000${email.toLowerCase()}`;
+    const existing = buckets.get(key);
+    if (existing) existing.commits += 1;
+    else buckets.set(key, { name, email, commits: 1 });
+  }
+  return [...buckets.values()].sort((left, right) => right.commits - left.commits
+    || left.name.localeCompare(right.name));
+}
+
 export class GitAdapter implements VcsAdapter {
   readonly type = 'git' as const;
 
@@ -342,6 +371,39 @@ export class GitAdapter implements VcsAdapter {
     ]);
     if (result.code !== 0) return null;
     return result.stdout.split('\0').map((line) => line.trim()).filter((line) => line.length > 0);
+  }
+
+  /**
+   * §5.6/§10.2：作者统计（详细提交信息）。
+   *
+   * - 历史提交：`git log --format=%aN%x1f%aE --no-merges -<limit> -- <paths>`；
+   * - 本次待提交：`git status --porcelain` 中已修改/新增的业务文件数（排除 `.ai-review/`）；
+   * - 只做只读命令，不触碰索引；命令失败返回 `diagnostic`，由正文写「统计不可用」。
+   */
+  async authorStats(paths: string[], limit = 500): Promise<AuthorStats> {
+    // 路径来自补丁头（仓库内容，不可信）：< 开头的路径在 `--` 之后仍会被 git 当作 pathspec 魔法
+    // 解析，因此统一用 :(literal) 前缀禁止通配与魔法；空路径表示全仓库统计。
+    const scoped = [...new Set(paths.map(toRepoRelative).filter((item) => item.length > 0 && !isAiReviewPath(item)))];
+    const scope: AuthorStats['scope'] = scoped.length > 0 ? 'tracked' : 'repo';
+    const cap = `-${String(Math.max(1, Math.trunc(limit)))}`;
+    const logArgs = ['log', '--no-merges', cap, '--format=%aN%x1f%aE'];
+    if (scope === 'tracked') logArgs.push('--', ...scoped.map((item) => `:(literal)${item}`));
+    const logResult = await git(this.root, logArgs);
+    const statusResult = await git(this.root, ['status', '--porcelain=v1', '--untracked-files=all']);
+    const pendingFiles = statusResult.code === 0
+      ? statusResult.stdout.split(/\r?\n/).filter((line) => line.trim().length > 0)
+        .map((line) => line.slice(3).trim()).filter(acceptedDirtyPath).length
+      : 0;
+    if (logResult.code !== 0) {
+      return { buckets: [], historyCommits: 0, pendingFiles, diagnostic: describe(logResult).slice(0, 200), scope };
+    }
+    const buckets = tallyAuthors(logResult.stdout);
+    return {
+      buckets,
+      historyCommits: buckets.reduce((sum, bucket) => sum + bucket.commits, 0),
+      pendingFiles,
+      scope,
+    };
   }
 
   /**
@@ -815,6 +877,38 @@ export class SvnAdapter implements VcsAdapter {
     if (target.length === 0) return null;
     const result = await svn(this.root, ['cat', '-r', rev, '--', target]);
     return result.code === 0 ? result.stdout : null;
+  }
+
+  /** §5.6/§10.2：作者统计（详细提交信息）。用 `svn log --xml` 的 `<author>` 聚合，失败时返回诊断。 */
+  async authorStats(paths: string[], limit = 500): Promise<AuthorStats> {
+    const scoped = [...new Set(paths.map(toRepoRelative).filter((item) => item.length > 0 && !isAiReviewPath(item)))];
+    const scope: AuthorStats['scope'] = scoped.length > 0 ? 'tracked' : 'repo';
+    const statusResult = await svn(this.root, ['status']);
+    const pendingFiles = statusResult.code === 0 ? parseSvnStatus(statusResult.stdout).filter(acceptedDirtyPath).length : 0;
+    const args = ['log', '--xml', '-l', String(Math.max(1, Math.trunc(limit)))];
+    // SVN 的 `--` 之后是 peg/ignore-ancestry 等位置参数：不能拼出 `-- -foo` 这种序列。
+    // 合法仓库路径不会以 `-` 开头，遇到直接跳过（统计退化为全仓库或其余路径，不猜测）。
+    const usable = scoped.filter((item) => !item.startsWith('-'));
+    if (usable.length > 0) args.push(...usable);
+    const logResult = await svn(this.root, args);
+    if (logResult.code !== 0) {
+      return { buckets: [], historyCommits: 0, pendingFiles, diagnostic: describe(logResult).slice(0, 200), scope };
+    }
+    const counts = new Map<string, number>();
+    for (const match of logResult.stdout.matchAll(/<logentry\b[\s\S]*?<\/logentry>/g)) {
+      const author = /<author>([\s\S]*?)<\/author>/.exec(match[0])?.[1]?.trim() ?? '';
+      const key = author || '(未署名)';
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    const buckets: AuthorStatBucket[] = [...counts.entries()]
+      .map(([name, commits]) => ({ name, email: '', commits }))
+      .sort((left, right) => right.commits - left.commits || left.name.localeCompare(right.name));
+    return {
+      buckets,
+      historyCommits: buckets.reduce((sum, bucket) => sum + bucket.commits, 0),
+      pendingFiles,
+      scope,
+    };
   }
 
   /**

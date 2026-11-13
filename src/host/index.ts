@@ -188,9 +188,30 @@ export async function createDshAuditSession(
   host: AuditSessionHost,
   input: { cwd: string; title: string; prompt: string; ownerSessionId?: string },
 ): Promise<{ sessionId: string }> {
+  return createDshSession(host, input, '审查');
+}
+
+/**
+ * §7.4（2026-11-12）：按「在新会话中执行修复」的目标创建会话。
+ *
+ * 与审查会话共用同一套创建序列与权限继承，只是标签不同；拆分标签是为了让
+ * 失败信息直接指向用户刚才点的那个入口（审查 / AI 修复），而不是笼统的“会话”。
+ */
+export async function createDshFixSession(
+  host: AuditSessionHost,
+  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string },
+): Promise<{ sessionId: string }> {
+  return createDshSession(host, input, '修复');
+}
+
+async function createDshSession(
+  host: AuditSessionHost,
+  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string },
+  label: string,
+): Promise<{ sessionId: string }> {
   const controller = host.get('sessionController') as DshSessionController | undefined;
   if (!controller || typeof controller.create !== 'function' || typeof controller.prompt !== 'function') {
-    throw new Error('当前 DSH Host 未挂载 sessionController，无法创建审查会话（请确认 DSH 版本包含 API Session 控制服务）');
+    throw new Error(`当前 DSH Host 未挂载 sessionController，无法创建${label}会话（请确认 DSH 版本包含 API Session 控制服务）`);
   }
   const registry = host.get('workspaceRegistry') as WorkspaceRegistryLike | undefined;
   let workspace: WorkspaceLike | undefined;
@@ -208,15 +229,15 @@ export async function createDshAuditSession(
       ? await controller.create({ workspaceId: workspace.id })
       : await controller.create({ cwd: input.cwd });
   } catch (error) {
-    throw new Error(`创建 DSH 审查会话失败：${describeSessionError(error)}`);
+    throw new Error(`创建 DSH ${label}会话失败：${describeSessionError(error)}`);
   }
   const sessionId = typeof created?.sessionId === 'string' ? created.sessionId : '';
-  if (!sessionId) throw new Error('创建 DSH 审查会话未返回 sessionId');
+  if (!sessionId) throw new Error(`创建 DSH ${label}会话未返回 sessionId`);
   if (controller.rename) {
     try {
       await controller.rename({ sessionId, title: input.title });
     } catch (error) {
-      host.logger?.warn(`dsh-code-review: 审查会话改名失败：${describeSessionError(error)}`);
+      host.logger?.warn(`dsh-code-review: ${label}会话改名失败：${describeSessionError(error)}`);
     }
   }
   const inherited = inheritOwnerPolicy(host, input.ownerSessionId ?? '', sessionId);
@@ -230,12 +251,12 @@ export async function createDshAuditSession(
       },
       AbortSignal.timeout(60_000),
     );
-    if (prompted?.accepted !== true) throw new Error('DSH 未接受审查提示词');
+    if (prompted?.accepted !== true) throw new Error(`DSH 未接受${label}提示词`);
   } catch (error) {
-    throw new Error(`发送审查任务失败：${describeSessionError(error)}`);
+    throw new Error(`发送${label}任务失败：${describeSessionError(error)}`);
   }
   host.logger?.info(
-    `dsh-code-review: 已创建审查会话 ${sessionId}（workspace=${workspace?.id ?? 'cwd'}，title=${input.title}，` +
+    `dsh-code-review: 已创建${label}会话 ${sessionId}（workspace=${workspace?.id ?? 'cwd'}，title=${input.title}，` +
       `preset=${inherited.preset ?? 'default'}，approval=${inherited.approval ?? 'default'}）`,
   );
   return { sessionId };
@@ -276,6 +297,7 @@ export function apply(ctx: HostContext): void {
       },
       resolveCredential,
       createAuditSession: (input) => createDshAuditSession(ctx, input),
+      createFixSession: (input) => createDshFixSession(ctx, input),
       resolveSessionCwd: (sessionId) => {
         const sessions = ctx.get('sessions') as {
           get?: (id: string) => { header?: { cwd?: string } } | undefined;

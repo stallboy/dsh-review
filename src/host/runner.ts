@@ -77,7 +77,8 @@ function packageRoot(): string {
   return path.resolve(import.meta.dirname, '..');
 }
 
-async function loadSystemPrompt(): Promise<string> {
+/** §7.4：修复器系统提示词（assets/ai-fixer-system.md）；缺失时退回内置两行约束。 */
+export async function loadSystemPrompt(): Promise<string> {
   const fallback = [
     '你是 AI Fixer。你在一个产品仓库中修复代码，并更新 .ai-review 候选目录中的 review.md 与 NNN.patch。',
     '不要提交代码；完成后把业务代码工作区还原干净，仅保留 .ai-review 下的文件。',
@@ -141,6 +142,47 @@ export async function buildFixPrompt(request: RunnerRequest): Promise<string> {
     '5. 完成时输出一行 DONE 和本次修改的简短摘要。',
   );
   return lines.join('\n');
+}
+
+/**
+ * §7.4 补充（2026-11-12）：在独立新会话里执行修复的提示词。
+ *
+ * 与 headless 的 `wrapAgentPrompt` 不同，新会话里 Agent 看到的是对话消息而不是一条
+ * stdin 管道：因此这里把系统约束展开成 Markdown 小节，并明确写入 `.ai-review/` 的
+ * 提交边界（Host 统一提交）——避免会话型 Agent 误以为可以自己 commit。
+ */
+export function buildSessionFixPrompt(system: string, user: string): string {
+  return [
+    '# 修复任务（独立会话）',
+    '',
+    '请直接在当前仓库中执行下面的修复任务；不要只输出计划或复述指令。',
+    '',
+    '## 执行准则',
+    '',
+    system.trim(),
+    '',
+    '## 提交边界',
+    '',
+    '- 不要执行 `git commit` / `git push` / `svn commit`；改动 `.ai-review/` 后回到评审面板，由 Host 统一原子提交。',
+    '- 只修改业务代码与当前候选目录；不得改动其他候选、历史补丁、人类评论或历史审核记录。',
+    '- 完成后业务工作区必须还原干净，只保留 `.ai-review/` 下的候选产物。',
+    '',
+    '## 任务',
+    '',
+    user.trim(),
+  ].join('\n');
+}
+
+/**
+ * §7.4（2026-11-12）：把 `manual` Runner 产出的完整修复提示词转换为新会话版本。
+ *
+ * `buildFixPrompt` 已经包含仓库、候选目录、意见与硬性要求；这里只把其中的
+ * 「grep 式执行提示」换成「新会话」口径，不改变任何硬性约束文本。
+ */
+export function toSessionFixPrompt(manualPrompt: string, system = ''): string {
+  const tightened = manualPrompt
+    .replace(/^请以 ([A-Z_]+) 模式执行修复，/m, '请以 $1 模式在独立会话中执行修复，');
+  return buildSessionFixPrompt(system, tightened);
 }
 
 function resolveDshCommand(settings: AppSettings): string | null {

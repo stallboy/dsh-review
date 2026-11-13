@@ -2,7 +2,7 @@ import type { ServerResponse } from 'node:http';
 import path from 'node:path';
 import { isAiReviewPath, parsePatch } from './patch.js';
 import { loadReviewers } from './reviewers.js';
-import { Runner } from './runner.js';
+import { Runner, loadSystemPrompt, toSessionFixPrompt } from './runner.js';
 import { AuditArchive, projectFindings } from './audit-archive.js';
 import { matchesReviewFilter } from './store.js';
 import type { ReviewStatus, ApprovalCommitLookup, PatchCheckDiagnostic } from './types.js';
@@ -464,7 +464,12 @@ export class ReadModels {
       log: () => undefined,
     });
     const result = await runner.run();
-    sendJson(res, 200, { prompt: result.prompt ?? result.errorMessage ?? '', comments });
+    // §7.4：mode=session 时返回「新会话」口径的提示词（与 /fix-session 实际投递的一致）；
+    // 缺省仍为 headless 口径，保持既有调用方语义。
+    const mode = url.searchParams.get('mode') === 'session' ? 'session' : 'headless';
+    const rawPrompt = result.prompt ?? result.errorMessage ?? '';
+    const prompt = mode === 'session' && rawPrompt ? toSessionFixPrompt(rawPrompt, await loadSystemPrompt()) : rawPrompt;
+    sendJson(res, 200, { prompt, comments, mode, title: detail.candidate.meta.title, revision: detail.candidate.meta.currentRevision });
   }
 
   /**

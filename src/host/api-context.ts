@@ -34,6 +34,19 @@ export interface ApiDeps {
     /** Session that owns the review tab; its permission/approval policy is inherited. */
     ownerSessionId?: string;
   }) => Promise<{ sessionId: string }>;
+  /**
+   * §7.4（2026-11-12）：创建承载「AI 修复」任务的独立会话。
+   *
+   * 与 `createAuditSession` 走同一条 sessionController 序列，但没有审查租约：修复会话
+   * 产出的是候选新版本，`.ai-review/` 的提交仍由 Host 在用户点「提交并让 AI 修复」时完成。
+   * 为空表示当前 Host 不支持会话执行器，`/fix-session` 返回 500 诊断。
+   */
+  createFixSession?: (input: {
+    cwd: string;
+    title: string;
+    prompt: string;
+    ownerSessionId?: string;
+  }) => Promise<{ sessionId: string }>;
   /** Host 的真实 turn 结束通知；不得用文件/状态轮询模拟。 */
   onAuditTurnEnd?: (sessionId: string, callback: () => void) => () => void;
   /** Diagnostic: the live client-module graph entry for this package, if any. */
@@ -295,4 +308,6 @@ export interface ApiHost {
 
   /** 启动一个 ai_fix Job（/ai-fix 与 /comments 的 autoFix 链共用同一次受理结论）。 */
   startAiFixJob(runtime: Runtime, id: string, guard: ConcurrencyGuard): Promise<JobRecord>;
+  /** §7.4：同仓修复会话的占用记录（`/fix-session` 的并发控制与诊断入口）。 */
+  readonly fixSessionGuard: { activeFor(root: string): { candidateId: string; sessionId: string } | undefined };
 }

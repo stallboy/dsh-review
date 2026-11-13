@@ -15,6 +15,9 @@ import type {
   ReviewCandidate,
   RunnerExecutionResult,
 } from './types.js';
+import { composeCommitMessage } from './commit-message.js';
+import { buildCommitDetails } from './commit-message.js';
+import type { CommitMessageDetail } from './commit-message.js';
 import type { VcsAdapter } from './vcs.js';
 
 export const MAX_COMMIT_RETRIES = 2;
@@ -73,6 +76,21 @@ export function checkCommitMessage(title: string, commitMessage: string): string
 
 export interface RunnerLike {
   run(): Promise<RunnerExecutionResult>;
+}
+
+/**
+ * §5.6/§10.2（2026-11-12）：批准业务提交信息的显式输入。
+ *
+ * - `commitDetail` 缺省时保持旧语义：业务提交使用候选 `commit_message` 全文；
+ * - `commitDetail: 'simple'` 只写规范单行 `review(<id>): <title>`；
+ * - `commitDetail: 'detailed'` 写「规范单行 + 空行 + 事实正文」；
+ * - `commitMessage` 仍按 §7.5 步骤 3 先替换候选 `commit_message` 再校验首行。
+ */
+export interface ApprovalCommitInput {
+  commitMessage?: string;
+  commitDetail?: CommitMessageDetail;
+  /** Host 在受理阶段生成的详细正文；`detailed` 时必须非空。 */
+  commitMessageBody?: string;
 }
 
 export interface ApprovalDeps {
@@ -140,7 +158,23 @@ export class ApprovalOrchestrator {
     decisions: ApprovalDecisions = { confirmed: [], waived: [] },
     operator?: string,
     commitMessage?: string,
+    commitInput?: ApprovalCommitInput,
   ): Promise<ApprovalOutcome> {
+    // §5.6：commitInput 是 commitMessage 的完整形态；调用方可能只传旧参数。
+    const messageOverride = commitInput?.commitMessage !== undefined ? commitInput.commitMessage : commitMessage;
+    /**
+     * 业务提交说明：显式 detail 时用 Host 生成的规范单行（+ 事实正文），否则沿用候选全文。
+     *
+     * 正文必须由本方法在**锁内、同步后**用同一份 `fresh` 快照生成：
+     * - 受理阶段生成会在 §7.5 步骤 6 同步重绑共享快照后过期（正文描述旧补丁、却提交新补丁）；
+     * - 提交针对的就是 fresh，正文与提交对象必须是同一次读取。
+     */
+    const businessMessageFor = async (candidate: ReviewCandidate): Promise<string | undefined> => {
+      const detail = commitInput?.commitDetail;
+      if (!detail) return undefined;
+      const body = detail === 'detailed' ? await this.buildDetailBody(candidate) : '';
+      return composeCommitMessage(candidate, detail, body);
+    };
     const { store, vcs, settings } = this.deps;
     const maxAttempts = MAX_COMMIT_RETRIES + 1;
     let lastCommitError = '';
@@ -151,7 +185,7 @@ export class ApprovalOrchestrator {
         return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: '已按取消请求中止（未产生共享提交）', jobId };
       }
       // §7.5 步骤 1-4：重读共享事实 → guard/状态 → 判断项 → 提交信息 → 完整性；重复候选 ①。
-      const pre = await this.runPrechecks(id, guard, decisions, jobId, log, commitMessage);
+      const pre = await this.runPrechecks(id, guard, decisions, jobId, log, messageOverride);
       if ('outcome' in pre) return pre.outcome;
       let candidate = pre.candidate;
       let sharedSource = pre.source;
@@ -193,7 +227,7 @@ export class ApprovalOrchestrator {
           };
         }
         // §7.5 步骤 6：同步后重新绑定共享快照，重跑步骤 1-4（含负向记忆）→ 重复候选 ②。
-        const resync = await this.runPrechecks(id, guard, decisions, jobId, log, commitMessage);
+        const resync = await this.runPrechecks(id, guard, decisions, jobId, log, messageOverride);
         if ('outcome' in resync) return resync.outcome;
         candidate = resync.candidate;
         sharedSource = resync.source;
@@ -310,8 +344,8 @@ export class ApprovalOrchestrator {
       const fresh = freshReload.candidate;
       // §7.5 步骤 3/10：请求体 commitMessage 先替换候选 commit_message 再校验；
       // 校验通过的值随本次原子提交一并写入 review.md，并作为业务提交说明。
-      if (commitMessage !== undefined) {
-        fresh.meta.commitMessage = commitMessage;
+      if (messageOverride !== undefined) {
+        fresh.meta.commitMessage = messageOverride;
         const replacedMessageError = checkCommitMessage(fresh.meta.title, fresh.meta.commitMessage);
         if (replacedMessageError) {
           await vcs.revertBusinessWorkspace().catch(() => undefined);
@@ -359,9 +393,13 @@ export class ApprovalOrchestrator {
         ...patchPaths,
         ...businessPaths.filter((rel) => !snapshotAfter.get(rel)),
       ])];
-      // §5.6：业务提交必须使用候选 commit_message 全文（首行已校验等于 title）。
-      const businessMessage = fresh.meta.commitMessage
-        || `review(${id}): approve rev ${String(fresh.meta.currentRevision)}`;
+      // §5.6：缺省用候选 commit_message 全文（首行已校验等于 title）；显式 commitDetail 时
+      // 改用 Host 生成的规范单行（简单）/ 规范单行 + 事实正文（详细）。
+      // 首行校验仍由 §7.5 步骤 3/10 覆盖：detail 模式不会放宽或跳过它，本分支只是在
+      // 校验通过之后决定「用哪一份已通过校验的信息去写提交说明」。
+      const businessMessage = (await businessMessageFor(fresh))
+        ?? (fresh.meta.commitMessage || `review(${id}): approve rev ${String(fresh.meta.currentRevision)}`);
+      if (commitInput?.commitDetail) log(`提交信息模式：${commitInput.commitDetail === 'detailed' ? '详细（单行综述 + 空行 + 事实正文）' : '简略（单行）'}`);
       const probePaths = [reviewRelPath, ...patchPaths];
       // §5.6：提交探针按目标路径取值——SVN 的根 revision 不随子路径提交前进（H1）。
       const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
@@ -611,6 +649,28 @@ export class ApprovalOrchestrator {
       };
     }
     return { candidate, ...(reload.source ? { source: reload.source } : {}) };
+  }
+
+  /**
+   * §5.6（2026-11-12）：「详细」提交信息的事实正文，只读取**即将提交的同一份快照**。
+   *
+   * 调用点必须在锁内、§7.5 步骤 6 同步重绑之后；任一来源不可读时只降级对应小节，
+   * 不猜测数字（作者统计不可用就写不可用）。
+   */
+  private async buildDetailBody(candidate: ReviewCandidate): Promise<string> {
+    const { store, vcs, settings } = this.deps;
+    // §7.1：补丁必须与即将提交的 review.md 来自同一共享快照。
+    const source = this.deps.sharedSource ? await this.deps.sharedSource() : undefined;
+    const patch = await store.currentPatch(candidate, source).catch(() => null);
+    const touched = patch ? parsePatch(patch.text).paths : [];
+    const authorStats = await vcs.authorStats(touched).catch(() => undefined);
+    return buildCommitDetails(candidate, {
+      repoRoot: store.repoRoot,
+      ...(authorStats ? { authorStats } : {}),
+      ...(patch ? { patchText: patch.text } : {}),
+      ...(source ? { readReviewersText: () => (source as { readReviewersText?: () => Promise<string | null> }).readReviewersText?.() ?? Promise.resolve(null) } : {}),
+      vcsType: settings.vcsType === 'svn' ? 'svn' : 'git',
+    });
   }
 
   /** §7.5 步骤 7/9：目标业务文件的内容（Git blob）与模式快照；缺失为 null。 */

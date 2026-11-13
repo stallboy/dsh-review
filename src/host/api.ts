@@ -41,6 +41,9 @@ import {
 import { ReadModels } from './api-readmodels.js';
 import { Writers } from './api-writers.js';
 import { AuditRuntime } from './api-audit.js';
+import { FixSessions } from './api-fix-session.js';
+import { normalizeCommitDetail } from './commit-message.js';
+import type { CommitMessageDetail } from './commit-message.js';
 
 export { API_PREFIX };
 
@@ -61,12 +64,15 @@ export class ReviewApi implements ApiHost {
   private readonly writers: Writers;
   /** 审查生命周期装配（租约持久化、开始/收尾/释放、跟踪 Job、1 小时超时、/sync）。 */
   private readonly auditRuntime: AuditRuntime;
+  /** §7.4（2026-11-12）：在独立 DSH 会话中启动修复（`/fix-session`）。 */
+  private readonly fixSessions: FixSessions;
 
   constructor(readonly deps: ApiDeps) {
     this.settings = deps.settings;
     this.readModels = new ReadModels(this);
     this.writers = new Writers(this, this.readModels);
     this.auditRuntime = new AuditRuntime(this);
+    this.fixSessions = new FixSessions(this);
   }
 
   /** ApiHost：子模块（写事务/审查生命周期）共用的 Job 管理器。 */
@@ -115,6 +121,13 @@ export class ReviewApi implements ApiHost {
   ensureNoAuditRunning(root?: string): void {
     this.auditRuntime.ensureNoAuditRunning(root);
   }
+
+  /** ApiHost：§7.4 同仓修复会话占用记录（/fix-session 自管理的并发控制与诊断）。 */
+  get fixSessionGuard(): FixSessions {
+    return this.fixSessions;
+  }
+
+  // ---------- §6.1 定时审查（scheduled trigger） ----------
 
   /** ApiHost：会话/手动/定时审查跟踪 Job 的完成回调（仅内存；重启后由 finalize 直接新建 Job）。 */
   readonly auditJobFinishes = new Map<string, (result?: unknown) => void>();
@@ -349,6 +362,11 @@ export class ReviewApi implements ApiHost {
     // ---------- 工作区事务（handler 内部在 Job 中取锁） ----------
     { method: 'POST', path: '/rebase', kind: 'workspace-txn', handler: ({ req, res, url }) => this.writers.rebase(req, res, url) },
     { method: 'POST', path: '/manual-revision', kind: 'workspace-txn', handler: ({ req, res, url }) => this.writers.manualRevision(req, res, url) },
+    // §7.4（2026-11-12）：在独立 DSH 会话中启动修复——只创建会话、不改工作区。
+    // 类别取 workspace-txn：复用受理期的审查租约互斥（会话会真实改动业务工作区，
+    // 不能与审查并行）。注意该类别**不**整体持 repo 锁，因此并发由 FixSessions 自己的
+    // 同仓占用记录串行（创建会话最长等 60 秒，放进 repo 锁会阻塞 approve/sync）。
+    { method: 'POST', path: '/fix-session', kind: 'workspace-txn', handler: ({ req, res, url }) => this.fixSessions.create(req, res, url) },
     // ---------- 长任务启动（受理前做审查互斥，Job 内取锁） ----------
     { method: 'POST', path: '/approve', kind: 'job-start', handler: ({ req, res, url }) => this.approve(req, res, url) },
     { method: 'POST', path: '/ai-fix', kind: 'job-start', handler: ({ req, res, url }) => this.aiFix(req, res, url) },
@@ -514,9 +532,25 @@ export class ReviewApi implements ApiHost {
     if (commitMessage !== undefined && !commitMessage.trim()) {
       throw new ApiError(422, 'bad_request', 'commitMessage 提供时必须非空');
     }
+    // §5.6/§10.2（2026-11-12）：可选 commitDetail——'simple' 只写规范单行，'detailed' 在规范
+    // 单行后空一行追加 Host 生成的事实正文（作者统计/改动摘要/修复方案/来源候选/门禁…）。
+    // 非法取值直接 422，不得静默降级成其中一种（提交信息会进入仓库历史，不能猜）。
+    let commitDetail: CommitMessageDetail | undefined;
+    if (body['commitDetail'] !== undefined) {
+      const normalized = normalizeCommitDetail(body['commitDetail']);
+      if (!normalized) throw new ApiError(422, 'bad_request', "commitDetail 只能是 'simple' 或 'detailed'");
+      commitDetail = normalized;
+    }
     // §12.2：非 Owner 403（takeover 除外）。
     await this.writers.requireOwnerOf(store, id);
     await this.writers.requireSharedCandidate(runtime, id); // §7.1
+    // §5.6（2026-11-12）：提交信息详略只决定 Job 内业务提交说明的组成。事实正文必须由
+    // 批准编排在**锁内、同步重绑后**用同一份 `fresh` 快照生成（否则同步换基线后正文会
+    // 描述旧补丁却提交新补丁），因此这里只透传模式，不在受理阶段生成正文。
+    // 注意：不要构造 `{ commitMessage: undefined }`——它会让编排误以为调用方显式传了覆盖值。
+    const approvalCommitInput = commitDetail === undefined && commitMessage === undefined
+      ? undefined
+      : { ...(commitMessage !== undefined ? { commitMessage } : {}), ...(commitDetail ? { commitDetail } : {}) };
     // §7.5/G19：受理前完整 guard 预检（409 stale）与 pending-only 状态预检（409 conflict）。
     {
       const detail = await store.get(id, null, await sharedSourceFor(runtime));
@@ -568,7 +602,7 @@ export class ReviewApi implements ApiHost {
       });
       // §12.1：批准人使用实际操作者，不用 expectedOwner 冒充身份。
       const me = await this.ownerFor(store.repoRoot);
-      const outcome = await this.withWriteLock(store.repoRoot, () => orchestrator.approve(id, guard, jobId, log, { confirmed, waived }, me, commitMessage));
+      const outcome = await this.withWriteLock(store.repoRoot, () => orchestrator.approve(id, guard, jobId, log, { confirmed, waived }, me, commitMessage, approvalCommitInput));
       log(`结果：${outcome.status}${outcome.reason ? ` (${outcome.reason})` : ''} — ${outcome.message}`);
       return outcome;
     });

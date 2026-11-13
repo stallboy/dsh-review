@@ -83,6 +83,30 @@ export interface ApprovalMeta {
   extra?: Record<string, unknown>;
 }
 
+/**
+ * §5.6/§10.2（2026-11-12 修订）：详细提交信息里的作者统计。
+ *
+ * 历史提交（`commits`）与本次待提交（`pendingFiles`）严格分开统计：尚未进入 VCS
+ * 历史的内容不得被算作某个作者的既有提交。
+ */
+export interface AuthorStatBucket {
+  name: string;
+  email: string;
+  commits: number;
+}
+
+export interface AuthorStats {
+  buckets: AuthorStatBucket[];
+  /** 参与统计的历史提交总数（等于各 bucket 之和，便于调用方交叉核对）。 */
+  historyCommits: number;
+  /** 当前工作区/索引中已修改或新增的业务文件数（不含 `.ai-review/`）。 */
+  pendingFiles: number;
+  /** 统计不可读（浅克隆、命令失败等）时的诊断；存在时正文只写「统计不可用」。 */
+  diagnostic?: string;
+  /** 统计范围：本候选补丁触及的业务路径，或整个仓库。 */
+  scope: 'tracked' | 'repo';
+}
+
 export interface GateCheckResult {
   command: string;
   exitCode: number | null;

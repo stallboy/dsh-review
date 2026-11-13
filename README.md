@@ -20,11 +20,11 @@ DeepSeek Harness（DSH）桌面端的代码评审插件。它把产品仓库里�
   - 批准或 AI 修复的运行状态与日志在页顶**内联卡片**展示，运行中可以继续浏览页面；队列页也保留该卡片；
   - 完整补丁 + 版本增量差异（Git 用临时 worktree 真实重建；跨基线先 3-way，失败退 hunk 级并显著提示）；
   - 按行内联评论、总体意见、评论状态（未处理/部分处理/已处理）；支持多条草稿一次性提交（目标契约，当前未实现）；跨版本评论按原文锚点重定位（目标契约）；
-  - **总体意见默认自动接 AI 修复**：「提交意见并让 AI 修复」会先保存意见（含所有未解决行内意见）再自动启动修复生成下一版；「仅提交意见」只记录不跑 AI。想再修一版时，直接在总体意见里写清要求后再次提交即可；
+  - **总体意见可按执行方式启动下一版**：「提交意见并新建修复会话」保存意见（含所有未解决行内意见）后，新建一个**可见的 DSH 会话**并把修复提示词投递进去（侧边栏可见、可追问）；「提交意见并导出修复提示词」只生成提示词，复制后粘贴到外部 Agent（如 `codex exec -`）手动执行。两条路径都只产出候选新版本，`.ai-review/` 的提交仍由你在面板上收尾；「仅提交意见」只记录不跑修复。想再修一版时，直接在总体意见里写清要求后再次提交即可；
   - 版本历史与审核记录（可折叠）。
 - 操作隔离：只有 `owner` 能操作；其他人只读，可「接管审核」。
 - 乐观锁：每次提交带 `expectedRevision + expectedOwner + expectedUpdatedAt`，旧页面操作会被拒绝并要求刷新。
-- 批准：内联审批面板确认 → 检查工作区干净 → 同步基线 → 严格应用补丁 → 依次执行 `gate_checks` → 业务代码 + `review.md` 状态/证据 + 删除过程补丁放入**同一个原子提交**；业务提交哈希由 Host 从 VCS 历史派生，不需要第二次回填提交。
+- 批准：内联审批面板确认 → 检查工作区干净 → 同步基线 → 严格应用补丁 → 依次执行 `gate_checks` → 业务代码 + `review.md` 状态/证据 + 删除过程补丁放入**同一个原子提交**；业务提交哈希由 Host 从 VCS 历史派生，不需要第二次回填提交。批准面板可选**提交信息详略**：`简略信息` 只写一行 `review(<候选>): <标题>`；`详细信息` 先写这一行综述，空一行后由 Host 附上作者统计（历史提交与“本次待提交”分开统计）、改动摘要、修复方案、来源候选、门禁与人工判断项等事实正文（面板会显示结构预览）。
 - 失败回退：补丁冲突或门禁失败时还原工作区，按设置尝试 AI 修复；AI 生成下一版后候选回到 `pending`，旧批准失效。
 - AI 修复：读取候选下所有未解决意见（总体 + 行内），把当前版本补丁应用到工作区后生成下一版 review.md/patch；成功后只提交 `.ai-review`，失败会自动还原业务工作区。执行器三选一：
   - `dsh`（默认）：spawn 本机 `dsh --profile headless --json -`，prompt 走 stdin，模型凭据通过 DSH `credentials` 服务解析 `DEEPSEEK_API_KEY`；
@@ -132,11 +132,15 @@ Host 端在 `/dsh-code-review/api` 下注册：
 - `POST /convert`（§6.2 B/Deferred 转候选：depends_on 满足判定 + 档案/候选两侧同一提交）
 - `POST /rebase` / `POST /manual-revision`（§6.5/§6.4：新版本 + 门禁重跑，返回 job）
 - `GET /audits`、`GET /findings`（§3 目录式审查档案与 §3.4 finding 投影；旧扁平报告不参与）
-- `POST /approve`（返回 jobId；body 支持 `confirmedDecisions`/`waivedDecisions`，§4.7 判断项全覆盖校验）、`POST /ai-fix`（显式启动同一 AI 修复 job，返回 jobId；UI 不再单独暴露按钮，保留给自动化）、`GET /jobs/:id`、`POST /sync`
+- `POST /approve`（返回 jobId；body 支持 `confirmedDecisions`/`waivedDecisions`，§4.7 判断项全覆盖校验；可选 `commitDetail: simple|detailed` 控制业务提交信息详略）、`POST /ai-fix`（显式启动同一 AI 修复 job，返回 jobId；UI 不再单独暴露按钮，保留给自动化）、`GET /jobs/:id`、`POST /sync`
+- `POST /fix-session`（§7.4：新建 DSH 会话并投递修复提示词，返回 sessionId；UI「提交意见并新建修复会话」使用，不占用审查租约、不提交候选）
+- `GET /fix-prompt?id=&mode=session|headless`（修复提示词；`mode=session` 与 `/fix-session` 投递的逐字节一致，可直接粘贴到 codex 等外部 Agent）
 - `GET /audit/prompt?mode=session|headless&targetPath=&note=`（导出审查提示词，含 reviewers.yml 路由注入；session 为独立会话模式，headless 为旧的无交互模式）
 - `POST /audit/session`（通过 Host `sessionController` 创建真实 DSH 审查会话并发送提示词，返回 sessionId；UI 使用）
 - `POST /audit`（可选 headless 审查，返回 jobId；插件负责复核与提交，UI 不使用）
-- `GET /fix-prompt?id=`、`GET /reviewers`、`GET /client-entry`
+- `GET /fix-prompt?id=&mode=`、`GET /reviewers`、`GET /client-entry`
+
+> 2026-11-12：详情页移除了「上传人工补丁 / 超时归档 / 从重开来源恢复」三个按钮。对应端点 `/manual-revision`、`/archive-stale`、`/reopen` 仍然提供（语义见上面两条），只是不再占用面板位置。
 
 ## 已知边界 / 与设计文档的差异
 

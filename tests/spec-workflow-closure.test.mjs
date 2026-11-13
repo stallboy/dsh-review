@@ -509,16 +509,26 @@ test('§11/AC-PROMPT-01：系统提示词和 Host 展开包含完整 Schema、9 
   }
 });
 
-test('§10/AC-UI-01：Client 包含审查租约、取消、人工修订与 finding 工作流入口', async () => {
+test('§10/AC-UI-01：Client 包含审查租约、取消、修复会话/导出提示词与 finding 工作流入口', async () => {
   const source = await readFile(new URL('../dist/client.js', import.meta.url), 'utf8');
-  for (const endpoint of ['/audit/manual', '/audit/finalize', '/audit/release', '/manual-revision', '/archive-stale', '/reopen', '/convert', '/dismiss-finding']) {
-    assert.ok(source.includes(`'${endpoint}'`), `Client 缺少 ${endpoint}`);
+  for (const endpoint of ['/audit/manual', '/audit/finalize', '/audit/release', '/fix-session', '/fix-prompt', '/convert', '/dismiss-finding']) {
+    assert.ok(source.includes(`'${endpoint}'`) || source.includes(`${endpoint}?`), `Client 缺少 ${endpoint}`);
   }
   assert.match(source, /\/jobs\/\$\{encodeURIComponent\(job\.id\)\}\/cancel/);
   for (const filter of ['statuses', 'tag', 'dir', 'text', 'createdAfter', 'createdBefore']) {
     assert.ok(source.includes(filter), `Client 缺少服务端筛选 ${filter}`);
   }
   assert.match(source, /query\.set\(key, filter\[key\]\)/);
+});
+
+test('§10.2（2026-11-12）：详情页移除「上传人工补丁 / 超时归档 / 从重开来源恢复」三个按钮（后端端点保留）', async () => {
+  const source = await readFile(new URL('../dist/client.js', import.meta.url), 'utf8');
+  for (const label of ['上传人工补丁', '超时归档', '从重开来源恢复']) {
+    assert.ok(!source.includes(label), `详情页不应再出现按钮「${label}」`);
+  }
+  for (const endpoint of ['/manual-revision', '/archive-stale', '/reopen']) {
+    assert.ok(!source.includes(`'${endpoint}'`), `Client 不应再调用已移除入口的 ${endpoint}`);
+  }
 });
 
 test('§7.6/§7.1：rejected 重开来源存在本地修改时必须拒绝', async () => {
