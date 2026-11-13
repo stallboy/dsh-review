@@ -127,10 +127,21 @@ test('§7.7：/ai-fix 在 manual Runner 下返回 MANUAL_REQUIRED + manualPrompt
 });
 
 test('§7.7/§7.5：实现源码中 ai_fix 端点不得再返回裸的非判别对象', async () => {
-  const source = await readFile(new URL('../src/host/api.ts', import.meta.url), 'utf8');
+  // 拆分后 api.ts 只保留路由/装配，结果工厂与写事务在 api-writers.ts，
+  // 因此按职责"全域扫描"：断言条件原样保留，只扩大读取范围。
+  const hostFiles = ['api.ts', 'api-writers.ts', 'api-readmodels.ts'];
+  const sources = await Promise.all(
+    hostFiles.map(async (name) => [name, await readFile(new URL(`../src/host/${name}`, import.meta.url), 'utf8')]),
+  );
+  const source = sources.map(([, text]) => text).join('\n');
   // 三个 ai_fix 端点必须通过工厂构造结果（aborted / recoveryRequired / committed / validationFailed）。
   for (const factory of ['this.aborted(', 'this.recoveryRequired(', 'this.committed(', 'this.validationFailed(']) {
     assert.ok(source.includes(factory), `必须存在工厂 ${factory}`);
+  }
+  // 工厂必须真实存在（不能只是调用点残留）：四个工厂都在 api-writers.ts 定义。
+  const writers = sources.find(([name]) => name === 'api-writers.ts')?.[1] ?? '';
+  for (const definition of ['aborted', 'recoveryRequired', 'committed', 'validationFailed']) {
+    assert.match(writers, new RegExp(`^ {2}${definition}\\(`, 'm'), `api-writers.ts 必须定义 ${definition} 工厂`);
   }
   // 旧的 {manual:true,prompt} 形状必须消失。
   assert.doesNotMatch(source, /manual: true, prompt:/, 'ai_fix 不得再返回 {manual:true,prompt} 形状');

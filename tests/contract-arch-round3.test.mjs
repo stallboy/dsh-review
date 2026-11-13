@@ -144,10 +144,28 @@ test('§7.7：Rebase 的“业务基线未变”守卫存在且使用业务差�
   // 2026-11-10 澄清后，“基线未变”不再比较顶层版本号（候选元数据提交必然推进 HEAD），
   // 而是比较**业务代码**是否变化；该分支因此完全可达（见 contract-business-base 的正向用例）。
   // 这里断言守卫仍然存在，避免以后被静默删除（原测试正是在迁移夹具时被整段删掉的）。
-  const source = await readFile(new URL('../src/host/api.ts', import.meta.url), 'utf8');
+  //
+  // 拆分后 api.ts 只保留路由/装配，Rebase 在 api-writers.ts、businessBaselineState 在
+  // api-readmodels.ts，因此按职责"全域扫描"：断言条件原样保留，只扩大读取范围，
+  // 并要求**同一文件内**两者同时出现（比拼接后跨文件匹配更强，避免守卫被拆到两个文件却仍通过）。
+  const hostFiles = ['api.ts', 'api-writers.ts', 'api-readmodels.ts'];
+  const sources = await Promise.all(
+    hostFiles.map(async (name) => [name, await readFile(new URL(`../src/host/${name}`, import.meta.url), 'utf8')]),
+  );
+  const source = sources.map(([, text]) => text).join('\n');
   assert.match(source, /businessBaselineState\(vcs, current\.baseRevision, base\)/, 'Rebase 必须用业务基线判定');
   assert.match(source, /'BASE_UNCHANGED'/);
   assert.doesNotMatch(source, /基线已是最新，无需 Rebase/, '旧的“比较版本号相同”判定必须移除');
+  // 守卫必须真实落地（不能只是调用点残留）：接住 vcs 与两条基线的调用点在
+  // api-writers.ts（Rebase），businessBaselineState 的定义在 api-readmodels.ts（读模型）。
+  const writers = sources.find(([name]) => name === 'api-writers.ts')?.[1] ?? '';
+  const readModels = sources.find(([name]) => name === 'api-readmodels.ts')?.[1] ?? '';
+  assert.match(
+    writers,
+    /this\.readModels\.businessBaselineState\(vcs, current\.baseRevision, base\)/,
+    'Rebase 必须在 api-writers.ts 经读模型判定业务基线',
+  );
+  assert.match(readModels, /^ {2}async businessBaselineState\($/m, 'api-readmodels.ts 必须定义 businessBaselineState');
 });
 
 test('§7.5：目录内出现未列入核对的暂存文件时拒绝提交（B1：集合相等而不是子集）', async () => {
