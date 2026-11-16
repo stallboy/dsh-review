@@ -2,6 +2,7 @@
   "name": "dsh-code-review",
   "version": "0.3.0",
   "private": true,
+  "workspaces": ["packages/*", "apps/*"],
   "type": "module",
   "description": "Session-scoped review tab for DeepSeek Harness: repository-backed queue, repository audit, patches, gate checks and approval.",
   "main": "./dist/index.js",
@@ -14,6 +15,11 @@
   },
   "files": [
     "dist",
+    "packages/protocol/package.json",
+    "packages/protocol/dist",
+    "apps/server/package.json",
+    "apps/server/dist",
+    "apps/web/dist",
     "assets",
     "locale",
     "icon.svg",
@@ -34,10 +40,16 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.host.json && tsc -p tsconfig.client.json",
-    "typecheck": "tsc -p tsconfig.host.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "build": "npm run build --workspaces --if-present && npm run build:plugin",
+    "build:plugin": "tsc -p tsconfig.host.json && tsc -p tsconfig.client.json",
+    "typecheck": "npm run build --workspace @dsh-review/protocol && npm run typecheck --workspaces --if-present && npm run typecheck:plugin",
+    "typecheck:plugin": "tsc -p tsconfig.host.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "npm run build && node --test \"tests/**/*.test.mjs\"",
+    "start:central": "node apps/server/dist/cli.js serve",
     "verify:audit": "node scripts/verify-audit-session.mjs"
+  },
+  "dependencies": {
+    "@dsh-review/protocol": "file:packages/protocol"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",
