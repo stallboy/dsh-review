@@ -21,6 +21,7 @@
     "apps/server/dist",
     "apps/web/dist",
     "docs/central-deployment.md",
+    "docs/central-user-guide.md",
     "assets",
     "locale",
     "icon.svg",

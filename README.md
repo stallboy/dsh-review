@@ -4,10 +4,11 @@
 > **任务内容**: 保留本地模式，并提供中央服务、多项目管理和远端交付入口。
 > **参考文档**:
 > - `SPEC.md` — 权威审核及中央模式契约。
+> - `docs/central-user-guide.md` — 面向使用者的 Web 操作手册。
 > - `docs/central-deployment.md` — 中央和节点的部署、配置与恢复。
 > **生成日期**: 2026-11-16
 
-新增中央托管模式：一个 TypeScript / Node.js 24 服务统一管理多个 DSH 插件节点，React Web 提供项目、报告、候选、审核和任务管理。中央使用 SQLite 保存平台状态与查询缓存，Git/SVN 中的 `.ai-review/` 仍是评审事实源。部署与节点配置见 [中央部署说明](docs/central-deployment.md)。
+新增中央托管模式：一个 TypeScript / Node.js 24 服务统一管理多个 DSH 插件节点，React Web 提供项目、报告、候选、审核和任务管理。中央使用 SQLite 保存平台状态与查询缓存，Git/SVN 中的 `.ai-review/` 仍是评审事实源。日常操作见 [使用手册](docs/central-user-guide.md)，部署与节点配置见 [中央部署说明](docs/central-deployment.md)。
 
 DeepSeek Harness（DSH）桌面端的代码评审插件。它把产品仓库里的 `.ai-review/` 目录变成可操作的审核队列：浏览候选修复、阅读全量/增量差异、按行评论、执行合并门禁、批准并原子提交，或把意见退回给 AI 生成下一版。
 
