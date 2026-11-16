@@ -1,4 +1,4 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ApiRequest, ApiResponse } from './api-context.js';
 
 /**
  * §7.7/§12.1：路由的横切语义声明。
@@ -28,8 +28,8 @@ export type RouteKind =
 
 /** 路由 handler：由 ReviewApi 提供，签名统一。 */
 export interface RouteContext {
-  req: IncomingMessage;
-  res: ServerResponse;
+  req: ApiRequest;
+  res: ApiResponse;
   url: URL;
   /** 路径参数（如 `/jobs/:id/cancel` 的 id）。 */
   params: Readonly<Record<string, string>>;

@@ -44,7 +44,7 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
     app.addHook('onRequest', async (raw, reply) => {
         const req = raw as RequestContext;
         reply.header('x-content-type-options', 'nosniff').header('x-frame-options', 'SAMEORIGIN').header('cache-control', 'no-store');
-        const pathname = new URL(req.url, 'http://local').pathname;
+        const pathname = req.routeOptions.url ?? new URL(req.url, 'http://local').pathname;
         if (pathname.startsWith('/node-api/')) {
             const token = /^Bearer ([a-zA-Z0-9_-]+)$/.exec(String(req.headers.authorization ?? ''))?.[1] ?? '';
             req.nodeId = database.nodeIdentity(token);
@@ -116,6 +116,7 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
     app.get('/api/v1/tasks/:commandId/logs', async req => commands.logs(params(req).commandId!, Number((req.query as Record<string, string>).since ?? 0)));
     app.post('/api/v1/projects/:projectId/commands', async (req, reply) => reply.status(202).send({ command: commands.create(params(req).projectId!, body(req), (req as RequestContext).actor!) }));
     app.post('/api/v1/commands/:commandId/cancel', async req => ({ command: commands.cancel(params(req).commandId!) }));
+    app.post('/api/v1/commands/:commandId/recover', async req => ({ command: commands.requestRecovery(params(req).commandId!, body(req).confirmStopped) }));
     app.get('/api/v1/queries/:queryId', async req => snapshots.queryStatus(params(req).queryId!));
     for (const kind of ['candidate', 'patch', 'diff', 'audit', 'reviewers'] as QueryKind[]) {
         app.get(`/api/v1/projects/:projectId/${kind}`, async (req, reply) => {

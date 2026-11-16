@@ -14,7 +14,7 @@ function command() {
         commandId: 'cmd-1', requestHash: 'a'.repeat(64), projectId: 'project-a', nodeId: 'node-a',
         bindingGeneration: 1, projectConfigRevision: 1, operation: 'approve',
         actor: { userId: 'user-a', reviewIdentity: '审核者甲' },
-        payload: { id: '2026-11/fix-retry', decisions: { confirmed: ['cancel'], waived: [] } },
+        payload: { id: '2026-11/fix-retry', confirmedDecisions: ['cancel'], waivedDecisions: [] },
         guard: { expectedRevision: 2, expectedOwner: '审核者甲', expectedUpdatedAt: '2026-11-16T06:00:00.000Z' },
         createdAt: '2026-11-16T06:10:00.000Z',
     };
@@ -39,6 +39,10 @@ test('中央协议拒绝未知操作和路径注入式实体编号', async () =>
     assert.throws(() => validateCommand({ ...command(), operation: 'shell' }), /operation/);
     assert.throws(() => validateCommand({ ...command(), projectId: '../other' }), /projectId/);
     assert.throws(() => validateCommand({ ...command(), bindingGeneration: Number.NaN }), /bindingGeneration/);
+    assert.throws(() => validateCommand({ ...command(), payload: { id: '2026-11/fix-retry', owner: 'forged' } }), /payload.owner/);
+    assert.throws(() => validateCommand({ ...command(), operation: 'dismiss-finding', payload: { auditId: '../secret', findingId: 'f1', reason: 'test' } }), /auditId/);
+    assert.doesNotThrow(() => validateCommand({ ...command(), operation: 'comments', payload: { id: '2026-11/fix-retry', file: '', line: 0, revision: 1, content: '总体意见' } }));
+    assert.throws(() => validateCommand({ ...command(), operation: 'comments', payload: { id: '2026-11/fix-retry', file: 'src/main.ts', line: 0, revision: 1, content: '行内意见' } }), /payload.line/);
 });
 
 test('快照要求正序号与完整独立的项目版本', async () => {

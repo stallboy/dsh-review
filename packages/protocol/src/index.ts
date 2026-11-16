@@ -1,7 +1,7 @@
 export const PROTOCOL_VERSION = 1;
 
 export const OPERATIONS = [
-    'approve', 'comments', 'comments-batch', 'takeover', 'reject', 'resume', 'rebase',
+    'approve', 'comments', 'comments-batch', 'comment-status', 'takeover', 'reject', 'resume', 'rebase',
     'ai-fix', 'manual-revision', 'reopen', 'archive-stale', 'audit', 'audit-finalize',
     'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'sync',
 ] as const;
@@ -183,7 +183,7 @@ export function validateCommand(value: unknown): ManagedCommand {
     const actor = record(input.actor, 'actor');
     entityId(actor.userId, 'actor.userId');
     textValue(actor.reviewIdentity, 'actor.reviewIdentity', 160);
-    record(input.payload, 'payload');
+    validatePayload(input.operation as ManagedOperation, record(input.payload, 'payload'));
     timestamp(input.createdAt, 'createdAt');
     const needsGuard = !['audit', 'audit-finalize', 'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'sync'].includes(String(input.operation));
     if (needsGuard || input.guard !== undefined) {
@@ -193,6 +193,26 @@ export function validateCommand(value: unknown): ManagedCommand {
         timestamp(guard.expectedUpdatedAt, 'guard.expectedUpdatedAt');
     }
     return structuredClone(input) as unknown as ManagedCommand;
+}
+
+function validatePayload(operation: ManagedOperation, payload: JsonRecord): void {
+    const fields: Record<ManagedOperation, string[]> = {
+        approve: ['id', 'confirmedDecisions', 'waivedDecisions', 'commitMessage', 'commitDetail'], comments: ['id', 'content', 'revision', 'file', 'line', 'side', 'anchor'],
+        'comments-batch': ['id', 'comments'], 'comment-status': ['id', 'commentId', 'status'], takeover: ['id'], reject: ['id', 'reason', 'category'], resume: ['id'],
+        rebase: ['id'], 'ai-fix': ['id'], 'manual-revision': ['id', 'patchText'], reopen: ['id', 'from', 'reason'], 'archive-stale': ['id'],
+        audit: ['targetPath', 'note'], 'audit-finalize': ['auditId'], 'audit-release': ['auditId', 'confirmStopped'], 'candidate-finalize': ['id'],
+        convert: ['auditId', 'findingId', 'candidateId'], 'dismiss-finding': ['auditId', 'findingId', 'reason'], sync: [],
+    };
+    for (const key of Object.keys(payload)) if (!fields[operation].includes(key)) throw new ProtocolError(`payload.${key}`);
+    for (const key of ['id', 'from', 'candidateId']) if (payload[key] !== undefined && (typeof payload[key] !== 'string' || !/^\d{4}-\d{2}\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(payload[key]))) throw new ProtocolError(`payload.${key}`);
+    if (payload.auditId !== undefined && (typeof payload.auditId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(payload.auditId))) throw new ProtocolError('payload.auditId');
+    for (const key of ['content', 'file', 'side', 'commentId', 'status', 'reason', 'category', 'patchText', 'targetPath', 'note', 'findingId', 'commitMessage', 'commitDetail']) {
+        if (payload[key] !== undefined && typeof payload[key] !== 'string') throw new ProtocolError(`payload.${key}`);
+    }
+    if (payload.revision !== undefined) positiveInteger(payload.revision, 'payload.revision');
+    if (payload.line !== undefined && (typeof payload.line !== 'number' || !Number.isSafeInteger(payload.line) || payload.line < 0 || (payload.file && payload.line === 0))) throw new ProtocolError('payload.line');
+    for (const key of ['comments', 'confirmedDecisions', 'waivedDecisions']) if (payload[key] !== undefined && !Array.isArray(payload[key])) throw new ProtocolError(`payload.${key}`);
+    if (payload.confirmStopped !== undefined && typeof payload.confirmStopped !== 'boolean') throw new ProtocolError('payload.confirmStopped');
 }
 
 export function validateSnapshot(value: unknown): ProjectSnapshot {
@@ -222,6 +242,7 @@ export function validateSnapshot(value: unknown): ProjectSnapshot {
 
 export function validateRegistration(value: unknown): NodeRegistration {
     const input = record(value, 'registration');
+    if (Object.keys(input).some(key => !['protocolVersion', 'instanceId', 'pluginVersion', 'dshVersion', 'platform', 'workspaces'].includes(key))) throw new ProtocolError('registration');
     positiveInteger(input.protocolVersion, 'protocolVersion');
     entityId(input.instanceId, 'instanceId');
     for (const key of ['pluginVersion', 'dshVersion', 'platform']) textValue(input[key], key);
@@ -229,6 +250,7 @@ export function validateRegistration(value: unknown): NodeRegistration {
     const ids = new Set<string>();
     for (const item of input.workspaces) {
         const workspace = record(item, 'workspace');
+        if (Object.keys(workspace).some(key => !['workspaceId', 'label', 'vcsType', 'target'].includes(key))) throw new ProtocolError('workspace');
         const id = entityId(workspace.workspaceId, 'workspaceId');
         if (ids.has(id)) throw new ProtocolError('重复 workspaceId');
         ids.add(id);

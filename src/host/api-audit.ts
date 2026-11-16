@@ -1,5 +1,5 @@
 import { mkdir, readFile } from 'node:fs/promises';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ApiRequest, ApiResponse } from './api-context.js';
 import path from 'node:path';
 import process from 'node:process';
 import {
@@ -210,7 +210,7 @@ export class AuditRuntime {
     return lines.join('\n');
   }
 
-  async auditPrompt(res: ServerResponse, url: URL): Promise<void> {
+  async auditPrompt(res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const owner = await this.host.ownerFor(runtime.root);
     const baseRevision = await runtime.vcs.getCurrentBase();
@@ -256,7 +256,7 @@ export class AuditRuntime {
     });
   }
 
-  async auditSession(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async auditSession(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const ownerSessionId = url.searchParams.get('sessionId') ?? '';
     const body = await readJson(req);
@@ -321,7 +321,7 @@ export class AuditRuntime {
     });
   }
 
-  async audit(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async audit(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const body = await readJson(req);
     const targetPath = stringField(body, 'targetPath');
@@ -374,7 +374,7 @@ export class AuditRuntime {
    * 外部 Agent 执行期间租约参与全部互斥；只有 /audit/finalize 正常完成才释放，
    * 取消或超时只能由人确认停止后经 /audit/release 释放。
    */
-  async auditManual(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async auditManual(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const body = await readJson(req);
     const targetPath = stringField(body, 'targetPath');
@@ -500,7 +500,7 @@ export class AuditRuntime {
     });
   }
 
-  async auditFinalize(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async auditFinalize(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const body = await readJson(req);
     const auditId = stringField(body, 'auditId');
@@ -516,7 +516,7 @@ export class AuditRuntime {
   }
 
   /** §7.6 释放租约：仅在租约已取消/超时（releasable）或人工确认外部执行已停止后使用。 */
-  async auditRelease(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async auditRelease(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const body = await readJson(req);
     const auditId = stringField(body, 'auditId');
@@ -546,7 +546,7 @@ export class AuditRuntime {
     sendJson(res, 200, { released: true });
   }
 
-  async sync(res: ServerResponse, url: URL): Promise<void> {
+  async sync(res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { vcs } = runtime;
     this.host.ensureNoAuditRunning(runtime.root);

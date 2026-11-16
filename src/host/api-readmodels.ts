@@ -1,4 +1,4 @@
-import type { ServerResponse } from 'node:http';
+import type { ApiResponse } from './api-context.js';
 import path from 'node:path';
 import { isAiReviewPath, parsePatch } from './patch.js';
 import { loadReviewers } from './reviewers.js';
@@ -105,7 +105,7 @@ export class ReadModels {
     });
   }
 
-  async queue(res: ServerResponse, url: URL): Promise<void> {
+  async queue(res: ApiResponse, url: URL): Promise<void> {
     let runtime: Runtime;
     try {
       runtime = await this.host.runtimeFor(url);
@@ -203,7 +203,7 @@ export class ReadModels {
     });
   }
 
-  async candidate(res: ServerResponse, url: URL): Promise<void> {
+  async candidate(res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store, vcs } = runtime;
     const me = await this.host.ownerFor(store.repoRoot);
@@ -323,7 +323,7 @@ export class ReadModels {
       : { approvalCommitLookup: result.lookup };
   }
 
-  async patch(res: ServerResponse, url: URL): Promise<void> {
+  async patch(res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const id = idFrom(url);
     const name = url.searchParams.get('name') ?? '';
@@ -332,7 +332,7 @@ export class ReadModels {
     sendJson(res, 200, { name, text });
   }
 
-  async diff(res: ServerResponse, url: URL): Promise<void> {
+  async diff(res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store, vcs } = runtime;
     const sharedSource = await sharedSourceFor(runtime);
@@ -373,14 +373,14 @@ export class ReadModels {
     sendJson(res, 200, { mode: 'incremental', ...inter });
   }
 
-  async reviewers(res: ServerResponse, url: URL): Promise<void> {
+  async reviewers(res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const config = await loadReviewers(runtime.root, await sharedSourceFor(runtime));
     sendJson(res, 200, { config });
   }
 
   /** §3：目录式审查档案列表（旧扁平报告不参与；§7.1 只列共享快照中的档案）。 */
-  async auditsList(res: ServerResponse, url: URL): Promise<void> {
+  async auditsList(res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const archive = new AuditArchive(runtime.root);
     const view = await sharedViewFor(runtime);
@@ -449,13 +449,13 @@ export class ReadModels {
   }
 
   /** §3.4：finding 投影（覆盖判定 → 最新观察 → 当前状态 → 可见性）。 */
-  async findings(res: ServerResponse, url: URL): Promise<void> {
+  async findings(res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { findings, errors } = await this.findingProjection(runtime);
     sendJson(res, 200, { findings, errors });
   }
 
-  async fixPrompt(res: ServerResponse, url: URL): Promise<void> {
+  async fixPrompt(res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const id = idFrom(url);
     const detail = await runtime.store.get(id, null, await sharedSourceFor(runtime));

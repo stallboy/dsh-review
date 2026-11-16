@@ -20,6 +20,7 @@
     "apps/server/package.json",
     "apps/server/dist",
     "apps/web/dist",
+    "docs/central-deployment.md",
     "assets",
     "locale",
     "icon.svg",

@@ -1,4 +1,4 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ApiRequest, ApiResponse } from './api-context.js';
 import { Runner, loadSystemPrompt, toSessionFixPrompt } from './runner.js';
 import { ApiError, type ReviewCandidate } from './types.js';
 import {
@@ -67,7 +67,7 @@ export class FixSessions {
     return toSessionFixPrompt(manualPrompt, await loadSystemPrompt());
   }
 
-  async create(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async create(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     if (!this.host.deps.createFixSession) {
       throw new ApiError(500, 'internal', '当前 Host 不支持创建 DSH 会话（sessionController 未挂载）；可用「导出修复提示词」手动执行。');

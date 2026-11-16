@@ -42,18 +42,26 @@ export class CentralDatabase {
                 node_id TEXT NOT NULL REFERENCES nodes, idempotency_key TEXT NOT NULL, request_hash TEXT NOT NULL,
                 envelope TEXT NOT NULL, state TEXT NOT NULL, cancel_requested INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, result TEXT,
-                last_event INTEGER NOT NULL DEFAULT 0, logs_total INTEGER NOT NULL DEFAULT 0, UNIQUE(project_id,idempotency_key));
+                last_event INTEGER NOT NULL DEFAULT 0, logs_total INTEGER NOT NULL DEFAULT 0,
+                recovery_requested INTEGER NOT NULL DEFAULT 0, UNIQUE(project_id,idempotency_key));
             CREATE UNIQUE INDEX IF NOT EXISTS one_project_writer ON commands(project_id) WHERE state!='completed';
             CREATE TABLE IF NOT EXISTS events (command_id TEXT NOT NULL REFERENCES commands, sequence INTEGER NOT NULL,
                 payload TEXT NOT NULL, PRIMARY KEY(command_id,sequence));
             CREATE TABLE IF NOT EXISTS logs (command_id TEXT NOT NULL REFERENCES commands, offset INTEGER NOT NULL,
                 line TEXT NOT NULL, PRIMARY KEY(command_id,offset));
             CREATE TABLE IF NOT EXISTS snapshots (project_id TEXT PRIMARY KEY REFERENCES projects,
-                binding_generation INTEGER NOT NULL, sequence INTEGER NOT NULL, vcs_snapshot TEXT NOT NULL, payload TEXT NOT NULL);
+                binding_generation INTEGER NOT NULL, sequence INTEGER NOT NULL, vcs_snapshot TEXT NOT NULL, payload TEXT NOT NULL,
+                received_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS queries (query_id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects,
                 cache_key TEXT NOT NULL UNIQUE, envelope TEXT NOT NULL, state TEXT NOT NULL, result TEXT);
             CREATE TABLE IF NOT EXISTS artifacts (hash TEXT PRIMARY KEY, size INTEGER NOT NULL);
         `);
+        if (!this.sql.prepare('PRAGMA table_info(snapshots)').all().some(column => column.name === 'received_at')) {
+            this.sql.exec("ALTER TABLE snapshots ADD COLUMN received_at TEXT NOT NULL DEFAULT ''");
+        }
+        if (!this.sql.prepare('PRAGMA table_info(commands)').all().some(column => column.name === 'recovery_requested')) {
+            this.sql.exec('ALTER TABLE commands ADD COLUMN recovery_requested INTEGER NOT NULL DEFAULT 0');
+        }
     }
 
     now(): string { return this.clock().toISOString(); }

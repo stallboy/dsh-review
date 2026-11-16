@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ApiRequest, ApiResponse } from './api-context.js';
 import path from 'node:path';
 import process from 'node:process';
 import { ApprovalOrchestrator } from './approval.js';
@@ -34,6 +34,11 @@ import {
   sendJson,
   sharedSourceFor,
   stringField,
+  currentTrustedActor,
+  internalRequest,
+  withTrustedActor,
+  type ApiInvocation,
+  type ApiInvocationResult,
   type ApiDeps,
   type ApiHost,
   type Runtime,
@@ -247,7 +252,8 @@ export class ReviewApi implements ApiHost {
     if (!validation.vcsType) return;
     const root = path.resolve(settings.repoRoot);
     this.store = new ReviewStore(root);
-    this.vcs = createVcs(validation.vcsType, root, settings.baseBranch);
+    const adapter = createVcs(validation.vcsType, root, settings.baseBranch);
+    this.vcs = this.deps.decorateVcs?.(adapter) ?? adapter;
   }
 
   async runtimeFor(url: URL): Promise<Runtime> {
@@ -264,11 +270,12 @@ export class ReviewApi implements ApiHost {
     if (!vcsType) {
       throw new ApiError(412, 'not_configured', `${root} 不是 Git/SVN 仓库，评审需要产品仓库工作区`);
     }
+    const adapter = createVcs(vcsType, root, this.settings.baseBranch);
     const runtime: Runtime = {
       root,
       vcsType,
       store: new ReviewStore(root),
-      vcs: createVcs(vcsType, root, this.settings.baseBranch),
+      vcs: this.deps.decorateVcs?.(adapter) ?? adapter,
     };
     this.runtimeCache.set(root, runtime);
     if (this.runtimeCache.size > 8) {
@@ -279,11 +286,31 @@ export class ReviewApi implements ApiHost {
   }
 
   async ownerFor(root: string): Promise<string> {
+    const actor = currentTrustedActor();
+    if (actor) return actor.reviewIdentity;
     if (this.settings.owner.trim()) return this.settings.owner;
     return suggestOwner(root).catch(() => '');
   }
 
-  async handle(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+  async invoke(input: ApiInvocation): Promise<ApiInvocationResult> {
+    const url = new URL(input.path, 'http://internal');
+    for (const [key, value] of Object.entries(input.query ?? {})) url.searchParams.set(key, String(value));
+    const headers: Record<string, string> = {};
+    let payload = '';
+    const response: ApiResponse = {
+        statusCode: 200,
+        setHeader(name, value) { headers[name.toLowerCase()] = value; },
+        end(value) { payload += typeof value === 'string' ? value : value ? Buffer.from(value).toString('utf8') : ''; },
+    };
+    const execute = async (): Promise<ApiInvocationResult> => {
+        try { await this.dispatch(internalRequest(input.method, url.href, input.body ?? {}), response, url.pathname, url); }
+        catch (error) { sendError(response, error); }
+        return { status: response.statusCode, body: headers['content-type']?.includes('application/json') ? JSON.parse(payload) : payload, headers };
+    };
+    return input.actor ? withTrustedActor(input.actor, execute) : execute();
+  }
+
+  async handle(req: ApiRequest, res: ApiResponse): Promise<boolean> {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
     if (url.pathname !== API_PREFIX && !url.pathname.startsWith(`${API_PREFIX}/`)) return false;
     const route = url.pathname.slice(API_PREFIX.length) || '/';
@@ -372,7 +399,7 @@ export class ReviewApi implements ApiHost {
     { method: 'POST', path: '/ai-fix', kind: 'job-start', handler: ({ req, res, url }) => this.aiFix(req, res, url) },
   ]);
 
-  private async dispatch(req: IncomingMessage, res: ServerResponse, route: string, url: URL): Promise<void> {
+  private async dispatch(req: ApiRequest, res: ApiResponse, route: string, url: URL): Promise<void> {
     const method = req.method ?? 'GET';
     const matched = this.routes.match(method, route);
     if (!matched) throw new ApiError(404, 'not_found', `未知接口：${method} ${route}`);
@@ -390,7 +417,7 @@ export class ReviewApi implements ApiHost {
     return holdsRepoLock(spec.kind) ? locked() : run();
   }
 
-  private async health(res: ServerResponse, url: URL): Promise<void> {
+  private async health(res: ApiResponse, url: URL): Promise<void> {
     const diagnostics: string[] = [];
     let currentBase: string | null = null;
     let counts: Record<ReviewStatus, number> = {
@@ -441,7 +468,7 @@ export class ReviewApi implements ApiHost {
     sendJson(res, 200, info);
   }
 
-  private async getSettingsResponse(res: ServerResponse, url: URL): Promise<void> {
+  private async getSettingsResponse(res: ApiResponse, url: URL): Promise<void> {
     let validation: { ok: boolean; errors: string[]; vcsType: VcsType | null } = {
       ok: true,
       errors: [],
@@ -472,7 +499,7 @@ export class ReviewApi implements ApiHost {
     });
   }
 
-  private async putSettings(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  private async putSettings(req: ApiRequest, res: ApiResponse): Promise<void> {
     const body = await readJson(req);
     const merged: AppSettings = {
       ...this.settings,
@@ -505,7 +532,7 @@ export class ReviewApi implements ApiHost {
     sendJson(res, 200, { settings: saved, validation });
   }
 
-  private async approve(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  private async approve(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.runtimeFor(url);
     const { store, vcs } = runtime;
     // §7.7 审查互斥由 routes.ts（kind: job-start）在受理阶段统一检查。
@@ -609,7 +636,7 @@ export class ReviewApi implements ApiHost {
     sendJson(res, 202, { jobId: job.id, job });
   }
 
-  private async aiFix(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  private async aiFix(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.runtimeFor(url);
     const body = await readJson(req);
     const id = stringField(body, 'id');
@@ -753,7 +780,7 @@ export class ReviewApi implements ApiHost {
    * 已结束 Job 直接返回原结果；运行中的设置 cancelRequested 标志（批准流程在安全检查点
    * 读取并中止——此时已证明共享提交不存在，可安全 ABORTED）；租约不随取消自动释放。
    */
-  private async jobCancel(req: IncomingMessage, res: ServerResponse, jobId: string): Promise<void> {
+  private async jobCancel(req: ApiRequest, res: ApiResponse, jobId: string): Promise<void> {
     await readJson(req).catch(() => ({}));
     const job = this.jobs.get(jobId);
     if (!job) throw new ApiError(404, 'not_found', '任务不存在');
@@ -781,11 +808,11 @@ export class ReviewApi implements ApiHost {
     sendJson(res, 202, { jobId: job.id, job });
   }
 
-  private jobsList(res: ServerResponse): void {
+  private jobsList(res: ApiResponse): void {
     sendJson(res, 200, { jobs: this.jobs.list() });
   }
 
-  private jobGet(res: ServerResponse, jobId: string, url: URL): void {
+  private jobGet(res: ApiResponse, jobId: string, url: URL): void {
     const job = this.jobs.get(jobId);
     if (!job) throw new ApiError(404, 'not_found', '任务不存在');
     // §8.2/G36：since/logOffset/totalLogLines/earliestLogOffset 都是单调递增绝对行序号；

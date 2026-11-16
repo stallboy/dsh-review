@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ApiRequest, ApiResponse } from './api-context.js';
 import path from 'node:path';
 import { AuditArchive } from './audit-archive.js';
 import { isAiReviewPath, parsePatch } from './patch.js';
@@ -380,7 +380,7 @@ export class Writers {
     }
   }
 
-  async addComment(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async addComment(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store } = runtime;
     const author = await this.host.ownerFor(store.repoRoot);
@@ -432,7 +432,7 @@ export class Writers {
     });
   }
 
-  async commentStatus(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async commentStatus(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store } = runtime;
     const body = await readJson(req);
@@ -451,7 +451,7 @@ export class Writers {
     sendJson(res, 200, { candidate, commit });
   }
 
-  async takeover(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async takeover(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store } = runtime;
     const body = await readJson(req);
@@ -466,7 +466,7 @@ export class Writers {
   }
 
   /** §5.1/G12 /resume：仅 Owner 把 changes_requested 转回 pending，不产生新版本。 */
-  async resume(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async resume(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store } = runtime;
     const body = await readJson(req);
@@ -481,7 +481,7 @@ export class Writers {
   }
 
   /** §8.3/G37 /comments/batch：全有或全无，一次共享写入与一次提交；状态只在批次内转换一次。 */
-  async addCommentsBatch(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async addCommentsBatch(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store } = runtime;
     const author = await this.host.ownerFor(store.repoRoot);
@@ -546,7 +546,7 @@ export class Writers {
     sendJson(res, 200, { candidate, commit, ...(job ? { job } : {}), ...(autoFixError ? { autoFixError } : {}) });
   }
 
-  async reject(req: IncomingMessage, res: ServerResponse, url: URL, mode: 'manual' | 'stale' = 'manual'): Promise<void> {
+  async reject(req: ApiRequest, res: ApiResponse, url: URL, mode: 'manual' | 'stale' = 'manual'): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store } = runtime;
     const body = await readJson(req);
@@ -613,7 +613,7 @@ export class Writers {
     sendJson(res, 200, { candidate, commitRevision: result.commitRevision });
   }
 
-  async reopen(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async reopen(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store } = runtime;
     const body = await readJson(req);
@@ -636,7 +636,7 @@ export class Writers {
   }
 
   /** §7.6/G22 /dismiss-finding：带理由、仅最新有效观察中的 pending item、独立提交。 */
-  async dismissFinding(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async dismissFinding(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const body = await readJson(req);
     const auditId = stringField(body, 'auditId');
@@ -697,7 +697,7 @@ export class Writers {
    * Deferred 必须先确认 depends_on 满足（前置 finding resolved，或其 converted 候选 approved）；
    * 审查档案与候选目录两侧必须在同一个共享提交中完成，失败恢复档案文件。
    */
-  async convert(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async convert(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store } = runtime;
     const body = await readJson(req);
@@ -798,7 +798,7 @@ export class Writers {
    * §6.5 Rebase：在最新基线上重建当前补丁——干净工作区 → 应用补丁（失败即冲突）
    * → 重跑门禁 → 追加新版本（author: ai，基线=最新）→ 回 pending → 只提交候选目录。
    */
-  async rebase(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async rebase(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store, vcs } = runtime;
     const body = await readJson(req);
@@ -963,7 +963,7 @@ export class Writers {
    * §6.4 人工微调（收尾）：外部提供的全量补丁文本在当前基线上验证 + 重跑门禁后
    * 追加新版本（author: human）→ 回 pending → 只提交候选目录。
    */
-  async manualRevision(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async manualRevision(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store, vcs } = runtime;
     // §7.7 审查互斥与 repo 锁由 routes.ts 的 RouteKind 统一套用。
@@ -1054,7 +1054,7 @@ export class Writers {
    * 不使用共享 guard：通过 repo 锁、本地候选完整性与目标共享目录冲突检查串行收尾，
    * 以 ai_fix Job 执行同一套完整校验（含 owner 路由），成功后仅提交该新候选目录。
    */
-  async candidateFinalize(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+  async candidateFinalize(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { store, vcs } = runtime;
     // §7.7 审查互斥与 repo 锁由 routes.ts 的 RouteKind 统一套用。

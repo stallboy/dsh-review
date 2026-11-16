@@ -56,3 +56,36 @@ test('离线状态禁止新写，取消请求不清空占用', async t => {
     now = new Date(now.getTime() + 31000);
     assert.equal((await app.inject({ method: 'POST', url: `/api/v1/projects/${otherProject.projectId}/commands`, headers, payload: approvePayload() })).statusCode, 503);
 });
+
+test('恢复回报不能抹掉已证明的提交或将待交付降为不需交付', async t => {
+    const { app, headers } = await setupCentral(t);
+    const node = await registerNode(app);
+    const project = await bindProject(app, headers, node);
+    const url = `/api/v1/projects/${project.projectId}/commands`;
+    const created = await app.inject({ method: 'POST', url, headers, payload: approvePayload() });
+    const commandId = created.json().command.commandId;
+    const outcome = { status: 'COMMITTED', commitRevision: 'abc', message: '已提交' };
+    const report = (sequence, result) => app.inject({ method: 'POST', url: '/node-api/v1/events', headers: node.headers,
+        payload: { instanceId: node.instanceId, events: [{ commandId, sequence, type: 'result', result }] } });
+    assert.equal((await report(1, { outcome, delivery: { state: 'pending', commitRevision: 'abc' } })).statusCode, 200);
+    assert.equal((await report(2, { outcome: { status: 'ABORTED', commitRevision: 'abc' }, delivery: { state: 'not_required' } })).statusCode, 409);
+    assert.equal((await report(2, { outcome, delivery: { state: 'not_required', commitRevision: 'abc' } })).statusCode, 409);
+    assert.equal((await app.inject({ method: 'POST', url, headers, payload: approvePayload('next') })).statusCode, 409);
+    assert.equal((await report(2, { outcome, delivery: { state: 'delivered', commitRevision: 'abc' } })).statusCode, 200);
+    assert.deepEqual((await app.inject({ url: `/api/v1/commands/${commandId}`, headers })).json().command.result.outcome, outcome);
+});
+
+test('恢复控制必须由用户明确请求，不因轮询自动重试交付', async t => {
+    const { app, headers } = await setupCentral(t);
+    const node = await registerNode(app);
+    const project = await bindProject(app, headers, node);
+    const created = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.projectId}/commands`, headers, payload: approvePayload() });
+    const commandId = created.json().command.commandId;
+    await app.inject({ method: 'POST', url: '/node-api/v1/events', headers: node.headers,
+        payload: { instanceId: node.instanceId, events: [{ commandId, sequence: 1, type: 'result',
+            result: { outcome: { status: 'COMMITTED', commitRevision: 'abc' }, delivery: { state: 'pending', commitRevision: 'abc' } } }] } });
+    const poll = () => app.inject({ method: 'POST', url: '/node-api/v1/commands/poll', headers: node.headers, payload: { instanceId: node.instanceId } });
+    assert.deepEqual((await poll()).json().recoveries, []);
+    assert.equal((await app.inject({ method: 'POST', url: `/api/v1/commands/${commandId}/recover`, headers, payload: { confirmStopped: true } })).statusCode, 200);
+    assert.deepEqual((await poll()).json().recoveries, [commandId]);
+});

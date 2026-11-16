@@ -53,13 +53,16 @@ export class Commands {
             const all = (db.sql.prepare("SELECT command_id FROM commands WHERE node_id=? AND state!='completed' ORDER BY created_at").all(nodeId) as Row[])
                 .map(row => this.get(row.command_id));
             const running = all.some(c => c.state === 'accepted' || c.state === 'executing' || c.state === 'recovery_required');
-            const commands = running ? [] : all.filter(c => c.state === 'queued' || c.state === 'dispatched').slice(0, 1);
+            const accepted = all.filter(c => c.state === 'accepted');
+            const commands = accepted.length ? accepted : running ? [] : all.filter(c => c.state === 'queued' || c.state === 'dispatched').slice(0, 1);
             for (const command of commands) {
+                if (command.state === 'accepted') continue;
                 db.sql.prepare("UPDATE commands SET state='dispatched',updated_at=? WHERE command_id=?").run(db.now(), command.commandId);
                 command.state = 'dispatched';
             }
+            const recoveries = db.sql.prepare("SELECT command_id FROM commands WHERE node_id=? AND state='recovery_required' AND recovery_requested=1").all(nodeId) as Row[];
             return { commands, cancellations: all.filter(c => c.cancelRequested).map(c => c.commandId),
-                recoveries: all.filter(c => c.state === 'recovery_required').map(c => c.commandId) };
+                recoveries: recoveries.map(row => row.command_id) };
         });
     }
 
@@ -76,6 +79,13 @@ export class Commands {
         const command = this.get(commandId);
         if (command.state !== 'completed') this.database.sql.prepare('UPDATE commands SET cancel_requested=1,updated_at=? WHERE command_id=?').run(this.database.now(), commandId);
         return this.get(commandId);
+    }
+
+    requestRecovery(commandId: string, confirmStopped: unknown): CommandRecord {
+        const command = this.get(commandId);
+        if (confirmStopped !== true || command.state !== 'recovery_required') throw new CentralError(409, 'recovery_confirmation_required', '仅在确认执行器已停止后请求核验恢复');
+        this.database.sql.prepare('UPDATE commands SET recovery_requested=1,updated_at=? WHERE command_id=?').run(this.database.now(), commandId);
+        return command;
     }
 
     private authorize(nodeId: string, command: CommandRecord): void {
@@ -139,8 +149,16 @@ export class Commands {
         if (event.result) {
             const before = command.result?.outcome.commitRevision;
             if (before && event.result.outcome.commitRevision !== before) throw new CentralError(409, 'commit_mismatch', '不能用另一提交替换原执行结果');
+            const proven = command.result && (command.result.outcome.status === 'COMMITTED'
+                || (before && command.result.outcome.status !== 'RECOVERY_REQUIRED'));
+            if (proven && stableJson(command.result!.outcome) !== stableJson(event.result.outcome)) {
+                throw new CentralError(409, 'outcome_mismatch', '已确认的业务提交结果不可被恢复回报覆盖');
+            }
+            if (proven && command.result!.delivery.state !== 'not_required' && event.result.delivery.state === 'not_required') {
+                throw new CentralError(409, 'delivery_mismatch', '已提交内容的远端交付义务不能被清除');
+            }
             const unresolved = event.result.outcome.status === 'RECOVERY_REQUIRED' || ['pending', 'conflict', 'unknown'].includes(event.result.delivery.state);
-            db.sql.prepare('UPDATE commands SET state=?,result=?,updated_at=? WHERE command_id=?').run(unresolved ? 'recovery_required' : 'completed', JSON.stringify(event.result), db.now(), commandId);
+            db.sql.prepare('UPDATE commands SET state=?,result=?,updated_at=?,recovery_requested=0 WHERE command_id=?').run(unresolved ? 'recovery_required' : 'completed', JSON.stringify(event.result), db.now(), commandId);
         } else {
             const state = event.type === 'recovery_required' ? 'recovery_required' : event.type === 'accepted' ? 'accepted' : 'executing';
             if (command.state === 'recovery_required') return;

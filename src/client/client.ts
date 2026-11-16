@@ -44,6 +44,7 @@
     autoFixOnFailure: boolean; gateTimeoutMs: number; syncBeforeApprove: boolean;
   }
   interface Health {
+    managed?: { centerUrl: string; nodeId: string };
     app: string; version: string; configured: boolean; repoRoot: string; owner: string;
     vcsType: 'git' | 'svn' | null; currentBase: string | null; diagnostics: string[];
     counts: Record<string, number>;
@@ -2037,6 +2038,11 @@
       };
 
       let content: any;
+      if (health?.managed) return h('div', { className: 'dcr', [VIEW_ATTR]: 'code-review' },
+        h('h1', null, '此节点已接入中央工作台'),
+        h('p', null, '项目、审查结果和任务由中央服务统一管理。'),
+        h('a', { className: 'dcr-btn dcr-primary', href: health.managed.centerUrl, target: '_blank', rel: 'noopener noreferrer' }, '打开中央工作台'),
+      );
       if (screen === 'loading') content = h('div', { className: 'dcr-empty' }, '加载评审…');
       else if (screen === 'setup' || screen === 'settings') content = renderSettings();
       else if (screen === 'queue') content = renderQueue();

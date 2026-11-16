@@ -2,6 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setupCentral, registerNode, bindProject } from './central-helpers.mjs';
 
+test('编码后的 API 路径仍依据匹配路由执行身份与 CSRF 校验', async t => {
+    const { app, headers } = await setupCentral(t);
+    assert.equal((await app.inject('/%61pi/v1/nodes')).statusCode, 401);
+    assert.equal((await app.inject({ method: 'POST', url: '/%61pi/v1/nodes', payload: { name: '不能创建' } })).statusCode, 401);
+    assert.equal((await app.inject({ method: 'POST', url: '/%61pi/v1/nodes', headers: { cookie: headers.cookie }, payload: { name: '不能创建' } })).statusCode, 403);
+    assert.equal((await app.inject({ method: 'POST', url: '/node-%61pi/v1/heartbeat', payload: { instanceId: 'untrusted' } })).statusCode, 401);
+});
+
 test('中央服务要求用户登录及写请求 CSRF，节点凭据不用于用户接口', async t => {
     const { app, headers } = await setupCentral(t);
     assert.equal((await app.inject('/api/v1/projects')).statusCode, 401);

@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { IncomingMessage, IncomingHttpHeaders } from 'node:http';
 import path from 'node:path';
 import type { AppSettings, ConcurrencyGuard, JobRecord, ReviewFilter, ReviewStatus, VcsType } from './types.js';
 import { ApiError } from './types.js';
@@ -20,10 +20,63 @@ export const APP_VERSION = '0.3.0';
 const BODY_LIMIT = 2 * 1024 * 1024;
 const STATUSES: ReviewStatus[] = ['pending', 'changes_requested', 'approved', 'rejected'];
 
+const INTERNAL_BODY = Symbol('internal-body');
+
+export type ApiRequest = IncomingMessage | {
+    method: string;
+    url: string;
+    headers: IncomingHttpHeaders;
+    [INTERNAL_BODY]: Record<string, unknown>;
+};
+
+export interface ApiResponse {
+    statusCode: number;
+    setHeader(name: string, value: string): unknown;
+    end(value?: string | Uint8Array): unknown;
+}
+
+export interface TrustedActor {
+    userId: string;
+    reviewIdentity: string;
+    commandId?: string;
+}
+
+export interface ApiInvocation {
+    method: 'GET' | 'POST' | 'PUT';
+    path: string;
+    query?: Record<string, string | number | boolean>;
+    body?: Record<string, unknown>;
+    actor?: TrustedActor;
+}
+
+export interface ApiInvocationResult {
+    status: number;
+    body: unknown;
+    headers: Record<string, string>;
+}
+
+const actorContext = new AsyncLocalStorage<TrustedActor>();
+const sharedContext = new AsyncLocalStorage<{ root: string; view: SharedView }>();
+
+export function withSharedView<T>(root: string, view: SharedView, task: () => T): T {
+    return sharedContext.run({ root, view }, task);
+}
+
+export function currentTrustedActor(): TrustedActor | undefined { return actorContext.getStore(); }
+
+export function withTrustedActor<T>(actor: TrustedActor, task: () => T): T {
+    return actorContext.run(Object.freeze({ ...actor }), task);
+}
+
+export function internalRequest(method: string, url: string, body: Record<string, unknown>): ApiRequest {
+    return { method, url, headers: {}, [INTERNAL_BODY]: body };
+}
+
 export interface ApiDeps {
   settings: AppSettings;
   saveSettings: (settings: AppSettings) => Promise<AppSettings>;
   resolveCredential?: (reference: string) => Promise<string | undefined>;
+  decorateVcs?: (vcs: VcsAdapter) => VcsAdapter;
   /** Resolve the working directory of the Session that owns the review tab. */
   resolveSessionCwd?: (sessionId: string) => string | undefined;
   /** Create a real DSH session (through the host `sessionController`) and send the audit prompt into it. */
@@ -92,6 +145,8 @@ export interface SharedView {
  * 不允许各自重建 —— 否则「一次计算内的档案与候选事实来自同一快照」的语义会被破坏。
  */
 export async function sharedViewFor(runtime: Runtime): Promise<SharedView | undefined> {
+  const managed = sharedContext.getStore();
+  if (managed?.root === runtime.root) return managed.view;
   if (runtime.vcsType === 'git') {
     const source = await GitHeadCandidateSource.create(runtime.root).catch(() => null);
     return source ? { source, snapshot: await source.snapshotId() } : undefined;
@@ -107,7 +162,7 @@ export async function sharedSourceFor(runtime: Runtime): Promise<SharedCandidate
   return (await sharedViewFor(runtime))?.source;
 }
 
-export function sendJson(res: ServerResponse, status: number, data: unknown): void {
+export function sendJson(res: ApiResponse, status: number, data: unknown): void {
   const body = JSON.stringify(data);
   res.statusCode = status;
   res.setHeader('content-type', 'application/json; charset=utf-8');
@@ -115,7 +170,7 @@ export function sendJson(res: ServerResponse, status: number, data: unknown): vo
   res.end(body);
 }
 
-export function sendError(res: ServerResponse, error: unknown): void {
+export function sendError(res: ApiResponse, error: unknown): void {
   if (error instanceof ApiError) {
     sendJson(res, error.status, { error: { code: error.code, message: error.message, details: error.details ?? {} } });
     return;
@@ -124,7 +179,8 @@ export function sendError(res: ServerResponse, error: unknown): void {
   sendJson(res, 500, { error: { code: 'internal', message, details: {} } });
 }
 
-export async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+export async function readJson(req: ApiRequest): Promise<Record<string, unknown>> {
+  if (INTERNAL_BODY in req) return req[INTERNAL_BODY];
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req) {
