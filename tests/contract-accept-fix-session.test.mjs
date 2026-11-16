@@ -5,12 +5,12 @@ import { createServer } from 'node:http';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { API_PREFIX, ReviewApi } from '../dist/api.js';
-import { DEFAULT_SETTINGS } from '../dist/settings.js';
-import { buildCommitDetails, buildCommitSubject, composeCommitMessage, normalizeCommitDetail } from '../dist/commit-message.js';
-import { buildSessionFixPrompt, toSessionFixPrompt } from '../dist/runner.js';
-import { createDshFixSession } from '../dist/index.js';
-import { createVcs } from '../dist/vcs.js';
+import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
+import { buildCommitDetails, buildCommitSubject, composeCommitMessage, normalizeCommitDetail } from '../packages/dsh-plugin/dist/host/commit-message.js';
+import { buildSessionFixPrompt, toSessionFixPrompt } from '../packages/dsh-plugin/dist/host/runner.js';
+import { createDshFixSession } from '../packages/dsh-plugin/dist/index.js';
+import { createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 import { commitCandidate, commentFixture, guardFixture } from './fixtures/contract.mjs';
 

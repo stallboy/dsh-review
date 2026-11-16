@@ -4,18 +4,18 @@ import { createServer } from 'node:http';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { API_PREFIX, ReviewApi } from '../dist/api.js';
-import { DEFAULT_SETTINGS } from '../dist/settings.js';
-import { parseReviewMarkdown, serializeReviewMarkdown } from '../dist/frontmatter.js';
-import { quickReviewInvariants } from '../dist/invariants.js';
-import { projectFindings } from '../dist/audit-archive.js';
-import { AuditLifecycle } from '../dist/audit-lifecycle.js';
-import { ReadModels } from '../dist/api-readmodels.js';
-import { SvnAdapter, createVcs } from '../dist/vcs.js';
-import { Auditor, buildAuditPrompt, loadAuditSystemPrompt } from '../dist/auditor.js';
-import { Writers } from '../dist/api-writers.js';
-import { ReviewStore } from '../dist/store.js';
-import { GitHeadCandidateSource } from '../dist/shared-facts.js';
+import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
+import { parseReviewMarkdown, serializeReviewMarkdown } from '../packages/dsh-plugin/dist/host/frontmatter.js';
+import { quickReviewInvariants } from '../packages/dsh-plugin/dist/host/invariants.js';
+import { projectFindings } from '../packages/dsh-plugin/dist/host/audit-archive.js';
+import { AuditLifecycle } from '../packages/dsh-plugin/dist/host/audit-lifecycle.js';
+import { ReadModels } from '../packages/dsh-plugin/dist/host/api-readmodels.js';
+import { SvnAdapter, createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
+import { Auditor, buildAuditPrompt, loadAuditSystemPrompt } from '../packages/dsh-plugin/dist/host/auditor.js';
+import { Writers } from '../packages/dsh-plugin/dist/host/api-writers.js';
+import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
+import { GitHeadCandidateSource } from '../packages/dsh-plugin/dist/host/shared-facts.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 import { commitCandidate, guardFixture, reviewFixture } from './fixtures/contract.mjs';
 
@@ -493,8 +493,8 @@ test('§11/AC-PROMPT-01：系统提示词和 Host 展开包含完整 Schema、9 
     now: new Date('2026-11-11T00:00:00Z'),
   });
   const assets = await Promise.all([
-    readFile(new URL('../assets/ai-fixer-system.md', import.meta.url), 'utf8'),
-    readFile(new URL('../assets/repo-audit-system.md', import.meta.url), 'utf8'),
+    readFile(new URL('../packages/dsh-plugin/assets/ai-fixer-system.md', import.meta.url), 'utf8'),
+    readFile(new URL('../packages/dsh-plugin/assets/repo-audit-system.md', import.meta.url), 'utf8'),
     loadAuditSystemPrompt(),
   ]);
   for (const text of [prompt, ...assets]) {
@@ -510,7 +510,7 @@ test('§11/AC-PROMPT-01：系统提示词和 Host 展开包含完整 Schema、9 
 });
 
 test('§10/AC-UI-01：Client 包含审查租约、取消、修复会话/导出提示词与 finding 工作流入口', async () => {
-  const source = await readFile(new URL('../dist/client.js', import.meta.url), 'utf8');
+  const source = await readFile(new URL('../packages/dsh-plugin/dist/client.js', import.meta.url), 'utf8');
   for (const endpoint of ['/audit/manual', '/audit/finalize', '/audit/release', '/fix-session', '/fix-prompt', '/convert', '/dismiss-finding']) {
     assert.ok(source.includes(`'${endpoint}'`) || source.includes(`${endpoint}?`), `Client 缺少 ${endpoint}`);
   }
@@ -522,7 +522,7 @@ test('§10/AC-UI-01：Client 包含审查租约、取消、修复会话/导出�
 });
 
 test('§10.2（2026-11-12）：详情页移除「上传人工补丁 / 超时归档 / 从重开来源恢复」三个按钮（后端端点保留）', async () => {
-  const source = await readFile(new URL('../dist/client.js', import.meta.url), 'utf8');
+  const source = await readFile(new URL('../packages/dsh-plugin/dist/client.js', import.meta.url), 'utf8');
   for (const label of ['上传人工补丁', '超时归档', '从重开来源恢复']) {
     assert.ok(!source.includes(label), `详情页不应再出现按钮「${label}」`);
   }
@@ -632,7 +632,7 @@ await writeFile(path.join(dir, '001.patch'), 'HISTORY REWRITTEN\\n', 'utf8');
 });
 
 test('§10：审查跟踪 Job 运行中仍可点击 finalize，不被 busy 死锁', async () => {
-  const source = await readFile(new URL('../dist/client.js', import.meta.url), 'utf8');
+  const source = await readFile(new URL('../packages/dsh-plugin/dist/client.js', import.meta.url), 'utf8');
   const finalize = source.match(/h\('button', \{ className: 'dcr-btn', disabled: ([^,]+), onClick: \(\) => \{ void startJob\('\/audit\/finalize'/);
   assert.ok(finalize, '找不到 finalize 按钮');
   assert.equal(finalize[1], 'auditLaunching');

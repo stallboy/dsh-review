@@ -1,3 +1,5 @@
+export * from './review.js';
+
 export const PROTOCOL_VERSION = 1;
 
 export const OPERATIONS = [

@@ -1,9 +1,15 @@
-# Third-party notices
+# 第三方许可声明
+
+> **任务来源**: 用户授权将插件和中央服务整理为独立包。
+> **任务内容**: 记录迁移后内置组件的位置并保留原许可。
+> **参考文档**:
+> - `packages/dsh-plugin/THIRD-PARTY.md` — 随插件分发的 js-yaml 许可。
+> - `apps/server/package.json` — 中央服务运行依赖。
+> **生成日期**: 2026-11-16
 
 ## js-yaml 4.3.2
 
-Vendored at `src/host/vendor/js-yaml.ts` (and compiled into `dist/vendor/js-yaml.js`) for parsing and
-writing `review.md` YAML frontmatter. It is the only third-party runtime code in this plugin.
+插件内置实现位于 `packages/dsh-plugin/src/host/vendor/js-yaml.ts`，编译为插件包内的 `dist/host/vendor/js-yaml.js`，用于读写评审 YAML。中央服务的第三方运行依赖声明在自身 package.json 中，其许可文件随依赖一起进入安装包。
 
 ```text
 (The MIT License)

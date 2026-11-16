@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { API_PREFIX, ReviewApi } from '../dist/api.js';
-import { DEFAULT_SETTINGS } from '../dist/settings.js';
-import { AuditArchive } from '../dist/audit-archive.js';
+import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
+import { AuditArchive } from '../packages/dsh-plugin/dist/host/audit-archive.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
 /** P7 验收：§6.2 转候选——depends_on 满足判定、两侧同一提交、状态/归档目标校验。 */

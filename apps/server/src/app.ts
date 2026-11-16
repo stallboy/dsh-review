@@ -163,7 +163,7 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
     });
     app.get('/api/v1/artifacts/:hash', async (req, reply) => reply.type('application/octet-stream').send(await snapshots.artifact(params(req).hash!)));
 
-    const webDir = options.webDir ?? fileURLToPath(new URL('../../web/dist/', import.meta.url));
+    const webDir = options.webDir ?? fileURLToPath(new URL('./public/', import.meta.url));
     app.get('/*', async (req, reply) => {
         const pathname = new URL(req.url, 'http://local').pathname;
         if (pathname.startsWith('/api/') || pathname.startsWith('/node-api/')) throw new CentralError(404, 'not_found', '接口不存在');

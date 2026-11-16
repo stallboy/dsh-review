@@ -74,7 +74,7 @@ export function wrapAgentPrompt(system: string, user: string): string {
 }
 
 function packageRoot(): string {
-  return path.resolve(import.meta.dirname, '..');
+  return path.resolve(import.meta.dirname, '../..');
 }
 
 /** §7.4：修复器系统提示词（assets/ai-fixer-system.md）；缺失时退回内置两行约束。 */

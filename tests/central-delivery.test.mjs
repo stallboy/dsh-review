@@ -16,7 +16,7 @@ async function fixture(t) {
     runCommand('git', ['config', 'user.name', 'review-node'], root);
     runCommand('git', ['config', 'user.email', 'review-node@example.com'], root);
     t.after(async () => { await rm(root, { recursive: true, force: true }); await rm(remote, { recursive: true, force: true }); });
-    const entry = new URL('../dist/managed-delivery.js', import.meta.url);
+    const entry = new URL('../packages/dsh-plugin/dist/managed/managed-delivery.js', import.meta.url);
     assert.equal(existsSync(entry), true, '托管交付实现必须存在');
     const { ManagedDelivery } = await import(entry.href);
     return { root, remote, target, delivery: new ManagedDelivery({ root, type: 'git', target }) };

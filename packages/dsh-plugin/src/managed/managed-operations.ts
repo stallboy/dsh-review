@@ -1,15 +1,15 @@
 import { realpath, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { JsonRecord, ManagedCommand, ManagedOperation, ManagedQuery, ManagedQueryResult, ManagedResult, ProjectRecord, WorkspaceRegistration } from '@dsh-review/protocol';
-import { ReviewApi } from './api.js';
-import { withSharedView } from './api-context.js';
-import { AuditArchive } from './audit-archive.js';
+import { ReviewApi } from '../host/api.js';
+import { withSharedView } from '../host/api-context.js';
+import { AuditArchive } from '../host/audit-archive.js';
 import { ManagedDelivery, decorateManagedVcs } from './managed-delivery.js';
 import { ManagedJournal } from './managed-journal.js';
 import { managedSource } from './managed-source.js';
-import { DEFAULT_SETTINGS } from './settings.js';
-import { runProcess } from './shell.js';
-import type { AppSettings } from './types.js';
+import { DEFAULT_SETTINGS } from '../host/settings.js';
+import { runProcess } from '../host/shell.js';
+import type { AppSettings } from '../host/types.js';
 
 export interface ManagedWorkspace {
     workspaceId: string;

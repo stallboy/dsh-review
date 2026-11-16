@@ -7,10 +7,10 @@ import test from 'node:test';
 import { setupCentral, registerNode, bindProject, approvePayload } from './central-helpers.mjs';
 
 async function nodeRuntime(t, app, registration, execute, extra = {}) {
-    const entry = new URL('../dist/managed-node.js', import.meta.url);
+    const entry = new URL('../packages/dsh-plugin/dist/managed/managed-node.js', import.meta.url);
     assert.equal(existsSync(entry), true, 'DSH 托管节点尚未实现');
     const { ManagedNode } = await import(entry.href);
-    const { ManagedJournal } = await import(new URL('../dist/managed-journal.js', import.meta.url));
+    const { ManagedJournal } = await import(new URL('../packages/dsh-plugin/dist/managed/managed-journal.js', import.meta.url));
     const directory = await mkdtemp(path.join(os.tmpdir(), 'central-node-test-'));
     const journal = new ManagedJournal(path.join(directory, 'node.sqlite'));
     const transport = async (url, options = {}) => {
@@ -36,7 +36,7 @@ test('ACK 已落库但响应丢失后可继续执行，受理记录不会永久�
         return { outcome: { status: 'ABORTED', reason: 'CANCELLED' }, delivery: { state: 'not_required' } };
     });
     const transport = runtime.transport;
-    const { ManagedNode } = await import('../dist/managed-node.js');
+    const { ManagedNode } = await import('../packages/dsh-plugin/dist/managed/managed-node.js');
     const node = new ManagedNode({ config: { centerUrl: 'http://127.0.0.1:3081', nodeId: registration.nodeId, token: registration.token,
         instanceId: registration.instanceId, workspaces: [{ workspaceId: registration.workspaceId, label: 'repo', vcsType: 'git', target: 'main' }] },
         journal: runtime.journal, execute: async () => { executions++; return { outcome: { status: 'ABORTED' }, delivery: { state: 'not_required' } }; },

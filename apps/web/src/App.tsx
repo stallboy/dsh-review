@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { ReviewCandidate, ReviewComment } from '../../../src/host/types.js';
+import type { ReviewCandidate, ReviewComment } from '@dsh-review/protocol';
 import { ApiError, clearSession, command, detail, request, setSession, type CommandRecord, type NodeRecord, type ProjectView, type QueueItem, type Session } from './api.js';
 import { Diff, type Anchor } from './Diff.js';
 import s from './App.module.css';

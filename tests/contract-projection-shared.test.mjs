@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { API_PREFIX, ReviewApi } from '../dist/api.js';
-import { buildAuditPrompt } from '../dist/auditor.js';
-import { GitHeadCandidateSource } from '../dist/shared-facts.js';
-import { DEFAULT_SETTINGS } from '../dist/settings.js';
+import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { buildAuditPrompt } from '../packages/dsh-plugin/dist/host/auditor.js';
+import { GitHeadCandidateSource } from '../packages/dsh-plugin/dist/host/shared-facts.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
 /**
@@ -136,7 +136,7 @@ test('§7.1/G41：finding 投影读 HEAD 快照，本地篡改不可见；新提
 });
 
 test('§7.1/G10：非全仓 scope 的空 target_files 会排除 item（buildAuditItems 告警）', async () => {
-  const { buildAuditItems } = await import('../dist/auditor.js');
+  const { buildAuditItems } = await import('../packages/dsh-plugin/dist/host/auditor.js');
   const warnings = [];
   const items = buildAuditItems([
     { label: '需要人工确认', text: '影响 `src/math.js` 的边界', category: 'confirm' },

@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { ApprovalOrchestrator } from '../dist/approval.js';
-import { ReviewStore } from '../dist/store.js';
-import { createVcs } from '../dist/vcs.js';
-import { DEFAULT_SETTINGS } from '../dist/settings.js';
+import { ApprovalOrchestrator } from '../packages/dsh-plugin/dist/host/approval.js';
+import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
+import { createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
 /**

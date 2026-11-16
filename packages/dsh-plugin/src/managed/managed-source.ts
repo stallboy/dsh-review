@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { GitHeadCandidateSource, SvnBaseCandidateSource, type SharedCandidateSource } from './shared-facts.js';
-import { runProcess } from './shell.js';
+import { GitHeadCandidateSource, SvnBaseCandidateSource, type SharedCandidateSource } from '../host/shared-facts.js';
+import { runProcess } from '../host/shell.js';
 
 export class SvnRevisionSource extends SvnBaseCandidateSource {
     constructor(private readonly cwd: string, private readonly url: string, private readonly revision: string) { super(cwd); }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { AuditLifecycle, LeaseTransitionError } from '../dist/audit-lifecycle.js';
+import { AuditLifecycle, LeaseTransitionError } from '../packages/dsh-plugin/dist/host/audit-lifecycle.js';
 
 /**
  * §7.6/§7.7 审查租约状态机的单元测试（架构改进 A4/A6）。

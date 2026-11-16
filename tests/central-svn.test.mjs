@@ -6,9 +6,9 @@ import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { runCommand } from './helpers.mjs';
 import { reviewFixture, patchFixture } from './fixtures/contract.mjs';
-import { ManagedDelivery } from '../dist/managed-delivery.js';
-import { ManagedJournal } from '../dist/managed-journal.js';
-import { ManagedOperations } from '../dist/managed-operations.js';
+import { ManagedDelivery } from '../packages/dsh-plugin/dist/managed/managed-delivery.js';
+import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
+import { ManagedOperations } from '../packages/dsh-plugin/dist/managed/managed-operations.js';
 
 test('SVN 子路径提交后固定远端版本读取，批准直接交付原远端版本', async t => {
     const base = await mkdtemp(path.join(os.tmpdir(), 'central-svn-'));

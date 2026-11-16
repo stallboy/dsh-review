@@ -1,11 +1,12 @@
 # dsh-code-review
 
-> **任务来源**: 用户认可中央管理服务、多机器 DSH 节点及独立 Web 方案，授权实施。
-> **任务内容**: 保留本地模式，并提供中央服务、多项目管理和远端交付入口。
+> **任务来源**: 用户认可在单仓内划清插件、中央服务、Web 和共享协议的边界，授权整理拆分。
+> **任务内容**: 保留本地与托管行为，提供独立插件 workspace、共享数据契约及分别交付的安装包。
 > **参考文档**:
 > - `SPEC.md` — 权威审核及中央模式契约。
 > - `docs/central-user-guide.md` — 面向使用者的 Web 操作手册。
 > - `docs/central-deployment.md` — 中央和节点的部署、配置与恢复。
+> - `docs/superpowers/specs/2026-11-16-package-boundaries-design.md` — 包边界与交付设计。
 > **生成日期**: 2026-11-16
 
 新增中央托管模式：一个 TypeScript / Node.js 24 服务统一管理多个 DSH 插件节点，React Web 提供项目、报告、候选、审核和任务管理。中央使用 SQLite 保存平台状态与查询缓存，Git/SVN 中的 `.ai-review/` 仍是评审事实源。日常操作见 [使用手册](docs/central-user-guide.md)，部署与节点配置见 [中央部署说明](docs/central-deployment.md)。
@@ -69,7 +70,7 @@ AI 按 A/B 类自动分流：
 
 ```powershell
 npm run build
-node scripts/verify-audit-session.mjs --commit --target src/host --wait-audit 300
+node scripts/verify-audit-session.mjs --commit --target packages/dsh-plugin/src/host --wait-audit 300
 ```
 
 脚本会：
@@ -85,17 +86,19 @@ host 代码更新后仍需在插件管理中禁用再启用一次 `dsh-code-revi
 ## 安装
 
 ```powershell
-npm install
-npm run build
+npm ci
+npm run build:plugin
 ```
 
-然后在 DSH 中用 Plugin Manager 安装本目录（绝对路径），或由代理执行：
+然后在 DSH 中用 Plugin Manager 安装 `packages/dsh-plugin` 的绝对路径，或由代理执行：
 
 ```text
-plugin_manager install_bundle target=D:\work\mygithub\dsh-review
+plugin_manager install_bundle target=D:\work\mygithub\dsh-review\packages\dsh-plugin
 ```
 
 安装后刷新 DSH 页面即可在会话顶部的视图标签中看到「评审」；若 host 代码刚更新，可在插件管理中先禁用再启用该插件以重新挂载。
+
+根目录只负责工作区管理。`npm run build:central` 单独构建中央服务和 Web；`npm run build` 构建全部组件。执行 `npm run pack:plugin` 或 `npm run pack:central`，分别生成根 `dist/` 下的插件和中央服务安装包；二者都包含各自运行依赖，中央包还包含 Web 静态资源。隔离安装、账号与节点配置见 [中央部署说明](docs/central-deployment.md)。
 
 ## 配置
 
@@ -186,21 +189,16 @@ Host 端在 `/dsh-code-review/api` 下注册：
 ## 目录
 
 ```text
-src/host/            TypeScript Host 半（ESM，编译到 dist/）
-  index.ts           插件入口、webServer 路由挂载、sessionController 审查会话创建
-  api.ts             JSON API 与 job 编排
-  auditor.ts         仓库审查：提示词、A/B 报告解析、候选复核与提交
-  store.ts           review.md 解析/写入、队列、并发锁
-  frontmatter.ts     YAML frontmatter + 正文分段
-  vcs.ts             Git/SVN 适配器、增量 diff
-  validator.ts       gate_checks 执行与证据
-  runner.ts          dsh headless / manual / external（修复与审查共用）
-  approval.ts        批准状态机
-  jobs.ts            内存 job 日志
-src/client/client.ts 浏览器半（classic script，React.createElement）
-assets/              AI Fixer / Repo Auditor system prompts
-scripts/             端到端验证脚本（verify-audit-session.mjs）
-tests/               Node 内置测试运行器（夹具 + 假审查执行器）
-src/host/vendor/      内置 js-yaml 4.3.2（MIT，见 THIRD-PARTY.md）
-locale/              插件显示名称/描述
+apps/server/                      中央服务，静态页面随包进入 dist/public/
+apps/web/                         中央 React 工作台
+packages/protocol/                节点通信及公开数据契约
+packages/dsh-plugin/              独立插件及其元数据、资源
+  src/host/                       审核编排、VCS、门禁、DSH 接入
+  src/managed/                    中央通信、执行记录、查询同步与交付
+  src/client/client.ts            DSH 内嵌经典脚本界面
+  assets/                         AI 提示词
+  locale/                         插件语言文件
+scripts/                          打包与端到端验证脚本
+tests/                            契约、隔离安装与集成测试
+dist/                             安装包产物（不提交）
 ```

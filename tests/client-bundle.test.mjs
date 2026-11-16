@@ -6,7 +6,7 @@ import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const bundleSource = readFileSync(path.join(here, '..', 'dist', 'client.js'), 'utf8');
+const bundleSource = readFileSync(path.join(here, '..', 'packages', 'dsh-plugin', 'dist', 'client.js'), 'utf8');
 const PACKAGE_ID = 'dsh-code-review';
 
 /**

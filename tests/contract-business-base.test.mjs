@@ -4,9 +4,9 @@ import { createServer } from 'node:http';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { API_PREFIX, ReviewApi } from '../dist/api.js';
-import { DEFAULT_SETTINGS } from '../dist/settings.js';
-import { createVcs } from '../dist/vcs.js';
+import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
+import { createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 import { commitCandidate, guardFixture } from './fixtures/contract.mjs';
 
@@ -143,7 +143,7 @@ test('§7.7：业务代码确有变化时 /rebase 正常产生新版本（不是
 
 test('§7.7/§7.5：ai_fix 的 ABORTED reason 与审批原因表相互独立（类型边界）', async () => {
   // §7.5 的 ApprovalAbortReason 不得包含 REBASE_CONFLICT / BASE_UNCHANGED。
-  const types = await readFile(new URL('../src/host/types.ts', import.meta.url), 'utf8');
+  const types = await readFile(new URL('../packages/dsh-plugin/src/host/types.ts', import.meta.url), 'utf8');
   const approvalBlock = /export type ApprovalAbortReason =([\s\S]*?);/.exec(types)?.[1] ?? '';
   assert.ok(approvalBlock.length > 0, '必须能定位 ApprovalAbortReason');
   assert.doesNotMatch(approvalBlock, /REBASE_CONFLICT/, '§7.5 审批原因表不得包含 REBASE_CONFLICT');

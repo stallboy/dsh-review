@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { quickReviewInvariants, fullReviewInvariants } from '../dist/invariants.js';
-import { ReviewStore } from '../dist/store.js';
+import { quickReviewInvariants, fullReviewInvariants } from '../packages/dsh-plugin/dist/host/invariants.js';
+import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
 import { createGitFixture } from './helpers.mjs';
 
 /** P2 验收：§13.1 不变量逐条正反用例 + 队列 broken 隔离。 */

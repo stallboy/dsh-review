@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { ReviewStore, nextUpdatedAt } from '../dist/store.js';
+import { ReviewStore, nextUpdatedAt } from '../packages/dsh-plugin/dist/host/store.js';
 
 /**
  * AC-LOCK-01（§4.3 / §8.1 / §12.1）：ConcurrencyGuard 必须含 expectedUpdatedAt，

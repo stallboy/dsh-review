@@ -1,7 +1,7 @@
 # 中央评审服务部署与运维
 
-> **任务来源**: 用户认可中央单体管理服务、多机器 DSH 执行节点及前后端分离方案，授权实现。
-> **任务内容**: 说明中央服务引导、节点配置、多项目接入、远端交付、备份与故障恢复。
+> **任务来源**: 用户认可中央模式并进一步授权在单仓内整理插件、中央服务、Web 的工程与交付边界。
+> **任务内容**: 说明独立安装包、中央服务引导、节点配置、远端交付、备份与故障恢复。
 > **参考文档**:
 > - `SPEC.md` — 中央模式契约及 AC-CENTRAL 验收要求。
 > - `docs/superpowers/specs/2026-11-16-central-review-web-design.md` — 已认可设计。
@@ -23,7 +23,7 @@
 ```text
 npm ci
 npm run typecheck
-npm run build
+npm run build:central
 ```
 
 以下命令都使用同一个持久化数据目录。账号密码通过 `DSH_REVIEW_PASSWORD` 环境变量传入，不写在命令参数中；创建完成后清除该环境变量。密码至少 12 个字符。
@@ -34,6 +34,20 @@ node apps/server/dist/cli.js serve --data-dir <中央数据目录> --host 127.0.
 ```
 
 本机开发访问 `http://127.0.0.1:3081`。前端热更新可另起 `npm run dev --workspace @dsh-review/web`，默认代理到本机 3081。
+
+### 独立交付
+
+在源码仓库根目录执行 `npm run pack:central`，生成 `dist/dsh-review-server-0.1.0.tgz`。将其复制到部署机器，在独立安装目录执行：
+
+```text
+npm install /path/to/dsh-review-server-0.1.0.tgz --offline --omit=dev
+npx --no-install dsh-review-central user-add --data-dir <中央数据目录> --username reviewer --review-identity <仓库审核身份>
+npx --no-install dsh-review-central serve --data-dir <中央数据目录> --host 127.0.0.1 --port 3081
+```
+
+账号创建仍需先设置 `DSH_REVIEW_PASSWORD`。安装包自带 Fastify、共享协议及运行依赖，静态资源位于自身 `dist/public/`；不需要源码仓库、DSH 插件或旁边的 `apps/web` 目录。生产数据目录必须独立于安装目录。
+
+插件通过根命令 `npm run pack:plugin` 单独生成 `dist/dsh-code-review-0.3.0.tgz`。开发时执行 `npm run build:plugin`，然后让 DSH Plugin Manager 安装 `packages/dsh-plugin` 的绝对路径。插件包自带协议依赖，不包含中央服务和中央 Web；中央服务也不安装插件。
 
 正式部署由已有反向代理提供 HTTPS，转发中央服务的整个站点，包括 `/api/v1` 和 `/node-api/v1`。服务启动时传入 `--public-url https://review.example.com`，启用 Secure 会话 Cookie；监听非回环地址时该参数是必需的。部署在域名根路径，不使用 URL 子路径。
 

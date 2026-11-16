@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseReviewMarkdown, serializeReviewMarkdown, ReviewFormatError } from '../dist/frontmatter.js';
-import { loadReviewers, reviewersPath, EMPTY_REVIEWERS } from '../dist/reviewers.js';
-import { AUDIT_TYPES } from '../dist/types.js';
+import { parseReviewMarkdown, serializeReviewMarkdown, ReviewFormatError } from '../packages/dsh-plugin/dist/host/frontmatter.js';
+import { loadReviewers, reviewersPath, EMPTY_REVIEWERS } from '../packages/dsh-plugin/dist/host/reviewers.js';
+import { AUDIT_TYPES } from '../packages/dsh-plugin/dist/host/types.js';
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';

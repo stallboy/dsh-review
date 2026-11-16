@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildHunkFallbackDiff, parsePatch } from '../dist/patch.js';
+import { buildHunkFallbackDiff, parsePatch } from '../packages/dsh-plugin/dist/host/patch.js';
 
 const CJK = '\u4e2d\u6587.txt';
 

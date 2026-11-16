@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { API_PREFIX, ReviewApi } from '../dist/api.js';
-import { DEFAULT_SETTINGS } from '../dist/settings.js';
-import { AuditArchive, auditInvariantErrors, parseAuditMarkdown, projectFindings, serializeAuditMarkdown } from '../dist/audit-archive.js';
+import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
+import { AuditArchive, auditInvariantErrors, parseAuditMarkdown, projectFindings, serializeAuditMarkdown } from '../packages/dsh-plugin/dist/host/audit-archive.js';
 import { createGitFixture, fakeAuditAgentPath, runCommand } from './helpers.mjs';
 
 /** P6 验收：audit.md 新契约（I1/I9/I10/I13）+ §3.4 投影四规则 + API /audits /findings。 */

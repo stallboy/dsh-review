@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { ManagedWorkspace } from './managed-operations.js';
-import { dshHome } from './settings.js';
+import { dshHome } from '../host/settings.js';
 
 export interface ManagedHandle {
     centerUrl: string;

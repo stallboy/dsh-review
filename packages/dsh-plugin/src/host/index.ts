@@ -4,7 +4,7 @@ import path from 'node:path';
 import { API_PREFIX, ReviewApi } from './api.js';
 import { loadSettings, saveSettings } from './settings.js';
 import type { AppSettings } from './types.js';
-import { loadManagedNode, type ManagedHandle } from './managed-config.js';
+import { loadManagedNode, type ManagedHandle } from '../managed/managed-config.js';
 
 /** Minimal shape of the host-side Cordis context this plugin uses. */
 export interface HostLogger {

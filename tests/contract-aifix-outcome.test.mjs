@@ -4,8 +4,8 @@ import { createServer } from 'node:http';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { API_PREFIX, ReviewApi } from '../dist/api.js';
-import { DEFAULT_SETTINGS } from '../dist/settings.js';
+import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 import { commitCandidate, guardFixture } from './fixtures/contract.mjs';
 
@@ -131,7 +131,7 @@ test('§7.7/§7.5：实现源码中 ai_fix 端点不得再返回裸的非判别�
   // 因此按职责"全域扫描"：断言条件原样保留，只扩大读取范围。
   const hostFiles = ['api.ts', 'api-writers.ts', 'api-readmodels.ts'];
   const sources = await Promise.all(
-    hostFiles.map(async (name) => [name, await readFile(new URL(`../src/host/${name}`, import.meta.url), 'utf8')]),
+    hostFiles.map(async (name) => [name, await readFile(new URL(`../packages/dsh-plugin/src/host/${name}`, import.meta.url), 'utf8')]),
   );
   const source = sources.map(([, text]) => text).join('\n');
   // 三个 ai_fix 端点必须通过工厂构造结果（aborted / recoveryRequired / committed / validationFailed）。

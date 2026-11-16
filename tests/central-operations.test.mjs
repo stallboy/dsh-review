@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { createGitFixture, runCommand } from './helpers.mjs';
 import { reviewFixture, patchFixture } from './fixtures/contract.mjs';
-import { ManagedJournal } from '../dist/managed-journal.js';
+import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
 
 async function fixture(t) {
     const root = await createGitFixture();
@@ -26,7 +26,7 @@ async function fixture(t) {
     runCommand('git', ['config', 'user.email', 'review-node@example.com'], root);
     const journal = new ManagedJournal(path.join(state, 'journal.sqlite'));
     t.after(async () => { journal.close(); await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }); });
-    const { ManagedOperations } = await import('../dist/managed-operations.js');
+    const { ManagedOperations } = await import('../packages/dsh-plugin/dist/managed/managed-operations.js');
     const operations = new ManagedOperations({ dataDir: state, journal, workspaces: [{ workspaceId: 'workspace-a', label: '项目 A', root, target, settings: { runner: 'manual', syncBeforeApprove: false } }] });
     await operations.init();
     t.after(() => operations.stop());

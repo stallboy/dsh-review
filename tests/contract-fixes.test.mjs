@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { API_PREFIX, ReviewApi } from '../dist/api.js';
-import { DEFAULT_SETTINGS } from '../dist/settings.js';
-import { parseReviewMarkdown, serializeReviewMarkdown, ReviewFormatError } from '../dist/frontmatter.js';
-import { quickReviewInvariants } from '../dist/invariants.js';
+import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
+import { parseReviewMarkdown, serializeReviewMarkdown, ReviewFormatError } from '../packages/dsh-plugin/dist/host/frontmatter.js';
+import { quickReviewInvariants } from '../packages/dsh-plugin/dist/host/invariants.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
 /** 验收审查修复项的回归测试：裸 ISO 时间、批准快照往返、I7/I14、duplicateOf 阻止批准、回填幂等、broken 可读。 */

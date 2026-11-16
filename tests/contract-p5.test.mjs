@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { API_PREFIX, ReviewApi } from '../dist/api.js';
-import { DEFAULT_SETTINGS } from '../dist/settings.js';
-import { checkDecisionCoverage, checkCommitMessage } from '../dist/approval.js';
+import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
+import { checkDecisionCoverage, checkCommitMessage } from '../packages/dsh-plugin/dist/host/approval.js';
 import { createGitFixture, fakeAuditAgentPath, runCommand } from './helpers.mjs';
 
 /** P5 验收：批准强化——I8 判断项全覆盖、§4.9 标题一致、§4.7 快照/结果/决定留痕、业务提交用 commit_message。 */

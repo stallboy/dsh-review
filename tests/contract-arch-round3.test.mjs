@@ -4,9 +4,9 @@ import { createServer } from 'node:http';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { API_PREFIX, ReviewApi } from '../dist/api.js';
-import { DEFAULT_SETTINGS } from '../dist/settings.js';
-import { createVcs, gitBlobHash } from '../dist/vcs.js';
+import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
+import { createVcs, gitBlobHash } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 import { commitCandidate, guardFixture, patchFixture } from './fixtures/contract.mjs';
 
@@ -153,7 +153,7 @@ test('§7.7：Rebase 的“业务基线未变”守卫存在且使用业务差�
   // 并要求**同一文件内**两者同时出现（比拼接后跨文件匹配更强，避免守卫被拆到两个文件却仍通过）。
   const hostFiles = ['api.ts', 'api-writers.ts', 'api-readmodels.ts'];
   const sources = await Promise.all(
-    hostFiles.map(async (name) => [name, await readFile(new URL(`../src/host/${name}`, import.meta.url), 'utf8')]),
+    hostFiles.map(async (name) => [name, await readFile(new URL(`../packages/dsh-plugin/src/host/${name}`, import.meta.url), 'utf8')]),
   );
   const source = sources.map(([, text]) => text).join('\n');
   assert.match(source, /businessBaselineState\(vcs, current\.baseRevision, base\)/, 'Rebase 必须用业务基线判定');

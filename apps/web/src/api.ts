@@ -1,5 +1,5 @@
 import type { CommandRecord, ProjectRecord, ProjectSnapshot, NodeRecord } from '@dsh-review/protocol';
-import type { CandidateSummary } from '../../../src/host/types.js';
+import type { CandidateSummary } from '@dsh-review/protocol';
 import type { QueryClient } from '@tanstack/react-query';
 
 export interface Session { user: { userId: string; username: string; reviewIdentity: string }; csrfToken: string }

@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { chmod, mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createVcs } from '../dist/vcs.js';
+import { createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
 function canRun(command) {

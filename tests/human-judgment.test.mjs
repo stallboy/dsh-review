@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { ReviewStore } from '../dist/store.js';
-import { extractHumanJudgment, isEmptyHumanJudgmentText } from '../dist/frontmatter.js';
+import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
+import { extractHumanJudgment, isEmptyHumanJudgmentText } from '../packages/dsh-plugin/dist/host/frontmatter.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
 test('placeholder human-judgment text is treated as empty', () => {

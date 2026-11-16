@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { buildAuditPrompt, normalizeAuditTarget, parseAuditReport, Auditor } from '../dist/auditor.js';
-import { DEFAULT_SETTINGS } from '../dist/settings.js';
-import { ReviewStore } from '../dist/store.js';
-import { createVcs } from '../dist/vcs.js';
+import { buildAuditPrompt, normalizeAuditTarget, parseAuditReport, Auditor } from '../packages/dsh-plugin/dist/host/auditor.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
+import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
+import { createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { createFakeDshCommand, createGitFixture, failAuditAgentPath, fakeAuditAgentPath, invalidCandidateAgentPath, reportOnlyAgentPath, runCommand } from './helpers.mjs';
 
 test('normalizeAuditTarget maps a relative directory into the repository', () => {

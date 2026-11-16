@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createDshAuditSession } from '../dist/index.js';
+import { createDshAuditSession } from '../packages/dsh-plugin/dist/index.js';
 
 const CWD = process.cwd();
 

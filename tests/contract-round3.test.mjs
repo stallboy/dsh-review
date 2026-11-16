@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { API_PREFIX, ReviewApi } from '../dist/api.js';
-import { DEFAULT_SETTINGS } from '../dist/settings.js';
-import { createVcs } from '../dist/vcs.js';
-import { resolveOwner } from '../dist/reviewers.js';
-import { formatMemorySummary } from '../dist/memory.js';
+import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
+import { createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
+import { resolveOwner } from '../packages/dsh-plugin/dist/host/reviewers.js';
+import { formatMemorySummary } from '../packages/dsh-plugin/dist/host/memory.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
 /** 第 3 轮：评论字段校验、Host anchor 兜底、manual Job/租约、Owner AND、负向记忆摘要、提交树核对。 */

@@ -1,7 +1,7 @@
 import type { ManagedResult } from '@dsh-review/protocol';
-import { currentTrustedActor } from './api-context.js';
-import { runProcess } from './shell.js';
-import type { VcsAdapter } from './vcs.js';
+import { currentTrustedActor } from '../host/api-context.js';
+import { runProcess } from '../host/shell.js';
+import type { VcsAdapter } from '../host/vcs.js';
 
 type Delivery = ManagedResult['delivery'];
 

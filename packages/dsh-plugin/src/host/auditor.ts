@@ -42,7 +42,7 @@ const SKIP_DIRS = new Set([
 const EMPTY_STATS: PatchStats = { files: 0, additions: 0, deletions: 0, entries: [] };
 
 function packageRoot(): string {
-  return path.resolve(import.meta.dirname, '..');
+  return path.resolve(import.meta.dirname, '../..');
 }
 
 function pad(value: number): string {
