@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
@@ -27,7 +27,8 @@ function successful(result) {
 }
 
 async function fixture(t) {
-    const directory = await mkdtemp(path.join(os.tmpdir(), 'dsh-deploy-test-'));
+    const temporaryRoot = await realpath(os.tmpdir());
+    const directory = await mkdtemp(path.join(temporaryRoot, 'dsh-deploy-test-'));
     t.after(async () => {
         for (const { child, target } of processes.get(t) ?? []) {
             let record;
@@ -40,7 +41,7 @@ async function fixture(t) {
                 try { await once(child, 'exit'); } finally { clearTimeout(timer); }
             }
         }
-        assert.ok(path.resolve(directory).startsWith(path.resolve(os.tmpdir()) + path.sep));
+        assert.ok(path.resolve(directory).startsWith(temporaryRoot + path.sep));
         await rm(directory, { recursive: true, force: true });
     });
     return directory;
