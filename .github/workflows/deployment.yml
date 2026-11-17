@@ -1,0 +1,30 @@
+name: 三平台部署与启动
+
+on:
+    push:
+    pull_request:
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+jobs:
+    deployment:
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [windows-latest, ubuntu-latest, macos-latest]
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 20
+        steps:
+            - uses: actions/checkout@v7
+              with:
+                  persist-credentials: false
+            - uses: actions/setup-node@v7
+              with:
+                  node-version: 24
+                  cache: npm
+            - run: npm ci --no-audit --no-fund
+            - run: npm run typecheck
+            - run: npm run build
+            - run: node --test --test-concurrency=1 --test-reporter=tap tests/deployment.test.mjs

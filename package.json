@@ -16,6 +16,8 @@
         "test": "npm run build && node --test --test-concurrency=1 --test-reporter=tap tests/*.test.mjs",
         "pack:plugin": "npm run build:plugin && node scripts/pack.mjs plugin",
         "pack:central": "npm run build:central && node scripts/pack.mjs central",
+        "deploy": "node scripts/deploy.mjs",
+        "start": "node scripts/start.mjs",
         "start:central": "node apps/server/dist/cli.js serve",
         "verify:audit": "node scripts/verify-audit-session.mjs"
     },

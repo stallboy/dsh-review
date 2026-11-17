@@ -1,7 +1,7 @@
 # 中央评审服务部署与运维
 
-> **任务来源**: 用户在完成单仓多包整理后，要求修订用户手册和部署文档，确保信息正确、清晰易懂。
-> **任务内容**: 说明中央服务安装、账号创建、DSH 节点接入、首次验收、升级备份与故障恢复。
+> **任务来源**: 用户要求修订拆包后的部署文档，并新增中央和节点的三平台独立部署、启动脚本。
+> **任务内容**: 说明脚本与手工安装、账号创建、DSH 节点接入、首次验收、重复升级与备份恢复。
 > **参考文档**:
 > - `../SPEC.md` — 中央模式职责、身份、执行与恢复契约。
 > - `../package.json` — 构建、打包及启动命令。
@@ -10,9 +10,14 @@
 > - `../packages/dsh-plugin/src/managed/managed-operations.ts` — 工作副本绑定与执行配置。
 > - `../packages/dsh-plugin/src/managed/managed-delivery.ts` — Git/SVN 交付核验。
 > - `package-boundaries-validation.md` — 拆包后的实际验证范围。
+> - `oneclick-deployment.md` — 三平台脚本、参数及数据保留方式。
 > **生成日期**: 2026-11-17
 
 本页面向部署和维护人员。日常审核见[中央 Web 手册](central-user-guide.md)；只在本机 DSH 中使用插件，见[本地插件指南](dsh-code-review-guide.md)。
+
+首次安装与日常覆盖升级，优先使用[一键部署与启动](oneclick-deployment.md)。脚本已将构建、安装、账号初始化和数据保留串联；`deploy` 负责部署，`start` 单独启动。本文保留手工安装方式，并说明 HTTPS、节点配置与恢复。
+
+本文 `npx --no-install dsh-review-central ...` 管理命令以手工安装目录为例。一键脚本部署后，对应入口是 `node <target>/app/node_modules/@dsh-review/server/dist/cli.js ...`，其中 `--data-dir` 使用 `<target>/deployment.json` 记录的 `dataDir`，确保管理命令和运行服务读写同一份数据。
 
 ## 1. 先确定安装在哪里
 
@@ -244,6 +249,8 @@ default_owner: reviewer
 
 ## 6. 升级与常见故障
 
+脚本部署的实例：先停止旧进程，再执行 `deploy.* --target <原部署目录>`；需要远端最新源码时增加 `--git`，完成后运行部署目录里的 `start.*`。重复部署只替换程序，保留原数据目录及节点状态；首次安装的插件固定路径仍为 `<target>/app/node_modules/dsh-code-review`。
+
 升级前备份并处理未决任务；停止待升级进程，替换或重新安装对应版本包，再使用原数据目录启动。节点升级保留 `managed/`、配置和凭据。启动后检查协议、工作副本和同步状态。当前未承诺自动跨版本数据迁移或降级兼容，应先隔离验证目标版本。
 
 | 现象 | 优先检查 |
@@ -260,4 +267,4 @@ default_owner: reviewer
 
 ## 7. 验证范围
 
-已有隔离 Git/SVN、中央 API、插件资源和 tarball 离线安装验证，见[拆包验证记录](package-boundaries-validation.md)。真实 DSH 加载、模型调用、Linux、跨机器 HTTPS 和各项目工具链仍需在目标环境验收。
+已有隔离 Git/SVN、中央 API、插件资源和 tarball 离线安装验证，见[拆包验证记录](package-boundaries-validation.md)。新增脚本的测试范围见[一键部署验证记录](oneclick-deployment-validation.md)。真实 DSH 加载、模型调用、Linux/macOS 原生部署、跨机器 HTTPS 和各项目工具链仍需在目标环境验收。

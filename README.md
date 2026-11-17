@@ -1,13 +1,14 @@
 # dsh-code-review
 
-> **任务来源**: 用户认可在单仓内划清插件、中央服务、Web 和共享协议的边界，授权整理拆分。
-> **任务内容**: 保留本地与托管行为，提供独立插件 workspace、共享数据契约及分别交付的安装包。
+> **任务来源**: 用户授权单仓拆分，并要求为中央服务和 DSH 节点提供三平台独立部署、启动脚本。
+> **任务内容**: 说明包边界及交付入口，补充可重复覆盖、Git 更新和独立启动的使用方式。
 > **参考文档**:
 > - `SPEC.md` — 权威审核及中央模式契约。
 > - `docs/central-user-guide.md` — 面向使用者的 Web 操作手册。
 > - `docs/central-deployment.md` — 中央和节点的部署、配置与恢复。
+> - `docs/oneclick-deployment.md` — 三平台部署、重复升级与独立启动。
 > - `docs/superpowers/specs/2026-11-16-package-boundaries-design.md` — 包边界与交付设计。
-> **生成日期**: 2026-11-16
+> **生成日期**: 2026-11-17
 
 新增中央托管模式：一个 TypeScript / Node.js 24 服务统一管理多个 DSH 插件节点，React Web 提供项目、报告、候选、审核和任务管理。中央使用 SQLite 保存平台状态与查询缓存，Git/SVN 中的 `.ai-review/` 仍是评审事实源。日常操作见 [使用手册](docs/central-user-guide.md)，部署与节点配置见 [中央部署说明](docs/central-deployment.md)。
 
@@ -84,6 +85,12 @@ node scripts/verify-audit-session.mjs --commit --target packages/dsh-plugin/src/
 host 代码更新后仍需在插件管理中禁用再启用一次 `dsh-code-review` 才会重新加载；只改 client 时刷新页面即可。
 
 ## 安装
+
+中央服务和 DSH 节点均可使用[一键部署与启动脚本](docs/oneclick-deployment.md)：Windows 为 `deploy.cmd` / `start.cmd`，Linux 为 `deploy.sh` / `start.sh`，macOS 为 `deploy.command` / `start.command`。部署与启动独立；部署可反复覆盖程序并保留数据，添加 `--git` 会先获取仓库最新代码。要求 Node.js 24 或更新版本。
+
+例如在仓库根运行 `deploy.cmd --role central --target C:/dsh-review/central`，完成后单独运行 `C:/dsh-review/central/start.cmd`。首次部署会提示设置登录密码；节点的 DSH 启动路径、连接配置与插件启用步骤见上述说明。
+
+以下是从源码安装本地插件的方式：
 
 ```powershell
 npm ci

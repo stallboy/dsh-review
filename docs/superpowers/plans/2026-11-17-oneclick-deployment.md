@@ -1,0 +1,50 @@
+# 三平台部署与启动实施计划
+
+> **任务来源**: 用户要求独立的一键部署/启动脚本，支持 Windows/Linux/macOS、中央与节点、重复覆盖及 `--git` 获取最新源码；Node.js 24 已安装，不满足则退出。
+> **任务内容**: 实现脚本、补齐真实行为回归、独立审查并完成可执行环境验证。
+> **参考文档**:
+> - `../specs/2026-11-17-oneclick-deployment-design.md` — 本次设计与边界。
+> - `../../../SPEC.md` — 权威执行与持久化契约。
+> - `../../central-deployment.md` — 需更新的操作文档。
+> - `../../../tests/package-install.test.mjs` — 既有隔离安装验证方式。
+> **生成日期**: 2026-11-17
+
+在 `worktree-oneclick-deploy` 隔离分支直接执行。已自审方案：部署与启动无相互调用，覆盖只影响程序，Git 更新不污染现有目录，节点启用不冒充成功。采用 writing-plans、executing-plans 和测试驱动流程，阶段记录写在本计划；临时文件仅在 `.tmp`，不为流程添加额外忽略规则。
+
+## 全局约束与审查重点
+
+Node >=24；UTF-8、四空格；不修改审核契约或放宽既有测试。重点检查失败回退、目录包含关系、账号/节点记录不丢失、真实 Git 新版本、Windows shell 参数边界、启动信号与占用，以及分平台验证证据。
+
+## 任务 1：部署与启动行为
+
+文件：新增 `scripts/deploy.mjs`、`scripts/start.mjs`、`scripts/deployment-common.mjs`、`tests/deployment.test.mjs`。
+
+- [x] 为首次/覆盖部署、启动隔离、失败保留、Git 更新、节点配置和路径边界写真实回归，先观察失败。
+- [x] 实现共用的 Node 检测、参数和配置读取、npm/Git 子进程参数传递；实现独立部署和独立启动。
+- [x] 使用真实安装包、临时 SQLite、临时 Git 仓库与轻量 DSH 执行夹具验证全部断言。
+
+## 任务 2：原生入口与交付
+
+文件：新增根 `deploy.cmd`、`start.cmd`、`deploy.sh`、`start.sh`、`deploy.command`、`start.command`，修改 `package.json`，更新部署文档，新增 `.github/workflows/deployment.yml`。
+
+- [x] 添加六个仅转发参数的入口，并在部署目标复制独立启动所需文件。
+- [x] 验证从不同当前目录、空格/特殊字符路径调用；macOS 入口与 POSIX 脚本设置可执行位。
+- [x] 配置 Windows/Linux/macOS Node 24 CI，保留本机真实运行与 CI 未执行的边界说明。
+
+## 任务 3：审查与交付验证
+
+- [x] 运行 typecheck、build、全量串行测试，测试数不少于原 265 项。
+- [x] 独立审查后主任务逐条复核，修复成立的问题并运行相关回归；最终全量回归见上一项。
+- [x] 更新验证记录，清理临时目录，检查 diff 并交付任务分支提交；本任务不继承上一轮已完成的推送授权。
+
+## 执行记录
+
+- 基线：`f606f3c`，主副本干净；通过原生工具建立新隔离 worktree。
+- 已读取实际打包、CLI 和节点配置源码；Node/DSH 自动安装与首次插件启用不在本次自动化范围。
+- 已观察初始测试因缺少实现失败；新增 7 项部署行为测试全通过。修复测试清理顺序，并针对 Windows 目录短暂占用增加有限重试及真实进程回归。
+- Windows 原生入口与 Git Bash 四个 POSIX 入口通过；四个 POSIX 入口的 Git 可执行模式为 `100755`。CI 使用官方 `actions/checkout` 与 `actions/setup-node` 当前文档中的 v7，参考 https://github.com/actions/checkout 和 https://github.com/actions/setup-node 。
+- 类型检查已通过；独立 reviewer 仅审查本任务文件，不继承实现会话上下文。最新测试将中央启动进一步改为调用部署后的原生入口，随后执行全量回归。
+- 首轮完整构建和 273 项测试全通过。独立审查的 1 项 P1、3 项 P2 已逐条复核修正：既有工作副本保护、锁内配置读取、启动文件参与发布回退、Git 新源码同步启动文件。
+- 新增调度窗口、发布故障注入与远端启动版本回归；观察真实失败后修复，3 项定向回归全通过。Reviewer 复审通过且独立验证两项轻量回归。
+- 最终 `npm run typecheck`、`npm test` 内完整构建均通过；275 项测试全部通过，0 失败、0 跳过，测试阶段约 508.8 秒。未修改或减少原有 265 项。
+- 文档链接检查、CI YAML 解析及 diff 格式检查通过；验证结果存入 `docs/oneclick-deployment-validation.md`，临时输出清理后提交任务分支，未合并或推送。Linux/macOS 原生验收和真实 DSH/模型环境仍保留待验收说明。
