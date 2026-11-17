@@ -267,4 +267,4 @@ default_owner: reviewer
 
 ## 7. 验证范围
 
-已有隔离 Git/SVN、中央 API、插件资源和 tarball 离线安装验证，见[拆包验证记录](package-boundaries-validation.md)。新增脚本的测试范围见[一键部署验证记录](oneclick-deployment-validation.md)。真实 DSH 加载、模型调用、Linux/macOS 原生部署、跨机器 HTTPS 和各项目工具链仍需在目标环境验收。
+已有隔离 Git/SVN、中央 API、插件资源和 tarball 离线安装验证，见[拆包验证记录](package-boundaries-validation.md)。新增脚本已通过 Windows、Ubuntu、macOS 原生 CI 的类型检查、构建和部署集成测试，范围见[一键部署验证记录](oneclick-deployment-validation.md)。真实 DSH 加载、模型调用、跨机器 HTTPS 和各项目工具链仍需在目标环境验收。

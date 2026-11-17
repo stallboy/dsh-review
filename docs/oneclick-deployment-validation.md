@@ -9,6 +9,7 @@
 > - `../.github/workflows/deployment.yml` — Windows、Ubuntu、macOS 验证矩阵。
 > - `oneclick-deployment.md` — 交付使用说明。
 > - `https://github.com/stallboy/dsh-review/actions/runs/44011766894` — 首次三平台原生 CI 及 macOS 路径别名问题证据。
+> - `https://github.com/stallboy/dsh-review/actions/runs/44014175575` — 修正后 Windows、Ubuntu、macOS 全部通过的原生 CI。
 > **生成日期**: 2026-11-17
 
 ## 环境与方法
@@ -22,9 +23,10 @@
 | 检查 | 状态 |
 | --- | --- |
 | `npm run typecheck` | 已通过。 |
-| `npm test`（包含完整构建与串行测试） | 275/275 通过，0 失败、0 跳过；测试阶段约 508.8 秒。原有 265 项保留，新增 10 项。 |
+| `npm test`（包含完整构建与串行测试） | 275/275 通过，0 失败、0 跳过；最终合并后测试阶段约 479.6 秒。原有 265 项保留，新增 10 项。 |
 | Node 脚本 `node --check` | 已通过。 |
 | CI YAML 解析 | 已通过，三平台矩阵及 push、pull_request、手动触发均可解析。 |
+| 三平台原生 CI | Windows、Ubuntu、macOS 的类型检查、构建与部署测试全部通过；每个平台 10/10，0 失败。见下方运行记录。 |
 | POSIX 入口权限与换行 | Git 可执行位为 `100755`；`.gitattributes` 固定 LF。 |
 
 部署测试验证：
@@ -54,7 +56,7 @@
 
 ## 验证边界
 
-Windows 与 Git Bash 的结果不能替代 Linux/macOS 原生验证。上述实现阶段的验证在本机完成，尚未取得 Ubuntu/macOS 原生运行结果；推送后的三平台运行结果应以对应提交的 CI 记录为准。
+Windows 与 Git Bash 的结果不能替代 Linux/macOS 原生验证。本次已另外取得 Windows、Ubuntu、macOS 的原生 CI 结果，三平台均通过；具体提交与运行链接见下方记录。
 
 节点自动测试使用真实插件包与轻量启动夹具，没有在真实 DSH 中自动启用插件或调用模型。首次插件启用、实际 DSH 运行时、跨机器 HTTPS、真实模型及各项目工具链需按使用说明在目标环境验收。
 
@@ -66,4 +68,6 @@ Windows 与 Git Bash 的结果不能替代 Linux/macOS 原生验证。上述实�
 
 [首次三平台 CI](https://github.com/stallboy/dsh-review/actions/runs/44011766894) 中 Windows、Ubuntu 通过，macOS 的两项测试暴露了临时目录别名差异：夹具使用 `/var`，脚本按真实路径得到 `/private/var`，使故障注入没有命中、`DSH_HOME` 断言与真实目录不一致。Windows 使用源码外目录链接复现了相同的两项失败。
 
-测试改动说明：**跟随规范收紧，未放宽断言**。夹具先解析临时基准目录的真实路径，再创建测试目录；清理仍严格检查该真实基准目录边界。10 项用例及其业务断言全部保留，不修改生产部署逻辑。修正后的 10 项测试在路径别名环境全部通过（约 135.6 秒），独立复审通过；最终主副本及三平台结果在复验完成后补记。
+测试改动说明：**跟随规范收紧，未放宽断言**。夹具先解析临时基准目录的真实路径，再创建测试目录；清理仍严格检查该真实基准目录边界。10 项用例及其业务断言全部保留，不修改生产部署逻辑。修正后的 10 项测试在路径别名环境全部通过（约 135.6 秒），独立复审通过。
+
+最终合并提交 `e975334` 的主副本类型检查、完整构建和 275 项全量测试再次全部通过，0 失败、0 跳过，测试阶段约 479.6 秒。[修正后的三平台 CI](https://github.com/stallboy/dsh-review/actions/runs/44014175575) 全部成功，已从各平台日志逐一核验 Windows、Ubuntu、macOS 均为 10/10、0 失败。

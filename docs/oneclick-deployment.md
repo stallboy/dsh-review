@@ -131,4 +131,4 @@ C:/dsh-review/central/start.cmd
 
 中央启动后检查 `/health`、页面和原账号登录。节点启动后检查插件已启用、中央“执行节点”在线、协议兼容、工作副本及项目同步正确。后续业务测试按[部署与运维](central-deployment.md#4-接入项目与首次验收)执行。
 
-三平台 CI 定义在 `.github/workflows/deployment.yml`，会在 Windows、Ubuntu、macOS 上运行 Node 24 的构建、类型检查和部署集成测试。工作流定义不代表三平台已实际通过；本次本机验证和原生平台待验收范围见[部署验证记录](oneclick-deployment-validation.md)。
+三平台 CI 定义在 `.github/workflows/deployment.yml`，会在 Windows、Ubuntu、macOS 上运行 Node 24 的构建、类型检查和部署集成测试。本次三平台原生 CI 均已通过，具体提交、运行链接及真实 DSH/模型环境的验收边界见[部署验证记录](oneclick-deployment-validation.md)。
