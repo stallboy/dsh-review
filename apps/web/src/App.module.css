@@ -115,7 +115,11 @@ a.projectCard:hover { text-decoration: none; border-color: #8fc4c5; }
 .loginCard h1 { font-size: 30px; line-height: 1.5; }
 .loginCard p { color: #697787; font-size: 12px; line-height: 1.8; }
 .loginCard small { text-align: center; font-size: 11px; }
-.diff h3 { padding: 14px 18px; background: #f6f8fa; border-bottom: 1px solid #e1e6ed; font: 12px Consolas, monospace; overflow-wrap: anywhere; }
+.diffTools { display: flex; align-items: center; gap: 8px; padding: 10px 18px; border-bottom: 1px solid #e1e6ed; }
+.diffTools small { margin-right: auto; color: #697787; }
+.diff > details > summary { padding: 14px 18px; background: #f6f8fa; border-bottom: 1px solid #e1e6ed; font: 12px Consolas, monospace; overflow-wrap: anywhere; cursor: pointer; }
+.diff > details > summary > span:first-of-type { margin-right: 14px; }
+.diff > details > summary:focus-visible { outline: 2px solid #258b62; outline-offset: -2px; }
 .diffLabels { display: grid; grid-template-columns: 1fr 1fr; background: #fafbfc; border-bottom: 1px solid #e1e6ed; font-size: 10px; color: #697787; }
 .diffLabels span { padding: 8px 16px; }
 .diffScroll { overflow: auto; }

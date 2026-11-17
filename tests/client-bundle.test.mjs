@@ -211,8 +211,7 @@ test('评审标签的底部区带（任务条 + 输入框）靠评审页根标�
 
   // 只认宿主公开的 data 锚点与插槽名：不依赖宿主 CSS Modules 的哈希 class。
   const style = page.styles[0]?.textContent ?? '';
-  assert.match(style, /\[data-conversation-content\]:has\(\[data-dcr-view\]\) \[data-slot="conversation\.input\.dock"\]/, '任务条必须随评审页出现而收起');
-  assert.match(style, /\[data-conversation-content\]:has\(\[data-dcr-view\]\) \[data-slot="conversation\.composer\.bar"\]/, '常驻输入框必须随评审页出现而收起');
+  assert.match(style, /\[data-conversation-scroll\]:has\(\[data-dcr-view\]\)\s*>\s*\[data-composer-seat\]\s*\{\s*display:none\s*\}/, '任务条和输入框必须在当前评审会话中整体收起');
   assert.doesNotMatch(style, /composerStack|composerSeat/, '不得依赖宿主 CSS Modules 的哈希 class');
 
   // 评审页根节点必须带标记；槽位接口仍是单一的评审视图。

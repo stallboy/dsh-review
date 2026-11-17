@@ -32,6 +32,9 @@ function createPanel(status = initialStatus()) {
     let pendingRequest = false;
     let sessionId = 'session-a';
     let failedWrite = '';
+    let delayNextRead = false;
+    let failNextRead = false;
+    const delayedReads = [];
     const components = new Map();
     const requests = [];
     const timers = new Map();
@@ -93,6 +96,18 @@ function createPanel(status = initialStatus()) {
         clearInterval(id) { timers.delete(id); },
         async fetch(url, init) {
             requests.push({ url: new URL(url), init, body: init.body ? JSON.parse(init.body) : undefined });
+            if (failNextRead && init.method === 'GET') {
+                failNextRead = false;
+                return { ok: false, status: 503, text: async () => JSON.stringify({ error: { message: '状态读取失败' } }) };
+            }
+            if (delayNextRead && init.method === 'GET' && String(url).includes('/connection')) {
+                delayNextRead = false;
+                const snapshot = JSON.stringify(activeStatus);
+                return new Promise((resolve, reject) => {
+                    delayedReads.push(() => resolve({ ok: true, status: 200, text: async () => snapshot }));
+                    init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+                });
+            }
             if (pendingRequest) return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
             if (failedWrite && init.method === 'POST') return { ok: false, status: 409, text: async () => JSON.stringify({ error: { message: failedWrite } }) };
             const value = String(url).includes('/connection') ? activeStatus
@@ -155,6 +170,9 @@ function createPanel(status = initialStatus()) {
         async poll() { for (const callback of [...timers.values()]) callback(); await flush(); },
         holdRequests() { pendingRequest = true; },
         releaseRequests() { pendingRequest = false; },
+        delayNextRead() { delayNextRead = true; },
+        failNextRead() { failNextRead = true; },
+        releaseReads() { for (const resolve of delayedReads.splice(0)) resolve(); },
         unmount() {
             disposed = true;
             for (const owner of components.values()) for (const hook of owner.hooks) hook?.cleanup?.();
@@ -165,7 +183,10 @@ function createPanel(status = initialStatus()) {
 test('中央连接默认展示，编辑草稿和状态刷新均不会启动或覆盖输入', async () => {
     const panel = createPanel();
     await panel.flush();
-    for (const label of ['中央连接', '项目接入', '中央工作台', '本地评审']) panel.button(label);
+    for (const label of ['中央连接', '项目接入', '中央工作台']) panel.button(label);
+    assert.equal(panel.nodes().some(node => node.type === 'button' && node.children.join('') === '本地评审'), false);
+    panel.button('修改连接').props.onClick();
+    await panel.flush();
     panel.button('连接已有中央').props.onClick();
     await panel.flush();
     panel.input('中央地址').props.onChange({ target: { value: 'https://central.example' } });
@@ -182,7 +203,7 @@ test('中央连接默认展示，编辑草稿和状态刷新均不会启动或�
 });
 
 test('显式应用和测试携带控制令牌，空 Token 保留已有凭据且停止单独提交', async () => {
-    const panel = createPanel();
+    const panel = createPanel({ ...initialStatus(), configured: false, enabled: false, phase: 'stopped' });
     await panel.flush();
     assert.equal(panel.input('审核身份').props.value, '张三');
     panel.button('应用并启动').props.onClick();
@@ -207,6 +228,8 @@ test('显式应用和测试携带控制令牌，空 Token 保留已有凭据且�
     writes = panel.requests.filter(request => request.init.method === 'POST');
     assert.deepEqual(writes[2].body, { mode: 'external', centerUrl: 'https://central.example', nodeId: 'node-b', token: 'node-secret', reviewIdentity: '张三' });
     assert.equal(panel.input('节点 Token').props.value, '');
+    panel.setStatus(initialStatus());
+    await panel.poll();
     panel.button('停止连接').props.onClick();
     await panel.flush();
     writes = panel.requests.filter(request => request.init.method === 'POST');
@@ -268,6 +291,8 @@ test('中央工作台使用同源 iframe，中央代次变化重建且卸载仅�
 test('重试使用已保存配置，待应用草稿及令牌不会随重试提交', async () => {
     const panel = createPanel({ ...initialStatus(), mode: 'external', phase: 'error', error: '节点认证失败' });
     await panel.flush();
+    panel.button('修改连接').props.onClick();
+    await panel.flush();
     panel.input('中央地址').props.onChange({ target: { value: 'https://draft.example' } });
     panel.input('节点 Token').props.onChange({ target: { value: 'draft-secret' } });
     await panel.flush();
@@ -295,18 +320,22 @@ test('失败操作原因在正常轮询后仍保留，避免未决任务阻止�
 test('切换会话取消旧请求并解除旧操作忙碌状态，草稿继续保留', async () => {
     const panel = createPanel();
     await panel.flush();
+    panel.button('修改连接').props.onClick();
+    await panel.flush();
+    panel.button('连接已有中央').props.onClick();
+    await panel.flush();
     panel.input('审核身份').props.onChange({ target: { value: '草稿审核者' } });
     await panel.flush();
     panel.holdRequests();
-    panel.button('应用并启动').props.onClick();
+    panel.button('应用更改').props.onClick();
     await panel.flush();
     const previousRequest = panel.requests.at(-1);
-    assert.equal(panel.button('应用并启动').props.disabled, true);
+    assert.equal(panel.button('正在连接…').props.disabled, true);
     panel.releaseRequests();
     panel.setSession('session-b');
     await panel.flush();
     assert.equal(previousRequest.init.signal.aborted, true);
-    assert.equal(panel.button('应用并启动').props.disabled, false);
+    assert.equal(panel.button('应用更改').props.disabled, false);
     assert.equal(panel.input('审核身份').props.value, '草稿审核者');
     assert.equal(panel.requests.at(-1).url.searchParams.get('sessionId'), 'session-b');
     panel.unmount();
@@ -323,12 +352,10 @@ test('轻量插件禁用本机启动但仍允许选择已有中央', async () =>
     panel.unmount();
 });
 
-test('存在已保存中央配置时本地评审明确引导中央操作，不加载旧可写面板', async () => {
+test('存在已保存中央配置时隐藏本地评审，不加载旧可写面板', async () => {
     const panel = createPanel({ ...initialStatus(), enabled: false, phase: 'stopped' });
     await panel.flush();
-    panel.button('本地评审').props.onClick();
-    await panel.flush();
-    assert.match(panel.text(), /请通过中央工作台/);
+    assert.equal(panel.nodes().some(node => node.type === 'button' && node.children.join('') === '本地评审'), false);
     assert.equal(panel.requests.some(request => request.url.pathname.startsWith('/dsh-code-review/api')), false);
     panel.unmount();
 });
@@ -347,27 +374,20 @@ test('旧托管节点诊断提示先处理任务并停用后重启，禁止覆�
     await panel.flush();
     assert.match(panel.text(), /旧托管配置/);
     assert.match(panel.text(), /处理.*任务.*停用.*重启/);
-    assert.equal(panel.button('应用并启动').props.disabled, true);
-    assert.equal(panel.button('停止连接').props.disabled, true);
-    panel.button('应用并启动').props.onClick();
-    await panel.flush();
+    assert.equal(panel.nodes().some(node => node.type === 'button' && ['应用并启动', '应用更改', '停止连接', '修改连接'].includes(node.children.join(''))), false);
     assert.equal(panel.requests.some(request => request.init.method === 'POST'), false);
-    panel.button('本地评审').props.onClick();
-    await panel.flush();
+    assert.equal(panel.nodes().some(node => node.type === 'button' && node.children.join('') === '本地评审'), false);
     assert.equal(panel.requests.some(request => request.url.pathname.startsWith('/dsh-code-review/api')), false);
     panel.unmount();
 });
 
-test('旧托管配置保留既有中央外链，本地评审指引可到达同一入口', async () => {
+test('旧托管配置保留既有中央外链并隐藏本地评审', async () => {
     const panel = createPanel({ ...initialStatus(), legacy: true, configured: false, enabled: false, phase: 'stopped', centerUrl: 'https://legacy-central.example' });
     await panel.flush();
-    for (const label of ['中央工作台', '本地评审']) {
+    assert.equal(panel.nodes().some(node => node.type === 'button' && node.children.join('') === '本地评审'), false);
+    for (const label of ['中央工作台']) {
         panel.button(label).props.onClick();
         await panel.flush();
-        if (label === '本地评审') {
-            panel.button('进入中央工作台').props.onClick();
-            await panel.flush();
-        }
         const link = panel.nodes().find(node => node.type === 'a' && node.children.join('') === '打开已有中央工作台');
         assert.ok(link, '旧托管配置缺少既有中央入口');
         assert.equal(link.props.href, 'https://legacy-central.example');
@@ -387,6 +407,148 @@ test('旧托管中央地址无效时明确提示且不生成外链或网关 ifra
     await panel.flush();
     assert.match(panel.text(), /中央地址无效/);
     assert.equal(panel.nodes().some(node => node.type === 'a' || node.type === 'iframe'), false);
+    panel.unmount();
+});
+
+test('连接成功后显示运行摘要和下一步，原启动按钮不再出现', async () => {
+    const panel = createPanel({ ...initialStatus(), configured: false, enabled: false, phase: 'stopped' });
+    await panel.flush();
+    panel.setStatus(initialStatus());
+    panel.button('应用并启动').props.onClick();
+    await panel.flush();
+    assert.match(panel.text(), /中央已连接/);
+    assert.match(panel.text(), /张三/);
+    assert.equal(panel.nodes().some(node => node.type === 'input'), false);
+    assert.equal(panel.nodes().some(node => node.type === 'button' && node.children.join('') === '应用并启动'), false);
+    panel.button('接入项目');
+    panel.button('进入中央工作台');
+    assert.equal(panel.requests.filter(request => request.init.method === 'POST').length, 1);
+    panel.unmount();
+});
+
+test('已连接的未变配置不能再次应用，取消编辑不改变运行连接', async () => {
+    const panel = createPanel();
+    await panel.flush();
+    panel.button('修改连接').props.onClick();
+    await panel.flush();
+    assert.equal(panel.button('应用更改').props.disabled, true);
+    panel.button('应用更改').props.onClick();
+    await panel.flush();
+    assert.equal(panel.requests.filter(request => request.init.method === 'POST').length, 0);
+    panel.button('连接已有中央').props.onClick();
+    await panel.flush();
+    panel.input('中央地址').props.onChange({ target: { value: 'https://draft.example' } });
+    await panel.flush();
+    assert.equal(panel.button('应用更改').props.disabled, false);
+    panel.button('取消修改').props.onClick();
+    await panel.flush();
+    assert.match(panel.text(), /本机托管/);
+    assert.equal(panel.nodes().some(node => node.type === 'input'), false);
+    assert.equal(panel.requests.filter(request => request.init.method === 'POST').length, 0);
+    panel.unmount();
+});
+
+test('启动中的同步重复点击只提交一次并明确显示启动中', async () => {
+    const panel = createPanel({ ...initialStatus(), configured: false, enabled: false, phase: 'stopped' });
+    await panel.flush();
+    panel.holdRequests();
+    const apply = panel.button('应用并启动');
+    apply.props.onClick();
+    apply.props.onClick();
+    await panel.flush();
+    assert.equal(panel.button('正在启动…').props.disabled, true);
+    assert.equal(panel.requests.filter(request => request.init.method === 'POST').length, 1);
+    panel.unmount();
+});
+
+test('服务就绪但节点离线显示降级提示，不发出自动重启或业务请求', async () => {
+    const panel = createPanel({ ...initialStatus(), nodeOnline: false });
+    await panel.flush();
+    assert.match(panel.text(), /节点暂时离线/);
+    panel.button('进入中央工作台');
+    await panel.poll();
+    assert.equal(panel.requests.filter(request => request.init.method === 'POST').length, 0);
+    assert.equal(panel.nodes().some(node => node.type === 'button' && node.children.join('') === '本地评审'), false);
+    panel.unmount();
+});
+
+test('应用等待新的写后状态，迟到轮询不能恢复启动表单或解除重复提交保护', async () => {
+    const panel = createPanel({ ...initialStatus(), configured: false, enabled: false, phase: 'stopped' });
+    await panel.flush();
+    panel.delayNextRead();
+    await panel.poll();
+    const oldRead = panel.requests.at(-1);
+    panel.setStatus(initialStatus());
+    panel.button('应用并启动').props.onClick();
+    await panel.flush();
+    assert.match(panel.text(), /中央已连接/);
+    assert.equal(oldRead.init.signal.aborted, true);
+    panel.releaseReads();
+    await panel.flush();
+    assert.match(panel.text(), /中央已连接/);
+    assert.equal(panel.nodes().some(node => node.type === 'input'), false);
+    assert.equal(panel.requests.filter(request => request.init.method === 'POST').length, 1);
+    panel.unmount();
+});
+
+test('其他页面接入中央后当前本地面板自动退出，故障和停止都不重新开放', async () => {
+    const panel = createPanel({ ...initialStatus(), configured: false, enabled: false, phase: 'stopped' });
+    await panel.flush();
+    panel.button('本地评审').props.onClick();
+    await panel.flush();
+    panel.setStatus(initialStatus());
+    await panel.poll();
+    const previousReads = panel.requests.filter(request => request.url.pathname.startsWith('/dsh-code-review/api')).length;
+    for (const phase of ['ready', 'error', 'stopped']) {
+        panel.setStatus({ ...initialStatus(), phase });
+        await panel.poll();
+        assert.equal(panel.nodes().some(node => node.type === 'button' && node.children.join('') === '本地评审'), false);
+    }
+    assert.equal(panel.requests.filter(request => request.url.pathname.startsWith('/dsh-code-review/api')).length, previousReads);
+    panel.unmount();
+});
+
+test('写后状态读取失败时继续禁止应用，轮询恢复后才显示已连接', async () => {
+    const panel = createPanel({ ...initialStatus(), configured: false, enabled: false, phase: 'stopped' });
+    await panel.flush();
+    panel.setStatus(initialStatus());
+    panel.failNextRead();
+    panel.button('应用并启动').props.onClick();
+    await panel.flush();
+    assert.match(panel.text(), /状态读取失败/);
+    assert.equal(panel.button('应用并启动').props.disabled, true);
+    assert.equal(panel.nodes().some(node => node.type === 'button' && node.children.join('') === '本地评审'), false);
+    panel.button('应用并启动').props.onClick();
+    await panel.flush();
+    assert.equal(panel.requests.filter(request => request.init.method === 'POST').length, 1);
+    await panel.poll();
+    assert.match(panel.text(), /中央已连接/);
+    panel.unmount();
+});
+
+test('切换会话后状态尚未确认时不沿用旧会话的本地评审权限', async () => {
+    const panel = createPanel({ ...initialStatus(), configured: false, enabled: false, phase: 'stopped' });
+    await panel.flush();
+    panel.button('本地评审').props.onClick();
+    await panel.flush();
+    const reads = panel.requests.filter(request => request.url.pathname.startsWith('/dsh-code-review/api')).length;
+    panel.holdRequests();
+    panel.setSession('session-b');
+    await panel.flush();
+    assert.equal(panel.nodes().some(node => node.type === 'button' && node.children.join('') === '本地评审'), false);
+    assert.equal(panel.requests.filter(request => request.url.pathname.startsWith('/dsh-code-review/api')).length, reads);
+    panel.unmount();
+});
+
+test('停止状态通过已保存配置启动，不需要重新填写或提交表单草稿', async () => {
+    const panel = createPanel({ ...initialStatus(), enabled: false, phase: 'stopped' });
+    await panel.flush();
+    assert.equal(panel.nodes().some(node => node.type === 'input'), false);
+    panel.setStatus(initialStatus());
+    panel.button('启动已保存连接').props.onClick();
+    await panel.flush();
+    assert.deepEqual(panel.requests.find(request => request.init.method === 'POST').body, { mode: 'local', reviewIdentity: '张三' });
+    assert.match(panel.text(), /中央已连接/);
     panel.unmount();
 });
 
