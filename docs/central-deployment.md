@@ -1,142 +1,263 @@
 # 中央评审服务部署与运维
 
-> **任务来源**: 用户认可中央模式并进一步授权在单仓内整理插件、中央服务、Web 的工程与交付边界。
-> **任务内容**: 说明独立安装包、中央服务引导、节点配置、远端交付、备份与故障恢复。
+> **任务来源**: 用户在完成单仓多包整理后，要求修订用户手册和部署文档，确保信息正确、清晰易懂。
+> **任务内容**: 说明中央服务安装、账号创建、DSH 节点接入、首次验收、升级备份与故障恢复。
 > **参考文档**:
-> - `SPEC.md` — 中央模式契约及 AC-CENTRAL 验收要求。
-> - `docs/superpowers/specs/2026-11-16-central-review-web-design.md` — 已认可设计。
-> - `docs/superpowers/plans/2026-11-16-central-review-implementation.md` — 实施计划与验证记录。
-> **生成日期**: 2026-11-16
+> - `../SPEC.md` — 中央模式职责、身份、执行与恢复契约。
+> - `../package.json` — 构建、打包及启动命令。
+> - `../apps/server/src/cli.ts` — 中央 CLI 参数及环境变量。
+> - `../packages/dsh-plugin/src/managed/managed-config.ts` — 节点配置与凭据加载。
+> - `../packages/dsh-plugin/src/managed/managed-operations.ts` — 工作副本绑定与执行配置。
+> - `../packages/dsh-plugin/src/managed/managed-delivery.ts` — Git/SVN 交付核验。
+> - `package-boundaries-validation.md` — 拆包后的实际验证范围。
+> **生成日期**: 2026-11-17
 
-## 1. 运行组成
+本页面向部署和维护人员。日常审核见[中央 Web 手册](central-user-guide.md)；只在本机 DSH 中使用插件，见[本地插件指南](dsh-code-review-guide.md)。
 
-中央服务使用 Node.js 24、Fastify 和内置 SQLite，一个进程同时提供 HTTP API 和构建后的 React 静态页面。前端仍可独立开发和部署，通过同源 `/api/v1` 访问中央服务。不需要 Redis、消息队列或独立缓存服务。
+## 1. 先确定安装在哪里
 
-每个 DSH 插件节点使用 Node.js 24，在本机管理预先准备好的 Git/SVN 工作副本、构建工具链、模型与仓库凭据。节点主动通过 HTTPS 连接中央服务，不需要对外开放 DSH Web 端口。操作系统按项目构建环境选择；工具平台本身不要求 Windows。
+| 位置 | 需要准备 | 负责什么 |
+| --- | --- | --- |
+| 中央机器 | Node.js 24、中央安装包、持久化数据目录 | 提供 Web、账号登录、节点和项目管理，保存任务与查询缓存。 |
+| 执行节点 | 使用 Node.js 24 或更新运行时的 DSH、评审插件、Git/SVN、模型与项目工具链 | 持有代码目录，执行审查、修复、门禁、提交和远端交付。 |
+| 审核人员电脑 | 浏览器、中央网址和账号 | 查看候选、提意见、批准并核对任务结果。 |
 
-首期账号均可管理接入项目及节点；候选 Owner、版本 guard 和批准门禁继续在节点执行。项目级角色、SSO 和细粒度权限是后续工作，不能把首期账号当成已有权限隔离的多租户账号。
+中央是独立进程，不需要安装 DSH 或业务代码工作副本。节点主动连接中央，不需要对外开放 DSH Web 端口。一个节点可以管理多个独立工作副本，同一真实目录不能重复配置。
 
-## 2. 构建和中央引导
+当前中央采用单实例 SQLite，不需要额外部署数据库或消息队列。中央账号具有相同的平台管理能力，尚无细粒度项目权限、角色或 SSO；候选负责人仍在节点执行时校验。
 
-在本仓库安装并构建：
+以下以 PowerShell 和 Windows 路径为例，按实际机器修改。Linux 使用相同 CLI 参数和对应绝对路径，但须在目标环境另行验收。JSON 中的 Windows 路径建议使用 `/`。
 
-```text
+## 2. 安装并启动中央服务
+
+### 2.1 生成安装包
+
+在有完整源码和构建依赖的机器上，从**仓库根目录**执行：
+
+```powershell
 npm ci
-npm run typecheck
+npm run pack:central
+npm run pack:plugin
+```
+
+当前版本生成：
+
+- `dist/dsh-review-server-0.1.0.tgz`：中央服务、Web 静态资源和运行依赖。
+- `dist/dsh-code-review-0.3.0.tgz`：DSH 插件、资源和协议依赖。
+
+中央包发到中央机器，插件包发到各节点；版本变化时使用实际文件名。请使用以上打包入口，直接对 workspace 执行 `npm pack` 不能替代运行依赖收集。
+
+### 2.2 在中央机器安装
+
+先建立独立安装目录，例如 `C:/dsh-review-central`，并把中央包放入其中，再执行：
+
+```powershell
+Set-Location C:/dsh-review-central
+npm init -y
+npm install ./dsh-review-server-0.1.0.tgz --offline --omit=dev --no-audit --no-fund
+```
+
+部署机器需要 Node.js/npm，不需要 TypeScript、源码目录或旁边的 `apps/web`。静态资源位于中央包自身的 `dist/public/`。
+
+### 2.3 创建第一个账号
+
+选择一个独立于安装目录的持久化数据目录，例如 `C:/dsh-review-data`。所有管理命令和服务进程必须指向同一目录。在刚才的安装目录中执行：
+
+```powershell
+$securePassword = Read-Host '设置登录密码（12～256 个字符）' -AsSecureString
+$env:DSH_REVIEW_PASSWORD = [System.Net.NetworkCredential]::new('', $securePassword).Password
+npx --no-install dsh-review-central user-add --data-dir C:/dsh-review-data --username reviewer --review-identity reviewer
+Remove-Item Env:DSH_REVIEW_PASSWORD
+Remove-Variable securePassword
+```
+
+`username` 用于登录；`reviewIdentity` 用于候选负责人、评论作者和审核记录，应与业务仓库的 owner 约定一致。创建其他账号时重复此命令并使用不同登录名。当前没有 Web 账号创建或密码修改入口。
+
+Linux/Bash 可先用 `read -r -s DSH_REVIEW_PASSWORD` 输入密码，再 `export DSH_REVIEW_PASSWORD`，执行相同的 `user-add` 命令，最后 `unset DSH_REVIEW_PASSWORD`。
+
+### 2.4 启动并检查
+
+```powershell
+npx --no-install dsh-review-central serve --data-dir C:/dsh-review-data --host 127.0.0.1 --port 3081
+```
+
+保持进程运行，访问 `http://127.0.0.1:3081` 并登录。另一个终端可检查：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:3081/health
+```
+
+预期返回 `status: ok`、`service: dsh-review-central`。这只能证明中央进程可用，不能证明节点、模型和项目工具链已就绪。
+
+### 2.5 正式对外访问
+
+使用反向代理提供 HTTPS，并将**整个站点**转发到中央进程，包括页面、静态资源、`/api/v1` 和 `/node-api/v1`。部署在域名根路径，例如 `https://review.example.com`，当前不使用 URL 子路径。
+
+即使代理与中央在同一机器，也应在启动时传入公开 HTTPS 地址，以启用 Secure 登录 Cookie：
+
+```powershell
+npx --no-install dsh-review-central serve --data-dir C:/dsh-review-data --host 127.0.0.1 --port 3081 --public-url https://review.example.com
+```
+
+监听非回环地址，如 `--host 0.0.0.0`，代码会要求提供 HTTPS 的 `--public-url`。**此参数不会自动建立 TLS**，证书与 HTTPS 仍由反向代理提供。
+
+代理请求体上限至少允许 8 MiB。中央普通 JSON 上限 2 MiB，附件上限 8 MiB。用服务管理器维护进程，并固定数据目录、启动参数与服务账号。
+
+### 2.6 从源码开发时
+
+在仓库根目录执行：
+
+```powershell
+npm ci
 npm run build:central
+$securePassword = Read-Host '设置开发账号密码（12～256 个字符）' -AsSecureString
+$env:DSH_REVIEW_PASSWORD = [System.Net.NetworkCredential]::new('', $securePassword).Password
+node apps/server/dist/cli.js user-add --data-dir C:/dsh-review-dev-data --username reviewer --review-identity reviewer
+Remove-Item Env:DSH_REVIEW_PASSWORD
+Remove-Variable securePassword
+node apps/server/dist/cli.js serve --data-dir C:/dsh-review-dev-data --host 127.0.0.1 --port 3081
 ```
 
-以下命令都使用同一个持久化数据目录。账号密码通过 `DSH_REVIEW_PASSWORD` 环境变量传入，不写在命令参数中；创建完成后清除该环境变量。密码至少 12 个字符。
-
-```text
-node apps/server/dist/cli.js user-add --data-dir <中央数据目录> --username reviewer --review-identity <仓库审核身份>
-node apps/server/dist/cli.js serve --data-dir <中央数据目录> --host 127.0.0.1 --port 3081
-```
-
-本机开发访问 `http://127.0.0.1:3081`。前端热更新可另起 `npm run dev --workspace @dsh-review/web`，默认代理到本机 3081。
-
-### 独立交付
-
-在源码仓库根目录执行 `npm run pack:central`，生成 `dist/dsh-review-server-0.1.0.tgz`。将其复制到部署机器，在独立安装目录执行：
-
-```text
-npm install /path/to/dsh-review-server-0.1.0.tgz --offline --omit=dev
-npx --no-install dsh-review-central user-add --data-dir <中央数据目录> --username reviewer --review-identity <仓库审核身份>
-npx --no-install dsh-review-central serve --data-dir <中央数据目录> --host 127.0.0.1 --port 3081
-```
-
-账号创建仍需先设置 `DSH_REVIEW_PASSWORD`。安装包自带 Fastify、共享协议及运行依赖，静态资源位于自身 `dist/public/`；不需要源码仓库、DSH 插件或旁边的 `apps/web` 目录。生产数据目录必须独立于安装目录。
-
-插件通过根命令 `npm run pack:plugin` 单独生成 `dist/dsh-code-review-0.3.0.tgz`。开发时执行 `npm run build:plugin`，然后让 DSH Plugin Manager 安装 `packages/dsh-plugin` 的绝对路径。插件包自带协议依赖，不包含中央服务和中央 Web；中央服务也不安装插件。
-
-正式部署由已有反向代理提供 HTTPS，转发中央服务的整个站点，包括 `/api/v1` 和 `/node-api/v1`。服务启动时传入 `--public-url https://review.example.com`，启用 Secure 会话 Cookie；监听非回环地址时该参数是必需的。部署在域名根路径，不使用 URL 子路径。
-
-允许代理转发的请求体上限至少为 8 MiB。中央普通 JSON 请求上限 2 MiB，附件上限 8 MiB；超大详情会明确提示拆分范围，不会截断补丁或伪装成功。生产进程由既有服务管理器重启，数据目录不能放在临时目录或随版本替换的发布目录中。
+账号仅在首次使用该数据目录时创建。前端热更新可另开终端运行 `npm run dev --workspace @dsh-review/web`，按 Vite 输出的网址访问；开发代理默认连接本机 3081。`build:central` 不构建插件。
 
 ## 3. 创建并配置节点
 
-在 Web“执行节点”创建节点，或执行：
+### 3.1 安装插件与准备代码
 
-```text
-node apps/server/dist/cli.js node-add --data-dir <中央数据目录> --name <节点名称>
+运行插件的 **DSH Host 本身**须使用 Node.js 24 或更新版本；终端中的 `node --version` 不能证明 DSH 内部运行时符合要求。
+
+使用独立插件包时，先在节点建立安装目录并复制插件包，例如 `C:/dsh-review-node`：
+
+```powershell
+Set-Location C:/dsh-review-node
+npm init -y
+npm install ./dsh-code-review-0.3.0.tgz --offline --omit=dev --no-audit --no-fund
 ```
 
-保存返回的 `nodeId` 和一次性 Token。中央只存 Token 摘要。将 Token 放入节点环境变量或 DSH 凭据服务；不要把真实 Token 写入业务仓库或截图、日志。
+然后让 DSH Plugin Manager 安装 **`C:/dsh-review-node/node_modules/dsh-code-review`**。从源码开发时，在仓库根目录执行 `npm run build:plugin`，安装 **`packages/dsh-plugin` 的绝对路径**。仓库根目录已不再是插件安装入口。
 
-在每个节点的 `$DSH_HOME/dsh-code-review/managed-node.json` 写入：
+业务代码须预先 Git clone 或 SVN checkout。用运行 DSH 的同一系统账号确认：
+
+- 工作副本有可用基线，业务工作区干净，目录是仓库或 SVN 工作副本根目录。
+- Git 已切到目标分支，已有 `origin` 远端目标分支；开启批准前同步时，upstream 须正确配置。提交者与推送凭据可用。
+- SVN 目标与凭据正确，非交互命令能够访问仓库。
+- 项目构建、测试命令和所选模型 Runner 可用，执行能正常结束。
+
+Web 不会自动下载仓库或安装工具链。
+
+### 3.2 创建节点凭据
+
+登录 Web 的“执行节点”，填写名称并点击“创建节点凭据”，保存一次性展示的节点 ID 和 Token。也可在中央安装目录执行：
+
+```powershell
+npx --no-install dsh-review-central node-add --data-dir C:/dsh-review-data --name build-node-01
+```
+
+将 Token 保存在节点环境变量或 DSH 凭据服务中。中央只存摘要，不能再次展示原文。每个 DSH 实例使用独立凭据，不写入业务仓库。
+
+### 3.3 写入节点配置
+
+配置文件为 `<DSH_HOME>/dsh-code-review/managed-node.json`。`DSH_HOME` 指运行 DSH 的进程环境变量；未设置时使用该系统账号主目录下的 `.dsh`，如 `C:/Users/你的账号/.dsh` 或 `/home/你的账号/.dsh`。
+
+创建目录和文件，保存为 UTF-8 JSON：
 
 ```json
 {
     "centerUrl": "https://review.example.com",
-    "nodeId": "中央生成的节点标识",
+    "nodeId": "替换为中央生成的节点ID",
     "tokenReference": "DSH_REVIEW_NODE_TOKEN",
     "workspaces": [
         {
             "workspaceId": "server-core",
             "label": "服务器核心库",
-            "root": "/srv/review/server-core",
+            "root": "C:/repos/server-core",
             "target": "main",
             "settings": {
                 "runner": "dsh",
                 "syncBeforeApprove": true,
                 "gateTimeoutMs": 600000
             }
-        },
-        {
-            "workspaceId": "game-client",
-            "label": "SVN 客户端",
-            "root": "/srv/review/game-client",
-            "target": "^/trunk",
-            "settings": {
-                "runner": "dsh"
-            }
         }
     ]
 }
 ```
 
-`tokenReference` 先解析同名环境变量，再查询 DSH 凭据服务。Token 不会上报给浏览器；本地绝对目录也不包含在节点注册信息中。Windows 的 `root` 可写成 `D:/review/server-core`。
+替换示例中的中央地址、节点 ID、目录和目标。`workspaceId` 用字母、数字、下划线或连字符标识工作副本，节点内唯一；`label` 是展示名称。`target` 可省略，首次启动时取当前分支或 SVN 相对 URL，此后持续核验，不能在运行期间自行切换目标。
 
-`target` 可省略，由首次启动时的实际位置确定；配置后会持续核验。Git 必须是仓库根目录的目标分支，远端名称为 `origin`，并提前配置好 upstream、提交者和推送权限。SVN 必须是工作副本根目录，目标使用 `svn info --show-item relative-url .` 的输出，例如 `^/trunk`。同一 workspaceId 不能在重启后悄悄改指另一个目录或目标；迁移需先处理未决任务并按新 workspace 接入。
+SVN 可作为另一项加入 `workspaces`，例如 `root: C:/repos/game-client`、`target: ^/trunk`；Linux 使用 `/srv/review/server-core` 这样的绝对目录。SVN 目标以 `svn info --show-item relative-url .` 输出为准。
 
-节点配置存在但格式无效或凭据无法解析时，插件报告初始化错误，不回退为本地可写模式。未配置该文件时，原本地插件流程保留。托管模式的插件面板提供中央工作台入口，本地 HTTP 入口拒绝评审写入，避免绕过中心占用。
+`tokenReference` 先按同名环境变量解析，未找到时再查询 DSH 凭据服务。使用环境变量时，必须让**启动 DSH 的进程或服务**继承它；在另一个终端设置不会改变已运行的 DSH。不要把 Token 原文填进 `tokenReference`。
 
-重启 DSH 使配置生效。一个 nodeId 同时只能有一个活动 instanceId；不要在两台机器复制相同的凭据与节点运行目录。重启可能要等待旧心跳离线窗口结束后才能重新注册。DSH 版本暂无法从宿主可靠取得时上报 `unknown`，不使用 Node 版本冒充 DSH 版本。
+`settings.runner` 可用 `dsh`、`external`、`manual`。`dsh` 使用进程 Runner；`external` 还需有效的 `externalCommand`；`manual` 不自动调用模型，会给出人工操作提示。托管模式不靠本地面板的可见对话判断任务结束。
 
-## 4. Web 接入与审核
+重启 DSH 后，检查节点在线、协议兼容且工作副本正确。配置存在但格式错误、凭据无法解析或工作副本无效时，插件报告初始化错误，不回退为本地可写模式。
 
-1. 登录后，在“执行节点”确认节点已注册且版本兼容。
-2. 在“项目管理”选择节点和该节点上报的 workspace，设置项目名称。
-3. 等待首次同步，然后在工作台、候选队列和审查报告中查看结果。
-4. 候选详情查看问题、方案、差异与人工判断。评论写入、AI 修复、人工补丁和批准均下发持久化指令，由节点执行。
-5. 在任务记录中分别核对原业务结果、原提交与远端交付状态。接收指令不等于代码已提交；Git 本地提交成功也不等于已推送远端。
+### 3.4 对齐审核身份
 
-托管模式把“提交意见”和“AI 修复”作为两条显式指令；每条都有独立结果与恢复依据。人工修复提示保留在任务详情中，补丁可从候选页面提交为新版本。判断项必须重新确认后才能批准，版本 guard 由节点复核。
+仓库 `.ai-review/reviewers.yml` 的 owner 应与中央账号 `reviewIdentity` 对应。例如默认交给身份 `reviewer`：
 
-节点约每 2 秒轮询控制指令，项目索引约每 10 秒同步。快照新鲜度以中央接收时间计算；节点在线不代表项目数据已更新。大于 256 KiB 的详情先按 SHA-256 上传为附件，再发布引用。离线时已有缓存仍可查询，未缓存详情明确不可用，禁止创建新的业务写指令。
+```yaml
+default_owner: reviewer
+```
 
-Git 查询读取固定 HEAD；SVN 查询读取固定远端 URL 与 revision，不能用可能落后的工作副本根 revision 作为缓存证明。远端已更新但工作副本尚未同步时，写入仍由原有 guard 和本地共享状态复核；可先从项目页同步仓库。
+补入项目实际门禁与路由配置，提交并同步到团队仓库。执行身份来自当前中央登录账号，不能通过改写节点本地 owner 冒充其他人。
+
+## 4. 接入项目与首次验收
+
+1. 在“项目管理”点击“＋ 接入项目”，选择在线且兼容的节点及工作副本。
+2. 等待项目“已同步”。首次接入不会自动开始审查。
+3. 在项目详情点击“开始全量审查”，到“任务记录”查看结果。
+4. 检查报告、候选和补丁能打开，在可接受的测试候选上验证评论、修复和批准。
+5. Git 核对原提交已进入 `origin` 目标分支；SVN 核对远端 revision。
+
+批准、评论、接管、拒绝和候选收尾等共享写都会尝试交付远端。意见提交与 AI 修复是不同指令；已受理不表示业务成功。日常操作见[使用手册](central-user-guide.md)。
+
+节点约每 2 秒轮询控制指令，索引约每 10 秒同步。任务执行、网络或同步错误可能使刷新延迟，在线不代表内容已更新。离线已有缓存可读，未缓存详情可能不可用，新业务写操作会被阻止。
 
 ## 5. 停止、备份和恢复
 
-停止中央服务不会自动取消已在节点执行的任务。节点断连仍可能完成提交，恢复连接后重传事件。卸载插件时尝试取消当前执行并保留本地执行记录；取消请求不直接释放中央写占用。
+### 日常停止与备份
 
-中央需要备份整个数据目录，包括 SQLite 数据库和 `artifacts/`。最简单方式是停止中央进程后复制整个目录；不能在运行时只复制主数据库文件而漏掉 WAL。各节点也需备份 `$DSH_HOME/dsh-code-review/managed/`，其中保存受理记录、事件 outbox、快照序号及执行检查点；业务仓库和凭据按现有运维方式备份。
+先处理或记录未决任务。停止中央不会自动终止节点操作；节点可能继续提交并在重连后回报。卸载插件会尝试取消执行并保留本地记录，取消不等于撤回提交。
 
-待核验任务应先检查旧进程、Git/SVN 状态及工作副本，确认原执行已停止，再在任务详情请求恢复。恢复只核验已有执行和交付，不重新批准或重跑 Agent：
-
-| 状态 | 处理 |
+| 位置 | 需要保留 |
 | --- | --- |
-| 原业务结果已记录，Git 推送待交付 | 网络恢复后请求重试原提交交付；不生成第二次业务提交。 |
-| Git 远端分叉 | 保留原提交及占用；管理员核对双方提交，人工处理目标分支后再核验，工具不强推或自动改写已审提交。 |
-| 已找到 `Dsh-Command` 提交标记，但原业务结果丢失 | 可以核验该提交的交付，业务仍保持待核验。提交存在不能证明批准成功，例如批准回退也可能提交新候选版本。 |
-| SVN 提交结果不明 | 查询原 revision 和指令标记；无法证明时继续保留现场，不再次提交。 |
-| 节点执行记录丢失或无法证明原业务结果 | 停止自动操作，人工核对并修复运行状态；首期没有“强制成功/释放占用”按钮。 |
+| 中央数据目录 | 整个目录，包括 `central.sqlite`、仍存在的 WAL/SHM 和 `artifacts/`。 |
+| 每个节点 | `managed-node.json`、`<DSH_HOME>/dsh-code-review/managed/`，以及独立保存的凭据。 |
+| 业务仓库 | 代码、`.ai-review/`、Git 尚未交付的本地提交和工作副本现场。 |
 
-指令标记只追加在托管模式的提交说明中，不改变 `.ai-review` 结构或原有业务提交首行。纯本地模式不增加该标记。
+停中央进程后复制整个数据目录是最容易操作的备份方式；节点执行记录应在执行停止后备份。运行中只复制 SQLite 主文件可能漏掉 WAL。远端代码不能替代尚未交付的本地提交和执行记录。
 
-## 6. 本次边界
+### 任务待核验时
 
-首期中央单实例、SQLite，不支持自动故障转移或在线迁移项目绑定。节点查询与控制分开进行，同节点的不同工作副本可继续读取；运行写操作的同一工作副本可读取中央已有缓存，新的节点详情读取等待安全窗口，避免读模型的工作副本检查与写事务互相干扰。
+先确认旧执行进程停止，再核对工作副本、日志和原提交。任务详情中勾选“我已确认旧执行进程停止”，点击“核验并重试原提交交付”。此入口核验原业务与交付，不重新批准或重跑 Agent。
 
-人工全量审查入口保留。本次不实现“先复查上轮结果，再开始本轮全量”的定时编排，也不改成增量审查。真实 DSH 宿主加载、实际模型调用、跨机器 HTTPS 和项目自身 Unity/Unreal/Godot/C++/Java/Go 构建工具链需在目标环境验收；隔离 Git/SVN 及测试执行器不能替代该验收。
+| 情况 | 处理 |
+| --- | --- |
+| Git 原提交存在，网络或凭据有问题 | 修复连接后重试原交付，不再次批准。 |
+| Git 远端分叉或非快进 | 保留原提交及项目占用，管理员核对并处理目标分支；工具不强推、不自动合并或改写已审提交。 |
+| 找到 `Dsh-Command` 标记，完整结果丢失 | 可核验提交交付，但业务结果仍可能待核验；找到提交不证明批准成功。 |
+| SVN 提交结果不明 | 查询原 revision 和内容；证据不足时保留现场，不再次提交。 |
+| 节点记录丢失或结果无法证明 | 保持待核验与写阻塞，人工恢复；没有“强制成功”或直接释放占用按钮。 |
+
+不要删除运行数据库、清除任务或复用旧节点身份绕过阻塞。吊销凭据不会停止已经运行的操作。
+
+## 6. 升级与常见故障
+
+升级前备份并处理未决任务；停止待升级进程，替换或重新安装对应版本包，再使用原数据目录启动。节点升级保留 `managed/`、配置和凭据。启动后检查协议、工作副本和同步状态。当前未承诺自动跨版本数据迁移或降级兼容，应先隔离验证目标版本。
+
+| 现象 | 优先检查 |
+| --- | --- |
+| 登录失败或看不到原数据 | 建账号与启动服务是否用同一绝对数据目录；当前 CLI 不提供改密命令。 |
+| 静态资源未构建 | 源码执行 `npm run build:central`；独立部署使用完整中央包。只编译 server 不会暂存 Web。 |
+| 节点一直离线 | 中央地址/TLS、Token 引用、DSH 继承的环境、实际 Node 运行时、工作副本和日志。 |
+| 重启后实例冲突 | 确认旧实例退出；在线窗口约 30 秒，窗口内新 instanceId 可能被拒绝。 |
+| 节点在线但项目未同步 | 仓库读取、目标、凭据与同步错误；在线不表示内容已更新。 |
+| 项目可读但不能操作 | 项目启用、协议、新鲜度、候选负责人及未决任务。 |
+| 改目录或分支后拒绝启动 | 同一 workspaceId 的真实目录、仓库类型与目标已持久绑定；先核验旧执行，再按新 workspace 接入，不删除记录强行重绑。 |
+
+项目存在未决任务时，改名、启停等配置修改也会被拒绝。Web 不支持在线迁移节点、工作副本或目标分支，也不提供自动故障转移。
+
+## 7. 验证范围
+
+已有隔离 Git/SVN、中央 API、插件资源和 tarball 离线安装验证，见[拆包验证记录](package-boundaries-validation.md)。真实 DSH 加载、模型调用、Linux、跨机器 HTTPS 和各项目工具链仍需在目标环境验收。
