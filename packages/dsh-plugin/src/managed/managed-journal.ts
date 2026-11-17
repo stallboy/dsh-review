@@ -113,4 +113,9 @@ export class ManagedJournal {
     close(): void {
         if (!this.closed) { this.database.close(); this.closed = true; }
     }
+
+    hasUnsettled(): boolean {
+        return Boolean(this.database.prepare("SELECT 1 FROM commands WHERE phase!='completed' LIMIT 1").get()
+            || this.database.prepare('SELECT 1 FROM outbox LIMIT 1').get());
+    }
 }

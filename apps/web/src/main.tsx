@@ -6,4 +6,5 @@ import { App } from './App.js';
 import './global.css';
 
 const client = new QueryClient({ defaultOptions: { queries: { retry: false, refetchOnWindowFocus: true } } });
-createRoot(document.getElementById('root')!).render(<React.StrictMode><QueryClientProvider client={client}><BrowserRouter><App /></BrowserRouter></QueryClientProvider></React.StrictMode>);
+const basePath = new URL(document.baseURI).pathname.replace(/\/$/, '');
+createRoot(document.getElementById('root')!).render(<React.StrictMode><QueryClientProvider client={client}><BrowserRouter basename={basePath || '/'}><App /></BrowserRouter></QueryClientProvider></React.StrictMode>);

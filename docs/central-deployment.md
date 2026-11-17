@@ -1,10 +1,14 @@
 # 中央评审服务部署与运维
 
-> **任务来源**: 用户要求修订拆包后的部署文档，并新增中央和节点的三平台独立部署、启动脚本。
-> **任务内容**: 说明脚本与手工安装、账号创建、DSH 节点接入、首次验收、重复升级与备份恢复。
+> **任务来源**: 用户要求修订拆包后的部署文档，提供三平台独立部署脚本，并增加插件内本机中央、已有中央连接及多项目接入。
+> **任务内容**: 说明普通插件与本机整合插件的选择、显式连接与恢复、脚本及手工安装、节点接入和备份恢复。
 > **参考文档**:
 > - `../SPEC.md` — 中央模式职责、身份、执行与恢复契约。
 > - `../package.json` — 构建、打包及启动命令。
+> - `../scripts/pack.mjs` — 普通插件、独立中央与本机整合包的依赖收集。
+> - `superpowers/specs/2026-11-17-plugin-central-design.md` — 插件内中央连接、项目接入与进程生命周期设计。
+> - `superpowers/plans/2026-11-17-plugin-central.md` — 本轮实施与验收计划。
+> - `../packages/dsh-plugin/src/connection/controller.ts` — 连接持久化、恢复、旧配置保护及工作台网关。
 > - `../apps/server/src/cli.ts` — 中央 CLI 参数及环境变量。
 > - `../packages/dsh-plugin/src/managed/managed-config.ts` — 节点配置与凭据加载。
 > - `../packages/dsh-plugin/src/managed/managed-operations.ts` — 工作副本绑定与执行配置。
@@ -15,7 +19,7 @@
 
 本页面向部署和维护人员。日常审核见[中央 Web 手册](central-user-guide.md)；只在本机 DSH 中使用插件，见[本地插件指南](dsh-code-review-guide.md)。
 
-首次安装与日常覆盖升级，优先使用[一键部署与启动](oneclick-deployment.md)。脚本已将构建、安装、账号初始化和数据保留串联；`deploy` 负责部署，`start` 单独启动。本文保留手工安装方式，并说明 HTTPS、节点配置与恢复。
+同一机器、同一 DSH 内的少量项目可使用下面的本机整合插件，在插件内启动中央。独立长期运行的中央与远程节点可使用[一键部署与启动](oneclick-deployment.md)；`deploy` 负责部署，`start` 单独启动。本文保留手工安装方式，并说明 HTTPS、节点配置与恢复。
 
 本文 `npx --no-install dsh-review-central ...` 管理命令以手工安装目录为例。一键脚本部署后，对应入口是 `node <target>/app/node_modules/@dsh-review/server/dist/cli.js ...`，其中 `--data-dir` 使用 `<target>/deployment.json` 记录的 `dataDir`，确保管理命令和运行服务读写同一份数据。
 
@@ -32,6 +36,45 @@
 当前中央采用单实例 SQLite，不需要额外部署数据库或消息队列。中央账号具有相同的平台管理能力，尚无细粒度项目权限、角色或 SSO；候选负责人仍在节点执行时校验。
 
 以下以 PowerShell 和 Windows 路径为例，按实际机器修改。Linux 使用相同 CLI 参数和对应绝对路径，但须在目标环境另行验收。JSON 中的 Windows 路径建议使用 `/`。
+
+### 1.1 同一机器上的插件内中央
+
+| 安装包 | 使用场景 |
+| --- | --- |
+| `dsh-code-review-0.3.0.tgz` | 普通插件，不包含中央运行目录；可使用原本地评审或连接已有中央。 |
+| `dsh-code-review-local-0.3.0.tgz` | 本机整合插件，包含独立中央服务、Web 和运行依赖；可在插件内启动本机中央，也可连接已有中央。 |
+| `dsh-review-server-0.1.0.tgz` | 独立中央，适合长期运行或供其他机器访问，继续使用本文第 2 节的安装方式。 |
+
+在构建机器的仓库根目录执行：
+
+```powershell
+npm ci
+npm run pack:local
+```
+
+把 `dist/dsh-code-review-local-0.3.0.tgz` 复制到目标机器的独立安装目录，例如 `C:/dsh-review-local`，执行：
+
+```powershell
+Set-Location C:/dsh-review-local
+npm init -y
+npm install ./dsh-code-review-local-0.3.0.tgz --offline --omit=dev --ignore-scripts --no-audit --no-fund
+```
+
+在 DSH Plugin Manager 中安装 `C:/dsh-review-local/node_modules/dsh-code-review`。普通插件与整合插件安装后的包名都为 `dsh-code-review`，同一实例选择其中一种。目标机器仍需要使用 Node.js 24 或更新运行时的 DSH、Git/SVN 和项目工具链；运行时不会下载依赖、构建中央或更新源码。
+
+打开 DSH 的“评审”标签，默认进入“中央连接”。选择“本机托管”，填写与候选 owner 对应的审核身份，点击“应用并启动”。仅选择模式、编辑配置或打开工作台不会启动中央。没有项目时也能启动；服务就绪后，打开“项目接入”，核对真实目录、VCS 和目标，再逐项接入。
+
+“中央工作台”在插件内打开中央页面；本机模式会为首次填写的本地审核身份建立用户会话。已有中央使用管理员提供的地址、节点 ID 与 Token，点击“测试连接”只测试，点击“应用并连接”才保存并启用；浏览工作台仍使用中央用户登录。节点 Token 留空会保留已保存凭据，界面不会回填秘密。审核身份初始化后不能靠编辑连接表单静默改为另一个本地用户。
+
+已启用连接在插件下次启动时自动恢复。点击“停止连接”会持久停用并保留配置，下次插件启动不自动连接，需再次明确应用或重试。关闭页面、切换会话或接入其他项目不改变中央生命周期；停止或重载插件会终止其自行拉起的中央，已有中央进程由外部维护。异常退出后显示故障，需显式重试。
+
+连接配置、凭据、本机中央数据及各中央的执行记录保存在 `<DSH_HOME>/dsh-code-review/`，不写入业务仓库。备份应包含整个目录；不要仅复制 `connection.json`，也不要删除执行记录来解除未决状态。存在未决业务任务、未核验执行或未确认事件时，切换中央、停用连接及修改接入会被拒绝，应先在原中央处理任务。
+
+尚未保存新连接时，原 `managed-node.json` 继续兼容。检测到旧托管配置后，插件界面展示诊断并禁止直接覆盖连接：先在原中央处理完旧任务，停用旧托管配置，再重启插件，随后配置新连接。旧节点凭据、执行记录与项目绑定不会自动迁移。已保存新中央配置后，即使连接停止，“本地评审”也只提供中央操作指引，不能绕过中央进行本地写入。
+
+同一真实工作副本的多个会话复用接入记录；不同目录即使名称或远端相同，也分别接入。项目停用保留历史和目录，关闭会话不会取消接入；发现或接入项目不会自动开始审查。
+
+整合包的隔离离线安装与中央 IPC 启停测试用于验证交付物可脱离源码运行。真实 DSH 宿主界面、宿主内 Node/Electron 行为及 Windows、macOS、Linux 三平台仍须分别实际验收，不能以自动化测试替身代替。
 
 ## 2. 安装并启动中央服务
 
@@ -266,5 +309,7 @@ default_owner: reviewer
 项目存在未决任务时，改名、启停等配置修改也会被拒绝。Web 不支持在线迁移节点、工作副本或目标分支，也不提供自动故障转移。
 
 ## 7. 验证范围
+
+本轮插件中央连接、项目接入及整合包验证见[插件中央验证记录](plugin-central-validation.md)。其中明确区分真实 HTTP/进程/安装测试与尚未执行的 DSH 桌面交互及本轮三平台原生验收。
 
 已有隔离 Git/SVN、中央 API、插件资源和 tarball 离线安装验证，见[拆包验证记录](package-boundaries-validation.md)。新增脚本已通过 Windows、Ubuntu、macOS 原生 CI 的类型检查、构建和部署集成测试，范围见[一键部署验证记录](oneclick-deployment-validation.md)。真实 DSH 加载、模型调用、跨机器 HTTPS 和各项目工具链仍需在目标环境验收。

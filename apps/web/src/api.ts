@@ -27,7 +27,8 @@ export class ApiError extends Error {
 }
 
 export async function request<T>(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<T> {
-    const response = await fetch(`/api/v1${path}`, { method, credentials: 'same-origin', signal,
+    const basePath = typeof document === 'undefined' ? '' : new URL(document.baseURI).pathname.replace(/\/$/, '');
+    const response = await fetch(`${basePath}/api/v1${path}`, { method, credentials: 'same-origin', signal,
         headers: { ...(body !== undefined ? { 'content-type': 'application/json' } : {}), ...(method !== 'GET' ? { 'x-csrf-token': csrfToken } : {}) },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
     const value = await response.json();

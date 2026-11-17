@@ -12,6 +12,7 @@ export interface ManagedNodeOptions {
         pluginVersion?: string;
         dshVersion?: string;
         workspaces: WorkspaceRegistration[];
+        pauseAdmission?: boolean;
     };
     journal: ManagedJournal;
     execute(command: ManagedCommand, signal: AbortSignal, emit: (line: string) => void, project: ProjectRecord): Promise<ManagedResult>;
@@ -32,7 +33,7 @@ interface PollResult {
 }
 
 export class ManagedNode {
-    private readonly instanceId: string;
+    readonly instanceId: string;
     private readonly transport: typeof globalThis.fetch;
     private readonly clock: () => Date;
     private readonly active = new Map<string, { projectId: string; controller: AbortController; promise: Promise<void> }>();
@@ -56,7 +57,8 @@ export class ManagedNode {
     private async request<T>(pathname: string, payload: unknown): Promise<T> {
         const url = new URL(pathname.replace(/^\//, ''), this.options.config.centerUrl.replace(/\/?$/, '/'));
         const response = await this.transport(url, {
-            method: 'POST', headers: { authorization: `Bearer ${this.options.config.token}`, 'content-type': 'application/json' },
+            method: 'POST', headers: { authorization: `Bearer ${this.options.config.token}`, 'content-type': 'application/json',
+                ...(pathname === '/node-api/v1/register' && this.options.config.pauseAdmission ? { 'x-dsh-review-admission': 'paused' } : {}) },
             body: JSON.stringify(payload), signal: AbortSignal.timeout(10000),
         });
         const result = await response.json() as { error?: { message?: string } };
@@ -71,6 +73,10 @@ export class ManagedNode {
         this.timer = setInterval(() => { void this.tick().catch(error => this.options.onError?.(error instanceof Error ? error : new Error(String(error)))); }, 2000);
         this.timer.unref?.();
         void this.tick().catch(error => this.options.onError?.(error instanceof Error ? error : new Error(String(error))));
+    }
+
+    completeConfiguration(): void {
+        this.options.config.pauseAdmission = false;
     }
 
     async tick(): Promise<void> {
@@ -100,6 +106,7 @@ export class ManagedNode {
             this.registered = true;
         }
         const poll = await this.request<PollResult>('/node-api/v1/commands/poll', { instanceId: this.instanceId });
+        if (this.stopping) return;
         for (const commandId of poll.cancellations) this.active.get(commandId)?.controller.abort();
         for (const value of poll.commands) {
             const command = validateCommand(value);
@@ -225,6 +232,7 @@ export class ManagedNode {
         this.timer = null;
         for (const value of this.active.values()) value.controller.abort();
         await this.ticking?.catch(() => {});
+        for (const value of this.active.values()) value.controller.abort();
         await this.drain();
         await this.flush().catch(() => {});
     }

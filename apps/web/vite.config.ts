@@ -1,2 +1,2 @@
 import { defineConfig } from 'vite';
-export default defineConfig({ server: { proxy: { '/api': 'http://127.0.0.1:3081' } } });
+export default defineConfig({ base: './', server: { proxy: { '/api': 'http://127.0.0.1:3081' } } });

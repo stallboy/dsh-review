@@ -20,6 +20,7 @@ export type Row = Record<string, any>;
 export class CentralDatabase {
     readonly sql: DatabaseSync;
     readonly clock: () => Date;
+    readonly centralId: string;
     private closed = false;
 
     constructor(readonly dataDir: string, clock: () => Date = () => new Date()) {
@@ -28,6 +29,7 @@ export class CentralDatabase {
         this.sql = new DatabaseSync(path.join(dataDir, 'central.sqlite'));
         this.sql.exec(`
             PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE,
                 review_identity TEXT NOT NULL UNIQUE, salt TEXT NOT NULL, password_hash TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users,
@@ -62,6 +64,11 @@ export class CentralDatabase {
         if (!this.sql.prepare('PRAGMA table_info(commands)').all().some(column => column.name === 'recovery_requested')) {
             this.sql.exec('ALTER TABLE commands ADD COLUMN recovery_requested INTEGER NOT NULL DEFAULT 0');
         }
+        if (!this.sql.prepare('PRAGMA table_info(nodes)').all().some(column => column.name === 'admission_paused')) {
+            this.sql.exec('ALTER TABLE nodes ADD COLUMN admission_paused INTEGER NOT NULL DEFAULT 0');
+        }
+        this.sql.prepare("INSERT OR IGNORE INTO metadata(key,value) VALUES ('central_id',?)").run(randomUUID());
+        this.centralId = (this.sql.prepare("SELECT value FROM metadata WHERE key='central_id'").get() as Row).value;
     }
 
     now(): string { return this.clock().toISOString(); }
@@ -112,6 +119,24 @@ export class CentralDatabase {
         return { nodeId, token };
     }
 
+    initializeOwned(input: { reviewIdentity: string; password: string; node?: { nodeId: string; token: string } }): { nodeId: string; token: string } {
+        textValue(input.reviewIdentity, 'reviewIdentity', 160);
+        textValue(input.password, 'password', 256);
+        return this.transaction(() => {
+            const existing = this.sql.prepare("SELECT * FROM users WHERE username='local'").get() as Row | undefined;
+            if (existing) {
+                if (existing.review_identity !== input.reviewIdentity || !passwordMatches(input.password, existing.salt, existing.password_hash)) {
+                    throw new CentralError(401, 'identity_mismatch', '本机账号凭据或审核身份不一致');
+                }
+            } else this.createUser({ username: 'local', password: input.password, reviewIdentity: input.reviewIdentity });
+            if (input.node) {
+                if (this.nodeIdentity(input.node.token) !== input.node.nodeId) throw new CentralError(401, 'identity_mismatch', '本机节点身份不一致');
+                return input.node;
+            }
+            return this.createNode('本机插件节点');
+        });
+    }
+
     nodeIdentity(token: string): string {
         const row = this.sql.prepare('SELECT node_id FROM nodes WHERE token_hash=? AND enabled=1').get(digest(token)) as Row | undefined;
         if (!row) throw new CentralError(401, 'unauthorized', '节点凭据无效');
@@ -126,22 +151,28 @@ export class CentralDatabase {
         };
         return { ...registration, nodeId, name: row.name, enabled: Boolean(row.enabled), lastSeenAt: row.last_seen_at,
             compatible: registration.protocolVersion === PROTOCOL_VERSION,
-            online: Boolean(row.enabled && row.last_seen_at && this.clock().getTime() - Date.parse(row.last_seen_at) <= 30000) };
+            online: Boolean(row.enabled && !row.admission_paused && row.last_seen_at && this.clock().getTime() - Date.parse(row.last_seen_at) <= 30000) };
     }
 
     listNodes(): NodeRecord[] {
         return (this.sql.prepare('SELECT node_id FROM nodes ORDER BY name,node_id').all() as Row[]).map(row => this.getNode(row.node_id));
     }
 
-    registerNode(nodeId: string, registration: NodeRegistration): NodeRecord {
-        const node = this.getNode(nodeId);
-        if (node.online && node.instanceId !== registration.instanceId) throw new CentralError(409, 'instance_conflict', '相同节点已有活动实例');
-        if (node.instanceId && node.instanceId !== registration.instanceId) {
-            this.sql.prepare("UPDATE commands SET state='recovery_required',updated_at=? WHERE node_id=? AND state IN ('accepted','executing')").run(this.now(), nodeId);
-        }
-        this.sql.prepare('UPDATE nodes SET registration=?,instance_id=?,last_seen_at=? WHERE node_id=?')
-            .run(JSON.stringify(registration), registration.instanceId, this.now(), nodeId);
-        return this.getNode(nodeId);
+    registerNode(nodeId: string, registration: NodeRegistration, admissionPaused = false): NodeRecord {
+        return this.transaction(() => {
+            const node = this.getNode(nodeId);
+            const activeLease = node.enabled && node.lastSeenAt && this.clock().getTime() - Date.parse(node.lastSeenAt) <= 30000;
+            if (activeLease && node.instanceId !== registration.instanceId) throw new CentralError(409, 'instance_conflict', '相同节点已有活动实例');
+            if (node.instanceId && node.instanceId !== registration.instanceId) {
+                this.sql.prepare("UPDATE commands SET state='recovery_required',updated_at=? WHERE node_id=? AND state IN ('accepted','executing')").run(this.now(), nodeId);
+            }
+            const paused = node.instanceId === registration.instanceId
+                ? Number((this.sql.prepare('SELECT admission_paused FROM nodes WHERE node_id=?').get(nodeId) as Row).admission_paused)
+                : admissionPaused ? 1 : 0;
+            this.sql.prepare('UPDATE nodes SET registration=?,instance_id=?,last_seen_at=?,admission_paused=? WHERE node_id=?')
+                .run(JSON.stringify(registration), registration.instanceId, this.now(), paused, nodeId);
+            return this.getNode(nodeId);
+        });
     }
 
     touchNode(nodeId: string, instanceId: string): NodeRecord {
@@ -154,6 +185,35 @@ export class CentralDatabase {
     revokeNode(nodeId: string): void {
         this.getNode(nodeId);
         this.sql.prepare('UPDATE nodes SET enabled=0 WHERE node_id=?').run(nodeId);
+    }
+
+    pendingNodeCommands(nodeId: string): number {
+        return Number((this.sql.prepare("SELECT COUNT(*) AS count FROM commands WHERE node_id=? AND state!='completed'").get(nodeId) as Row).count);
+    }
+
+    quiesceNode(nodeId: string, instanceId: string): void {
+        this.transaction(() => {
+            const node = this.getNode(nodeId);
+            if (!node.enabled || !instanceId || node.instanceId !== instanceId) throw new CentralError(409, 'instance_conflict', '节点实例已失效，请重新核验');
+            if (this.pendingNodeCommands(nodeId)) throw new CentralError(409, 'node_busy', '节点有未决操作，不能暂停接入');
+            this.sql.prepare('UPDATE nodes SET admission_paused=1 WHERE node_id=?').run(nodeId);
+        });
+    }
+
+    activateNode(nodeId: string, instanceId: string): void {
+        this.transaction(() => {
+            this.touchNode(nodeId, instanceId);
+            this.sql.prepare('UPDATE nodes SET admission_paused=0 WHERE node_id=?').run(nodeId);
+        });
+    }
+
+    disconnectNode(nodeId: string, instanceId: string): void {
+        this.transaction(() => {
+            const node = this.getNode(nodeId);
+            if (!node.enabled || !instanceId || node.instanceId !== instanceId) throw new CentralError(409, 'instance_conflict', '节点实例已失效，请重新核验');
+            this.sql.prepare('UPDATE nodes SET last_seen_at=NULL,admission_paused=1 WHERE node_id=?').run(nodeId);
+            this.sql.prepare("UPDATE commands SET state='recovery_required',updated_at=? WHERE node_id=? AND state IN ('accepted','executing')").run(this.now(), nodeId);
+        });
     }
 
     getProject(projectId: string): ProjectRecord {
@@ -180,6 +240,25 @@ export class CentralDatabase {
         this.sql.prepare('INSERT INTO projects(project_id,name,node_id,workspace_id,vcs_type,target) VALUES (?,?,?,?,?,?)')
             .run(id, input.name, input.nodeId, input.workspaceId, workspace.vcsType, workspace.target);
         return this.getProject(id);
+    }
+
+    ensureNodeProject(nodeId: string, input: { instanceId: string; workspaceId: string; name: string; enabled: boolean; restore?: boolean }): ProjectRecord {
+        entityId(input.workspaceId, 'workspaceId');
+        textValue(input.name, 'name', 160);
+        return this.transaction(() => {
+            const node = this.touchNode(nodeId, input.instanceId);
+            if (!node.compatible || !node.workspaces.some(workspace => workspace.workspaceId === input.workspaceId)) {
+                throw new CentralError(409, 'workspace_unavailable', '节点没有可绑定的工作副本');
+            }
+            const existing = this.sql.prepare('SELECT project_id FROM projects WHERE node_id=? AND workspace_id=?').get(nodeId, input.workspaceId) as Row | undefined;
+            const project = existing ? this.getProject(existing.project_id) : undefined;
+            if (project && input.restore) return project;
+            if (project && project.name === input.name && project.enabled === input.enabled) return project;
+            if (this.pendingNodeCommands(nodeId)) throw new CentralError(409, 'project_busy', '节点有未决操作，不能更改项目接入');
+            if (project) return this.updateProject(project.projectId, { name: input.name, enabled: input.enabled });
+            if (!input.enabled) throw new CentralError(409, 'workspace_unavailable', '首次接入的工作副本必须启用');
+            return this.bindProject({ nodeId, workspaceId: input.workspaceId, name: input.name });
+        });
     }
 
     updateProject(projectId: string, input: { name?: string; enabled?: boolean }): ProjectRecord {

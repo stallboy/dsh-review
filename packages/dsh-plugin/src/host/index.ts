@@ -2,9 +2,12 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from './api.js';
-import { loadSettings, saveSettings } from './settings.js';
+import { dshHome, loadSettings, saveSettings } from './settings.js';
 import type { AppSettings } from './types.js';
 import { loadManagedNode, type ManagedHandle } from '../managed/managed-config.js';
+import { ConnectionController, CONNECTION_PREFIX } from '../connection/controller.js';
+import { discoverCandidates } from '../connection/config.js';
+import { CENTRAL_PREFIX } from '../connection/gateway.js';
 
 /** Minimal shape of the host-side Cordis context this plugin uses. */
 export interface HostLogger {
@@ -33,7 +36,7 @@ export interface WebServerService {
 
 export interface HostContext {
   webServer: WebServerService;
-  effect(callback: () => void | (() => void), label?: string): void;
+  effect(callback: () => void | (() => void | Promise<void>), label?: string): void;
   inject(services: string[], callback: (ctx: HostContext) => void): void;
   get(name: string): unknown;
   logger?: HostLogger;
@@ -269,6 +272,7 @@ export function apply(ctx: HostContext): void {
   let managed: ManagedHandle | null = null;
   let disposed = false;
   let initError: Error | undefined;
+  let localWrites = 0;
 
   const resolveCredential = async (reference: string): Promise<string | undefined> => {
     try {
@@ -282,7 +286,28 @@ export function apply(ctx: HostContext): void {
     }
   };
 
+  const connection = new ConnectionController({
+    directory: path.join(dshHome(), 'dsh-code-review'),
+    resolveCredential,
+    beforeConfigure: () => {
+      if (localWrites || api?.jobManager.list().some(job => job.status === 'running')) throw new Error('本地评审仍有操作执行中，请先处理后启用中央连接');
+      api?.stopScheduler();
+    },
+    candidates: async sessionId => {
+      const registry = ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined;
+      const sessions = ctx.get('sessions') as SessionsLike | undefined;
+      const current = sessionId ? sessions?.get?.(sessionId)?.header?.cwd : undefined;
+      return discoverCandidates([
+        ...(registry?.list?.() ?? []).map(workspace => ({ root: workspace.path })),
+        ...(current ? [{ root: current, current: true }] : []),
+      ]);
+    },
+  });
+
   const ready = (async () => {
+    await connection.init();
+    if (disposed) { await connection.stop(); return; }
+    if (connection.configured) return;
     managed = await loadManagedNode(resolveCredential, error => logger?.warn(`dsh-code-review: 中央连接异常：${error.message}`));
     if (disposed) { await managed?.stop(); return; }
     if (managed) {
@@ -336,10 +361,11 @@ export function apply(ctx: HostContext): void {
     path: API_PREFIX,
     handler: async (req, res) => {
       await ready;
-      if (managed) {
+      if (managed || connection.configured) {
         const endpoint = new URL(req.url ?? '/', 'http://localhost').pathname;
         if (req.method === 'GET' && [API_PREFIX, `${API_PREFIX}/`, `${API_PREFIX}/health`].includes(endpoint)) {
-          writeJson(res, 200, { managed: { centerUrl: managed.centerUrl, nodeId: managed.nodeId }, configured: true, counts: {} });
+          const state = managed ?? await connection.status();
+          writeJson(res, 200, { managed: { centerUrl: state.centerUrl, nodeId: state.nodeId }, configured: true, counts: {} });
         } else writeJson(res, 409, { error: { code: 'managed_mode', message: '当前节点由中央工作台管理，请通过中央服务操作' } });
         return;
       }
@@ -348,6 +374,7 @@ export function apply(ctx: HostContext): void {
         return;
       }
       try {
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method ?? 'GET')) localWrites++;
         const handled = await api.handle(req, res);
         if (!handled) writeJson(res, 404, { error: { code: 'not_found', message: 'unknown endpoint' } });
       } catch (error) {
@@ -356,16 +383,25 @@ export function apply(ctx: HostContext): void {
         } else {
           res.end();
         }
+      } finally {
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method ?? 'GET')) localWrites--;
       }
     },
   });
+  const offConnection = ctx.webServer.register({ kind: 'prefix', path: CONNECTION_PREFIX,
+    handler: async (req, res) => { await ready; await connection.handle(req, res); } });
+  const offCentral = ctx.webServer.register({ kind: 'prefix', path: CENTRAL_PREFIX,
+    handler: async (req, res) => { await ready; await connection.handle(req, res); } });
   ctx.effect(
-    () => () => {
+    () => async () => {
       disposed = true;
       // 插件卸载/重载时停止定时审查调度，避免回调泄漏。
       api?.stopScheduler();
-      void managed?.stop().catch(error => logger?.error(`dsh-code-review: 节点停止失败：${String(error)}`));
       off();
+      offConnection();
+      offCentral();
+      const results = await Promise.allSettled([connection.stop(), managed?.stop()]);
+      for (const result of results) if (result.status === 'rejected') logger?.error(`dsh-code-review: 节点停止失败：${String(result.reason)}`);
     },
     'dsh-code-review: http routes',
   );

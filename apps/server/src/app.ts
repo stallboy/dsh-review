@@ -2,7 +2,7 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import { readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ProtocolError, record, textValue, validateRegistration, type JsonRecord, type QueryKind } from '@dsh-review/protocol';
+import { PROTOCOL_VERSION, ProtocolError, entityId, record, textValue, validateRegistration, type JsonRecord, type QueryKind } from '@dsh-review/protocol';
 import { CentralDatabase, CentralError, type User } from './database.js';
 import { Commands } from './commands.js';
 import { Snapshots } from './snapshots.js';
@@ -48,7 +48,7 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
         if (pathname.startsWith('/node-api/')) {
             const token = /^Bearer ([a-zA-Z0-9_-]+)$/.exec(String(req.headers.authorization ?? ''))?.[1] ?? '';
             req.nodeId = database.nodeIdentity(token);
-        } else if (pathname.startsWith('/api/v1/') && pathname !== '/api/v1/auth/login') {
+        } else if (pathname.startsWith('/api/v1/') && !['/api/v1/auth/login', '/api/v1/info'].includes(pathname)) {
             const session = database.session(sessionToken(req));
             req.actor = session.user;
             req.csrfToken = session.csrfToken;
@@ -68,6 +68,7 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
     });
 
     app.get('/health', async () => ({ status: 'ok', service: 'dsh-review-central', protocolVersion: 1 }));
+    app.get('/api/v1/info', async () => ({ centralId: database.centralId, protocolVersion: PROTOCOL_VERSION }));
     app.post('/api/v1/auth/login', async (req, reply) => {
         const input = body(req);
         const result = database.login(textValue(input.username, 'username', 80), textValue(input.password, 'password', 256));
@@ -125,7 +126,34 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
         });
     }
 
-    app.post('/node-api/v1/register', async req => ({ node: database.registerNode((req as RequestContext).nodeId!, validateRegistration(req.body)) }));
+    app.post('/node-api/v1/register', async req => ({ node: database.registerNode((req as RequestContext).nodeId!, validateRegistration(req.body), req.headers['x-dsh-review-admission'] === 'paused') }));
+    app.post('/node-api/v1/status', async req => {
+        const id = (req as RequestContext).nodeId!;
+        return { centralId: database.centralId, nodeId: id, projects: database.listProjects(id), pending: database.pendingNodeCommands(id) };
+    });
+    app.post('/node-api/v1/projects/ensure', async req => {
+        const input = body(req);
+        if (Object.keys(input).some(key => !['instanceId', 'workspaceId', 'name', 'enabled', 'restore'].includes(key)) || typeof input.enabled !== 'boolean'
+            || (input.restore !== undefined && typeof input.restore !== 'boolean')) {
+            throw new CentralError(422, 'bad_request', '项目接入参数无效');
+        }
+        return { project: database.ensureNodeProject((req as RequestContext).nodeId!, {
+            instanceId: entityId(input.instanceId, 'instanceId'), workspaceId: entityId(input.workspaceId, 'workspaceId'),
+            name: textValue(input.name, 'name', 160), enabled: input.enabled, restore: input.restore as boolean | undefined,
+        }) };
+    });
+    app.post('/node-api/v1/quiesce', async req => {
+        database.quiesceNode((req as RequestContext).nodeId!, entityId(body(req).instanceId, 'instanceId'));
+        return { ok: true };
+    });
+    app.post('/node-api/v1/activate', async req => {
+        database.activateNode((req as RequestContext).nodeId!, entityId(body(req).instanceId, 'instanceId'));
+        return { ok: true };
+    });
+    app.post('/node-api/v1/disconnect', async req => {
+        database.disconnectNode((req as RequestContext).nodeId!, entityId(body(req).instanceId, 'instanceId'));
+        return { ok: true };
+    });
     const identify = (req: FastifyRequest): string => {
         const id = (req as RequestContext).nodeId!;
         database.touchNode(id, textValue(body(req).instanceId, 'instanceId'));

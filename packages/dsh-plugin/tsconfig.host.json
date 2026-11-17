@@ -19,6 +19,7 @@
     "include": [
         "src/index.ts",
         "src/host/**/*.ts",
-        "src/managed/**/*.ts"
+        "src/managed/**/*.ts",
+        "src/connection/**/*.ts"
     ]
 }

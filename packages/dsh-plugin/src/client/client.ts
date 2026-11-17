@@ -43,6 +43,33 @@
     runner: 'dsh' | 'manual' | 'external'; dshCommand: string; externalCommand: string;
     autoFixOnFailure: boolean; gateTimeoutMs: number; syncBeforeApprove: boolean;
   }
+    interface ConnectionDraft {
+        mode: 'local' | 'external';
+        centerUrl: string;
+        nodeId: string;
+        token: string;
+        reviewIdentity: string;
+    }
+    interface ConnectionStatus {
+        controlToken: string;
+        configured: boolean;
+        enabled: boolean;
+        mode: 'local' | 'external';
+        centerUrl: string;
+        centralId: string;
+        nodeId: string;
+        reviewIdentity: string;
+        phase: 'stopped' | 'starting' | 'ready' | 'error';
+        nodeOnline: boolean;
+        error?: string;
+        generation: number;
+        candidates: { id: string; label: string; root: string; vcsType?: string; target?: string; error?: string; current: boolean }[];
+        projects: { workspaceId: string; root: string; label: string; enabled: boolean; projectId?: string; vcsType: string; target: string }[];
+        logs: string[];
+        hasCredentials: boolean;
+        localAvailable: boolean;
+        legacy?: boolean;
+    }
   interface Health {
     managed?: { centerUrl: string; nodeId: string };
     app: string; version: string; configured: boolean; repoRoot: string; owner: string;
@@ -143,7 +170,7 @@
     dispose(): void;
   }
 
-  function createApi(sessionId: string): ApiClient {
+  function createApi(sessionId: string, apiRoot = API_ROOT, controlToken?: () => string): ApiClient {
     const inflight = new Set<AbortController>();
     let disposed = false;
     const request = async <T>(path: string, method: string, body: unknown): Promise<T> => {
@@ -152,13 +179,16 @@
       inflight.add(controller);
       try {
         const base = typeof document === 'undefined' ? '/' : document.baseURI;
-        const url = new URL(`${API_ROOT}${path}`, base);
+        const url = new URL(`${apiRoot}${path}`, base);
         if (sessionId) url.searchParams.set('sessionId', sessionId);
         const response = await fetch(url.toString(), {
           method,
           cache: 'no-store',
           signal: controller.signal,
-          headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+          headers: {
+            ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+            ...(method !== 'GET' && controlToken ? { 'x-dsh-review-control': controlToken() } : {}),
+          },
           body: body === undefined ? undefined : JSON.stringify(body),
         });
         const text = await response.text();
@@ -367,9 +397,14 @@
 .dcr-sub{font-size:12px;color:var(--dsw-alias-label-secondary);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dcr-grow{flex:1;min-width:0}
 .dcr-body{flex:1;min-height:0;overflow:auto;padding:18px;scrollbar-gutter:stable}
+.dcr-central-nav{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:10px 18px;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}
+.dcr-central-nav button[aria-selected="true"]{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}
+.dcr-central-frame{display:block;flex:1;width:100%;min-height:0;border:0;background:var(--dsw-alias-bg-base)}
+.dcr-central-path{overflow-wrap:anywhere;white-space:normal}
 .dcr-wrap{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
 .dcr-btn{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-radius:6px;padding:5px 11px;font:inherit;cursor:pointer;line-height:18px;white-space:nowrap}
 .dcr-btn:hover{border-color:var(--dsw-alias-brand-primary)}
+.dcr-btn[aria-pressed="true"]{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}
 .dcr-btn:disabled{opacity:.45;cursor:not-allowed}
 .dcr-btn.p{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
 .dcr-btn.d{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
@@ -606,6 +641,195 @@
         blocks.push(h('p', { key: nextKey() }, ...inlineNodes(paragraph.join(' '), nextKey())));
       }
       return h('div', { className: `dcr-rt ${props.className ?? ''}`.trim() }, ...blocks);
+    }
+
+    function ReviewPanel(props: { t: (key: string) => string; sessionId: string }) {
+        const [tab, setTab] = useState<'connection' | 'projects' | 'central' | 'local'>('connection');
+        const [status, setStatus] = useState<ConnectionStatus | null>(null);
+        const [draft, setDraft] = useState<ConnectionDraft>({ mode: 'local', centerUrl: '', nodeId: '', token: '', reviewIdentity: '' });
+        const [error, setError] = useState('');
+        const [loadError, setLoadError] = useState('');
+        const [notice, setNotice] = useState('');
+        const [busy, setBusy] = useState(false);
+        const [controlReady, setControlReady] = useState(false);
+        const [framePath, setFramePath] = useState('/dsh-code-review/central/');
+        const initialized = useRef(false);
+        const edited = useRef(false);
+        const scopeRef = useRef<{ api: ApiClient; active: boolean; loading: boolean; token: string } | null>(null);
+
+        const refresh = useCallback(async (): Promise<void> => {
+            const scope = scopeRef.current;
+            if (!scope?.active || scope.loading) return;
+            scope.loading = true;
+            try {
+                const value = await scope.api.get<ConnectionStatus>('');
+                if (!scope.active) return;
+                scope.token = value.controlToken;
+                setStatus(value);
+                setControlReady(true);
+                setLoadError('');
+                if (!initialized.current) {
+                    initialized.current = true;
+                    if (!edited.current) setDraft({ mode: value.mode, centerUrl: value.centerUrl, nodeId: value.nodeId, token: '', reviewIdentity: value.reviewIdentity });
+                }
+            } catch (reason) {
+                if (scope.active) setLoadError(reason instanceof Error ? reason.message : String(reason));
+            } finally {
+                scope.loading = false;
+            }
+        }, []);
+
+        useEffect(() => {
+            const scope = { api: null as unknown as ApiClient, active: true, loading: false, token: '' };
+            scope.api = createApi(props.sessionId, '/dsh-code-review/connection', () => scope.token);
+            scopeRef.current = scope;
+            setBusy(false);
+            setControlReady(false);
+            void refresh();
+            const timer = setInterval(() => { void refresh(); }, 3000);
+            return () => {
+                scope.active = false;
+                clearInterval(timer);
+                scope.api.dispose();
+                if (scopeRef.current === scope) scopeRef.current = null;
+            };
+        }, [props.sessionId, refresh]);
+
+        const edit = (change: Partial<ConnectionDraft>): void => {
+            edited.current = true;
+            setDraft(previous => ({ ...previous, ...change }));
+        };
+        const write = async (path: string, body: unknown, message = '', clearToken = false): Promise<void> => {
+            const scope = scopeRef.current;
+            if (!scope?.active || !scope.token || busy || status?.legacy) return;
+            setBusy(true);
+            setError('');
+            setNotice('');
+            try {
+                await scope.api.post(path, body);
+                if (!scope.active) return;
+                if (clearToken) setDraft(previous => ({ ...previous, token: '' }));
+                setNotice(message);
+                await refresh();
+            } catch (reason) {
+                if (scope.active) setError(reason instanceof Error ? reason.message : String(reason));
+            } finally {
+                if (scope.active) setBusy(false);
+            }
+        };
+        const credentials = {
+            centerUrl: draft.centerUrl.trim(),
+            ...(draft.nodeId.trim() ? { nodeId: draft.nodeId.trim() } : {}),
+            ...(draft.token ? { token: draft.token } : {}),
+        };
+        const apply = (): void => {
+            void write('/apply', {
+                mode: draft.mode,
+                ...(draft.mode === 'external' ? credentials : {}),
+                reviewIdentity: draft.reviewIdentity.trim(),
+            }, '', true);
+        };
+        const openProject = (projectId: string, event: { preventDefault(): void }): void => {
+            event.preventDefault();
+            setFramePath(`/dsh-code-review/central/projects/${encodeURIComponent(projectId)}`);
+            setTab('central');
+        };
+        const projectLink = (projectId: string, label: string): any => h('a', {
+            className: 'dcr-btn',
+            href: `/dsh-code-review/central/projects/${encodeURIComponent(projectId)}`,
+            onClick: (event: { preventDefault(): void }) => openProject(projectId, event),
+        }, label);
+        const currentCandidate = status?.candidates.find(candidate => candidate.current);
+        const currentProject = status?.projects.find(project => project.root === currentCandidate?.root);
+        const disabled = busy || !status || !controlReady || Boolean(status.legacy);
+        const field = (label: string, key: 'centerUrl' | 'nodeId' | 'token' | 'reviewIdentity'): any => h('label', { className: 'dcr-field' },
+            h('span', null, label),
+            h('input', {
+                className: 'dcr-input', 'aria-label': label,
+                type: key === 'token' ? 'password' : 'text',
+                autoComplete: key === 'token' ? 'new-password' : 'off',
+                value: draft[key], disabled: busy,
+                onChange: (event: { target: { value: string } }) => edit({ [key]: event.target.value }),
+            }),
+        );
+        let content: any;
+        if (tab === 'local') content = !status
+            ? h('div', { className: 'dcr-empty' }, '正在检查中央连接状态…')
+            : status.configured || status.legacy
+                ? h('div', { className: 'dcr-body' }, h('section', { className: 'dcr-card' },
+                    h('h2', null, '此节点由中央管理'),
+                    h('p', null, '请通过中央工作台查看项目并执行评审。已保存中央配置时，本地评审写入保持停用。'),
+                    h('button', { className: 'dcr-btn p', onClick: () => setTab('central') }, '进入中央工作台'),
+                ))
+                : h(App, props);
+        else if (tab === 'central') content = status?.phase === 'ready'
+            ? h('iframe', { className: 'dcr-central-frame', title: '中央工作台', src: framePath, key: `${status.generation}:${framePath}` })
+            : h('div', { className: 'dcr-empty' }, '中央尚未就绪，请在中央连接中应用配置或重试。');
+        else if (tab === 'projects') content = h('div', { className: 'dcr-body' }, h('div', { className: 'dcr-wrap' },
+            h('div', { className: 'dcr-card' }, h('h2', null, '选择接入项目'), h('p', { className: 'dcr-muted' }, '按工作副本目录独立接入；接入后不会自动发起审查。')),
+            ...(status?.candidates ?? []).map(candidate => {
+                const project = status?.projects.find(value => value.root === candidate.root);
+                return h('section', { className: 'dcr-card', key: candidate.id },
+                    h('div', { className: 'dcr-row' }, h('strong', { className: 'dcr-grow' }, candidate.label), candidate.current ? h('span', { className: 'dcr-chip' }, '当前项目') : null),
+                    h('p', { className: 'dcr-mono dcr-central-path' }, candidate.root),
+                    h('p', { className: 'dcr-muted' }, `${candidate.vcsType?.toUpperCase() ?? '未识别 VCS'} · ${candidate.target ?? '目标未确定'}`),
+                    candidate.error ? h('div', { className: 'dcr-banner err' }, candidate.error) : null,
+                    project ? h('span', { className: 'dcr-chip' }, project.enabled ? '已接入' : '已停用')
+                        : h('button', { className: 'dcr-btn p', disabled: disabled || Boolean(candidate.error) || status?.phase !== 'ready', onClick: () => { void write('/projects', { candidateId: candidate.id, enabled: true }); } }, '接入项目'),
+                );
+            }),
+            !status?.candidates.length ? h('div', { className: 'dcr-empty' }, '未发现可接入的工作副本。请打开项目会话后刷新。') : null,
+            h('h2', null, '已保存的项目'),
+            ...(status?.projects ?? []).map(project => h('section', { className: 'dcr-card', key: project.workspaceId },
+                h('div', { className: 'dcr-row' }, h('strong', { className: 'dcr-grow' }, project.label), h('span', { className: 'dcr-chip' }, project.enabled ? '已启用' : '已停用')),
+                h('p', { className: 'dcr-mono dcr-central-path' }, project.root),
+                h('p', { className: 'dcr-muted' }, `${project.vcsType.toUpperCase()} · ${project.target}`),
+                h('div', { className: 'dcr-row' },
+                    h('button', { className: 'dcr-btn', disabled, onClick: () => { void write('/projects', { workspaceId: project.workspaceId, enabled: !project.enabled }); } }, project.enabled ? '停用项目' : '启用项目'),
+                    project.projectId ? projectLink(project.projectId, '打开项目') : h('span', { className: 'dcr-muted' }, '等待中央绑定'),
+                ),
+            )),
+        ));
+        else content = h('div', { className: 'dcr-body' }, h('div', { className: 'dcr-wrap' },
+            h('section', { className: 'dcr-card' },
+                h('div', { className: 'dcr-row' }, h('h2', { className: 'dcr-grow' }, '中央连接'),
+                    h('span', { className: 'dcr-chip' }, status ? ({ stopped: '已停止', starting: '启动中', ready: '服务就绪', error: '连接故障' }[status.phase]) : '加载中'),
+                    status ? h('span', { className: 'dcr-chip' }, status.nodeOnline ? '节点在线' : '节点离线') : null),
+                h('p', { className: 'dcr-muted' }, '此连接由整个 DSH 实例共用。编辑设置后，点击应用使其生效。'),
+                h('div', { className: 'dcr-row' },
+                    h('button', { className: 'dcr-btn', 'aria-pressed': draft.mode === 'local', disabled: busy, onClick: () => edit({ mode: 'local' }) }, '本机托管'),
+                    h('button', { className: 'dcr-btn', 'aria-pressed': draft.mode === 'external', disabled: busy, onClick: () => edit({ mode: 'external' }) }, '连接已有中央'),
+                ),
+                draft.mode === 'external' ? h('div', { className: 'dcr-list', style: { marginTop: 14 } },
+                    field('中央地址', 'centerUrl'), field('节点 ID', 'nodeId'), field('节点 Token', 'token'),
+                    h('p', { className: 'dcr-muted' }, status?.hasCredentials ? '已保存节点凭据。Token 留空时保留已有凭据。' : '填写中央管理员提供的节点 ID 与 Token。'),
+                ) : h('p', { className: 'dcr-muted' }, status?.localAvailable === false ? '当前插件包未包含中央服务，请安装本机整合包或连接已有中央。' : '应用后启动本机中央，关闭页面不会停止服务。'),
+                field('审核身份', 'reviewIdentity'),
+                h('div', { className: 'dcr-row', style: { marginTop: 14 } },
+                    draft.mode === 'external' ? h('button', { className: 'dcr-btn', disabled: disabled || !draft.centerUrl.trim(), onClick: () => { void write('/test', credentials, '连接测试通过，配置尚未应用。'); } }, '测试连接') : null,
+                    h('button', { className: 'dcr-btn p', disabled: disabled || (draft.mode === 'local' ? status?.localAvailable === false || !draft.reviewIdentity.trim() : !draft.centerUrl.trim()), onClick: apply }, draft.mode === 'local' ? '应用并启动' : '应用并连接'),
+                    h('button', { className: 'dcr-btn d', disabled: disabled || !status?.enabled, onClick: () => { void write('/stop', {}); } }, '停止连接'),
+                    status?.configured && (status.phase === 'error' || status.phase === 'stopped') ? h('button', { className: 'dcr-btn', disabled, onClick: () => { void write('/apply', { mode: status.mode, reviewIdentity: status.reviewIdentity, ...(status.mode === 'external' ? { centerUrl: status.centerUrl, nodeId: status.nodeId } : {}) }); } }, '重试已保存连接') : null,
+                ),
+            ),
+            status ? h('section', { className: 'dcr-card' }, h('h3', null, '已保存连接'),
+                h('p', { className: 'dcr-central-path' }, `${status.mode === 'local' ? '本机托管' : '已有中央'} · ${status.enabled ? '已启用' : '已停用'} · ${status.centerUrl || '地址待就绪'}`),
+                h('p', { className: 'dcr-small dcr-mono dcr-central-path' }, `中央 ${status.centralId || '未核验'} · 节点 ${status.nodeId || '未分配'}`),
+            ) : null,
+            status?.logs.length ? h('details', { className: 'dcr-card' }, h('summary', null, '连接日志'), h('pre', { className: 'dcr-log' }, status.logs.join('\n'))) : null,
+        ));
+        return h('div', { className: 'dcr', [VIEW_ATTR]: 'code-review' },
+            h('nav', { className: 'dcr-central-nav', 'aria-label': '评审入口' },
+                ...([['connection', '中央连接'], ['projects', '项目接入'], ['central', '中央工作台'], ['local', '本地评审']] as const).map(([key, label]) => h('button', { className: 'dcr-btn', key, 'aria-selected': tab === key, onClick: () => { if (key === 'central') setFramePath('/dsh-code-review/central/'); setTab(key); } }, label)),
+                h('span', { className: 'dcr-grow' }),
+                currentProject?.projectId ? projectLink(currentProject.projectId, '打开当前项目') : currentCandidate ? h('button', { className: 'dcr-btn', onClick: () => setTab('projects') }, '当前项目') : null,
+                h('button', { className: 'dcr-btn g', disabled: busy, onClick: () => { void refresh(); } }, '刷新连接'),
+            ),
+            error || loadError || status?.error ? h('div', { className: 'dcr-banner err', role: 'alert' }, error || loadError || status?.error) : null,
+            status?.legacy ? h('div', { className: 'dcr-banner info', role: 'status' }, '当前正在使用旧托管配置（managed-node.json）。请先在原中央处理未决任务，再停用旧托管配置并重启插件，然后设置新中央连接。') : null,
+            notice ? h('div', { className: 'dcr-banner info', role: 'status' }, notice) : null,
+            content,
+        );
     }
 
     function App(props: { t: (key: string) => string; sessionId: string }) {
@@ -2086,7 +2310,7 @@
         ctx.slots.inject('conversation.view', () => {
           const off = ctx.slots.register(
             { name: 'conversation.view', id: 'code-review', order: 40, label: () => t('nav'), locale: NS, inject: () => ({ t }) },
-            (props: any) => h(App, {
+            (props: any) => h(ReviewPanel, {
               t,
               sessionId: typeof props?.sessionId === 'string' ? props.sessionId : '',
             }),
