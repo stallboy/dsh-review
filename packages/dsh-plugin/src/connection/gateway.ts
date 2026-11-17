@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 export const CENTRAL_PREFIX = '/dsh-code-review/central';
@@ -20,7 +20,12 @@ export class CentralGateway {
     private identity = '';
     private generation = 0;
     private readonly sessions = new Map<string, { cookie: string; usedAt: number }>();
+    private readonly cookieName: string;
     private login?: () => Promise<string>;
+
+    constructor(namespace = randomBytes(32).toString('base64url')) {
+        this.cookieName = `dsh_review_gateway_${createHash('sha256').update(namespace).digest('hex')}`;
+    }
 
     connect(centerUrl: string, identity: string, login?: () => Promise<string>): void {
         if (this.target !== centerUrl || this.identity !== identity) { this.sessions.clear(); this.generation++; }
@@ -56,7 +61,7 @@ export class CentralGateway {
         }
         const now = Date.now();
         for (const [id, session] of this.sessions) if (now - session.usedAt > 12 * 60 * 60 * 1000) this.sessions.delete(id);
-        let id = /(?:^|;\s*)dsh_review_gateway=([a-zA-Z0-9_-]+)/.exec(String(req.headers.cookie ?? ''))?.[1];
+        let id = new RegExp(`(?:^|;\\s*)${this.cookieName}=([a-zA-Z0-9_-]+)`).exec(String(req.headers.cookie ?? ''))?.[1];
         let session = id ? this.sessions.get(id) : undefined;
         if (!session) {
             if (this.sessions.size >= 256) this.sessions.delete(this.sessions.keys().next().value!);
@@ -64,7 +69,7 @@ export class CentralGateway {
             session = { cookie: this.login ? await this.login() : '', usedAt: now };
             checkCurrent();
             this.sessions.set(id, session);
-            res.setHeader('set-cookie', `dsh_review_gateway=${id}; HttpOnly; SameSite=Strict; Path=${CENTRAL_PREFIX}/${(req.socket as { encrypted?: boolean }).encrypted ? '; Secure' : ''}`);
+            res.setHeader('set-cookie', `${this.cookieName}=${id}; HttpOnly; SameSite=Strict; Path=${CENTRAL_PREFIX}/${(req.socket as { encrypted?: boolean }).encrypted ? '; Secure' : ''}`);
         }
         session.usedAt = now;
         const headers: Record<string, string> = {};

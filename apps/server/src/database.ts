@@ -158,11 +158,15 @@ export class CentralDatabase {
         return (this.sql.prepare('SELECT node_id FROM nodes ORDER BY name,node_id').all() as Row[]).map(row => this.getNode(row.node_id));
     }
 
+    hasActiveNodeInstance(nodeId: string): boolean {
+        const node = this.getNode(nodeId);
+        return Boolean(node.enabled && node.lastSeenAt && this.clock().getTime() - Date.parse(node.lastSeenAt) <= 30000);
+    }
+
     registerNode(nodeId: string, registration: NodeRegistration, admissionPaused = false): NodeRecord {
         return this.transaction(() => {
             const node = this.getNode(nodeId);
-            const activeLease = node.enabled && node.lastSeenAt && this.clock().getTime() - Date.parse(node.lastSeenAt) <= 30000;
-            if (activeLease && node.instanceId !== registration.instanceId) throw new CentralError(409, 'instance_conflict', '相同节点已有活动实例');
+            if (this.hasActiveNodeInstance(nodeId) && node.instanceId !== registration.instanceId) throw new CentralError(409, 'instance_conflict', '相同节点已有活动实例');
             if (node.instanceId && node.instanceId !== registration.instanceId) {
                 this.sql.prepare("UPDATE commands SET state='recovery_required',updated_at=? WHERE node_id=? AND state IN ('accepted','executing')").run(this.now(), nodeId);
             }
@@ -247,11 +251,11 @@ export class CentralDatabase {
         textValue(input.name, 'name', 160);
         return this.transaction(() => {
             const node = this.touchNode(nodeId, input.instanceId);
-            if (!node.compatible || !node.workspaces.some(workspace => workspace.workspaceId === input.workspaceId)) {
-                throw new CentralError(409, 'workspace_unavailable', '节点没有可绑定的工作副本');
-            }
             const existing = this.sql.prepare('SELECT project_id FROM projects WHERE node_id=? AND workspace_id=?').get(nodeId, input.workspaceId) as Row | undefined;
             const project = existing ? this.getProject(existing.project_id) : undefined;
+            if (!node.compatible || (!node.workspaces.some(workspace => workspace.workspaceId === input.workspaceId) && (!project || input.enabled))) {
+                throw new CentralError(409, 'workspace_unavailable', '节点没有可绑定的工作副本');
+            }
             if (project && input.restore) return project;
             if (project && project.name === input.name && project.enabled === input.enabled) return project;
             if (this.pendingNodeCommands(nodeId)) throw new CentralError(409, 'project_busy', '节点有未决操作，不能更改项目接入');

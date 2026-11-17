@@ -762,9 +762,17 @@
                     h('button', { className: 'dcr-btn p', onClick: () => setTab('central') }, '进入中央工作台'),
                 ))
                 : h(App, props);
-        else if (tab === 'central') content = status?.phase === 'ready'
-            ? h('iframe', { className: 'dcr-central-frame', title: '中央工作台', src: framePath, key: `${status.generation}:${framePath}` })
-            : h('div', { className: 'dcr-empty' }, '中央尚未就绪，请在中央连接中应用配置或重试。');
+        else if (tab === 'central') content = status?.legacy
+            ? status.centerUrl
+                ? h('div', { className: 'dcr-body' }, h('section', { className: 'dcr-card' },
+                    h('h2', null, '既有中央工作台'),
+                    h('p', null, '请在已有中央处理未决任务，再停用旧托管配置并重启插件。'),
+                    h('a', { className: 'dcr-btn p', href: status.centerUrl, target: '_blank', rel: 'noopener noreferrer' }, '打开已有中央工作台'),
+                ))
+                : h('div', { className: 'dcr-empty' }, '旧托管配置中的中央地址无效，请检查 managed-node.json。')
+            : status?.phase === 'ready'
+                ? h('iframe', { className: 'dcr-central-frame', title: '中央工作台', src: framePath, key: `${status.generation}:${framePath}` })
+                : h('div', { className: 'dcr-empty' }, '中央尚未就绪，请在中央连接中应用配置或重试。');
         else if (tab === 'projects') content = h('div', { className: 'dcr-body' }, h('div', { className: 'dcr-wrap' },
             h('div', { className: 'dcr-card' }, h('h2', null, '选择接入项目'), h('p', { className: 'dcr-muted' }, '按工作副本目录独立接入；接入后不会自动发起审查。')),
             ...(status?.candidates ?? []).map(candidate => {

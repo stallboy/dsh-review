@@ -16,6 +16,8 @@ export class LocalCentralProcess {
     constructor(readonly entry: URL = new URL('../../central-runtime/server/dist/owned.js', import.meta.url),
         private readonly onExit: () => void = () => {}) {}
 
+    get running(): boolean { return this.child !== null; }
+
     async available(): Promise<boolean> {
         try { await access(this.entry); return true; } catch { return false; }
     }

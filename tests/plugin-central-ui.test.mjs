@@ -358,6 +358,38 @@ test('旧托管节点诊断提示先处理任务并停用后重启，禁止覆�
     panel.unmount();
 });
 
+test('旧托管配置保留既有中央外链，本地评审指引可到达同一入口', async () => {
+    const panel = createPanel({ ...initialStatus(), legacy: true, configured: false, enabled: false, phase: 'stopped', centerUrl: 'https://legacy-central.example' });
+    await panel.flush();
+    for (const label of ['中央工作台', '本地评审']) {
+        panel.button(label).props.onClick();
+        await panel.flush();
+        if (label === '本地评审') {
+            panel.button('进入中央工作台').props.onClick();
+            await panel.flush();
+        }
+        const link = panel.nodes().find(node => node.type === 'a' && node.children.join('') === '打开已有中央工作台');
+        assert.ok(link, '旧托管配置缺少既有中央入口');
+        assert.equal(link.props.href, 'https://legacy-central.example');
+        assert.equal(link.props.target, '_blank');
+        assert.equal(link.props.rel, 'noopener noreferrer');
+        assert.equal(panel.nodes().some(node => node.type === 'iframe'), false);
+    }
+    assert.equal(panel.requests.some(request => request.url.pathname.startsWith('/dsh-code-review/api')), false);
+    assert.equal(panel.requests.some(request => request.init.method === 'POST'), false);
+    panel.unmount();
+});
+
+test('旧托管中央地址无效时明确提示且不生成外链或网关 iframe', async () => {
+    const panel = createPanel({ ...initialStatus(), legacy: true, configured: false, enabled: false, phase: 'stopped', centerUrl: '' });
+    await panel.flush();
+    panel.button('中央工作台').props.onClick();
+    await panel.flush();
+    assert.match(panel.text(), /中央地址无效/);
+    assert.equal(panel.nodes().some(node => node.type === 'a' || node.type === 'iframe'), false);
+    panel.unmount();
+});
+
 test('中央 Web API 同时支持根路径和内嵌子路径并保留 CSRF', async () => {
     const originalDocument = globalThis.document;
     const originalFetch = globalThis.fetch;

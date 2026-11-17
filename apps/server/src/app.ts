@@ -129,7 +129,8 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
     app.post('/node-api/v1/register', async req => ({ node: database.registerNode((req as RequestContext).nodeId!, validateRegistration(req.body), req.headers['x-dsh-review-admission'] === 'paused') }));
     app.post('/node-api/v1/status', async req => {
         const id = (req as RequestContext).nodeId!;
-        return { centralId: database.centralId, nodeId: id, projects: database.listProjects(id), pending: database.pendingNodeCommands(id) };
+        return { centralId: database.centralId, nodeId: id, instanceId: database.getNode(id).instanceId,
+            activeInstance: database.hasActiveNodeInstance(id), projects: database.listProjects(id), pending: database.pendingNodeCommands(id) };
     });
     app.post('/node-api/v1/projects/ensure', async req => {
         const input = body(req);

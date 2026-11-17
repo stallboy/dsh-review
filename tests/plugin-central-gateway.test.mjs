@@ -47,6 +47,67 @@ test('同源网关固定目标、改写base、隔离浏览器Cookie且禁止节�
     assert.equal(received.at(-1).cookie, undefined);
 });
 
+test('同一浏览器跨端口访问两个独立网关时保留各自中央登录会话', async t => {
+    const { app } = await setupCentral(t);
+    app.database.createUser({ username: 'reviewer-b', password: 'another-long-test-password', reviewIdentity: '审核者乙' });
+    const centerUrl = await app.listen({ host: '127.0.0.1', port: 0 });
+    const { CentralGateway } = await import('../packages/dsh-plugin/dist/connection/gateway.js');
+    const locals = [];
+    for (let i = 0; i < 2; i++) {
+        const gateway = new CentralGateway();
+        gateway.connect(`${centerUrl}/`, app.database.centralId);
+        locals.push(await listen(t, (req, res) => { void gateway.handle(req, res).catch(error => { res.statusCode = 502; res.end(error.message); }); }));
+    }
+    const cookies = new Map();
+    const request = async (local, pathname, options = {}) => {
+        const url = new URL(`/dsh-code-review/central${pathname}`, local);
+        const cookie = [...cookies.values()].filter(item => url.pathname.startsWith(item.path)).map(item => item.value).join('; ');
+        const response = await fetch(url, { ...options, headers: { ...options.headers, cookie } });
+        for (const item of response.headers.getSetCookie()) {
+            const value = item.split(';')[0];
+            const name = value.split('=')[0];
+            const path = /;\s*Path=([^;]+)/i.exec(item)[1];
+            cookies.set(`${name};${path}`, { path, value });
+        }
+        return response;
+    };
+    const users = [
+        { username: 'reviewer', password: 'a-long-test-password' },
+        { username: 'reviewer-b', password: 'another-long-test-password' },
+    ];
+    for (let i = 0; i < locals.length; i++) {
+        let response = await request(locals[i], '/api/v1/auth/session');
+        assert.equal(response.status, 401);
+        await response.arrayBuffer();
+        response = await request(locals[i], '/api/v1/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(users[i]) });
+        assert.equal(response.status, 200);
+        assert.equal((await response.json()).user.username, users[i].username);
+    }
+    for (const i of [0, 1, 0, 1]) {
+        const response = await request(locals[i], '/api/v1/auth/session');
+        assert.equal(response.status, 200, `网关 ${i + 1} 的登录会话被另一端口覆盖`);
+        assert.equal((await response.json()).user.username, users[i].username);
+    }
+});
+
+test('网关Cookie名称按实例命名空间稳定隔离且不暴露原始路径', async t => {
+    const { CentralGateway } = await import('../packages/dsh-plugin/dist/connection/gateway.js');
+    const upstream = await listen(t, (_req, res) => res.end('ok'));
+    const names = [];
+    for (const namespace of ['C:\\DSH data\\甲; Path=/', 'C:\\DSH data\\甲; Path=/', 'C:\\DSH data\\乙; Path=/']) {
+        const gateway = new CentralGateway(namespace);
+        gateway.connect(`${upstream}/`, 'central');
+        const local = await listen(t, (req, res) => { void gateway.handle(req, res).catch(error => { res.statusCode = 502; res.end(error.message); }); });
+        const response = await fetch(`${local}/dsh-code-review/central/`);
+        assert.equal(response.status, 200);
+        names.push(response.headers.get('set-cookie').split('=')[0]);
+        await response.arrayBuffer();
+    }
+    assert.equal(names[0], names[1]);
+    assert.notEqual(names[0], names[2]);
+    assert.match(names[0], /^dsh_review_gateway_[a-f0-9]+$/);
+});
+
 test('本地登录等待期间切换中央不会将旧会话写入新中央的网关', async t => {
     const { CentralGateway } = await import('../packages/dsh-plugin/dist/connection/gateway.js');
     const received = [];

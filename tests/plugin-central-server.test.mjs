@@ -70,14 +70,44 @@ test('节点状态只包含自己的项目和未决数量且与用户鉴权隔�
     assert.equal(status.statusCode, 200, status.body);
     assert.equal(status.json().centralId, (await app.inject('/api/v1/info')).json().centralId);
     assert.equal(status.json().nodeId, own.nodeId);
+    assert.equal(status.json().instanceId, own.instanceId);
     assert.deepEqual(status.json().projects.map(item => item.projectId), [project.projectId]);
     assert.equal(status.json().pending, 1);
     assert.equal(status.body.includes(own.token), false);
     const otherStatus = await app.inject({ method: 'POST', url: '/node-api/v1/status', headers: other.headers, payload: { nodeId: own.nodeId } });
     assert.equal(otherStatus.statusCode, 200, otherStatus.body);
     assert.equal(otherStatus.json().nodeId, other.nodeId);
+    assert.equal(otherStatus.json().instanceId, other.instanceId);
     assert.equal((await app.inject({ method: 'POST', url: '/node-api/v1/status', headers, payload: {} })).statusCode, 401);
     assert.equal((await app.inject({ url: '/api/v1/projects', headers: own.headers })).statusCode, 401);
+});
+
+test('节点状态的活动实例租约独立于暂停接入并在断开或超时后失效', async t => {
+    let now = new Date('2026-11-17T00:00:00.000Z');
+    const { app } = await setupCentral(t, { clock: () => now });
+    const own = await registerNode(app), other = await registerNode(app, 'node-b', 'workspace-b');
+    const status = headers => app.inject({ method: 'POST', url: '/node-api/v1/status', headers, payload: { nodeId: other.nodeId } });
+    assert.equal((await status(own.headers)).json().activeInstance, true);
+    const paused = await app.inject({ method: 'POST', url: '/node-api/v1/quiesce', headers: own.headers, payload: { instanceId: own.instanceId } });
+    assert.equal(paused.statusCode, 200, paused.body);
+    assert.equal(app.database.getNode(own.nodeId).online, false);
+    assert.equal((await status(own.headers)).json().activeInstance, true);
+    now = new Date('2026-11-17T00:00:30.000Z');
+    assert.equal((await status(own.headers)).json().activeInstance, true);
+    now = new Date('2026-11-17T00:00:30.001Z');
+    assert.equal((await status(own.headers)).json().activeInstance, false);
+    const otherHeartbeat = await app.inject({ method: 'POST', url: '/node-api/v1/heartbeat', headers: other.headers, payload: { instanceId: other.instanceId } });
+    assert.equal(otherHeartbeat.statusCode, 200, otherHeartbeat.body);
+    const heartbeat = await app.inject({ method: 'POST', url: '/node-api/v1/heartbeat', headers: own.headers, payload: { instanceId: own.instanceId } });
+    assert.equal(heartbeat.statusCode, 200, heartbeat.body);
+    assert.equal((await status(own.headers)).json().activeInstance, true);
+    const disconnected = await app.inject({ method: 'POST', url: '/node-api/v1/disconnect', headers: own.headers, payload: { instanceId: own.instanceId } });
+    assert.equal(disconnected.statusCode, 200, disconnected.body);
+    assert.equal((await status(own.headers)).json().activeInstance, false);
+    const otherStatus = await status(other.headers);
+    assert.equal(otherStatus.json().nodeId, other.nodeId);
+    assert.equal(otherStatus.json().instanceId, other.instanceId);
+    assert.equal(otherStatus.json().activeInstance, true);
 });
 
 test('节点接入自身声明工作副本幂等创建并保留停用历史', async t => {
@@ -98,6 +128,65 @@ test('节点接入自身声明工作副本幂等创建并保留停用历史', as
     assert.equal(enabled.json().project.projectId, project.projectId);
     assert.equal(enabled.json().project.name, '新名称');
     assert.equal(app.database.listProjects(node.nodeId).length, 1);
+});
+
+test('移除注册声明后仍能停用自身历史项目但不能启用新建或操作其他节点', async t => {
+    const { app, headers } = await setupCentral(t);
+    const own = await registerNode(app), other = await registerNode(app, 'node-b', 'workspace-b');
+    const project = await bindProject(app, headers, own), otherProject = await bindProject(app, headers, other);
+    const registration = {
+        protocolVersion: 1, instanceId: own.instanceId, pluginVersion: '0.3.0', dshVersion: '0.2.1', platform: 'linux', workspaces: [],
+    };
+    const registered = await app.inject({ method: 'POST', url: '/node-api/v1/register', headers: own.headers, payload: registration });
+    assert.equal(registered.statusCode, 200, registered.body);
+    const ensure = payload => app.inject({ method: 'POST', url: '/node-api/v1/projects/ensure', headers: own.headers, payload });
+    const input = { instanceId: own.instanceId, workspaceId: own.workspaceId, name: project.name, enabled: false };
+    assert.equal((await ensure({ ...input, instanceId: other.instanceId })).statusCode, 409);
+    const disabled = await ensure(input);
+    assert.equal(disabled.statusCode, 200, disabled.body);
+    assert.equal(disabled.json().project.projectId, project.projectId);
+    assert.equal(disabled.json().project.enabled, false);
+    const restored = await ensure({ ...input, restore: true });
+    assert.equal(restored.statusCode, 200, restored.body);
+    assert.equal(restored.json().project.enabled, false);
+    for (const restore of [undefined, true]) {
+        for (const payload of [
+            { ...input, enabled: true },
+            { ...input, workspaceId: 'missing-workspace', enabled: true },
+            { ...input, workspaceId: 'missing-workspace' },
+            { ...input, workspaceId: other.workspaceId },
+        ]) {
+            const rejected = await ensure({ ...payload, restore });
+            assert.equal(rejected.statusCode, 409, rejected.body);
+            assert.equal(rejected.json().error.code, 'workspace_unavailable');
+        }
+    }
+    assert.equal(app.database.listProjects(own.nodeId).length, 1);
+    assert.equal(app.database.getProject(project.projectId).enabled, false);
+    assert.equal(app.database.getProject(otherProject.projectId).enabled, true);
+    const incompatible = await app.inject({ method: 'POST', url: '/node-api/v1/register', headers: own.headers, payload: { ...registration, protocolVersion: 2 } });
+    assert.equal(incompatible.statusCode, 200, incompatible.body);
+    const rejected = await ensure(input);
+    assert.equal(rejected.statusCode, 409, rejected.body);
+    assert.equal(rejected.json().error.code, 'workspace_unavailable');
+});
+
+test('移除注册声明后未决写操作仍阻止停用历史项目', async t => {
+    const { app, headers } = await setupCentral(t);
+    const node = await registerNode(app), project = await bindProject(app, headers, node);
+    const created = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.projectId}/commands`, headers, payload: approvePayload() });
+    assert.equal(created.statusCode, 202, created.body);
+    const registered = await app.inject({ method: 'POST', url: '/node-api/v1/register', headers: node.headers, payload: {
+        protocolVersion: 1, instanceId: node.instanceId, pluginVersion: '0.3.0', dshVersion: '0.2.1', platform: 'linux', workspaces: [],
+    } });
+    assert.equal(registered.statusCode, 200, registered.body);
+    const disabled = await app.inject({ method: 'POST', url: '/node-api/v1/projects/ensure', headers: node.headers, payload: {
+        instanceId: node.instanceId, workspaceId: node.workspaceId, name: project.name, enabled: false,
+    } });
+    assert.equal(disabled.statusCode, 409, disabled.body);
+    assert.equal(disabled.json().error.code, 'project_busy');
+    assert.equal(app.database.getProject(project.projectId).enabled, true);
+    assert.equal(app.database.pendingNodeCommands(node.nodeId), 1);
 });
 
 test('恢复接入尊重中央已改名和停用的项目，显式配置仍可修改', async t => {

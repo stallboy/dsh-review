@@ -1,9 +1,10 @@
 import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, open, readFile, unlink } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
-import { PROTOCOL_VERSION } from '@dsh-review/protocol';
+import { DatabaseSync } from 'node:sqlite';
+import { PROTOCOL_VERSION, type ProjectRecord } from '@dsh-review/protocol';
 import { startManagedNode, type ManagedHandle } from '../managed/managed-config.js';
 import { ManagedJournal } from '../managed/managed-journal.js';
 import { normalizeCenterUrl, readJson, saveJson, type Candidate, type ConnectionConfig, type ConnectionSecrets } from './config.js';
@@ -20,12 +21,21 @@ interface ControllerOptions {
     beforeConfigure?: () => void;
 }
 
+interface NodeStatus {
+    centralId: string;
+    nodeId: string;
+    instanceId: string;
+    activeInstance: boolean;
+    projects: ProjectRecord[];
+    pending: number;
+}
+
 export class ConnectionController {
     private config: ConnectionConfig | null = null;
     private secrets: ConnectionSecrets = { password: randomBytes(32).toString('base64url'), nodes: {} };
     private node: ManagedHandle | null = null;
     private readonly local: LocalCentralProcess;
-    private readonly gateway = new CentralGateway();
+    private readonly gateway: CentralGateway;
     private readonly controlToken = randomBytes(32).toString('base64url');
     private phase: 'stopped' | 'starting' | 'ready' | 'error' = 'stopped';
     private error = '';
@@ -33,11 +43,14 @@ export class ConnectionController {
     private queue: Promise<unknown> = Promise.resolve();
     private disposed = false;
     private locked = false;
+    private ownership: DatabaseSync | null = null;
     private legacy = false;
+    private legacyConnection: { centerUrl: string; nodeId: string } | null = null;
     private claimed = false;
     private readonly logs: string[] = [];
 
     constructor(private readonly options: ControllerOptions) {
+        this.gateway = new CentralGateway(options.directory);
         this.local = new LocalCentralProcess(options.localEntry, () => {
             if (this.phase === 'ready' && !this.disposed) {
                 this.phase = 'error';
@@ -70,6 +83,12 @@ export class ConnectionController {
         this.config = await readJson<ConnectionConfig>(path.join(this.options.directory, 'connection.json'));
         this.secrets = await readJson<ConnectionSecrets>(path.join(this.options.directory, 'connection-secrets.json')) ?? this.secrets;
         this.legacy = !this.config && existsSync(path.join(this.options.directory, 'managed-node.json'));
+        if (this.legacy) {
+            const saved = await readJson<{ centerUrl?: unknown; nodeId?: unknown }>(path.join(this.options.directory, 'managed-node.json'));
+            try {
+                if (saved && typeof saved.nodeId === 'string') this.legacyConnection = { centerUrl: normalizeCenterUrl(saved.centerUrl), nodeId: saved.nodeId };
+            } catch { this.record('旧托管中央地址无效，请检查 managed-node.json'); }
+        }
         if (this.config && (this.config.version !== 1 || !['local', 'external'].includes(this.config.mode) || !this.config.profiles)) {
             throw new Error('中央连接配置格式不受支持，请检查 connection.json');
         }
@@ -111,33 +130,33 @@ export class ConnectionController {
     private async acquire(): Promise<void> {
         if (this.locked) return;
         await mkdir(this.options.directory, { recursive: true, mode: 0o700 });
-        const filename = path.join(this.options.directory, 'connection.lock');
+        let ownership: DatabaseSync | undefined;
         try {
-            const lock = await open(filename, 'wx', 0o600);
-            await lock.writeFile(JSON.stringify({ pid: process.pid }));
-            await lock.close();
+            ownership = new DatabaseSync(path.join(this.options.directory, 'connection-owner.sqlite'));
+            ownership.exec('PRAGMA busy_timeout=0; BEGIN EXCLUSIVE');
+            const previous = await readJson<{ pid: number }>(path.join(this.options.directory, 'connection.lock'));
+            if (previous) {
+                if (!Number.isSafeInteger(previous.pid) || previous.pid <= 0) throw new Error('旧中央连接锁损坏，请核对旧插件进程');
+                let active = true;
+                try { process.kill(previous.pid, 0); }
+                catch (probe) { if ((probe as NodeJS.ErrnoException).code === 'ESRCH') active = false; }
+                if (active) throw new Error('此 DSH 数据目录已有活动中央连接，请先停止旧插件实例');
+            }
+            this.ownership = ownership;
             this.locked = true;
         } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-            const saved = JSON.parse(await readFile(filename, 'utf8')) as { pid: number };
-            if (!Number.isSafeInteger(saved.pid) || saved.pid <= 0) throw new Error('中央连接锁损坏，请核对旧插件进程');
-            try { process.kill(saved.pid, 0); }
-            catch (probe) {
-                if ((probe as NodeJS.ErrnoException).code === 'ESRCH') {
-                    await unlink(filename);
-                    return this.acquire();
-                }
-            }
-            throw new Error('此 DSH 数据目录已有活动中央连接，请先停止旧插件实例');
+            ownership?.close();
+            if ((Number((error as { errcode?: number }).errcode) & 255) === 5) throw new Error('此 DSH 数据目录已有活动中央连接，请先停止旧插件实例');
+            throw error;
         }
     }
 
     private async release(): Promise<void> {
         if (!this.locked) return;
         this.locked = false;
-        await unlink(path.join(this.options.directory, 'connection.lock')).catch(error => {
-            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-        });
+        const ownership = this.ownership;
+        this.ownership = null;
+        ownership?.close();
     }
 
     private async persist(): Promise<void> {
@@ -156,12 +175,13 @@ export class ConnectionController {
             }
             return await task();
         } finally {
-            if (!this.node && this.phase !== 'ready' && this.phase !== 'starting') await this.release();
+            if (!this.node && !this.local.running && this.phase !== 'ready' && this.phase !== 'starting') await this.release();
         }
     }
 
     private async resume(): Promise<void> {
         const config = this.config!;
+        let centralReady = false;
         this.phase = 'starting';
         this.error = '';
         try {
@@ -183,35 +203,60 @@ export class ConnectionController {
             const profile = config.profiles[config.centralId] ??= { nodeId: credentials.nodeId, workspaces: [] };
             if (profile.nodeId !== credentials.nodeId) throw new Error('节点身份不匹配，拒绝复用原工作副本绑定');
             await this.persist();
+            centralReady = true;
             await this.connectNode();
             await this.persist();
-            this.gateway.connect(config.centerUrl, config.centralId, config.mode === 'local' ? async () => {
-                const response = await fetch(new URL('api/v1/auth/login', config.centerUrl), { method: 'POST',
-                    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'local', password: this.secrets.password }),
-                    redirect: 'error', signal: AbortSignal.timeout(5000) });
-                if (!response.ok) throw new Error('本机审核会话初始化失败');
-                return response.headers.getSetCookie().find(value => value.startsWith('dsh_review_session='))?.split(';')[0] ?? '';
-            } : undefined);
+            this.connectGateway();
             this.phase = 'ready';
             this.generation++;
             this.record(config.mode === 'local' ? '本机中央已就绪，节点已连接' : '已有中央已连接，节点已注册');
         } catch (error) {
-            await this.shutdown();
             this.phase = 'error';
             this.error = error instanceof Error ? error.message : '中央连接失败';
             this.record(this.error);
+            if (centralReady && this.local.running) {
+                const node = this.node;
+                this.node = null;
+                await node?.stop();
+                this.gateway.close();
+            } else {
+                await this.shutdown();
+                this.phase = 'error';
+            }
             throw error;
         }
+    }
+
+    private connectGateway(): void {
+        const config = this.config!;
+        this.gateway.connect(config.centerUrl, config.centralId, config.mode === 'local' ? async () => {
+            const response = await fetch(new URL('api/v1/auth/login', config.centerUrl), { method: 'POST',
+                headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'local', password: this.secrets.password }),
+                redirect: 'error', signal: AbortSignal.timeout(5000) });
+            if (!response.ok) throw new Error('本机审核会话初始化失败');
+            return response.headers.getSetCookie().find(value => value.startsWith('dsh_review_session='))?.split(';')[0] ?? '';
+        } : undefined);
     }
 
     private async connectNode(change?: { workspaceId: string; enabled: boolean }): Promise<void> {
         const config = this.config!;
         const credentials = this.secrets.nodes[config.centralId]!;
         const profile = config.profiles[config.centralId]!;
+        const state = await this.request(config.centerUrl, 'node-api/v1/status', credentials.token, {}) as NodeStatus;
+        if (state.centralId !== config.centralId || state.nodeId !== credentials.nodeId) throw new Error('中央或节点身份不匹配');
+        for (const workspace of profile.workspaces) {
+            const project = state.projects.find(project => project.workspaceId === workspace.workspaceId);
+            if (project && change?.workspaceId !== workspace.workspaceId) {
+                workspace.label = project.name;
+                workspace.enabled = project.enabled;
+                workspace.projectId = project.projectId;
+            }
+        }
+        const active = profile.workspaces.filter(workspace => workspace.enabled);
         this.node = await startManagedNode({ centerUrl: config.centerUrl, ...credentials, pauseAdmission: true,
             workspaces: profile.workspaces.map(workspace => ({ ...workspace })) }, path.join(this.options.directory, 'connections', config.centralId),
             this.options.resolveCredential ?? (async () => undefined), error => this.record(`节点连接异常：${error.message}`));
-        for (const workspace of profile.workspaces) {
+        for (const workspace of active) {
             let result = await this.request(config.centerUrl, 'node-api/v1/projects/ensure', credentials.token, {
                 instanceId: this.node.instanceId, workspaceId: workspace.workspaceId, name: workspace.label, enabled: workspace.enabled, restore: true,
             });
@@ -228,9 +273,9 @@ export class ConnectionController {
         this.node.completeConfiguration();
     }
 
-    private async idle(): Promise<void> {
+    private async idle(): Promise<NodeStatus | null> {
         if (this.legacy) throw new Error('检测到旧 managed-node.json；请先在原中央处理未决任务，停用旧托管配置并重启插件，再应用新连接。旧执行记录不会自动迁移');
-        if (!this.config?.centralId) return;
+        if (!this.config?.centralId) return null;
         const journalFile = path.join(this.options.directory, 'connections', this.config.centralId, 'journal.sqlite');
         if (this.node?.hasUnsettled()) throw new Error('节点存在未核验执行或未确认事件，请先处理原任务');
         if (!this.node && existsSync(journalFile)) {
@@ -238,12 +283,18 @@ export class ConnectionController {
             try { if (journal.hasUnsettled()) throw new Error('节点存在未核验执行或未确认事件，请先恢复原连接'); }
             finally { journal.close(); }
         }
-        if (!this.config.enabled) return;
+        if (!this.config.enabled) return null;
         const credentials = this.secrets.nodes[this.config.centralId];
         if (!credentials) throw new Error('无法核验原中央节点状态，请恢复原连接');
-        const status = await this.request(this.config.centerUrl, 'node-api/v1/status', credentials.token, {});
-        if (status.centralId !== this.config.centralId || status.pending) throw new Error('原中央身份变化或仍有未决任务，不能更换或停用连接');
-        if (this.node) await this.request(this.config.centerUrl, 'node-api/v1/quiesce', credentials.token, { instanceId: this.node.instanceId });
+        const status = await this.request(this.config.centerUrl, 'node-api/v1/status', credentials.token, {}) as NodeStatus;
+        if (status.centralId !== this.config.centralId || status.nodeId !== credentials.nodeId || status.pending) throw new Error('原中央身份变化或仍有未决任务，不能更换或停用连接');
+        if (!this.node) {
+            if (typeof status.activeInstance !== 'boolean' || typeof status.instanceId !== 'string') throw new Error('中央缺少实例恢复状态，请升级后重试');
+            if (status.activeInstance) throw new Error('原节点仍有活动实例，请先确认旧节点已停止');
+        }
+        const instanceId = this.node?.instanceId ?? status.instanceId;
+        if (instanceId) await this.request(this.config.centerUrl, 'node-api/v1/quiesce', credentials.token, { instanceId });
+        return status;
     }
 
     async apply(input: Record<string, unknown>): Promise<void> {
@@ -301,8 +352,8 @@ export class ConnectionController {
     }
 
     async project(input: Record<string, unknown>, sessionId?: string): Promise<void> {
-        return this.run(async () => {
-            if (!this.config?.enabled || this.phase !== 'ready') throw new Error('请先启用中央连接');
+        return this.run(() => this.withOwnership(async () => {
+            if (!this.config?.enabled || (this.phase !== 'ready' && !(this.phase === 'error' && input.enabled === false && typeof input.workspaceId === 'string'))) throw new Error('请先启用中央连接');
             if (typeof input.enabled !== 'boolean') throw new Error('项目接入状态无效');
             const profile = this.config.profiles[this.config.centralId]!;
             const workspaces = structuredClone(profile.workspaces);
@@ -319,23 +370,32 @@ export class ConnectionController {
             }
             if (!workspace) throw new Error('项目接入记录不存在');
             workspace.enabled = input.enabled;
-            await this.idle();
+            const state = await this.idle();
             this.phase = 'starting';
-            const node = this.node;
-            this.node = null;
-            await node?.stop();
-            profile.workspaces = workspaces;
-            await this.persist();
             try {
+                const project = state?.projects.find(project => project.workspaceId === workspace.workspaceId);
+                if (!input.enabled && project?.enabled) {
+                    await this.request(this.config.centerUrl, 'node-api/v1/projects/ensure', this.secrets.nodes[this.config.centralId]!.token, {
+                        instanceId: this.node?.instanceId ?? state!.instanceId, workspaceId: workspace.workspaceId, name: project.name, enabled: false,
+                    });
+                }
+                const node = this.node;
+                this.node = null;
+                if (node) await node.stop();
+                else if (state?.instanceId) await this.request(this.config.centerUrl, 'node-api/v1/disconnect', this.secrets.nodes[this.config.centralId]!.token, { instanceId: state.instanceId });
+                profile.workspaces = workspaces;
+                await this.persist();
                 await this.connectNode({ workspaceId: workspace.workspaceId, enabled: input.enabled });
                 await this.persist();
+                this.connectGateway();
                 this.phase = 'ready';
+                this.error = '';
             } catch (error) {
                 this.phase = 'error';
                 this.error = error instanceof Error ? error.message : '项目接入失败';
                 throw error;
             }
-        });
+        }));
     }
 
     async status(sessionId?: string): Promise<Record<string, unknown>> {
@@ -355,8 +415,8 @@ export class ConnectionController {
             } catch { nodeOnline = false; }
         }
         return { controlToken: this.controlToken, configured: this.configured, legacy: this.legacy,
-            enabled: config?.enabled ?? false, mode: config?.mode ?? 'local', centerUrl: config?.centerUrl ?? '',
-            centralId: config?.centralId ?? '', nodeId: profile?.nodeId ?? '', reviewIdentity: config?.reviewIdentity ?? '',
+            enabled: config?.enabled ?? false, mode: config?.mode ?? (this.legacy ? 'external' : 'local'), centerUrl: config?.centerUrl ?? this.legacyConnection?.centerUrl ?? '',
+            centralId: config?.centralId ?? '', nodeId: profile?.nodeId ?? this.legacyConnection?.nodeId ?? '', reviewIdentity: config?.reviewIdentity ?? '',
             phase: this.phase, nodeOnline, error: this.error, generation: this.generation,
             candidates: await this.options.candidates(sessionId), projects,
             logs: [...this.logs], hasCredentials: Boolean(config && this.secrets.nodes[config.centralId]), localAvailable: await this.local.available() };
