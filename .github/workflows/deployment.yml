@@ -15,7 +15,7 @@ jobs:
             matrix:
                 os: [windows-latest, ubuntu-latest, macos-latest]
         runs-on: ${{ matrix.os }}
-        timeout-minutes: 20
+        timeout-minutes: 40
         steps:
             - uses: actions/checkout@v7
               with:
@@ -24,7 +24,24 @@ jobs:
               with:
                   node-version: 24
                   cache: npm
+            - if: runner.os == 'Windows'
+              run: choco install sliksvn --version=1.14.5 --yes --no-progress
+            - if: runner.os == 'Linux'
+              run: |
+                  if ! command -v svn || ! command -v svnadmin; then
+                      sudo apt-get update
+                      sudo apt-get install -y subversion
+                  fi
+            - if: runner.os == 'macOS'
+              run: |
+                  if ! command -v svn || ! command -v svnadmin; then
+                      brew install subversion
+                  fi
+            - shell: bash
+              run: |
+                  svn --version --quiet
+                  svnadmin --version --quiet
             - run: npm ci --no-audit --no-fund
             - run: npm run typecheck
             - run: npm run build
-            - run: node --test --test-concurrency=1 --test-reporter=tap tests/deployment.test.mjs
+            - run: node --test --test-concurrency=1 --test-reporter=tap tests/*.test.mjs
