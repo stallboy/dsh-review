@@ -21,7 +21,7 @@ test('托管内部入口保留审核 guard 与 owner 校验，身份不会串扰
     const settings = { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'local-owner', runner: 'manual', syncBeforeApprove: false };
     const api = new ReviewApi({ settings, saveSettings: async next => next, statePath: path.join(state, 'runtime.json') });
     await api.init();
-    t.after(async () => { api.stopScheduler(); await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }); });
+    t.after(async () => { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }); });
     assert.equal(typeof api.invoke, 'function', '必须提供类型化内部调用入口');
     const actor = { userId: 'user-a', reviewIdentity: 'tester', commandId: 'command-a' };
     const other = { userId: 'user-b', reviewIdentity: 'other', commandId: 'command-b' };

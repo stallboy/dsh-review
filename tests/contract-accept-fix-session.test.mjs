@@ -29,9 +29,7 @@ const hasSvn = canRun('svn') && canRun('svnadmin');
  */
 
 const servers = [];
-const apis = [];
 after(async () => {
-  for (const api of apis) api.stopScheduler();
   await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
 });
 
@@ -51,7 +49,6 @@ async function startApi(root, settingsPatch = {}, depsPatch = {}) {
   const server = createServer((req, res) => { void api.handle(req, res); });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   servers.push(server);
-  apis.push(api);
   return { api, base: `http://127.0.0.1:${String(server.address().port)}${API_PREFIX}` };
 }
 

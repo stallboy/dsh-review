@@ -2,14 +2,14 @@ import { createContext, useContext, useEffect, useRef, useState, type FormEvent,
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { ReviewCandidate, ReviewComment } from '@dsh-review/protocol';
-import { ApiError, clearSession, command, detail, request, setSession, type CommandRecord, type NodeRecord, type ProjectView, type QueueItem, type Session } from './api.js';
+import { ApiError, clearSession, command, detail, request, saveAuditSchedule, setSession, type AuditSchedule, type AuditScheduleSettings, type CommandRecord, type NodeRecord, type ProjectDetail, type ProjectView, type QueueItem, type Session } from './api.js';
 import { Diff, type Anchor } from './Diff.js';
 import s from './App.module.css';
 
 const UserContext = createContext<Session['user']>(null!);
-const labels: Record<string, string> = { online: '在线', unresolved: '未解决', resolved: '已解决', outdated: '已过期', open: '待处理', closed: '已关闭', dismissed: '已忽略', converted: '已关联候选', reopened: '已重新打开', pending: '待审核', changes_requested: '待修复', approved: '已批准', rejected: '已拒绝', queued: '排队中', dispatched: '已分派', accepted: '已受理', executing: '执行中', completed: '已结束', recovery_required: '待核验', synced: '已同步', stale: '同步延迟', offline: '离线', not_synced: '未同步', delivered: '已交付远端', not_required: '无需交付', conflict: '交付冲突', unknown: '结果待核验', COMMITTED: '已提交', ABORTED: '已中止', RECOVERY_REQUIRED: '需要恢复', SUCCEEDED: '已完成', MANUAL_REQUIRED: '需要人工处理', VALIDATION_FAILED: '校验未通过' };
+const labels: Record<string, string> = { online: '在线', unresolved: '未解决', resolved: '已解决', outdated: '已过期', open: '待处理', closed: '已关闭', dismissed: '已忽略', converted: '已关联候选', reopened: '已重新打开', pending: '待审核', changes_requested: '待修复', approved: '已批准', rejected: '已拒绝', queued: '排队中', dispatched: '已分派', accepted: '已受理', executing: '执行中', completed: '已结束', recovery_required: '待核验', waiting: '等待执行条件', skipped: '已跳过', synced: '已同步', stale: '同步延迟', offline: '离线', not_synced: '未同步', delivered: '已交付远端', not_required: '无需交付', conflict: '交付冲突', unknown: '结果待核验', COMMITTED: '已提交', ABORTED: '已中止', RECOVERY_REQUIRED: '需要恢复', SUCCEEDED: '已完成', MANUAL_REQUIRED: '需要人工处理', VALIDATION_FAILED: '校验未通过' };
 const label = (value: string) => labels[value] ?? value;
-const time = (value?: string | null) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '尚无记录';
+const time = (value?: string | null, timeZone?: string) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false, timeZone }) : '尚无记录';
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const candidateUrl = (projectId: string, id: string) => `/projects/${projectId}/candidates/${id.split('/').map(encodeURIComponent).join('/')}`;
 
@@ -79,12 +79,69 @@ function Projects() {
 function ProjectPage() {
     const { projectId = '' } = useParams();
     const client = useQueryClient(), navigate = useNavigate();
-    const project = useQuery({ queryKey: ['project', projectId], queryFn: () => request<ProjectView>(`/projects/${projectId}`), refetchInterval: 4000 });
+    const project = useQuery({ queryKey: ['project', projectId], queryFn: ({ signal }) => request<ProjectDetail>(`/projects/${projectId}`, 'GET', undefined, signal), refetchInterval: 4000 });
     const [name, setName] = useState(''), [note, setNote] = useState('');
     const update = useMutation({ mutationFn: (value: unknown) => request(`/projects/${projectId}`, 'PUT', value), onSuccess: () => { void client.invalidateQueries({ queryKey: ['project', projectId] }); void client.invalidateQueries({ queryKey: ['projects'] }); } });
     const run = useMutation({ mutationFn: (operation: string) => command(projectId, operation, operation === 'audit' ? { targetPath: '.', note } : {}), onSuccess: () => navigate(`/tasks?projectId=${projectId}`) });
     const view = project.data;
-    return <><Heading eyebrow="PROJECT" title={view?.project.name ?? '项目详情'} actions={<Link className={s.button} to={`/tasks?projectId=${projectId}`}>任务记录 ↗</Link>}>{view ? `${view.project.vcsType.toUpperCase()} · ${view.project.target}` : '正在读取项目…'}</Heading><ErrorBox error={project.error ?? update.error ?? run.error} />{view && <><div className={s.notice}><Badge value={view.freshness} />上次同步 {time(view.lastSyncedAt)}{!view.project.enabled && ' · 项目已停用'}</div><div className={s.twoColumns}><Panel title="执行与同步"><div className={s.form}><p>手动发起全量审查。定时编排将在后续阶段加入。</p><label>本次审查补充说明<textarea value={note} onChange={event => setNote(event.target.value)} placeholder="可选：需要重点关注的模块与约束" /></label><div className={s.actions}><button className={s.primary} disabled={!view.writable || run.isPending} onClick={() => run.mutate('audit')}>开始全量审查</button><button disabled={!view.online || !view.project.enabled || run.isPending} onClick={() => run.mutate('sync')}>同步仓库</button></div>{!view.writable && <small>节点离线、快照过期或存在未决任务时，暂不能开始新审查。</small>}</div></Panel><Panel title="项目设置"><form className={s.form} onSubmit={event => { event.preventDefault(); update.mutate({ name }); }}><label>项目名称<input placeholder={view.project.name} value={name} onChange={event => setName(event.target.value)} required /></label><div className={s.actions}><button disabled={update.isPending}>保存名称</button><button type="button" onClick={() => update.mutate({ enabled: !view.project.enabled })}>{view.project.enabled ? '停用项目' : '启用项目'}</button></div><small>节点 {view.project.nodeId}<br />工作副本 {view.project.workspaceId}</small></form></Panel></div><Panel title="候选"><CandidateList items={(view.snapshot?.queue ?? []).map(item => ({ ...item, projectId, projectName: view.project.name } as unknown as QueueItem))} /></Panel></>}</>;
+    return <><Heading eyebrow="PROJECT" title={view?.project.name ?? '项目详情'} actions={<Link className={s.button} to={`/tasks?projectId=${projectId}`}>任务记录 ↗</Link>}>{view ? `${view.project.vcsType.toUpperCase()} · ${view.project.target}` : '正在读取项目…'}</Heading><ErrorBox error={project.error ?? update.error ?? run.error} />{view && <><div className={s.notice}><Badge value={view.freshness} />上次同步 {time(view.lastSyncedAt)}{!view.project.enabled && ' · 项目已停用'}</div><div className={s.twoColumns}><Panel title="执行与同步"><div className={s.form}><label>本次审查补充说明<textarea value={note} onChange={event => setNote(event.target.value)} placeholder="可选：需要重点关注的模块与约束" /></label><div className={s.actions}><button className={s.primary} disabled={!view.writable || run.isPending} onClick={() => run.mutate('audit')}>开始全量审查</button><button disabled={!view.online || !view.project.enabled || run.isPending} onClick={() => run.mutate('sync')}>同步仓库</button></div>{!view.writable && <small>节点离线、快照过期或存在未决任务时，暂不能开始新审查。</small>}</div></Panel><Panel title="项目设置"><form className={s.form} onSubmit={event => { event.preventDefault(); update.mutate({ name }); }}><label>项目名称<input placeholder={view.project.name} value={name} onChange={event => setName(event.target.value)} required /></label><div className={s.actions}><button disabled={update.isPending}>保存名称</button><button type="button" onClick={() => update.mutate({ enabled: !view.project.enabled })}>{view.project.enabled ? '停用项目' : '启用项目'}</button></div><small>节点 {view.project.nodeId}<br />工作副本 {view.project.workspaceId}</small></form></Panel></div><AuditSchedulePanel key={projectId} projectId={projectId} schedule={view.auditSchedule} /><Panel title="候选"><CandidateList items={(view.snapshot?.queue ?? []).map(item => ({ ...item, projectId, projectName: view.project.name } as unknown as QueueItem))} /></Panel></>}</>;
+}
+
+const defaultAuditSchedule: AuditScheduleSettings = {
+    enabled: false,
+    startTime: '02:00',
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+};
+
+function AuditSchedulePanel({ projectId, schedule }: { projectId: string; schedule: AuditSchedule | null }) {
+    const client = useQueryClient();
+    const [draft, setDraft] = useState<Partial<AuditScheduleSettings>>({});
+    const saved = schedule ?? defaultAuditSchedule;
+    const enabled = draft.enabled ?? saved.enabled;
+    const startTime = draft.startTime ?? saved.startTime;
+    const timeZone = draft.timeZone ?? saved.timeZone;
+    const dirty = enabled !== saved.enabled || startTime !== saved.startTime || timeZone !== saved.timeZone;
+    const run = schedule?.lastRun;
+    const save = useMutation({
+        mutationFn: (settings: AuditScheduleSettings) => saveAuditSchedule(projectId, settings),
+        onSuccess: async ({ auditSchedule }) => {
+            const queryKey = ['project', projectId];
+            await client.cancelQueries({ queryKey, exact: true });
+            client.setQueryData<ProjectDetail>(queryKey, current => current && { ...current, auditSchedule });
+            setDraft({});
+        },
+    });
+    function edit<Key extends keyof AuditScheduleSettings>(key: Key, value: AuditScheduleSettings[Key]) {
+        setDraft(current => ({ ...current, [key]: value === saved[key] ? undefined : value }));
+    }
+
+    return <Panel title="定时审查" extra={<small>{saved.enabled ? '已启用' : '已关闭'}</small>}>
+        <form className={s.form} onSubmit={event => {
+            event.preventDefault();
+            if (dirty && !save.isPending) save.mutate({ enabled, startTime, timeZone: timeZone.trim() });
+        }}>
+            <label className={s.check}>
+                <input type="checkbox" checked={enabled} disabled={save.isPending} onChange={event => edit('enabled', event.target.checked)} />启用每日全量审查
+            </label>
+            <div className={s.scheduleFields}>
+                <label>每日开始时间<input type="time" name="startTime" required value={startTime} disabled={save.isPending} onChange={event => edit('startTime', event.target.value)} /></label>
+                <label>时区（IANA）<input name="timeZone" placeholder="例如 Asia/Shanghai" required value={timeZone} spellCheck={false} disabled={save.isPending} onChange={event => edit('timeZone', event.target.value)} /></label>
+            </div>
+            <small>到达设定时间后最多等待 30 分钟。到期未受理时跳过本轮，已受理的任务正常收尾。</small>
+            <ErrorBox error={save.error} />
+            <div className={s.actions}>
+                <button disabled={!dirty || !startTime || !timeZone.trim() || save.isPending}>{save.isPending ? '正在保存…' : '保存定时设置'}</button>
+                {save.isSuccess && !dirty && <small role="status">已保存</small>}
+            </div>
+            <div className={s.scheduleSummary}>
+                <p>下次审查 {schedule?.nextRunAt ? `${time(schedule.nextRunAt, schedule.timeZone)}（${schedule.timeZone}）` : '暂无安排'}</p>
+                {run ? <>
+                    <div className={s.actions}><p>最近一次计划 {time(run.scheduledAt, schedule?.timeZone)}</p><Badge value={run.state} />{run.commandId && <Link to={`/tasks?projectId=${projectId}`}>查看项目任务</Link>}</div>
+                    {run.reason && <p>{run.reason}</p>}
+                </> : <p>最近一次计划 尚无记录</p>}
+            </div>
+        </form>
+    </Panel>;
 }
 
 function Nodes() {
@@ -100,7 +157,7 @@ function Reports() {
     const projects = useProjects();
     const [selected, setSelected] = useState<{ projectId: string; auditId: string } | null>(null);
     const report = useQuery({ queryKey: ['report', selected], queryFn: ({ signal }) => detail<{ body: string; meta: { auditId: string; scope: string; items: { findingId: string; title: string; summary: string; status: string }[] } }>(selected!.projectId, 'audit', { id: selected!.auditId }, signal), enabled: Boolean(selected) });
-    return <><Heading eyebrow="AUDIT REPORTS" title="审查报告">保留每次全量审查的范围、发现和处理脉络。</Heading><ErrorBox error={projects.error ?? report.error} /><div className={s.twoColumns}><Panel title="审查记录"><div className={s.stack}>{projects.data?.projects.flatMap(view => (view.snapshot?.audits ?? []).map(audit => <button key={`${view.project.projectId}/${audit.auditId}`} className={s.reportRow} onClick={() => setSelected({ projectId: view.project.projectId, auditId: String(audit.auditId) })}><span><b>{String(audit.auditId)}</b><small>{view.project.name} · 范围 {String(audit.scope)}</small><small>{time(String(audit.createdAt))}</small></span><span>{String(audit.itemCount)} 项 →</span></button>))}{projects.data?.projects.every(view => !view.snapshot?.audits.length) && <Empty>尚无已同步审查报告。</Empty>}</div></Panel><Panel title={selected ? selected.auditId : '报告详情'}>{!selected ? <Empty>选择左侧记录，查看报告内容。</Empty> : report.isPending ? <Empty>正在向节点读取该版本报告…</Empty> : report.data ? <div className={s.document}>{report.data.meta.items.map(item => <article key={item.findingId}><Badge value={item.status} /><h3>{item.title}</h3><p>{item.summary}</p></article>)}<pre>{report.data.body}</pre></div> : <button onClick={() => void report.refetch()}>重新读取</button>}</Panel></div></>;
+    return <><Heading eyebrow="AUDIT REPORTS" title="审查报告">保留每次全量审查的范围、发现和处理脉络。</Heading><ErrorBox error={projects.error ?? report.error} /><div className={s.twoColumns}><Panel title="审查记录"><div className={s.stack}>{projects.data?.projects.flatMap(view => (view.snapshot?.audits ?? []).map(audit => <button key={`${view.project.projectId}/${audit.auditId}`} className={s.reportRow} onClick={() => setSelected({ projectId: view.project.projectId, auditId: String(audit.auditId) })}><span><b>{String(audit.auditId)}</b><small>{view.project.name} · 范围 {String(audit.scope)}{audit.trigger === 'scheduled' && ' · 定时触发'}</small><small>{time(String(audit.createdAt))}</small></span><span>{String(audit.itemCount)} 项 →</span></button>))}{projects.data?.projects.every(view => !view.snapshot?.audits.length) && <Empty>尚无已同步审查报告。</Empty>}</div></Panel><Panel title={selected ? selected.auditId : '报告详情'}>{!selected ? <Empty>选择左侧记录，查看报告内容。</Empty> : report.isPending ? <Empty>正在向节点读取该版本报告…</Empty> : report.data ? <div className={s.document}>{report.data.meta.items.map(item => <article key={item.findingId}><Badge value={item.status} /><h3>{item.title}</h3><p>{item.summary}</p></article>)}<pre>{report.data.body}</pre></div> : <button onClick={() => void report.refetch()}>重新读取</button>}</Panel></div></>;
 }
 
 function Tasks() {
@@ -111,7 +168,7 @@ function Tasks() {
     const selected = tasks.data?.tasks.find(task => task.commandId === selectedId) ?? tasks.data?.tasks[0];
     const logs = useQuery({ queryKey: ['logs', selected?.commandId, selected?.state], queryFn: () => request<{ log: string[]; logStartOffset: number }>(`/tasks/${selected!.commandId}/logs`), enabled: Boolean(selected), refetchInterval: selected?.state === 'completed' ? false : 2000 });
     const control = useMutation({ mutationFn: (operation: string) => request(`/commands/${selected!.commandId}/${operation}`, 'POST', operation === 'recover' ? { confirmStopped } : {}), onSuccess: () => { setConfirmStopped(false); void client.invalidateQueries({ queryKey: ['tasks'] }); } });
-    return <><Heading eyebrow="TASK HISTORY" title="任务记录" actions={projectId ? <Link className={s.button} to="/tasks">查看全部项目</Link> : null}>业务执行结果与远端交付状态分别记录。</Heading><ErrorBox error={tasks.error ?? logs.error ?? control.error} /><div className={s.taskColumns}><Panel title="指令记录"><div className={s.stack}>{tasks.data?.tasks.map(task => <button className={`${s.reportRow} ${selected?.commandId === task.commandId ? s.selected : ''}`} key={task.commandId} onClick={() => { setSelectedId(task.commandId); setConfirmStopped(false); }}><span><b>{task.operation}</b><small>{task.actor.reviewIdentity} · {time(task.createdAt)}</small><small>{task.projectId.slice(0, 12)}</small></span><Badge value={task.state} /></button>)}{tasks.data?.tasks.length === 0 && <Empty>还没有任务记录。</Empty>}</div></Panel><Panel title={selected ? `${selected.operation} · ${selected.commandId.slice(0, 8)}` : '执行详情'}>{selected ? <div className={s.form}><div className={s.actions}><Badge value={selected.state} />{selected.result && <><Badge value={selected.result.outcome.status} /><Badge value={selected.result.delivery.state} delivery /></>}</div><p>{String(selected.result?.outcome.message ?? selected.result?.outcome.detail ?? '')}</p>{selected.result?.delivery.commitRevision && <div className={s.mono}>原提交 {selected.result.delivery.commitRevision}</div>}{selected.result?.delivery.reason && <p>{selected.result.delivery.reason}</p>}{selected.state !== 'completed' && selected.state !== 'recovery_required' && <button disabled={control.isPending || selected.cancelRequested} onClick={() => control.mutate('cancel')}>{selected.cancelRequested ? '已请求取消，等待节点回报' : '请求取消'}</button>}{selected.state === 'recovery_required' && <div className={s.notice}><p>恢复只核验原执行与交付，不会重新批准或重跑业务。</p><label className={s.check}><input type="checkbox" checked={confirmStopped} onChange={event => setConfirmStopped(event.target.checked)} />我已确认旧执行进程停止</label><button disabled={!confirmStopped || control.isPending} onClick={() => control.mutate('recover')}>核验并重试原提交交付</button></div>}<h3>执行日志</h3><pre className={s.logs}>{logs.data?.log.join('\n') || '尚无日志'}</pre>{selected.result?.outcome.manualPrompt ? <details><summary>人工操作提示</summary><pre className={s.logs}>{String(selected.result.outcome.manualPrompt)}</pre></details> : null}<details><summary>完整业务结果</summary><pre className={s.logs}>{JSON.stringify(selected.result?.outcome ?? {}, null, 2)}</pre></details></div> : <Empty>选择一条任务查看执行结果与日志。</Empty>}</Panel></div></>;
+    return <><Heading eyebrow="TASK HISTORY" title="任务记录" actions={projectId ? <Link className={s.button} to="/tasks">查看全部项目</Link> : null}>业务执行结果与远端交付状态分别记录。</Heading><ErrorBox error={tasks.error ?? logs.error ?? control.error} /><div className={s.taskColumns}><Panel title="指令记录"><div className={s.stack}>{tasks.data?.tasks.map(task => <button className={`${s.reportRow} ${selected?.commandId === task.commandId ? s.selected : ''}`} key={task.commandId} onClick={() => { setSelectedId(task.commandId); setConfirmStopped(false); }}><span><b>{task.operation}</b>{task.scheduledAudit && ' · 定时触发'}<small>{task.actor.reviewIdentity} · {time(task.createdAt)}</small><small>{task.projectId.slice(0, 12)}</small></span><Badge value={task.state} /></button>)}{tasks.data?.tasks.length === 0 && <Empty>还没有任务记录。</Empty>}</div></Panel><Panel title={selected ? `${selected.operation} · ${selected.commandId.slice(0, 8)}` : '执行详情'}>{selected ? <div className={s.form}><div className={s.actions}><Badge value={selected.state} />{selected.result && <><Badge value={selected.result.outcome.status} /><Badge value={selected.result.delivery.state} delivery /></>}</div>{selected.scheduledAudit && <p>定时触发 · 计划开始 {time(selected.scheduledAudit.scheduledAt)} · 最晚受理 {time(selected.scheduledAudit.expiresAt)}</p>}<p>{String(selected.result?.outcome.message ?? selected.result?.outcome.detail ?? '')}</p>{selected.result?.delivery.commitRevision && <div className={s.mono}>原提交 {selected.result.delivery.commitRevision}</div>}{selected.result?.delivery.reason && <p>{selected.result.delivery.reason}</p>}{selected.state !== 'completed' && selected.state !== 'recovery_required' && <button disabled={control.isPending || selected.cancelRequested} onClick={() => control.mutate('cancel')}>{selected.cancelRequested ? '已请求取消，等待节点回报' : '请求取消'}</button>}{selected.state === 'recovery_required' && <div className={s.notice}><p>恢复只核验原执行与交付，不会重新批准或重跑业务。</p><label className={s.check}><input type="checkbox" checked={confirmStopped} onChange={event => setConfirmStopped(event.target.checked)} />我已确认旧执行进程停止</label><button disabled={!confirmStopped || control.isPending} onClick={() => control.mutate('recover')}>核验并重试原提交交付</button></div>}<h3>执行日志</h3><pre className={s.logs}>{logs.data?.log.join('\n') || '尚无日志'}</pre>{selected.result?.outcome.manualPrompt ? <details><summary>人工操作提示</summary><pre className={s.logs}>{String(selected.result.outcome.manualPrompt)}</pre></details> : null}<details><summary>完整业务结果</summary><pre className={s.logs}>{JSON.stringify(selected.result?.outcome ?? {}, null, 2)}</pre></details></div> : <Empty>选择一条任务查看执行结果与日志。</Empty>}</Panel></div></>;
 }
 
 interface CandidateView { candidate: ReviewCandidate; patchText: string; currentBase: string | null; isBaseBehind: boolean; comments: ReviewComment[]; validation: string[]; patchCheck?: { state: string }; approvalCommitRevision?: string; approvalCommitLookup?: 'found' | 'ambiguous' | 'unknown' }

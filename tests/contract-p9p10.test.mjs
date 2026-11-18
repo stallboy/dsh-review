@@ -59,27 +59,28 @@ test('P9: 审查提示词包含 reviewers.yml 路由解析结果', async () => {
   assert.match(response.prompt, /路径命中数 > tag 命中数/);
 });
 
-test('P9: 定时审查——间隔到期自动创建审查会话且提示词含 scheduled 与路由', async () => {
+test('P9: 旧定时配置键被忽略，手动审查会话仍注入 Owner 路由', async () => {
   const root = await createGitFixture();
   await mkdir(path.join(root, '.ai-review'), { recursive: true });
   await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\n', 'utf8');
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const created = [];
-  const { api } = await startApi(root, {
+  const { base } = await startApi(root, {
     createAuditSession: async (request) => {
       created.push(request);
-      return { sessionId: 'sched-1' };
+      return { sessionId: 'manual-1' };
     },
-  }, { scheduleIntervalMinutes: 0.001 }); // 60ms
-  // 首轮提示词构建含仓库扫描，需要较长等待窗口。
-  for (let i = 0; i < 40 && created.length === 0; i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  api.stopScheduler();
-  assert.ok(created.length >= 1, '定时审查未触发');
-  assert.equal(created[0].title, '定时仓库审查');
-  assert.match(created[0].prompt, /trigger: scheduled/);
+  });
+  const updated = await fetch(`${base}/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ scheduleIntervalMinutes: 0.001 }) });
+  assert.equal(updated.status, 200);
+  assert.equal((await updated.json()).settings.scheduleIntervalMinutes, undefined);
+  const started = await fetch(`${base}/audit/session`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ targetPath: '', note: '' }) });
+  assert.equal(started.status, 202);
+  assert.equal(created.length, 1);
+  assert.equal((await started.json()).sessionId, 'manual-1');
   assert.match(created[0].prompt, /Owner 路由/);
 });
 

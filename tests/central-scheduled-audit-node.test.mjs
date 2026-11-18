@@ -1,0 +1,240 @@
+import assert from 'node:assert/strict';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import test from 'node:test';
+import { AuditArchive, parseAuditMarkdown } from '../packages/dsh-plugin/dist/host/audit-archive.js';
+import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
+import { ManagedNode } from '../packages/dsh-plugin/dist/managed/managed-node.js';
+import { ManagedOperations } from '../packages/dsh-plugin/dist/managed/managed-operations.js';
+import { createGitFixture, runCommand } from './helpers.mjs';
+import { writeCandidate } from './fixtures/contract.mjs';
+import { bindProject, setupCentral } from './central-helpers.mjs';
+
+const workspaceId = 'workspace-a';
+const projectId = 'project-a';
+const nodeId = 'node-a';
+const fakeRunner = fileURLToPath(new URL('./fixtures/scheduled-audit-agent.mjs', import.meta.url));
+
+function commandFor(id, scheduled = true) {
+    const now = Date.now();
+    return {
+        commandId: id, requestHash: 'b'.repeat(64), projectId, nodeId,
+        bindingGeneration: 1, projectConfigRevision: 1, operation: 'audit', payload: { targetPath: '.' },
+        actor: { userId: scheduled ? 'system-scheduled-audit' : 'user-a', reviewIdentity: '配置人' },
+        createdAt: new Date(now).toISOString(),
+        ...(scheduled ? { scheduledAudit: { scheduledAt: new Date(now - 1000).toISOString(), expiresAt: new Date(now - 1000 + 30 * 60 * 1000).toISOString() } } : {}),
+    };
+}
+
+async function setup(t, runner = 'external', runnerArg = '') {
+    const root = await createGitFixture();
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'central-scheduled-node-'));
+    const journal = new ManagedJournal(path.join(directory, 'journal.sqlite'));
+    const target = runCommand('git', ['branch', '--show-current'], root).stdout.trim();
+    const remote = path.join(directory, 'remote.git');
+    const writer = path.join(directory, 'writer');
+    const operations = new ManagedOperations({
+        dataDir: directory, journal,
+        workspaces: [{ workspaceId, label: '项目 A', root, target, settings: { runner, externalCommand: `"${process.execPath}" "${fakeRunner}" ${runnerArg}` } }],
+    });
+    t.after(async () => {
+        operations.stop();
+        journal.close();
+        await rm(root, { recursive: true, force: true });
+        await rm(directory, { recursive: true, force: true });
+    });
+    runCommand('git', ['init', '--bare', '-q', remote], root);
+    runCommand('git', ['remote', 'add', 'origin', remote], root);
+    runCommand('git', ['push', '-qu', 'origin', target], root);
+    runCommand('git', ['clone', '-q', '-b', target, remote, writer], root);
+    runCommand('git', ['config', 'user.name', 'scheduled-review'], root);
+    runCommand('git', ['config', 'user.email', 'review@example.com'], root);
+    await operations.init();
+    const project = { projectId, nodeId, workspaceId, name: '项目 A', bindingGeneration: 1, projectConfigRevision: 1, vcsType: 'git', target, enabled: true };
+    const execute = async command => {
+        journal.accept(command);
+        return operations.execute(command, new AbortController().signal, () => {}, project);
+    };
+    return { root, writer, remote, target, operations, project, journal, directory, execute };
+}
+
+async function writeArchive(root, id, base, scope, items = [], candidates = []) {
+    const [, date, time] = /^(\d{8})-(\d{6})-/.exec(id);
+    const createdAt = `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6)}T${time.slice(0, 2)}:${time.slice(2, 4)}:${time.slice(4)}Z`;
+    return new AuditArchive(root).write({
+        schemaVersion: 1, auditId: id, createdAt, baseRevision: base, scope, trigger: 'manual',
+        previousAudit: null, candidates, items,
+    }, '# 既有共享审查档案');
+}
+
+test('托管定时审查同步绑定分支，在同一基线上先复查，再归档全仓结果和稳定 finding ID', async t => {
+    const { root, writer, remote, target, operations, journal } = await setup(t);
+    const original = runCommand('git', ['rev-parse', 'HEAD'], writer).stdout.trim();
+    await writeCandidate(writer, 'approved-last-round', {
+        review: {
+            baseRevision: JSON.stringify(original), status: 'approved',
+            approval: '{approved_by: tester, approved_at: "2026-11-01T11:00:00+08:00", gate_checks: ["node --version"], gate_results: [{command: "node --version", exit_code: 0, duration_ms: 10}], confirmed_decisions: [], waived_decisions: [], commit_revision: null}',
+        },
+    });
+    const item = (findingId, title, status = 'pending') => ({
+        findingId, kind: 'confirm', title, summary: '需要核实历史问题', targetFiles: ['src/math.js'], dependsOn: null, status, candidate: null,
+    });
+    await writeArchive(writer, '20261117-090000-repo', original, '.', [
+        item('historical-fixed', '加法误用减号'),
+        item('historical-unverified', '未知边界'),
+        item('historical-dismissed', '已人工排除', 'dismissed'),
+    ], ['2026-11/approved-last-round']);
+    await writeArchive(writer, '20261117-100000-src', original, 'src');
+    await writeFile(path.join(writer, 'src', 'math.js'), 'export const add = (a, b) => a + b;\n');
+    runCommand('git', ['add', '-A'], writer);
+    runCommand('git', ['commit', '-qm', '上游修复与共享审查档案'], writer);
+    runCommand('git', ['push', '-q', 'origin', target], writer);
+    const upstream = runCommand('git', ['rev-parse', 'HEAD'], writer).stdout.trim();
+    let now = new Date('2026-11-18T07:59:00Z');
+    const clock = () => now;
+    const { app, headers } = await setupCentral(t, { clock });
+    const credential = app.database.createNode('定时审查节点');
+    const centerUrl = await app.listen({ host: '127.0.0.1', port: 0 });
+    const snapshotStarted = Promise.withResolvers(), snapshotCanFinish = Promise.withResolvers();
+    const node = new ManagedNode({
+        config: { centerUrl, ...credential, workspaces: operations.registrations() }, journal, clock,
+        execute: operations.execute.bind(operations), read: operations.read.bind(operations),
+        snapshot: async project => {
+            snapshotStarted.resolve();
+            await snapshotCanFinish.promise;
+            return operations.snapshot(project);
+        },
+    });
+    t.after(() => { snapshotCanFinish.resolve(); return node.stop(); });
+    await node.tick();
+    const project = await bindProject(app, headers, { ...credential, workspaceId });
+    const schedule = await app.inject({ method: 'PUT', url: `/api/v1/projects/${project.projectId}/audit-schedule`, headers,
+        payload: { enabled: true, startTime: '08:00', timeZone: 'UTC' } });
+    assert.equal(schedule.statusCode, 200, schedule.body);
+    await node.tick();
+    await snapshotStarted.promise;
+    now = new Date('2026-11-18T08:05:00Z');
+    try {
+        await node.tick();
+        const waiting = await app.inject({ url: `/api/v1/tasks?projectId=${project.projectId}`, headers });
+        assert.deepEqual(waiting.json().tasks, [], '本机仍在读取时不应占用中央任务名额');
+    } finally {
+        snapshotCanFinish.resolve();
+    }
+    await node.drain();
+    await node.tick();
+    await node.drain();
+    await node.tick();
+    const tasks = await app.inject({ url: `/api/v1/tasks?projectId=${project.projectId}`, headers });
+    const [task, ...others] = tasks.json().tasks;
+    assert.ok(task, tasks.body);
+    assert.equal(others.length, 0);
+    assert.equal(task.state, 'completed', JSON.stringify(task));
+    assert.deepEqual(task.actor, { userId: 'system-scheduled-audit', reviewIdentity: '审核者甲' });
+    const { result } = task;
+    assert.equal(result.outcome.status, 'COMMITTED', JSON.stringify(result));
+    assert.equal(result.delivery.state, 'delivered');
+    const committed = runCommand('git', ['show', `refs/heads/${target}:${result.outcome.report.path}`], remote).stdout;
+    const record = parseAuditMarkdown(committed);
+    assert.equal(record.meta.trigger, 'scheduled');
+    assert.equal(record.meta.baseRevision, upstream);
+    assert.equal(record.meta.previousAudit, '20261117-090000-repo');
+    assert.deepEqual(record.meta.items.map(({ findingId, status }) => [findingId, status]), [['historical-fixed', 'resolved']], record.body);
+    assert.match(record.meta.items[0].summary, /src\/math\.js:1/);
+    assert.match(record.body, /approved-last-round.*已核实/);
+    assert.doesNotMatch(record.body, /AI 报告不应覆盖/);
+    const snapshot = await operations.snapshot(project);
+    assert.equal(snapshot.findings.find(finding => finding.findingId === 'historical-unverified').lastObservedAudit, '20261117-090000-repo');
+    await node.drain();
+});
+
+test('托管手动审查保持 manual，手动 Runner 不申报定时能力', async t => {
+    const manual = await setup(t, 'manual');
+    assert.equal(manual.operations.registrations()[0].supportsScheduledAudit, undefined);
+    const result = await manual.execute(commandFor('scheduled-unavailable'));
+    assert.equal(result.outcome.status, 'ABORTED');
+    const external = await setup(t);
+    assert.equal(external.operations.registrations()[0].supportsScheduledAudit, true);
+    const committed = await external.execute(commandFor('user-review', false));
+    assert.equal(committed.outcome.status, 'COMMITTED');
+    const text = runCommand('git', ['show', `HEAD:${committed.outcome.report.path}`], external.root).stdout;
+    assert.equal(parseAuditMarkdown(text).meta.trigger, 'manual');
+});
+
+test('历史复查误写的候选被保留待核验，定时审查不进入全仓扫描或远端交付', async t => {
+    const { root, remote, target, directory, operations, project, execute } = await setup(t, 'external', 'write-during-recheck');
+    const before = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+    await writeArchive(root, '20261117-090000-repo', before, '.');
+    runCommand('git', ['add', '.ai-review'], root);
+    runCommand('git', ['commit', '-qm', '共享历史档案'], root);
+    runCommand('git', ['push', '-q', 'origin', target], root);
+    const shared = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+    const command = commandFor('history-written');
+    const result = await execute(command);
+    assert.equal(result.outcome.status, 'RECOVERY_REQUIRED', JSON.stringify(result));
+    assert.equal(result.outcome.reason, 'SCHEDULE_RECHECK_DIRTY');
+    assert.equal(result.delivery.state, 'unknown');
+    assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), shared);
+    assert.equal(runCommand('git', ['rev-parse', `refs/heads/${target}`], remote).stdout.trim(), shared);
+    const uncommitted = path.join(root, '.ai-review/2026-11/stage-one-candidate');
+    assert.match(await readFile(path.join(uncommitted, 'review.md'), 'utf8'), /stage-one-candidate/);
+    const leaseState = async () => JSON.parse(await readFile(path.join(directory, `${workspaceId}-runtime.json`), 'utf8')).leases.at(-1).state;
+    assert.equal(await leaseState(), 'releasable');
+    assert.equal((await operations.recover(command, result, project)).outcome.status, 'RECOVERY_REQUIRED');
+    assert.equal(await leaseState(), 'releasable');
+    await rm(uncommitted, { recursive: true });
+    const recovered = await operations.recover(command, result, project);
+    assert.equal(recovered.outcome.status, 'ABORTED', JSON.stringify(recovered));
+    assert.equal(recovered.delivery.state, 'not_required');
+    assert.equal(await leaseState(), 'released');
+    assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), shared);
+});
+
+test('工作副本有未提交的评审配置时跳过定时审查并保留草稿', async t => {
+    const { root, execute } = await setup(t);
+    const before = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+    const reviewers = path.join(root, '.ai-review', 'reviewers.yml');
+    await mkdir(path.dirname(reviewers), { recursive: true });
+    await writeFile(reviewers, 'default_owner: 草稿负责人\n');
+    const result = await execute(commandFor('skip-local-reviewers'));
+    assert.equal(result.outcome.status, 'ABORTED', JSON.stringify(result));
+    assert.equal(result.outcome.reason, 'SCHEDULE_WORKSPACE_DIRTY');
+    assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), before);
+    assert.equal(await readFile(reviewers, 'utf8'), 'default_owner: 草稿负责人\n');
+});
+
+test('定时命令在确认期间被中央结束时收敛本地记录且不启动', async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'central-scheduled-ack-'));
+    const journal = new ManagedJournal(path.join(directory, 'journal.sqlite'));
+    const command = commandFor('expired-at-ack');
+    const project = { projectId, nodeId, workspaceId, name: '项目 A', bindingGeneration: 1, projectConfigRevision: 1, vcsType: 'git', target: 'main', enabled: true };
+    const result = { outcome: { status: 'ABORTED', reason: 'SCHEDULE_EXPIRED' }, delivery: { state: 'not_required' } };
+    const requests = new Map();
+    let executions = 0;
+    const node = new ManagedNode({
+        config: { centerUrl: 'http://127.0.0.1/', nodeId, token: 'fake',
+            workspaces: [{ workspaceId, label: '项目 A', vcsType: 'git', target: 'main', supportsScheduledAudit: true }] },
+        journal,
+        execute: async () => { executions++; return result; },
+        read: async () => { throw new Error('不应读取详情'); },
+        fetch: async (url, request) => {
+            const pathname = new URL(url).pathname;
+            requests.set(pathname, JSON.parse(request.body));
+            if (pathname.endsWith('/commands/poll')) return Response.json({ commands: [command], projects: [project], cancellations: [], queries: [], recoveries: [] });
+            if (pathname.endsWith('/ack')) return Response.json({ command: { ...command, state: 'completed', cancelRequested: false, updatedAt: command.createdAt, result } });
+            if (pathname.endsWith('/events')) return Response.json({ acks: {} });
+            return Response.json({});
+        },
+    });
+    t.after(async () => { await node.stop(); journal.close(); await rm(directory, { recursive: true, force: true }); });
+    await node.tick();
+    await node.drain();
+    assert.equal(executions, 0);
+    assert.equal(journal.get(command.commandId).phase, 'completed');
+    assert.deepEqual(journal.get(command.commandId).result, result);
+    assert.deepEqual(journal.pending(), []);
+    assert.deepEqual(requests.get('/node-api/v1/commands/poll').scheduledAuditWorkspaces, [workspaceId]);
+    assert.equal(requests.get('/node-api/v1/register').workspaces[0].supportsScheduledAudit, undefined);
+});

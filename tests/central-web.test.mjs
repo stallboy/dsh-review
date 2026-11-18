@@ -51,3 +51,20 @@ test('注销取消旧会话刷新，迟到的旧账号响应不能覆盖重新�
     unsubscribe();
     client.clear();
 });
+
+test('定时审查设置通过项目接口提交本地时刻、时区和 CSRF 令牌', async t => {
+    const { saveAuditSchedule, setSession } = await import('../apps/web/src/api.ts');
+    const settings = { enabled: true, startTime: '08:45', timeZone: 'Asia/Shanghai' };
+    const auditSchedule = { ...settings, nextRunAt: '2026-11-19T00:45:00.000Z', lastRun: null };
+    const fetch = t.mock.method(globalThis, 'fetch', async () => Response.json({ auditSchedule }));
+    setSession({ csrfToken: 'audit-csrf', user: { userId: 'u', username: 'name', reviewIdentity: '张三' } });
+    t.after(() => setSession(null));
+
+    assert.deepEqual(await saveAuditSchedule('project-1', settings), { auditSchedule });
+    assert.equal(fetch.mock.callCount(), 1);
+    const [url, options] = fetch.mock.calls[0].arguments;
+    assert.equal(url, '/api/v1/projects/project-1/audit-schedule');
+    assert.equal(options.method, 'PUT');
+    assert.equal(options.headers['x-csrf-token'], 'audit-csrf');
+    assert.deepEqual(JSON.parse(options.body), settings);
+});

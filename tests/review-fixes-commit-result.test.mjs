@@ -28,7 +28,6 @@ async function fixture(t, audit = false) {
             return typeof value === 'function' ? value.bind(target) : value;
         } }) });
     await api.init();
-    t.after(() => api.stopScheduler());
     const detail = (await api.invoke({ method: 'GET', path: '/candidate', query: { id: '2026-11/verified' } })).body;
     const meta = detail.candidate.meta;
     const guard = { expectedRevision: meta.currentRevision, expectedOwner: meta.owner, expectedUpdatedAt: meta.updatedAt };

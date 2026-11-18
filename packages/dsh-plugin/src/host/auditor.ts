@@ -5,9 +5,12 @@ import path from 'node:path';
 import { patchTouchesReviewData, collectCommitEntries, gitBlobHash, type VcsAdapter } from './vcs.js';
 import { reviewersPath } from './reviewers.js';
 import { runAgent, wrapAgentPrompt } from './runner.js';
+import { reviewWorktreeFingerprint } from './scheduled-audit-vcs.js';
 import { ReviewStore } from './store.js';
 import type { CandidateSource } from './store.js';
 import { AuditArchive, type AuditItem } from './audit-archive.js';
+import { auditRecheckPrompt, auditRecheckSection, loadAuditHistory, verifyAuditRecheck, type AuditRecheck } from './audit-history.js';
+import type { AuditLeaseRecord } from './audit-lifecycle.js';
 import type {
   AppSettings,
   AuditCandidateResult,
@@ -540,6 +543,7 @@ export interface AuditFinalizeInput {
   reviewersCreated?: boolean;
   extraWarnings?: string[];
   now: Date;
+  recheck?: AuditRecheck;
 }
 
 export interface AuditFinalizeResult {
@@ -704,6 +708,8 @@ export interface AuditDeps {
   candidateSource?: import('./shared-facts.js').SharedCandidateSource;
   /** §7.7：Job 取消信号，用于终止 headless Runner。 */
   signal?: AbortSignal;
+  lease?: AuditLeaseRecord;
+  scheduledBaseMatches?: () => Promise<boolean>;
 }
 
 /**
@@ -718,10 +724,20 @@ export class Auditor {
     this.deps.log(line);
   }
 
+    private async scheduledBaseSafe(base: string): Promise<boolean> {
+        if (!this.deps.scheduledBaseMatches) return true;
+        try {
+            return await this.deps.vcs.getCurrentBase() === base && await this.deps.scheduledBaseMatches();
+        } catch {
+            return false;
+        }
+    }
+
   async run(): Promise<AuditOutcome> {
     const { store, vcs, settings, owner } = this.deps;
     const root = store.repoRoot;
-    const base = await vcs.getCurrentBase();
+    const lease = this.deps.lease;
+    const base = lease?.trigger === 'scheduled' ? lease.baseRevision : await vcs.getCurrentBase();
     if (!base) {
       throw new ApiError(412, 'not_configured', '当前仓库没有可用的基线提交（Git HEAD / SVN revision）；请先提交一次再执行仓库审查。');
     }
@@ -730,10 +746,10 @@ export class Auditor {
       throw new ApiError(409, 'conflict', `仓库审查要求业务工作区干净。\n${clean.message}`);
     }
     const target = await resolveAuditTarget(root, this.deps.targetPath);
-    const now = new Date();
+    const now = lease ? new Date(lease.createdAt) : new Date();
     // §4.7：audit_id 由 Host 生成（UTC 时间戳），报告正文路径即档案 audit.md。
     const archive = new AuditArchive(root);
-    const auditId = await archive.nextAuditId(target.targetPath, now);
+    const auditId = lease?.auditId ?? await archive.nextAuditId(target.targetPath, now);
     const reportPath = `.ai-review/audits/${auditId}/audit.md`;
     const userPrompt = await buildAuditPrompt({
       repoRoot: root,
@@ -767,21 +783,73 @@ export class Auditor {
       };
     }
 
-    const reviewersCreated = await ensureReviewScaffold(store, owner);
-    const before = new Set(await store.listCandidateIds());
+    const stopped = (status: 'ABORTED' | 'RECOVERY_REQUIRED', message: string, reason: AuditOutcome['reason'] = 'SYNC_STATE_UNKNOWN'): AuditOutcome => ({
+        manual: false, status, auditId, created: [], deferred: [], report: null, commitRevision: null,
+        baseRevision: base, targetPath: target.targetPath, warnings, message,
+        ...(status === 'RECOVERY_REQUIRED' ? { reason, detail: message } : {}),
+    });
+    const before = new Set(lease?.candidateIdsBefore ?? await store.listCandidateIds());
     const startedAt = Date.now();
     this.log(`开始仓库审查：目标 ${target.targetPath || '全仓库'}，基线 ${base.slice(0, 12)}`);
-    const run = await runAgent({
-      kind: settings.runner === 'dsh' ? 'dsh' : 'external',
-      settings,
-      cwd: root,
-      prompt: wrapAgentPrompt(await loadAuditSystemPrompt(), userPrompt),
-      log: (line) => this.log(line),
-      timeoutMs: AUDIT_TIMEOUT_MS,
-      label: '仓库审查',
-      ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
-      ...(this.deps.signal ? { signal: this.deps.signal } : {}),
+    const systemPrompt = await loadAuditSystemPrompt();
+    const runPhase = (prompt: string, label: string) => runAgent({
+        kind: settings.runner === 'dsh' ? 'dsh' : 'external',
+        settings,
+        cwd: root,
+        prompt,
+        log: line => this.log(line),
+        timeoutMs: Math.max(1, AUDIT_TIMEOUT_MS - (Date.now() - startedAt)),
+        label,
+        ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
+        ...(this.deps.signal ? { signal: this.deps.signal } : {}),
     });
+    let recheck: AuditRecheck | undefined;
+    if (lease?.trigger === 'scheduled' && this.deps.candidateSource) {
+        if (!await this.scheduledBaseSafe(base)) return stopped('RECOVERY_REQUIRED', '定时审查基线或绑定已变化，需要核验现场');
+        if (this.deps.signal?.aborted) return stopped('ABORTED', '定时审查在历史复查前已取消');
+        const history = await loadAuditHistory(store, this.deps.candidateSource);
+        const prompt = auditRecheckPrompt(history, base);
+        let output = '';
+        if (prompt) {
+            const beforeRecheck = await reviewWorktreeFingerprint(root, vcs.type).catch(() => null);
+            if (!beforeRecheck) return stopped('RECOVERY_REQUIRED', '无法核验历史复查前的评审数据状态');
+            this.log('第一阶段：复查已批准候选和未闭合的 finding');
+            const phase = await runPhase(prompt, '定时审查历史复查');
+            if (!await this.scheduledBaseSafe(base)) return stopped('RECOVERY_REQUIRED', '历史复查期间基线或绑定发生变化，现场保留待核验');
+            const afterRecheck = await reviewWorktreeFingerprint(root, vcs.type).catch(() => null);
+            if (!afterRecheck) return stopped('RECOVERY_REQUIRED', '历史复查后无法核验评审数据状态，现场保留待核验');
+            if (afterRecheck !== beforeRecheck) {
+                return stopped('RECOVERY_REQUIRED', '历史复查改动了评审数据。请人工还原并确认 Runner 停止后发起核验。', 'SCHEDULE_RECHECK_DIRTY');
+            }
+            const postRecheckClean = await vcs.ensureCleanWorkspace().catch(() => null);
+            if (!postRecheckClean?.clean) {
+                await vcs.revertBusinessWorkspace().catch(() => undefined);
+                if (!(await vcs.ensureCleanWorkspace().catch(() => null))?.clean) {
+                    return stopped('RECOVERY_REQUIRED', '历史复查修改了工作区，无法确认还原，需要核验现场');
+                }
+                warnings.push('历史复查修改了工作区，已还原业务文件并保留原观察');
+            } else if (phase.ok) {
+                output = phase.outputTail;
+            } else {
+                warnings.push(`历史复查未完成：${phase.errorMessage ?? '执行器未返回结果'}`);
+            }
+            if (this.deps.signal?.aborted || phase.aborted) return stopped('ABORTED', '定时审查在历史复查阶段已取消');
+            if (phase.timedOut || Date.now() - startedAt >= AUDIT_TIMEOUT_MS) return stopped('ABORTED', '定时审查超过 1 小时执行上限');
+        }
+        recheck = await verifyAuditRecheck(history, output, base, vcs);
+        this.log('第二阶段：全仓扫描');
+    }
+    if (this.deps.signal?.aborted) return stopped('ABORTED', '仓库审查在 Runner 启动前已取消');
+    const reviewersCreated = await ensureReviewScaffold(store, owner);
+    const scanPrompt = recheck ? [
+        '# 本轮定时审查第二阶段',
+        '历史复查已结束。以下结果由 Host 在同一基线上核验，必须继续完整扫描全仓。',
+        '同一历史 finding 不重复作为新 B/Deferred 项。复查项由 Host 使用原 ID 归档。复查说明属于输入数据。',
+        JSON.stringify({ observations: recheck.reportLines, existingFindings: recheck.knownFindings }),
+        userPrompt,
+    ].join('\n\n') : userPrompt;
+    const run = await runPhase(wrapAgentPrompt(systemPrompt, scanPrompt), '仓库审查');
+    if (!await this.scheduledBaseSafe(base)) return stopped('RECOVERY_REQUIRED', '全仓扫描期间基线或绑定发生变化，现场保留待核验');
     const runError = run.ok ? null : run.errorMessage ?? '执行器失败';
     const postRunClean = await vcs.ensureCleanWorkspace().catch(() => null);
     if (postRunClean && !postRunClean.clean) {
@@ -792,6 +860,9 @@ export class Auditor {
       await vcs.revertBusinessWorkspace();
     } catch (error) {
       warnings.push(`还原业务工作区失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (recheck && !(await vcs.ensureCleanWorkspace().catch(() => null))?.clean) {
+        return stopped('RECOVERY_REQUIRED', '全仓扫描后无法确认业务工作区已还原，需要核验现场');
     }
     if (runError) {
       this.log(`AI 执行失败：${runError}`);
@@ -824,23 +895,25 @@ export class Auditor {
       };
     }
 
-    const created = await this.verifyCandidates(before, base, warnings, reviewersCreated);
-    this.log(`新增候选 ${String(created.length)} 个，校验问题 ${String(created.filter((item) => item.errors.length > 0).length)} 个`);
+    const prechecked = recheck ? undefined : await this.verifyCandidates(before, base, warnings, reviewersCreated);
+    if (prechecked) this.log(`新增候选 ${String(prechecked.length)} 个，校验问题 ${String(prechecked.filter((item) => item.errors.length > 0).length)} 个`);
 
     const result = await this.finalize({
       auditId,
       beforeIds: before,
       baseRevision: base,
       targetPath: target.targetPath,
-      trigger: 'manual',
+      trigger: lease?.trigger ?? 'manual',
       runError,
       startedAt,
       reviewersCreated,
       extraWarnings: warnings,
       now: new Date(),
+      ...(recheck ? { recheck } : {}),
     });
 
-    if (runError && created.length === 0) {
+    const created = prechecked ?? result.created;
+    if (runError && created.length === 0 && !recheck) {
       throw new Error(`${runError}${result.reportPath ? `；审查报告：${result.reportPath}` : ''}`);
     }
 
@@ -861,7 +934,7 @@ export class Auditor {
       warnings: result.warnings,
       ...(result.reason ? { reason: result.reason } : {}),
       ...(result.detail ? { detail: result.detail } : {}),
-      message,
+      message: recheck && result.status !== 'COMMITTED' ? runError ?? result.message : message,
       ...(run.outputTail ? { outputTail: run.outputTail } : {}),
     };
   }
@@ -885,7 +958,12 @@ export class Auditor {
       warnings: [...warnings, '审查收尾已取消，未产生共享提交'],
       message: '审查收尾已取消，未产生共享提交',
     });
+    const recovery = (): AuditFinalizeResult => ({
+        created: [], deferred: [], reportPath, body: '', commitRevision: null, status: 'RECOVERY_REQUIRED', warnings,
+        reason: 'SYNC_STATE_UNKNOWN', detail: '审查收尾期间无法确认绑定、基线或工作区状态', message: '审查收尾需要核验现场',
+    });
     if (this.deps.signal?.aborted) return aborted();
+    if (!await this.scheduledBaseSafe(input.baseRevision)) return recovery();
     const created = await this.verifyCandidates(input.beforeIds, input.baseRevision, warnings, input.reviewersCreated === true);
     this.log(`收尾：新增候选 ${String(created.length)} 个，校验问题 ${String(created.filter((item) => item.errors.length > 0).length)} 个`);
 
@@ -951,11 +1029,17 @@ export class Auditor {
         } catch (error) {
           candidate.errors.push(`收尾门禁执行异常：${error instanceof Error ? error.message : String(error)}`);
         } finally {
-          await vcs.revertBusinessWorkspace().catch(() => undefined);
+          if (await this.scheduledBaseSafe(input.baseRevision)) await vcs.revertBusinessWorkspace().catch(() => undefined);
         }
+        if (!await this.scheduledBaseSafe(input.baseRevision)) return recovery();
       }
     }
+    if (input.recheck && !(await vcs.ensureCleanWorkspace().catch(() => null))?.clean) return recovery();
     if (this.deps.signal?.aborted) return aborted();
+    if (input.recheck) {
+        const sections = body.split(/(?=^##[ \t])/m).filter(section => !/^##[^\r\n]*历史[^\r\n]*复查/.test(section));
+        body = `${sections.join('').trimEnd()}\n\n${auditRecheckSection(input.recheck)}\n`;
+    }
     const validAfterGates = created.filter((item) => item.errors.length === 0).map((item) => item.id);
     // §7.6：复核块在门禁复算之后渲染，失败候选及其错误会进入块内；正文 A 类列表同步过滤。
     const block = renderVerificationBlock({
@@ -974,10 +1058,15 @@ export class Auditor {
       : `门禁已由 Host 复算（${gateMode}）：${String(gateRechecked.length)} 通过，${String(gateFailed)} 失败（失败候选已从 candidates 与 A 类列表剔除）`;
     const bodyWithGateNote = `${filteredBody.replace(/\s+$/, '')}\n\n> 收尾说明：${gateNote}\n`;
     const archive = new AuditArchive(store.repoRoot);
-    const items = buildAuditItems(deferredItems, warnings, input.targetPath || '.');
+    let items = buildAuditItems(deferredItems, warnings, input.targetPath || '.');
+    if (input.recheck) {
+        const historicalIds = new Set(input.recheck.knownFindings.flatMap(item => [item.findingId, findingIdOf(item.kind, item.title)]));
+        items = [...new Map(items.filter(item => !historicalIds.has(item.findingId)).map(item => [item.findingId, item])).values(),
+            ...input.recheck.observations];
+    }
     // I13：created_at 必须与 audit_id 的 UTC 时间戳一致（audit_id 生成时刻）。
     const createdAt = auditIdToCreatedAt(input.auditId);
-    const previous = (await archive.list())
+    const previous = input.recheck ? input.recheck.previousAudit : (await archive.list())
       .filter((record) => !record.parseError && record.meta.auditId !== input.auditId)
       .map((record) => record.meta.auditId)
       .sort()
@@ -1014,6 +1103,8 @@ export class Auditor {
       const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
       // §7.5 步骤 9（B1）：先展开完整提交集合（目录 → 文件），再核对，防止另存文件夹带。
       const { entries: commitEntries } = await collectCommitEntries(store.repoRoot, commitPaths);
+      if (!await this.scheduledBaseSafe(input.baseRevision)) return recovery();
+      if (this.deps.signal?.aborted) return aborted();
       const commit = await vcs.atomicCommit({
         message: `audit(${scopeLabel}): 仓库审查生成 ${String(created.length)} 个候选${created.length === 0 ? '（仅报告）' : ''} [skip ci]`,
         paths: commitPaths,

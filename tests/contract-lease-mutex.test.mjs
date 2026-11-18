@@ -10,7 +10,7 @@ import { createGitFixture, runCommand } from './helpers.mjs';
 
 /**
  * §7.6/§7.7 / AC-SCHEDULE-01 租约互斥：
- * - 定时审查必须创建持久化执行租约与可追踪 Job，租约/运行中 Job 期间跳过下一次触发；
+ * - 会话审查必须创建持久化执行租约与可追踪 Job，租约/运行中 Job 期间拒绝再次创建会话；
  * - /audit、/audit/session 等新审查入口必须检查未释放租约；
  * - /audit/finalize 提交失败（ABORTED）时必须保留租约，只有正常收尾才释放。
  */
@@ -80,29 +80,35 @@ function post(base, route, body) {
   });
 }
 
-test('AC-SCHEDULE-01：定时审查创建租约与跟踪 Job，租约存在时跳过下一次触发', async () => {
+test('AC-SCHEDULE-01：手动会话审查创建租约与跟踪 Job，租约存在时阻止重复会话', async () => {
   const root = await createGitFixture();
   await ensureReviewers(root);
   const created = [];
-  const { api, statePath } = await startApi(root, {
+  const { base, statePath } = await startApi(root, {
     createAuditSession: async (input) => {
       created.push(input);
-      return { sessionId: 'sess-scheduled' };
+      return { sessionId: 'sess-manual' };
     },
   });
 
-  await api.runScheduledAudit();
-  assert.equal(created.length, 1, '首次定时审查应创建会话');
+  const response = await post(base, '/audit/session', { targetPath: '', note: '' });
+  assert.equal(response.status, 202);
+  const accepted = await response.json();
+  assert.equal(created.length, 1, '首次手动审查应创建会话');
   const state = JSON.parse(await readFile(statePath, 'utf8'));
   assert.equal(state.leases.length, 1);
-  assert.equal(state.leases[0].trigger, 'scheduled');
+  assert.equal(state.leases[0].trigger, 'manual');
+  assert.equal(state.leases[0].sessionId, 'sess-manual');
   assert.match(state.leases[0].auditId, /^\d{8}-\d{6}-/);
   assert.equal(state.leases[0].state, 'active');
   assert.ok(created[0].prompt.includes(`.ai-review/audits/${state.leases[0].auditId}/audit.md`), '提示词必须使用租约的 auditId/reportPath');
-  assert.ok((await api['jobs'].list()).some((job) => job.type === 'audit' && job.status === 'running'), '必须创建跟踪 audit Job');
+  const job = await (await fetch(`${base}/jobs/${accepted.jobId}`)).json();
+  assert.equal(job.type, 'audit');
+  assert.equal(job.status, 'running');
 
-  await api.runScheduledAudit();
-  assert.equal(created.length, 1, '已有租约/运行中 Job 时不得再次触发');
+  const duplicate = await post(base, '/audit/session', { targetPath: '', note: '' });
+  assert.equal(duplicate.status, 409);
+  assert.equal(created.length, 1, '已有租约/运行中 Job 时应拒绝启动第二个会话');
 });
 
 test('AC-SCHEDULE-01：未释放手动租约阻止 /audit 与 /audit/session', async () => {

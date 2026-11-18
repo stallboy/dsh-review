@@ -33,7 +33,7 @@ export class Snapshots {
         });
     }
 
-    view(projectId: string): JsonRecord {
+    view(projectId: string) {
         const project = this.database.getProject(projectId), node = this.database.getNode(project.nodeId), snapshot = this.get(projectId);
         const received = this.database.sql.prepare('SELECT received_at FROM snapshots WHERE project_id=?').get(projectId);
         const fresh = snapshot?.bindingGeneration === project.bindingGeneration && snapshot.projectConfigRevision === project.projectConfigRevision

@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { IncomingMessage, IncomingHttpHeaders } from 'node:http';
+import type { ManagedCommand } from '@dsh-review/protocol';
 import path from 'node:path';
 import type { AppSettings, ConcurrencyGuard, JobRecord, ReviewFilter, ReviewStatus, VcsType } from './types.js';
 import { ApiError } from './types.js';
@@ -39,6 +40,7 @@ export interface TrustedActor {
     userId: string;
     reviewIdentity: string;
     commandId?: string;
+    scheduledAudit?: NonNullable<ManagedCommand['scheduledAudit']> & { target: string; signal: AbortSignal };
 }
 
 export interface ApiInvocation {

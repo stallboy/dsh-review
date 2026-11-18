@@ -184,8 +184,6 @@ export interface AppSettings {
   autoFixOnFailure: boolean;
   gateTimeoutMs: number;
   syncBeforeApprove: boolean;
-  /** §6.1 定时审查间隔（分钟）；0 = 关闭。 */
-  scheduleIntervalMinutes: number;
 }
 
 /** One A-class candidate that the repo auditor actually produced on disk. */
@@ -229,7 +227,7 @@ export interface AuditOutcome {
   report: AuditReportInfo | null;
   commitRevision: string | null;
   /** §7.7：RECOVERY_REQUIRED 必含 reason/detail。 */
-  reason?: 'COMMIT_OUTCOME_UNKNOWN' | 'SYNC_STATE_UNKNOWN';
+  reason?: 'COMMIT_OUTCOME_UNKNOWN' | 'SYNC_STATE_UNKNOWN' | 'SCHEDULE_RECHECK_DIRTY';
   detail?: string;
   baseRevision: string;
   targetPath: string;

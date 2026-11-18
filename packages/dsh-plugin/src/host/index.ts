@@ -293,7 +293,6 @@ export function apply(ctx: HostContext): void {
       if (initError) throw new Error(`本地评审恢复状态无法核验：${initError.message}`);
       if (localWrites || api?.jobManager.list().some(job => job.status === 'running')) throw new Error('本地评审仍有操作执行中，请先处理后启用中央连接');
       api?.ensureNoAuditRunning();
-      api?.stopScheduler();
     },
     candidates: async sessionId => {
       const registry = ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined;
@@ -350,7 +349,7 @@ export function apply(ctx: HostContext): void {
       },
     });
     await instance.init();
-    if (disposed) { instance.stopScheduler(); return; }
+    if (disposed) return;
     api = instance;
     logger?.info(`dsh-code-review host mounted（repo=${settings.repoRoot || '未配置'}）`);
   })().catch((error: unknown) => {
@@ -397,8 +396,6 @@ export function apply(ctx: HostContext): void {
   ctx.effect(
     () => async () => {
       disposed = true;
-      // 插件卸载/重载时停止定时审查调度，避免回调泄漏。
-      api?.stopScheduler();
       off();
       offConnection();
       offCentral();

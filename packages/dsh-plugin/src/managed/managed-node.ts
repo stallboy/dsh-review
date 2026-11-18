@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { PROTOCOL_VERSION, validateCommand, type JsonRecord, type ManagedCommand, type ManagedQuery,
+import { PROTOCOL_VERSION, validateCommand, type CommandRecord, type ManagedCommand, type ManagedQuery,
     type ManagedQueryResult, type ManagedResult, type ProjectRecord, type ProjectSnapshot, type WorkspaceRegistration } from '@dsh-review/protocol';
 import { ManagedJournal } from './managed-journal.js';
 
@@ -102,31 +102,41 @@ export class ManagedNode {
         if (!this.registered) {
             await this.request('/node-api/v1/register', { protocolVersion: PROTOCOL_VERSION, instanceId: this.instanceId,
                 pluginVersion: config.pluginVersion ?? '0.3.0', dshVersion: config.dshVersion ?? 'unknown',
-                platform: process.platform, workspaces: config.workspaces });
+                platform: process.platform, workspaces: config.workspaces.map(({ supportsScheduledAudit: _capability, ...workspace }) => workspace) });
             this.registered = true;
         }
-        const poll = await this.request<PollResult>('/node-api/v1/commands/poll', { instanceId: this.instanceId });
+        const scheduledAuditWorkspaces = this.active.size || this.background.size || config.pauseAdmission ? [] :
+            config.workspaces.filter(workspace => workspace.supportsScheduledAudit).map(workspace => workspace.workspaceId);
+        const poll = await this.request<PollResult>('/node-api/v1/commands/poll', { instanceId: this.instanceId, scheduledAuditWorkspaces });
         if (this.stopping) return;
         for (const commandId of poll.cancellations) this.active.get(commandId)?.controller.abort();
-        for (const value of poll.commands) {
+        const unconfirmed = journal.awaitingScheduledAcknowledgement().filter(command => !poll.commands.some(value => value.commandId === command.commandId));
+        for (const value of [...poll.commands, ...unconfirmed]) {
             const command = validateCommand(value);
             if (command.nodeId !== config.nodeId) throw new Error('拒绝不属于本节点的指令');
-            const saved = journal.accept(command);
             if (this.active.has(command.commandId)) continue;
-            if (!saved.fresh && saved.record.phase !== 'accepted') continue;
             if (this.active.size > 0) break;
             if ([...this.background.values()].some(task => task.projectId === command.projectId)) continue;
+            const saved = journal.accept(command);
+            if (saved.record.phase !== 'accepted') continue;
             const project = poll.projects.find(p => p.projectId === command.projectId);
             const workspace = project && config.workspaces.find(w => w.workspaceId === project.workspaceId);
             const valid = project && project.nodeId === config.nodeId && workspace && project.bindingGeneration === command.bindingGeneration
-                && project.projectConfigRevision === command.projectConfigRevision && workspace.vcsType === project.vcsType && workspace.target === project.target;
-            await this.request(`/node-api/v1/commands/${command.commandId}/ack`, { instanceId: this.instanceId });
+                && project.projectConfigRevision === command.projectConfigRevision && workspace.vcsType === project.vcsType && workspace.target === project.target
+                && (!command.scheduledAudit || workspace.supportsScheduledAudit);
+            const { command: acknowledged } = await this.request<{ command?: CommandRecord }>(
+                `/node-api/v1/commands/${command.commandId}/ack`, { instanceId: this.instanceId });
+            if (acknowledged?.state === 'completed' && acknowledged.result) {
+                journal.settleBeforeExecution(command.commandId, acknowledged.result);
+                continue;
+            }
+            if (command.scheduledAudit && acknowledged?.state !== 'accepted') continue;
             if (this.stopping) return;
             if (!valid) {
                 journal.emit(command.commandId, 'result', undefined, { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '节点项目绑定或执行配置不一致' }, delivery: { state: 'not_required' } });
                 continue;
             }
-            this.launch(command, poll.cancellations.includes(command.commandId), project);
+            this.launch(command, acknowledged?.cancelRequested === true || poll.cancellations.includes(command.commandId), project);
         }
         for (const id of poll.recoveries) {
             const saved = journal.get(id);

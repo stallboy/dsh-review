@@ -739,7 +739,7 @@ Git 与 SVN 适配器对核心流程提供统一的底层能力（所有 VCS 子
 * **业务结果判别（`result.status`）**：除 §7.5 的 `ApprovalOutcome`（仅属 `approve` Job）外，通用业务 Job 取值为 `COMMITTED`、`MANUAL_REQUIRED`、`VALIDATION_FAILED`、`ABORTED` 与 `RECOVERY_REQUIRED`：
   * `audit` Job 若有任何候选校验失败，即使合法候选和档案已提交，也必须返回 `VALIDATION_FAILED` 并携带 `commitRevision` 与逐候选错误。
   * `ai_fix` Job（含 `/rebase`、`/manual-revision`、`/candidate/finalize`、`/ai-fix`）返回 `ABORTED` 时，其 `reason` 枚举为：`REBASE_CONFLICT` / `GATE_CHECK_FAILED` / `BASE_UNCHANGED` / `DIRTY_WORKSPACE` / `CONCURRENCY_MISMATCH` / `STATE_CONFLICT` / `INVALID_CANDIDATE` / `SYNC_FAILED` / `COMMIT_FAILED` / `RUNNER_FAILED` / `CANCELLED`（严禁将 `REBASE_CONFLICT` 或 `BASE_UNCHANGED` 混入 §7.5 的 `ApprovalOutcome`）。
-* **Repo 级互斥与定时调度**：所有共享写和工作区事务经同一 repo 级进程内锁串行。`audit`（含会话与手动租约）运行中禁止 `approve`、`ai-fix`、`rebase`、`manual-revision`、`fix-session` 和其他 `sync`；新 `audit` 要求无任何运行中 Job。定时审查默认关闭，任一 Job 运行中、工作区脏或无基线时跳过本次。
+* **Repo 级互斥与定时调度**：所有共享写和工作区事务经同一 repo 级进程内锁串行。`audit`（含会话与手动租约）运行中禁止 `approve`、`ai-fix`、`rebase`、`manual-revision`、`fix-session` 和其他 `sync`；新 `audit` 要求无任何运行中 Job。定时审查由中央工作台按项目配置，默认关闭。每日到点等待节点最多 30 分钟，受理后可正常收尾。执行节点同步基线后先复查上轮，再扫描全仓。正式契约见 `SPEC.md` 的中央定时审查部分。
 * **Job 取消语义（`POST /jobs/:id/cancel`）**：只请求停止后续执行，终止进程树或会话并等待清理后，按实际提交进度返回结果（已证明未提交返回 `ABORTED`；已提交返回对应 `COMMITTED`/`VALIDATION_FAILED`；结果不明返回 `RECOVERY_REQUIRED`；手动租约不随取消自动释放）。
 * **Rebase 编排（运行于 `ai_fix` Job）**：
   1. **前置检查**：工作区必须干净；读取当前基线，若**有效业务基线未变**则返回 `ABORTED / BASE_UNCHANGED`。
@@ -807,7 +807,7 @@ API 优先根据请求 query 中的 `sessionId` 解析会话 `cwd` 作为仓库�
 
 | 方法与路径 | 请求体（Request Body） | 成功响应与服务端副作用 |
 | :--- | :--- | :--- |
-| `PUT /settings` | 部分 `AppSettings`（只更新出现的合法键） | `200 {settings, validation}`；原子保存并重载定时调度。 |
+| `PUT /settings` | 部分 `AppSettings`（只更新出现的合法键） | `200 {settings, validation}`；原子保存。 |
 | `POST /audit/session` | `{targetPath: string, note: string}`（空串表示全仓/无补充） | `202 {sessionId, jobId, job, auditId, targetPath, reportPath, baseRevision, owner}`；创建会话及跟踪 `audit` Job。 |
 | `POST /audit` | 同上 | `202 {jobId, job}`；启动 Headless Runner `audit` Job，结束后由 Host 收尾提交。 |
 | `POST /audit/manual` | 同上 | `202 {jobId, job, auditId, prompt, targetPath, reportPath, baseRevision, owner}`；创建外部审查持久化执行租约。 |
@@ -850,7 +850,6 @@ API 优先根据请求 query 中的 `sessionId` 解析会话 `cwd` 作为仓库�
 | `autoFixOnFailure` | boolean，`true` | 批准发生补丁冲突或门禁失败后是否自动唤醒 Runner 修复。 |
 | `gateTimeoutMs` | number，`600000` | 单条门禁超时毫秒数；有限数值且 `> 1000` 时保留并夹至上限 `3600000`（60 分钟），否则回退默认值（10 分钟）。 |
 | `syncBeforeApprove` | boolean，`true` | 批准前是否先同步远端基线。 |
-| `scheduleIntervalMinutes` | number，`0` | 定时审查间隔分钟数；有限数值且 `> 0` 时启用，否则归一为 `0`（关闭）。 |
 
 ---
 

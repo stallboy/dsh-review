@@ -784,9 +784,9 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 
 ### 7.6 审查编排
 
-审查支持手动与定时触发，以及三种执行方式：
+审查支持手动与中央定时触发，以及三种执行方式：
 
-- **Headless Runner 模式**：`POST /audit` 以 audit Job 调用当前设置的进程型 Runner；Runner 结束后由 Host 执行收尾。
+- **Headless Runner 模式**：`POST /audit` 以 audit Job 调用当前设置的进程型 Runner；Runner 结束后由 Host 执行收尾。仅中央内部受信指令可设置 `scheduled` 触发来源（§16.11）。
 - **DSH 会话模式**：创建真实会话，挂载到 cwd 所属 workspace、命名并以 queue 模式投递提示词，接受超时 60 秒。同时创建 `audit` Job 跟踪该会话，直到真实会话 turn 结束或超时；随后由 Host 执行收尾。宿主提供 turn 结束事件时，自动收尾必须在**会话确认空闲**（无排队续轮/goal 自动续轮）后才触发——多轮审查的中间轮结束不得提前收尾；turn 确认结束时必须同时解除执行超时闹钟。租约必须记录会话模式创建的 `sessionId`（其余模式缺省）。在宿主提供 turn 结束事件前（见附录 A G43），收尾由用户经面板触发：阻塞租约通过 `/queue` 的 `auditLease` 诊断暴露，执行超时把租约置 releasable 时，Job 结果与提示必须同时给出两条出路——收尾（`/audit/finalize`）与确认停止后释放（`/audit/release`），不得只引导释放。优先继承发起会话权限预设；不可继承时回退为审批策略覆盖。定时触发没有发起会话，不执行权限继承。
 - **手动提示词模式**：`POST /audit/manual` 创建持续有效的 audit Job/执行租约，记录 auditId、基线与输出目录，并返回完整提示词。外部 Agent 执行期间租约参与全部互斥与定时跳过。只有 `/audit/finalize` 正常完成才自动释放；取消或超时只停止 Job 并进入恢复状态，不得自动解除互斥。必须由人明确确认外部执行已停止，再调用 `/audit/release` 复核工作区并释放租约。仅导出预览不启动执行；实际外部执行必须使用该入口。手动租约与恢复标记必须持久化在本机 DSH_HOME 的运行时状态中，Host 重启后继续阻塞自动写操作，直到 release 或 finalize，不能因内存 Job 丢失而解除互斥。
 
@@ -814,7 +814,7 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 - 本地模式 Job 仅保存在内存；中央托管模式必须另按 §16 持久化指令、执行阶段、事件与结果。Host 重启后不得将中断 Job 当作成功；批准恢复以共享事实和 §5.5 的提交派生结果为准。若崩溃后工作区状态或提交结果无法确定，必须阻止自动写操作并要求人工恢复，不得猜测回滚。
 - 所有共享写和工作区事务必须经同一 repo 级进程内锁串行；guard 校验、同步、应用补丁、门禁、Runner、还原和提交位于同一锁临界区。`/sync` 在其他工作区事务运行时必须排队，不得改变其基线。手动审查的执行租约同样参与互斥。
 - audit（包括会话与手动租约 Job）运行中禁止 approve、ai-fix、rebase、manual-revision、fix-session 和其他 sync；新 audit 与 audit/session/manual 要求无任何运行中 Job。
-- 定时审查默认关闭；任一 Job 运行中、工作区脏或无基线时跳过本次，插件卸载时停止调度。
+- 定时审查由中央管理并默认关闭（§16.11）。节点检查租约、活动 Job、工作区和基线后才启动执行。
 - `POST /jobs/:id/cancel` 只请求停止后续执行，不强行把业务结果改为 ABORTED。Host 终止完整进程树或结束会话并等待清理后：已证明共享提交不存在才返回 ABORTED；普通共享提交已存在则返回对应 COMMITTED/VALIDATION_FAILED；批准业务提交已存在则返回 COMMITTED，并返回该提交的 VCS 版本号；结果不明返回 RECOVERY_REQUIRED 且禁止恢复。已结束 Job 直接返回原结果。手动租约不得随取消自动释放，必须按 §7.6 经人工确认停止后释放。不得靠 Host 重启释放锁。
 
 Rebase 由插件自身以 ai_fix Job 执行：读取当前基线，基线未变则 ABORTED；工作区必须干净。执行分两段：先尝试确定性的 VCS three-way 应用与门禁重跑——干净应用且门禁通过时无需调用 Runner，直接进入导出步骤（author 仍记为 `ai`）；应用冲突或门禁失败时，按 §7.4 转入 `RESOLVE_CONFLICT`（Mode C），由 Runner 从干净的新基线开始消解冲突并生成新版本，`runner` 为 `manual` 时不自动调用，返回 `ABORTED / REBASE_CONFLICT` 并在 message 携带人工修复提示词。门禁通过后必须基于新基线导出包含实际冲突解决结果的完整 `--binary` diff，并验证该新补丁能在新基线干净应用。只有该验证通过才追加 author=ai 的新 revision、回到 pending 并提交 `.ai-review/`。不得复用旧补丁文本。已证明未提交的明确失败不产生新版本并还原工作区；提交结果不明时返回 RECOVERY_REQUIRED，不得按普通失败还原。
@@ -896,7 +896,7 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 
 | 方法 | 路径 | 请求体 | 成功响应与副作用 |
 | --- | --- | --- | --- |
-| PUT | `/settings` | 部分 AppSettings；只更新出现的合法键 | 200 `{settings, validation}`；原子保存并重载调度。 |
+| PUT | `/settings` | 部分 AppSettings；只更新出现的合法键 | 200 `{settings, validation}`；原子保存。 |
 | POST | `/audit/session` | `{targetPath: string, note: string}`；空字符串分别表示全仓和无补充 | 202 `{sessionId, jobId, job, auditId, targetPath, reportPath, baseRevision, owner}`；创建会话及跟踪它的 audit Job。 |
 | POST | `/audit` | 同上 | 202 `{jobId, job}`，Job 类型 audit，由 Host 收尾提交。 |
 | POST | `/audit/manual` | 同上 | 202 `{jobId, job, auditId, prompt, targetPath, reportPath, baseRevision, owner}`；创建外部审查执行租约。 |
@@ -938,7 +938,6 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 | `autoFixOnFailure` | boolean，`true` | 批准冲突或门禁失败后是否自动修复。 |
 | `gateTimeoutMs` | number，`600000` | 有限数值且 >1000 时保留并夹至 3600000，否则回退默认值。 |
 | `syncBeforeApprove` | boolean，`true` | 批准前是否同步远端。 |
-| `scheduleIntervalMinutes` | number，`0` | 有限数值且 >0 时启用，否则归一为 0。 |
 
 `stale_days / rejection_memory_days / max_anti_patterns / allowed_gate_commands` 属于仓库级 `reviewers.yml`，不属于应用设置。
 
@@ -1219,7 +1218,7 @@ Agent 结束任务前必须逐项确认：
 
 首期中央单实例，执行节点多实例。节点主动通过 HTTPS 注册、心跳、拉取指令和回报结果；节点不必公开 DSH Web 端口。开发环境可使用回环 HTTP。平台支持跨平台部署，项目工具链由各节点准备。
 
-本轮不实现“复查上轮结果后再全量审查”的自动编排，不改用增量审查。可以手动启动现有全量审查。
+中央项目支持手动全量审查和定时两阶段全量审查，自动编排见 §16.11。
 
 ### 16.2 身份与节点注册
 
@@ -1336,6 +1335,23 @@ projectId、nodeId、workspaceId 必须明确区分。节点本地配置 workspa
 | AC-PLUGIN-CENTRAL-07 | 连接成功转为摘要，明确启动/停止/故障与节点离线，未变配置、同步连点和迟到轮询不能重复应用，编辑取消及刷新不覆盖草稿。 |
 | AC-PLUGIN-CENTRAL-08 | 仅评审会话隐藏宿主底部输入和任务区域且不留占位，切回及卸载恢复，相邻会话不受影响。 |
 | AC-PLUGIN-CENTRAL-09 | 仅无中央配置及旧托管配置时显示原本地评审，停止或故障不回退，旧中央入口继续可访问。 |
+
+### 16.11 中央定时审查
+
+中央按项目持久化启用状态、每日计划开始时间（`HH:mm`）与 IANA 时区。默认关闭，项目详情给出设置、最近一轮的状态和原因及下次计划时刻。`PUT /api/v1/projects/:projectId/audit-schedule` 接收 `{enabled, startTime, timeZone}` 并返回 `{auditSchedule}`。生效后从下一个适用的计划时刻开始，旧本地间隔配置不再参与调度。
+
+从计划时刻起等待最多 30 分钟，手动任务优先。中央在兼容执行节点轮询且能受理时派发，节点声明可运行的工作副本。到截止时尚未受理的指令结束并记为跳过；已受理的任务沿用取消、执行超时、收尾和交付规则。修改或关闭计划时撤回未受理的定时任务。窗口跨午夜时使用开始的本地日期作为归属；夏令时重复时刻采用首次，不存在的本地时刻当日跳过。
+
+定时审查沿用中央任务占用，使用项目与本地计划日期生成唯一幂等键。中央使用仅限定时 `audit` 的系统身份构造 `scheduledAudit: {scheduledAt, expiresAt}` 信封。Owner 以共享快照的 `reviewers.yml` 解析，配置时的受信审核身份兜底。用户写指令不得供应定时信封。
+
+节点必须在工作副本锁和执行租约保护下确认业务工作区、`.ai-review/` 干净且基线有效，同步绑定目标后固定共享快照。首先只读复查上一份已提交全仓档案的已合入候选和有效的未闭合 finding，其后全量审查。同一轮的两阶段共用基线和 1 小时的 Agent 执行预算。没有历史输入时直接全量审查。只有明确证据可产生原 `finding_id` 的新观察，已解决记录为 `resolved`，未核实保留此前投影。收尾写入一份 `trigger: scheduled` 的档案，候选继续通过人工审批。发现只读复查留下评审变动，或同步、提交、远端交付存在不确定性时，保留现场进入恢复流程。
+
+| 验收编号 | 要点 |
+| --- | --- |
+| AC-CENTRAL-SCHEDULE-01 | 节点正忙则等待，手动任务优先，期间空闲可执行；重启及重投递最多发起一轮。 |
+| AC-CENTRAL-SCHEDULE-02 | 时区和跨午夜计算正确；过期未受理的任务不可启动。 |
+| AC-CENTRAL-SCHEDULE-03 | 旧节点与离线节点错过开始时限可看到跳过原因；已受理任务可正常收尾。 |
+| AC-CENTRAL-SCHEDULE-04 | 用户不能伪造定时任务；关闭计划撤回未受理任务。 |
 
 ## 附录 A. 当前实现差距
 

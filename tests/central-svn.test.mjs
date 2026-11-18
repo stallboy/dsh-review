@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { runCommand } from './helpers.mjs';
 import { reviewFixture, patchFixture } from './fixtures/contract.mjs';
 import { ManagedDelivery } from '../packages/dsh-plugin/dist/managed/managed-delivery.js';
 import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
 import { ManagedOperations } from '../packages/dsh-plugin/dist/managed/managed-operations.js';
+import { parseAuditMarkdown } from '../packages/dsh-plugin/dist/host/audit-archive.js';
 
 test('SVN 子路径提交后固定远端版本读取，批准直接交付原远端版本', async t => {
     const base = await mkdtemp(path.join(os.tmpdir(), 'central-svn-'));
@@ -55,4 +56,44 @@ test('SVN 子路径提交后固定远端版本读取，批准直接交付原远�
     const recovered = await operations.recover(command, result, project);
     assert.equal(recovered.delivery.commitRevision, result.delivery.commitRevision);
     assert.equal(recovered.delivery.state, 'delivered');
+});
+
+test('中央定时 SVN 首轮使用同步后的基线并直接交付审查档案', async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'central-scheduled-svn-'));
+    let journal, operations;
+    t.after(async () => {
+        operations?.stop();
+        journal?.close();
+        await rm(directory, { recursive: true, force: true });
+    });
+    const repo = path.join(directory, 'repo'), root = path.join(directory, 'wc'), writer = path.join(directory, 'writer');
+    const url = pathToFileURL(repo).href;
+    runCommand('svnadmin', ['create', repo], directory);
+    runCommand('svn', ['checkout', '-q', url, root], directory);
+    runCommand('svn', ['checkout', '-q', url, writer], directory);
+    await writeFile(path.join(writer, 'content.md'), '# 审查对象\n');
+    runCommand('svn', ['add', 'content.md'], writer);
+    runCommand('svn', ['commit', '-qm', '业务基线'], writer);
+    const runner = fileURLToPath(new URL('./fixtures/report-only-agent.mjs', import.meta.url));
+    journal = new ManagedJournal(path.join(directory, 'journal.sqlite'));
+    operations = new ManagedOperations({ dataDir: path.join(directory, 'state'), journal,
+        workspaces: [{ workspaceId: 'svn-wc', label: 'SVN 项目', root, target: '^/',
+            settings: { runner: 'external', externalCommand: `"${process.execPath}" "${runner}"` } }] });
+    await operations.init();
+    const project = { projectId: 'svn-project', nodeId: 'svn-node', name: 'SVN', workspaceId: 'svn-wc',
+        bindingGeneration: 1, projectConfigRevision: 1, vcsType: 'svn', target: '^/', enabled: true };
+    const start = Date.now();
+    const command = { commandId: 'svn-scheduled-audit', requestHash: 'b'.repeat(64), projectId: project.projectId,
+        nodeId: project.nodeId, bindingGeneration: 1, projectConfigRevision: 1, operation: 'audit', payload: { targetPath: '.' },
+        actor: { userId: 'system-scheduled-audit', reviewIdentity: 'tester' }, createdAt: new Date(start).toISOString(),
+        scheduledAudit: { scheduledAt: new Date(start).toISOString(), expiresAt: new Date(start + 30 * 60_000).toISOString() } };
+    journal.accept(command);
+    const result = await operations.execute(command, new AbortController().signal, () => {}, project);
+    assert.equal(result.outcome.status, 'COMMITTED', JSON.stringify(result));
+    assert.equal(result.delivery.state, 'delivered');
+    const report = parseAuditMarkdown(runCommand('svn', ['cat', `${url}/${result.outcome.report.path}`], root).stdout);
+    assert.equal(report.meta.baseRevision, '1');
+    assert.equal(report.meta.trigger, 'scheduled');
+    assert.equal(report.meta.previousAudit, null);
+    assert.match(await readFile(path.join(root, 'content.md'), 'utf8'), /审查对象/);
 });

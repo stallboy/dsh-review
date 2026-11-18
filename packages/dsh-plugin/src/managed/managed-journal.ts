@@ -58,6 +58,17 @@ export class ManagedJournal {
         if (result.changes !== 1) throw new Error('指令尚未受理或已经执行，拒绝重复启动');
     }
 
+    awaitingScheduledAcknowledgement(): ManagedCommand[] {
+        return this.database.prepare("SELECT envelope FROM commands WHERE phase='accepted'").all()
+            .map(row => validateCommand(JSON.parse(String(row.envelope))))
+            .filter(command => command.scheduledAudit);
+    }
+
+    settleBeforeExecution(commandId: string, result: ManagedResult): void {
+        this.database.prepare("UPDATE commands SET phase='completed',result=? WHERE id=? AND phase='accepted'")
+            .run(JSON.stringify(result), commandId);
+    }
+
     interrupted(): JournalCommand[] {
         return this.database.prepare("SELECT id FROM commands WHERE phase='executing'").all().map(row => this.get(String(row.id))!);
     }

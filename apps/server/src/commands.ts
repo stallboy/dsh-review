@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { entityId, positiveInteger, record, textValue, validateCommand, type CommandRecord, type JsonRecord,
-    type ManagedResult, type NodeEvent } from '@dsh-review/protocol';
+import { entityId, positiveInteger, record, SCHEDULED_AUDIT_ACTOR, textValue, validateCommand, type Actor, type CommandRecord,
+    type JsonRecord, type ManagedResult, type NodeEvent, type ProjectRecord, type ScheduledAudit } from '@dsh-review/protocol';
 import { digest, stableJson } from './auth.js';
 import { CentralDatabase, CentralError, type Row, type User } from './database.js';
+import { AuditSchedules } from './audit-schedule.js';
 
 export class Commands {
-    constructor(private readonly database: CentralDatabase) {}
+    constructor(private readonly database: CentralDatabase, private readonly schedules: AuditSchedules) {}
 
     get(commandId: string): CommandRecord {
         const row = this.database.sql.prepare('SELECT * FROM commands WHERE command_id=?').get(commandId) as Row | undefined;
@@ -24,8 +25,10 @@ export class Commands {
         const db = this.database;
         const project = db.getProject(projectId);
         const key = entityId(input.idempotencyKey, 'idempotencyKey');
+        if ('scheduledAudit' in input) throw new CentralError(422, 'bad_request', '定时审查标识由中央生成');
         const requestHash = digest(stableJson({ operation: input.operation, payload: input.payload, guard: input.guard, actor: user.userId }));
         return db.transaction(() => {
+            this.schedules.expire();
             const existing = db.sql.prepare('SELECT command_id,request_hash FROM commands WHERE project_id=? AND idempotency_key=?').get(projectId, key) as Row | undefined;
             if (existing) {
                 if (existing.request_hash !== requestHash) throw new CentralError(409, 'idempotency_conflict', '同一幂等键已用于不同操作');
@@ -34,27 +37,43 @@ export class Commands {
             if (db.sql.prepare("SELECT 1 FROM commands WHERE project_id=? AND state!='completed'").get(projectId)) throw new CentralError(409, 'project_busy', '项目有未决操作');
             const node = db.getNode(project.nodeId);
             if (!project.enabled || !node.online || !node.compatible) throw new CentralError(503, 'node_unavailable', '执行节点离线、停用或协议不兼容');
-            const command = validateCommand({ commandId: randomUUID(), requestHash, projectId, nodeId: project.nodeId,
-                bindingGeneration: project.bindingGeneration, projectConfigRevision: project.projectConfigRevision,
-                operation: input.operation, payload: input.payload,
-                actor: { userId: user.userId, reviewIdentity: user.reviewIdentity },
-                ...(input.guard !== undefined ? { guard: input.guard } : {}), createdAt: db.now() });
-            db.sql.prepare(`INSERT INTO commands(command_id,project_id,node_id,idempotency_key,request_hash,envelope,state,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,'queued',?,?)`).run(command.commandId, projectId, project.nodeId, key, requestHash, JSON.stringify(command), db.now(), db.now());
-            return this.get(command.commandId);
+            return this.insert(project, key, input, { userId: user.userId, reviewIdentity: user.reviewIdentity }, requestHash);
         });
     }
 
-    poll(nodeId: string): { commands: CommandRecord[]; cancellations: string[]; recoveries: string[] } {
+    private insert(project: ProjectRecord, key: string, input: JsonRecord, actor: Actor, requestHash: string, scheduledAudit?: ScheduledAudit): CommandRecord {
+        const db = this.database;
+        const createdAt = db.now();
+        const command = validateCommand({ commandId: randomUUID(), requestHash, projectId: project.projectId, nodeId: project.nodeId,
+            bindingGeneration: project.bindingGeneration, projectConfigRevision: project.projectConfigRevision,
+            operation: input.operation, payload: input.payload, actor, ...(input.guard !== undefined ? { guard: input.guard } : {}),
+            ...(scheduledAudit ? { scheduledAudit } : {}), createdAt });
+        db.sql.prepare(`INSERT INTO commands(command_id,project_id,node_id,idempotency_key,request_hash,envelope,state,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,'queued',?,?)`).run(command.commandId, project.projectId, project.nodeId, key, requestHash, JSON.stringify(command), createdAt, createdAt);
+        return this.get(command.commandId);
+    }
+
+    poll(nodeId: string, scheduledAuditWorkspaces: ReadonlySet<string>): { commands: CommandRecord[]; cancellations: string[]; recoveries: string[] } {
         const db = this.database;
         return db.transaction(() => {
             const node = db.getNode(nodeId);
             if (!node.compatible) return { commands: [], cancellations: [], recoveries: [] };
+            this.schedules.expire();
             const all = (db.sql.prepare("SELECT command_id FROM commands WHERE node_id=? AND state!='completed' ORDER BY created_at").all(nodeId) as Row[])
                 .map(row => this.get(row.command_id));
+            if (!all.length && node.online) {
+                const due = this.schedules.due(nodeId, scheduledAuditWorkspaces)[0];
+                if (due) {
+                    const { key, ...schedule } = due.slot;
+                    const input = { operation: 'audit', payload: { targetPath: '.', note: '' } };
+                    const actor = { userId: SCHEDULED_AUDIT_ACTOR, reviewIdentity: due.reviewIdentity };
+                    all.push(this.insert(due.project, key, input, actor, digest(stableJson({ ...input, actor, schedule })), schedule));
+                }
+            }
             const running = all.some(c => c.state === 'accepted' || c.state === 'executing' || c.state === 'recovery_required');
-            const accepted = all.filter(c => c.state === 'accepted');
-            const commands = accepted.length ? accepted : running ? [] : all.filter(c => c.state === 'queued' || c.state === 'dispatched').slice(0, 1);
+            const dispatchable = all.filter(c => !c.scheduledAudit || scheduledAuditWorkspaces.has(db.getProject(c.projectId).workspaceId));
+            const accepted = dispatchable.filter(c => c.state === 'accepted');
+            const commands = accepted.length ? accepted : running ? [] : dispatchable.filter(c => c.state === 'queued' || c.state === 'dispatched').slice(0, 1);
             for (const command of commands) {
                 if (command.state === 'accepted') continue;
                 db.sql.prepare("UPDATE commands SET state='dispatched',updated_at=? WHERE command_id=?").run(db.now(), command.commandId);
@@ -67,13 +86,18 @@ export class Commands {
     }
 
     acknowledge(nodeId: string, commandId: string): CommandRecord {
-        const command = this.get(commandId);
-        this.authorize(nodeId, command);
-        if (command.state === 'queued' || command.state === 'dispatched') {
-            if (!this.database.getNode(nodeId).compatible) throw new CentralError(409, 'protocol_incompatible', '节点协议不兼容，不能受理写指令');
-            this.database.sql.prepare("UPDATE commands SET state='accepted',updated_at=? WHERE command_id=?").run(this.database.now(), commandId);
-        }
-        return this.get(commandId);
+        const db = this.database;
+        return db.transaction(() => {
+            const now = db.now();
+            this.schedules.expire(now);
+            const command = this.get(commandId);
+            this.authorize(nodeId, command);
+            if (command.state === 'queued' || command.state === 'dispatched') {
+                if (!db.getNode(nodeId).compatible) throw new CentralError(409, 'protocol_incompatible', '节点协议不兼容，不能受理写指令');
+                db.sql.prepare("UPDATE commands SET state='accepted',updated_at=? WHERE command_id=?").run(now, commandId);
+            }
+            return this.get(commandId);
+        });
     }
 
     cancel(commandId: string): CommandRecord {

@@ -1,6 +1,8 @@
 export * from './review.js';
 
 export const PROTOCOL_VERSION = 1;
+export const SCHEDULED_AUDIT_ACTOR = 'system-scheduled-audit';
+export const SCHEDULED_AUDIT_WAIT_MS = 30 * 60_000;
 
 export const OPERATIONS = [
     'approve', 'comments', 'comments-batch', 'comment-status', 'takeover', 'reject', 'resume', 'rebase',
@@ -24,6 +26,11 @@ export interface Guard {
     expectedUpdatedAt: string;
 }
 
+export interface ScheduledAudit {
+    scheduledAt: string;
+    expiresAt: string;
+}
+
 export interface ManagedCommand {
     commandId: string;
     requestHash: string;
@@ -35,6 +42,7 @@ export interface ManagedCommand {
     actor: Actor;
     payload: JsonRecord;
     guard?: Guard;
+    scheduledAudit?: ScheduledAudit;
     createdAt: string;
 }
 
@@ -62,6 +70,7 @@ export interface WorkspaceRegistration {
     vcsType: 'git' | 'svn';
     target: string;
     executionConfigHash?: string;
+    supportsScheduledAudit?: true;
 }
 
 export interface NodeRegistration {
@@ -188,6 +197,15 @@ export function validateCommand(value: unknown): ManagedCommand {
     entityId(actor.userId, 'actor.userId');
     textValue(actor.reviewIdentity, 'actor.reviewIdentity', 160);
     validatePayload(input.operation as ManagedOperation, record(input.payload, 'payload'));
+    if (input.scheduledAudit !== undefined) {
+        const schedule = record(input.scheduledAudit, 'scheduledAudit');
+        const start = timestamp(schedule.scheduledAt, 'scheduledAudit.scheduledAt');
+        const expiry = timestamp(schedule.expiresAt, 'scheduledAudit.expiresAt');
+        if (input.operation !== 'audit' || actor.userId !== SCHEDULED_AUDIT_ACTOR || (input.payload as JsonRecord).targetPath !== '.'
+            || Date.parse(expiry) - Date.parse(start) !== SCHEDULED_AUDIT_WAIT_MS) throw new ProtocolError('scheduledAudit');
+    } else if (actor.userId === SCHEDULED_AUDIT_ACTOR) {
+        throw new ProtocolError('scheduledAudit');
+    }
     timestamp(input.createdAt, 'createdAt');
     const needsGuard = !['audit', 'audit-finalize', 'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'sync'].includes(String(input.operation));
     if (needsGuard || input.guard !== undefined) {
@@ -254,7 +272,7 @@ export function validateRegistration(value: unknown): NodeRegistration {
     const ids = new Set<string>();
     for (const item of input.workspaces) {
         const workspace = record(item, 'workspace');
-        if (Object.keys(workspace).some(key => !['workspaceId', 'label', 'vcsType', 'target', 'executionConfigHash'].includes(key))) throw new ProtocolError('workspace');
+        if (Object.keys(workspace).some(key => !['workspaceId', 'label', 'vcsType', 'target', 'executionConfigHash', 'supportsScheduledAudit'].includes(key))) throw new ProtocolError('workspace');
         const id = entityId(workspace.workspaceId, 'workspaceId');
         if (ids.has(id)) throw new ProtocolError('重复 workspaceId');
         ids.add(id);
@@ -262,6 +280,7 @@ export function validateRegistration(value: unknown): NodeRegistration {
         if (workspace.vcsType !== 'git' && workspace.vcsType !== 'svn') throw new ProtocolError('workspace.vcsType');
         textValue(workspace.target, 'workspace.target');
         if (workspace.executionConfigHash !== undefined && (typeof workspace.executionConfigHash !== 'string' || !/^[a-f0-9]{64}$/.test(workspace.executionConfigHash))) throw new ProtocolError('workspace.executionConfigHash');
+        if (workspace.supportsScheduledAudit !== undefined && workspace.supportsScheduledAudit !== true) throw new ProtocolError('workspace.supportsScheduledAudit');
     }
     return structuredClone(input) as unknown as NodeRegistration;
 }

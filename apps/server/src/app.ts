@@ -6,6 +6,7 @@ import { PROTOCOL_VERSION, ProtocolError, entityId, record, textValue, validateR
 import { CentralDatabase, CentralError, type User } from './database.js';
 import { Commands } from './commands.js';
 import { Snapshots } from './snapshots.js';
+import { AuditSchedules } from './audit-schedule.js';
 
 interface RequestContext extends FastifyRequest {
     actor: User | null;
@@ -33,7 +34,8 @@ const body = (req: FastifyRequest): JsonRecord => record(req.body, 'body');
 export async function createCentralApp(options: CentralOptions): Promise<CentralApp> {
     const app = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024 });
     const database = new CentralDatabase(options.dataDir, options.clock);
-    const commands = new Commands(database), snapshots = new Snapshots(database);
+    const schedules = new AuditSchedules(database);
+    const commands = new Commands(database, schedules), snapshots = new Snapshots(database);
     app.decorate('database', database);
     app.decorateRequest('actor', null);
     app.decorateRequest('nodeId', null);
@@ -56,6 +58,7 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
                 throw new CentralError(403, 'csrf_mismatch', '请求校验失败，请刷新登录状态');
             }
         }
+        if (req.actor || req.nodeId) schedules.expire();
     });
 
     app.setErrorHandler((error, _req, reply) => {
@@ -100,7 +103,14 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
         if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new CentralError(422, 'bad_request', '项目启停值无效');
         return { project: database.updateProject(params(req).projectId!, { ...(input.name !== undefined ? { name: textValue(input.name, 'name', 160) } : {}), ...(input.enabled !== undefined ? { enabled: input.enabled as boolean } : {}) }) };
     });
-    app.get('/api/v1/projects/:projectId', async req => ({ ...snapshots.view(params(req).projectId!), snapshot: snapshots.get(params(req).projectId!) }));
+    app.get('/api/v1/projects/:projectId', async req => {
+        const projectId = params(req).projectId!;
+        const view = snapshots.view(projectId);
+        return { ...view, snapshot: snapshots.get(projectId), auditSchedule: schedules.view(view.project) };
+    });
+    app.put('/api/v1/projects/:projectId/audit-schedule', async req => ({
+        auditSchedule: schedules.update(database.getProject(params(req).projectId!), body(req), (req as RequestContext).actor!),
+    }));
     app.get('/api/v1/projects/:projectId/queue', async req => {
         const projectId = params(req).projectId!, snapshot = snapshots.get(projectId);
         return { ...snapshots.view(projectId), items: snapshot?.queue ?? [], errors: snapshot?.errors ?? [] };
@@ -166,7 +176,10 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
     });
     app.post('/node-api/v1/commands/poll', async req => {
         const id = identify(req);
-        return { ...commands.poll(id), projects: database.listProjects(id), queries: snapshots.pending(id) };
+        const capabilities = body(req).scheduledAuditWorkspaces ?? [];
+        if (!Array.isArray(capabilities)) throw new CentralError(422, 'bad_request', '节点审查能力声明无效');
+        const workspaces = new Set(capabilities.map(id => entityId(id, 'scheduledAuditWorkspaces')));
+        return { ...commands.poll(id, workspaces), projects: database.listProjects(id), queries: snapshots.pending(id) };
     });
     app.post('/node-api/v1/commands/:commandId/ack', async req => ({ command: commands.acknowledge(identify(req), params(req).commandId!) }));
     app.post('/node-api/v1/events', async req => {

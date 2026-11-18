@@ -4,6 +4,12 @@ import type { QueryClient } from '@tanstack/react-query';
 
 export interface Session { user: { userId: string; username: string; reviewIdentity: string }; csrfToken: string }
 export interface ProjectView { project: ProjectRecord; online: boolean; compatible: boolean; freshness: 'not_synced' | 'synced' | 'offline' | 'stale'; writable: boolean; lastSyncedAt: string | null; vcsSnapshot: string | null; snapshot?: ProjectSnapshot }
+export interface AuditScheduleSettings { enabled: boolean; startTime: string; timeZone: string }
+export interface AuditSchedule extends AuditScheduleSettings {
+    nextRunAt: string | null;
+    lastRun: { scheduledAt: string; state: CommandRecord['state'] | 'waiting' | 'skipped'; reason: string | null; commandId: string | null } | null;
+}
+export interface ProjectDetail extends ProjectView { auditSchedule: AuditSchedule | null }
 export type QueueItem = CandidateSummary & { projectId: string; projectName: string };
 export type { CommandRecord, NodeRecord };
 
@@ -34,6 +40,10 @@ export async function request<T>(path: string, method = 'GET', body?: unknown, s
     const value = await response.json();
     if (!response.ok) throw new ApiError(response.status, value.error?.code ?? 'http_error', value.error?.message ?? `请求失败（${response.status}）`);
     return value;
+}
+
+export function saveAuditSchedule(projectId: string, settings: AuditScheduleSettings) {
+    return request<{ auditSchedule: AuditSchedule }>(`/projects/${projectId}/audit-schedule`, 'PUT', settings);
 }
 
 export async function detail<T>(projectId: string, kind: string, params: Record<string, string>, signal: AbortSignal): Promise<T> {

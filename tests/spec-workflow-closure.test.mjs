@@ -20,9 +20,7 @@ import { createGitFixture, runCommand } from './helpers.mjs';
 import { commitCandidate, guardFixture, reviewFixture } from './fixtures/contract.mjs';
 
 const servers = [];
-const apis = [];
 after(async () => {
-  for (const api of apis) api.stopScheduler();
   await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
 });
 
@@ -42,7 +40,6 @@ async function startApi(root, settingsPatch = {}, depsPatch = {}) {
   const server = createServer((req, res) => { void api.handle(req, res); });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   servers.push(server);
-  apis.push(api);
   return { api, base: `http://127.0.0.1:${String(server.address().port)}${API_PREFIX}` };
 }
 
@@ -397,21 +394,22 @@ test('§7.6：真实 turn 结束通知驱动 audit Job 自动 Host finalize 并�
   assert.equal(audits.audits[0].auditId, started.auditId);
 });
 
-test('§7.7：并发定时审查在同一 repo 锁内完成互斥、auditId 与租约，只创建一个会话', async () => {
+test('AC-SCHEDULE-01：并发会话审查在同一 repo 锁内取得租约，只创建一个会话', async () => {
   const root = await createGitFixture();
   const calls = [];
-  const { api } = await startApi(root, {}, {
+  const { api, base } = await startApi(root, {}, {
     createAuditSession: async (input) => {
       calls.push(input);
       await new Promise((resolve) => setTimeout(resolve, 100));
-      return { sessionId: `scheduled-${calls.length}` };
+      return { sessionId: `manual-${calls.length}` };
     },
   });
-  const results = await Promise.allSettled([
-    api.runScheduledAuditOnce(),
-    api.runScheduledAuditOnce(),
+  const responses = await Promise.all([
+    post(base, '/audit/session', { targetPath: '', note: '' }),
+    post(base, '/audit/session', { targetPath: '', note: '' }),
   ]);
-  assert.equal(calls.length, 1, JSON.stringify(results));
+  assert.deepEqual(responses.map(response => response.status).sort(), [202, 409]);
+  assert.equal(calls.length, 1);
   assert.equal(api.auditLifecycle.all().filter((lease) => lease.state === 'active').length, 1);
 });
 

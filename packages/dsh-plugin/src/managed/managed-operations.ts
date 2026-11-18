@@ -9,6 +9,7 @@ import { ManagedDelivery, decorateManagedVcs } from './managed-delivery.js';
 import { ManagedJournal } from './managed-journal.js';
 import { managedSource } from './managed-source.js';
 import { DEFAULT_SETTINGS } from '../host/settings.js';
+import { scheduledReviewDataClean } from '../host/scheduled-audit-vcs.js';
 import { runProcess } from '../host/shell.js';
 import type { AppSettings } from '../host/types.js';
 
@@ -93,20 +94,22 @@ export class ManagedOperations {
             if (targetResult.code !== 0 || !target || (config.target && config.target !== target)) throw new Error(`workspace ${config.workspaceId} 的目标分支不匹配`);
             this.options.journal.bindWorkspace(config.workspaceId, JSON.stringify({ root: identity, type, target }));
             const settings: AppSettings = { ...DEFAULT_SETTINGS, ...config.settings, repoRoot: root, vcsType: type, baseBranch: target,
-                owner: 'managed-node', scheduleIntervalMinutes: 0 };
+                owner: 'managed-node' };
             api = new ReviewApi({ settings, saveSettings: async () => { throw new Error('托管配置仅由节点本地文件管理'); },
                 statePath: path.join(this.options.dataDir, `${config.workspaceId}-runtime.json`), decorateVcs: decorateManagedVcs,
                 ...(this.options.resolveCredential ? { resolveCredential: this.options.resolveCredential } : {}) });
             await api.init();
             if (api.lastConfigErrors.length) throw new Error(api.lastConfigErrors.join('；'));
             if (this.stopped) throw new Error('托管执行器已停止');
-            const registration: WorkspaceRegistration = { workspaceId: config.workspaceId, label: config.label, vcsType: type, target, executionConfigHash: executionConfigHash(config) };
+            const registration: WorkspaceRegistration = {
+                workspaceId: config.workspaceId, label: config.label, vcsType: type, target, executionConfigHash: executionConfigHash(config),
+                ...(settings.runner !== 'manual' && (settings.runner !== 'external' || settings.externalCommand.trim()) ? { supportsScheduledAudit: true } : {}),
+            };
             const runtime = { root, api, registration, delivery: new ManagedDelivery({ root, type, target }) };
             this.runtimes.set(config.workspaceId, runtime);
             this.declarations.set(config.workspaceId, registration);
             return runtime;
         } catch (error) {
-            api?.stopScheduler();
             this.roots.delete(identity);
             throw error;
         }
@@ -136,18 +139,23 @@ export class ManagedOperations {
 
     async execute(command: ManagedCommand, signal: AbortSignal, emit: (line: string) => void, project: ProjectRecord): Promise<ManagedResult> {
         const runtime = await this.runtime(project);
-        await this.checkTarget(runtime);
+        if (!command.scheduledAudit) await this.checkTarget(runtime);
         if (command.projectId !== project.projectId || command.bindingGeneration !== project.bindingGeneration || command.projectConfigRevision !== project.projectConfigRevision) throw new Error('执行配置已过期');
         if (command.payload.autoFix === true) return { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '托管模式请先提交评论，再单独启动 AI 修复' }, delivery: { state: 'not_required' } };
+        if (command.scheduledAudit && !runtime.registration.supportsScheduledAudit) {
+            return { outcome: { status: 'ABORTED', reason: 'RUNNER_UNAVAILABLE', message: '此工作副本未配置进程型审查 Runner' }, delivery: { state: 'not_required' } };
+        }
         this.options.journal.checkpoint(command.commandId, { phase: 'invoking', workspaceId: project.workspaceId });
         const response = await runtime.api.invoke({ method: 'POST', path: routes[command.operation], body: { ...command.payload, ...command.guard,
-            ...(command.operation === 'takeover' ? { owner: command.actor.reviewIdentity } : {}) }, actor: { ...command.actor, commandId: command.commandId } });
+            ...(command.operation === 'takeover' ? { owner: command.actor.reviewIdentity } : {}) },
+        actor: { ...command.actor, commandId: command.commandId,
+            ...(command.scheduledAudit ? { scheduledAudit: { ...command.scheduledAudit, target: runtime.registration.target, signal } } : {}) } });
         const data = object(response.body);
         let outcome: ManagedResult['outcome'];
         if (response.status >= 400) {
             const error = object(data.error), details = object(error.details);
             outcome = details.status === 'RECOVERY_REQUIRED' ? { ...details, status: 'RECOVERY_REQUIRED', message: error.message } : {
-                status: response.status < 500 ? 'ABORTED' : 'RECOVERY_REQUIRED', reason: error.code ?? 'EXECUTION_EXCEPTION', message: error.message, httpStatus: response.status,
+                status: response.status < 500 ? 'ABORTED' : 'RECOVERY_REQUIRED', reason: details.reason ?? error.code ?? 'EXECUTION_EXCEPTION', message: error.message, httpStatus: response.status,
             };
         } else if (typeof data.jobId === 'string') {
             this.options.journal.checkpoint(command.commandId, { phase: 'job', workspaceId: project.workspaceId, jobId: data.jobId });
@@ -175,9 +183,12 @@ export class ManagedOperations {
         }
         let commit = typeof outcome.commitRevision === 'string' ? outcome.commitRevision : null;
         if (!commit) commit = await runtime.delivery.findCommandCommit(command.commandId);
-        const result: ManagedResult = { outcome, delivery: commit ? { state: 'pending', commitRevision: commit } : { state: outcome.status === 'RECOVERY_REQUIRED' ? 'unknown' : 'not_required' } };
+        const unverifiedSchedule = command.scheduledAudit && outcome.status === 'RECOVERY_REQUIRED';
+        const result: ManagedResult = { outcome, delivery: unverifiedSchedule
+            ? { state: 'unknown', ...(commit ? { commitRevision: commit } : {}) }
+            : commit ? { state: 'pending', commitRevision: commit } : { state: outcome.status === 'RECOVERY_REQUIRED' ? 'unknown' : 'not_required' } };
         this.options.journal.checkpoint(command.commandId, { phase: 'business_finished', result });
-        if (commit) result.delivery = await runtime.api.withWriteLock(runtime.root, () => runtime.delivery.deliver(commit!));
+        if (commit && !unverifiedSchedule) result.delivery = await runtime.api.withWriteLock(runtime.root, () => runtime.delivery.deliver(commit!));
         this.options.journal.checkpoint(command.commandId, { phase: 'finished', result });
         return result;
     }
@@ -195,6 +206,29 @@ export class ManagedOperations {
             const result = saved?.outcome ? structuredClone(saved) : previous?.outcome.status !== 'RECOVERY_REQUIRED' ? structuredClone(previous) : undefined;
             const commit = result?.delivery.commitRevision ?? await runtime.delivery.findCommandCommit(command.commandId);
             if (!commit) {
+                if (command.scheduledAudit && result?.outcome.reason === 'SCHEDULE_RECHECK_DIRTY') {
+                    const { auditId, baseRevision } = result.outcome;
+                    const lease = typeof auditId === 'string' ? runtime.api.leaseLookup(auditId) : undefined;
+                    const releaseStarted = checkpoint?.phase === 'recheck_releasing';
+                    if (!lease || lease.root !== runtime.root || lease.trigger !== 'scheduled' || lease.baseRevision !== baseRevision
+                        || (lease.state !== 'releasable' && !(lease.state === 'released' && releaseStarted))) return result;
+                    const current = await runtime.api.runtimeFor(new URL('http://managed/'));
+                    if (await current.vcs.getCurrentBase() !== lease.baseRevision || !(await current.vcs.ensureCleanWorkspace()).clean
+                        || !await scheduledReviewDataClean(current)) return result;
+                    if (current.vcsType === 'svn') {
+                        const { source } = await managedSource(current.root, current.vcsType);
+                        if (!(await source.snapshotId())?.endsWith(`@${lease.baseRevision}`)) return result;
+                    }
+                    this.options.journal.checkpoint(command.commandId, { phase: 'recheck_releasing', result });
+                    await runtime.api.leaseTransition(lease.auditId, 'released');
+                    const recovered: ManagedResult = {
+                        outcome: { status: 'ABORTED', reason: 'SCHEDULE_RECHECK_DIRTY_RECOVERED', auditId, baseRevision,
+                            message: '已确认历史复查未产生提交，且绑定工作副本已还原，租约已释放' },
+                        delivery: { state: 'not_required' },
+                    };
+                    this.options.journal.checkpoint(command.commandId, { phase: 'finished', result: recovered });
+                    return recovered;
+                }
                 if (result?.delivery.state === 'not_required') return result;
                 if (checkpoint?.phase === 'not_started' && (!previous || previous.outcome.status === 'RECOVERY_REQUIRED')
                     && !runtime.api.auditLifecycle.blockingLeaseFor(runtime.root)) {
@@ -206,7 +240,10 @@ export class ManagedOperations {
                 return unknownResult('没有足够证据证明原执行结果；请保留现场并人工核验，不会重跑业务操作');
             }
             const restored = result ?? { outcome: { status: 'RECOVERY_REQUIRED', reason: 'EXECUTION_OUTCOME_UNKNOWN', commitRevision: commit,
-                detail: '已找到原指令的提交，但缺少完整业务结果，不能仅据提交标记推断批准成功' }, delivery: { state: 'pending' as const, commitRevision: commit } };
+                detail: '已找到原指令的提交，但缺少完整业务结果，不能仅据提交标记推断执行成功' }, delivery: { state: 'pending' as const, commitRevision: commit } };
+            if (command.scheduledAudit && restored.outcome.status === 'RECOVERY_REQUIRED') {
+                return { ...restored, delivery: { state: 'unknown', commitRevision: commit } };
+            }
             restored.delivery = await runtime.delivery.deliver(commit);
             this.options.journal.checkpoint(command.commandId, { phase: 'finished', result: restored });
             return restored;
@@ -260,6 +297,5 @@ export class ManagedOperations {
 
     stop(): void {
         this.stopped = true;
-        for (const runtime of this.runtimes.values()) runtime.api.stopScheduler();
     }
 }

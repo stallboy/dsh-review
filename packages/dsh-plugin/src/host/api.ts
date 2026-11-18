@@ -3,7 +3,6 @@ import type { ApiRequest, ApiResponse } from './api-context.js';
 import path from 'node:path';
 import process from 'node:process';
 import { ApprovalOrchestrator } from './approval.js';
-import { buildAuditPrompt, loadAuditSystemPrompt } from './auditor.js';
 import type { AuditLifecycle, AuditLeaseRecord } from './audit-lifecycle.js';
 import { JobManager } from './jobs.js';
 import { RouteTable, blockedByRunningAudit, holdsRepoLock, isAuditSelfManaged } from './routes.js';
@@ -26,7 +25,6 @@ import {
   API_PREFIX,
   APP_VERSION,
   RepoLock,
-  composeSessionPrompt,
   guardFrom,
   readJson,
   relative,
@@ -89,7 +87,6 @@ export class ReviewApi implements ApiHost {
     await this.reconfigure(this.deps.settings);
     // §7.6：加载持久化审查租约——Host 重启后 active/releasable 租约继续阻塞自动写操作。
     await this.auditRuntime.loadAuditLeases();
-    this.startScheduler();
   }
 
   /** ApiHost：`settings` 在 reconfigure 中被整体替换，子模块必须经此访问当前值。 */
@@ -132,90 +129,10 @@ export class ReviewApi implements ApiHost {
     return this.fixSessions;
   }
 
-  // ---------- §6.1 定时审查（scheduled trigger） ----------
-
-  /** ApiHost：会话/手动/定时审查跟踪 Job 的完成回调（仅内存；重启后由 finalize 直接新建 Job）。 */
+  /** ApiHost：会话/手动提示词审查跟踪 Job 的完成回调（仅内存；重启后由 finalize 直接新建 Job）。 */
   readonly auditJobFinishes = new Map<string, (result?: unknown) => void>();
   /** ApiHost：跟踪 Job id → auditId，供 /jobs/:id/cancel 把租约转为 releasable。 */
   readonly auditJobLeases = new Map<string, string>();
-
-  // ---------- §6.1 定时审查（scheduled trigger） ----------
-
-  private scheduleTimer: ReturnType<typeof setInterval> | null = null;
-
-  private startScheduler(): void {
-    this.stopScheduler();
-    const minutes = this.settings.scheduleIntervalMinutes;
-    if (!(minutes > 0) || !this.deps.createAuditSession) return;
-    this.scheduleTimer = setInterval(() => {
-      void this.runScheduledAudit().catch((error) => {
-        console.error('[dsh-code-review] 定时审查失败：', error instanceof Error ? error.message : String(error));
-      });
-    }, minutes * 60_000);
-    this.scheduleTimer.unref?.();
-  }
-
-  /** 停止定时审查调度（插件卸载 / 测试收尾时调用）。 */
-  stopScheduler(): void {
-    if (this.scheduleTimer) {
-      clearInterval(this.scheduleTimer);
-      this.scheduleTimer = null;
-    }
-  }
-
-  /** §7.6：定时触发防重入——60ms 级间隔下多次 tick 可能在首个租约落盘前重叠进入。 */
-  private scheduledAuditInFlight = false;
-
-  private async runScheduledAudit(): Promise<void> {
-    if (this.scheduledAuditInFlight) return;
-    this.scheduledAuditInFlight = true;
-    try {
-      await this.runScheduledAuditOnce();
-    } finally {
-      this.scheduledAuditInFlight = false;
-    }
-  }
-
-  private async runScheduledAuditOnce(): Promise<void> {
-    const runtime = await this.runtimeFor(new URL('http://local/')).catch(() => null);
-    if (!runtime || !this.deps.createAuditSession) return;
-    await this.withWriteLock(runtime.root, async () => {
-      if (this.jobs.list().some((job) => job.status === 'running')) return;
-      if (this.auditLifecycle.blockingLeaseFor(runtime.root)) return;
-      const baseRevision = await runtime.vcs.getCurrentBase().catch(() => null);
-      if (!baseRevision) return;
-      const clean = await runtime.vcs.ensureCleanWorkspace().catch(() => ({ clean: false, message: 'unknown' }));
-      const owner = await this.ownerFor(runtime.root);
-      const now = new Date();
-      const { auditId, reportPath } = await this.auditRuntime.beginAuditLeaseUnderLock(
-        runtime,
-        { targetPath: '', baseRevision, owner, now, trigger: 'scheduled' },
-        clean,
-      );
-      try {
-        const sharedSource = await sharedSourceFor(runtime);
-        const userPrompt = await buildAuditPrompt({
-          repoRoot: runtime.root,
-          vcsType: runtime.vcsType,
-          owner,
-          targetPath: '',
-          note: '定时审查（trigger: scheduled）',
-          baseRevision,
-          reportPath,
-          mode: 'session',
-          now,
-          ...(sharedSource ? { source: sharedSource } : {}),
-        });
-        const prompt = composeSessionPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.auditRuntime.ownerRoutingBlock(runtime.root, sharedSource)}`);
-        const created = await this.deps.createAuditSession?.({ cwd: runtime.root, title: '定时仓库审查', prompt, ownerSessionId: '' });
-        if (!created) throw new Error('定时审查会话创建未返回结果');
-        this.auditRuntime.trackAuditSession(runtime, auditId, created.sessionId);
-      } catch (error) {
-        await this.auditRuntime.releaseLeaseById(auditId);
-        throw error;
-      }
-    });
-  }
 
   withWriteLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
     return this.repoLock.withWriteLock(repoRoot, fn);
@@ -513,7 +430,6 @@ export class ReviewApi implements ApiHost {
       ...(typeof body['autoFixOnFailure'] === 'boolean' ? { autoFixOnFailure: body['autoFixOnFailure'] } : {}),
       ...(typeof body['syncBeforeApprove'] === 'boolean' ? { syncBeforeApprove: body['syncBeforeApprove'] } : {}),
       ...(typeof body['gateTimeoutMs'] === 'number' ? { gateTimeoutMs: body['gateTimeoutMs'] } : {}),
-      ...(typeof body['scheduleIntervalMinutes'] === 'number' ? { scheduleIntervalMinutes: body['scheduleIntervalMinutes'] } : {}),
     };
     // §9：owner 保存时校验非空；vcsType 必须与实际仓库一致。
     if (body['owner'] !== undefined && (typeof body['owner'] !== 'string' || !body['owner'].trim())) {
@@ -527,7 +443,6 @@ export class ReviewApi implements ApiHost {
     }
     const saved = await this.deps.saveSettings(merged);
     await this.reconfigure(saved);
-    this.startScheduler(); // 调度间隔运行期可改，立即生效
     const validation = await validateSettings(saved).catch(() => ({ ok: false, errors: this.configErrors, vcsType: this.vcsType }));
     sendJson(res, 200, { settings: saved, validation });
   }

@@ -47,6 +47,9 @@ export class CentralDatabase {
                 last_event INTEGER NOT NULL DEFAULT 0, logs_total INTEGER NOT NULL DEFAULT 0,
                 recovery_requested INTEGER NOT NULL DEFAULT 0, UNIQUE(project_id,idempotency_key));
             CREATE UNIQUE INDEX IF NOT EXISTS one_project_writer ON commands(project_id) WHERE state!='completed';
+            CREATE TABLE IF NOT EXISTS audit_schedules (project_id TEXT PRIMARY KEY REFERENCES projects,
+                enabled INTEGER NOT NULL, start_time TEXT NOT NULL, time_zone TEXT NOT NULL,
+                effective_at TEXT NOT NULL, review_identity TEXT NOT NULL, last_missed_at TEXT);
             CREATE TABLE IF NOT EXISTS events (command_id TEXT NOT NULL REFERENCES commands, sequence INTEGER NOT NULL,
                 payload TEXT NOT NULL, PRIMARY KEY(command_id,sequence));
             CREATE TABLE IF NOT EXISTS logs (command_id TEXT NOT NULL REFERENCES commands, offset INTEGER NOT NULL,

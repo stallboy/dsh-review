@@ -14,6 +14,8 @@ import {
   type AuditLeaseRecord,
 } from './audit-lifecycle.js';
 import { AuditArchive } from './audit-archive.js';
+import { SCHEDULED_AUDIT_ACTOR } from '@dsh-review/protocol';
+import { matchesAuditTarget, scheduledReviewDataClean, syncScheduledAudit } from './scheduled-audit-vcs.js';
 import { wrapAgentPrompt } from './runner.js';
 import { loadReviewers } from './reviewers.js';
 import { dshHome } from './settings.js';
@@ -21,12 +23,14 @@ import type { JobRecord } from './types.js';
 import { ApiError } from './types.js';
 import {
   composeSessionPrompt,
+  currentTrustedActor,
   readJson,
   sendJson,
   sharedSourceFor,
   stringField,
   type ApiHost,
   type Runtime,
+  type TrustedActor,
 } from './api-context.js';
 
 /**
@@ -324,6 +328,12 @@ export class AuditRuntime {
   async audit(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const body = await readJson(req);
+    const actor = currentTrustedActor();
+    if (actor?.userId === SCHEDULED_AUDIT_ACTOR && actor.commandId && actor.scheduledAudit) {
+        const job = await this.startScheduledAudit(runtime, actor.scheduledAudit);
+        sendJson(res, 202, { jobId: job.id, job });
+        return;
+    }
     const targetPath = stringField(body, 'targetPath');
     const note = stringField(body, 'note');
     const target = await resolveAuditTarget(runtime.root, targetPath);
@@ -338,7 +348,7 @@ export class AuditRuntime {
     const now = new Date();
     const { auditId } = await this.beginAuditLease(
       runtime,
-      { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'scheduled' },
+      { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'manual' },
       clean,
     );
     // §7.7：headless Runner 的工作区事务必须与其他共享写经同一 repo 锁串行。
@@ -356,6 +366,7 @@ export class AuditRuntime {
           ...(sharedSource ? { candidateSource: sharedSource } : {}),
           ...(this.host.deps.resolveCredential ? { resolveCredential: this.host.deps.resolveCredential } : {}),
           signal,
+          lease: this.auditLifecycle.find(auditId)!,
         });
         const outcome = await auditor.run();
         log(`结果：${outcome.status} — ${outcome.message}`);
@@ -368,6 +379,73 @@ export class AuditRuntime {
     this.host.auditJobLeases.set(job.id, auditId);
     sendJson(res, 202, { jobId: job.id, job });
   }
+
+    private async startScheduledAudit(runtime: Runtime, scheduled: NonNullable<TrustedActor['scheduledAudit']>): Promise<JobRecord> {
+        let admit!: (job: JobRecord) => void;
+        let rejectAdmission!: (reason: unknown) => void;
+        const admitted = new Promise<JobRecord>((resolve, reject) => {
+            admit = resolve;
+            rejectAdmission = reject;
+        });
+        void this.host.withWriteLock(runtime.root, async () => {
+            const settings = this.host.currentSettings();
+            if (settings.runner === 'manual' || (settings.runner === 'external' && !settings.externalCommand.trim())) {
+                throw new ApiError(409, 'conflict', '未配置可无人值守的审查 Runner', { reason: 'RUNNER_UNAVAILABLE' });
+            }
+            const clean = await runtime.vcs.ensureCleanWorkspace();
+            try {
+                this.assertAuditStartAllowed(runtime, clean);
+            } catch (error) {
+                if (!(error instanceof ApiError)) throw error;
+                const busy = Boolean(this.activeLeaseFor(runtime.root) || this.host.jobManager.list().some(job => job.status === 'running'));
+                throw new ApiError(409, 'conflict', error.message, { reason: busy ? 'SCHEDULE_WORKSPACE_BUSY' : 'SCHEDULE_WORKSPACE_DIRTY' });
+            }
+            if (!await scheduledReviewDataClean(runtime)) {
+                throw new ApiError(409, 'conflict', '评审目录有未提交的改动，已跳过本轮定时审查并保留现场', { reason: 'SCHEDULE_WORKSPACE_DIRTY' });
+            }
+            const baseRevision = await syncScheduledAudit(runtime, scheduled.target, scheduled.signal);
+            if (scheduled.signal.aborted) throw new ApiError(409, 'conflict', '定时审查在启动 Runner 前已取消', { reason: 'CANCELLED' });
+            if (!await scheduledReviewDataClean(runtime)) {
+                throw new ApiError(409, 'conflict', '同步后评审目录出现未提交改动，需要核验现场', {
+                    status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', detail: '无法证明同步后的评审数据与共享基线一致',
+                });
+            }
+            const candidateSource = await sharedSourceFor(runtime);
+            if (!candidateSource || (runtime.vcsType === 'git' && await candidateSource.snapshotId() !== baseRevision)) {
+                throw new ApiError(409, 'conflict', '无法固定同步后的审查基线', {
+                    status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', detail: '共享快照与同步结果无法对应',
+                });
+            }
+            const owner = await this.host.ownerFor(runtime.root);
+            const { auditId } = await this.beginAuditLeaseUnderLock(
+                runtime, { targetPath: '', baseRevision, owner, now: new Date(), trigger: 'scheduled' }, clean,
+            );
+            const lease = this.auditLifecycle.find(auditId)!;
+            let execution: Promise<unknown> | undefined;
+            const job = this.host.jobManager.start('audit', (log, jobId, signal) => {
+                this.host.auditJobLeases.set(jobId, auditId);
+                const auditor = new Auditor({
+                    store: runtime.store, vcs: runtime.vcs, settings, owner, targetPath: '', note: '', log,
+                    candidateSource, lease, signal: AbortSignal.any([scheduled.signal, signal]),
+                    ...(this.host.deps.resolveCredential ? { resolveCredential: this.host.deps.resolveCredential } : {}),
+                    scheduledBaseMatches: () => matchesAuditTarget(runtime, scheduled.target),
+                });
+                execution = auditor.run().then(async outcome => {
+                    const state = outcome.status === 'RECOVERY_REQUIRED' ? 'releasable' : 'released';
+                    await this.releaseLeaseById(auditId, state);
+                    log(`结果：${outcome.status} — ${outcome.message}`);
+                    return outcome;
+                }, async error => {
+                    await this.releaseLeaseById(auditId, 'releasable');
+                    throw error;
+                }).finally(() => this.host.auditJobLeases.delete(jobId));
+                return execution;
+            });
+            admit(job);
+            await execution;
+        }).catch(rejectAdmission);
+        return admitted;
+    }
 
   /**
    * §7.6 手动提示词模式：创建持久化执行租约并返回完整提示词。
