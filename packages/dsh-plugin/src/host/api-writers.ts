@@ -252,6 +252,7 @@ export class Writers {
       verifyEntries,
       ...(input.deletePaths && input.deletePaths.length > 0 ? { verifyDeletions: input.deletePaths } : {}),
     });
+    if (commit.verificationFailed) return { landed: false, outcome: 'RECOVERY_REQUIRED', detail: commit.errorOutput };
     if (commit.success) {
       if (commit.commitRevision) return { landed: true, commitRevision: commit.commitRevision };
       const fallbackProbe = await runtime.vcs.getCommitProbe(probePaths).catch(() => null);

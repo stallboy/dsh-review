@@ -410,6 +410,10 @@ export class ApprovalOrchestrator {
         verifyEntries,
         verifyDeletions,
       });
+      if (commit.verificationFailed) return {
+          status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN',
+          message: '提交已执行但完整核验失败，请保留现场并人工核对。', detail: commit.errorOutput, jobId,
+      };
       if (!commit.success) {
         lastCommitError = commit.errorOutput;
         log(`提交失败：${commit.errorOutput}`);
@@ -856,6 +860,10 @@ export class ApprovalOrchestrator {
         paths: [relative(store.repoRoot, latest.candidate.dirPath)],
         verifyEntries,
       });
+      if (commit.verificationFailed) return {
+          status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN',
+          message: '新版本提交已执行但完整核验失败，请保留现场并人工核对。', detail: commit.errorOutput, jobId,
+      };
       if (!commit.success) {
         const probeAfter = await this.deps.vcs.getCommitProbe(probePaths).catch(() => null);
         if (probeBeforeFix === null || probeAfter === null) {

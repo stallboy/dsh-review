@@ -1019,7 +1019,13 @@ export class Auditor {
         paths: commitPaths,
         verifyEntries: commitEntries,
       });
-      if (commit.success) {
+      if (commit.verificationFailed) {
+          commitRevision = commit.commitRevision;
+          status = 'RECOVERY_REQUIRED';
+          recoveryReason = 'COMMIT_OUTCOME_UNKNOWN';
+          recoveryDetail = commit.errorOutput;
+          warnings.push(`收尾提交已执行但完整核验失败，现场保留待人工核对：${commit.errorOutput}`);
+      } else if (commit.success) {
         commitRevision = commit.commitRevision;
         this.log(`已提交审查收尾：${commitRevision?.slice(0, 12) ?? '(无版本号)'}`);
         status = created.some((item) => item.errors.length > 0) ? 'VALIDATION_FAILED' : 'COMMITTED';

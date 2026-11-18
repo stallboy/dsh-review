@@ -1,5 +1,6 @@
-import { mkdir, readFile, rm } from 'node:fs/promises';
+import { lstat, mkdir, readFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -52,6 +53,7 @@ export interface CommitResult {
   commitRevision: string | null;
   outOfDate: boolean;
   errorOutput: string;
+    verificationFailed?: boolean;
 }
 
 export interface CleanResult {
@@ -252,7 +254,7 @@ function svnRepoPath(prefix: string, relPath: string): string {
  */
 function svnRepoPathToRelative(prefix: string, repoPath: string): string | null {
   const base = decodeSvnPath(prefix.trim().replace(/^\^/, '')).replace(/\/+$/, '');
-  const target = decodeSvnPath(repoPath.trim());
+  const target = repoPath.trim();
   if (base === '' || base === '/') {
     const trimmedRoot = target.replace(/^\/+/, '');
     return trimmedRoot.length > 0 ? trimmedRoot : null;
@@ -815,6 +817,68 @@ function parseSvnStatus(output: string): string[] {
   return parseSvnStatusEntries(output).map((entry) => entry.path);
 }
 
+function svnXmlText(value: string): string {
+    return value.replace(/&(amp|lt|gt|quot|apos);/g, (_, name: string) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" })[name] ?? '');
+}
+
+function svnXmlAttribute(value: string, name: string): string {
+    return svnXmlText(new RegExp(`\\b${name}="([^"]*)"`).exec(value)?.[1] ?? '');
+}
+
+function svnProperties(output: string): Map<string, string> {
+    return new Map([...output.matchAll(/<property\b([^>]*)>([\s\S]*?)<\/property>/g)].map((match) => [svnXmlAttribute(match[1] ?? '', 'name'), svnXmlText(match[2] ?? '')]));
+}
+
+function svnCommitStates(root: string, output: string): Map<string, { state: string; properties: string; copied: boolean }> {
+    const states = new Map<string, { state: string; properties: string; copied: boolean }>();
+    for (const match of output.matchAll(/<entry\b([^>]*)>([\s\S]*?)<\/entry>/g)) {
+        const attributes = /<wc-status\b([^>]*)>/.exec(match[2] ?? '')?.[1] ?? '';
+        states.set(normalizeCommitPath(root, svnXmlAttribute(match[1] ?? '', 'path')), {
+            state: svnXmlAttribute(attributes, 'item'),
+            properties: svnXmlAttribute(attributes, 'props'),
+            copied: svnXmlAttribute(attributes, 'copied') === 'true',
+        });
+    }
+    return states;
+}
+
+async function svnContentHash(root: string, revision: string, target: string, size: number): Promise<string | null> {
+    return new Promise((resolve) => {
+        const hash = createHash('sha1').update(`blob ${String(size)}\0`);
+        let bytes = 0;
+        let timedOut = false;
+        let termination = Promise.resolve();
+        const child = spawn('svn', ['--non-interactive', 'cat', '--ignore-keywords', '-r', revision, '--', `${target}@${revision}`], {
+            cwd: root,
+            detached: process.platform !== 'win32',
+            windowsHide: true,
+            stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        const timeout = setTimeout(() => {
+            timedOut = true;
+            if (!child.pid) return;
+            if (process.platform === 'win32') {
+                termination = runProcess('taskkill', ['/pid', String(child.pid), '/t', '/f'], { cwd: root, timeoutMs: 10_000, maxBytes: 4096 }).then(() => undefined);
+            } else {
+                try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+            }
+        }, VCS_TIMEOUT_MS);
+        child.stdout.on('data', (chunk: Buffer) => {
+            bytes += chunk.length;
+            hash.update(chunk);
+        });
+        child.once('error', () => {
+            clearTimeout(timeout);
+            resolve(null);
+        });
+        child.once('close', async (code) => {
+            clearTimeout(timeout);
+            await termination;
+            resolve(!timedOut && code === 0 && bytes === size ? hash.digest('hex') : null);
+        });
+    });
+}
+
 export class SvnAdapter implements VcsAdapter {
   readonly type = 'svn' as const;
 
@@ -1077,46 +1141,181 @@ export class SvnAdapter implements VcsAdapter {
   }
 
   async atomicCommit(input: CommitInput): Promise<CommitResult> {
-    const paths = input.paths.filter((item) => item.trim().length > 0);
-    if (paths.length === 0) {
-      return { success: false, commitRevision: null, outOfDate: false, errorOutput: '没有指定要提交的路径' };
+    let commitStarted = false;
+    let preparing = false;
+    let beforeStates: ReturnType<typeof svnCommitStates> | undefined;
+    let preparationScopes: string[] = [];
+    const failure = async (errorOutput: string, commitRevision: string | null = null, verificationFailed = false): Promise<CommitResult> => {
+        if (preparing && !commitStarted && beforeStates) {
+            const current = await svn(this.root, ['status', '--xml', '--verbose', '--ignore-externals', '--', ...preparationScopes]);
+            if (current.code !== 0 || !/<status>[\s\S]*<\/status>\s*$/.test(current.stdout)) {
+                errorOutput += `\n无法核对本次 SVN 调度以执行恢复：${describe(current)}`;
+            } else {
+                const states = svnCommitStates(this.root, current.stdout);
+                const affected = [...states].filter(([target]) => allowed.some((item) => target === item || target.startsWith(`${item}/`) || item.startsWith(`${target}/`)));
+                const additions = affected.filter(([target, entry]) => entry.state === 'added' && beforeStates?.get(target)?.state !== 'added').map(([target]) => target).sort((left, right) => right.split('/').length - left.split('/').length);
+                const removals = affected.filter(([target, entry]) => entry.state === 'deleted' && beforeStates?.get(target)?.state !== 'deleted').map(([target]) => target).sort((left, right) => left.split('/').length - right.split('/').length);
+                const missing: string[] = [];
+                for (const target of [...removals, ...additions]) {
+                    const reverted = await svn(this.root, ['revert', '--depth', 'empty', '--', target]);
+                    if (reverted.code !== 0) {
+                        errorOutput += `\n无法撤销本次 SVN 调度 ${target}：${describe(reverted)}`;
+                    } else if (beforeStates.get(target)?.state === 'missing') {
+                        missing.push(target);
+                    }
+                }
+                for (const target of missing) await rm(path.join(this.root, target), { recursive: true, force: true });
+            }
+        }
+        return { success: false, commitRevision, outOfDate: false, errorOutput, ...(verificationFailed ? { verificationFailed: true } : {}) };
+    };
+    const paths = [...new Set(input.paths.filter((item) => item.trim()).map((item) => normalizeCommitPath(this.root, item)))];
+    const deletions = [...new Set((input.deletePaths ?? []).map((item) => normalizeCommitPath(this.root, item)))];
+    const allowed = [...paths, ...deletions];
+    if (paths.length === 0) return failure('没有指定要提交的路径');
+    if (allowed.some((item) => !item || item === '..' || item.startsWith('../'))) return failure('提交路径必须位于工作副本内');
+    preparationScopes = [...new Set(allowed.map((item) => item.split('/')[0] ?? item))];
+    const before = await svn(this.root, ['status', '--xml', '--verbose', '--no-ignore', '--ignore-externals', '--', ...preparationScopes]);
+    if (before.code !== 0 || !/<status>[\s\S]*<\/status>\s*$/.test(before.stdout)) return failure(`无法保存完整提交前 SVN 调度：${describe(before)}`);
+    beforeStates = svnCommitStates(this.root, before.stdout);
+    for (const deletion of deletions) {
+        if (beforeStates.get(deletion)?.state === 'deleted') continue;
+        const dirty = [...beforeStates].find(([target, entry]) => (target === deletion || target.startsWith(`${deletion}/`)) && (!['normal', 'missing'].includes(entry.state) || entry.properties === 'modified' || entry.copied));
+        if (dirty) return failure(`删除路径包含调用前的本地改动，已拒绝提交：${dirty[0]}`);
     }
-    for (const deletion of input.deletePaths ?? []) {
-      const absolute = path.isAbsolute(deletion) ? deletion : path.join(this.root, deletion);
-      // A versioned but missing file still needs a scheduled deletion for `svn commit`.
-      await svn(this.root, ['delete', '--force', absolute]).catch(() => undefined);
-      await rm(absolute, { force: true }).catch(() => undefined);
+    preparing = true;
+    for (const deletion of deletions) {
+        if (beforeStates.get(deletion)?.state === 'deleted') continue;
+        const result = await svn(this.root, ['delete', '--force', '--', deletion]);
+        if (result.code !== 0) {
+            const status = await svn(this.root, ['status', '--xml', '--depth', 'empty', '--', deletion]);
+            if (status.code !== 0 || !/item="deleted"/.test(status.stdout)) return failure(`无法安排删除 ${deletion}：${describe(result)}`);
+        }
     }
     for (const target of paths) {
-      // `--parents` versions unversioned ancestors such as a brand-new .ai-review tree.
-      await svn(this.root, ['add', '--force', '--parents', target]).catch(() => undefined);
+        if (!existsSync(path.join(this.root, target))) continue;
+        const added = await svn(this.root, ['add', '--force', '--parents', '--', target]);
+        if (added.code !== 0) return failure(`无法准备提交路径 ${target}：${describe(added)}`);
     }
-    const commitPaths = new Set(paths);
-    for (const target of paths) {
-      let current = path.resolve(this.root, target);
-      const rootWithSep = this.root.endsWith(path.sep) ? this.root : `${this.root}${path.sep}`;
-      while (current !== this.root && current.startsWith(rootWithSep)) {
-        const status = await svn(this.root, ['status', '--depth', 'empty', current]);
-        const line = status.stdout.trim();
-        if (line.length === 0) break;
-        const state = line.slice(0, 1);
-        if (state !== 'A' && state !== '?') break;
-        commitPaths.add(path.relative(this.root, current).replaceAll('\\', '/'));
-        current = path.dirname(current);
-      }
+    const status = await svn(this.root, ['status', '--xml', '--verbose', '--ignore-externals', '--', ...allowed]);
+    if (status.code !== 0 || !/<status>[\s\S]*<\/status>\s*$/.test(status.stdout)) return failure(`无法核对完整提交集合：${describe(status)}`);
+    const states = svnCommitStates(this.root, status.stdout);
+    const verified = new Map((input.verifyEntries ?? []).map((entry) => [normalizeCommitPath(this.root, entry.path), entry]));
+    const verifiedDeletions = new Set((input.verifyDeletions ?? []).map((item) => normalizeCommitPath(this.root, item)));
+    const strict = input.verifyEntries !== undefined || input.verifyDeletions !== undefined;
+    const commitPaths = new Set<string>();
+    const verifiedSizes = new Map<string, number>();
+    const propertiesBefore = new Map<string, Map<string, string>>();
+    const problems: string[] = [];
+    for (const [target, entry] of states) {
+        if (!allowed.some((item) => target === item || target.startsWith(`${item}/`))) {
+            problems.push(`提交集合包含指定路径之外的条目：${target}`);
+            continue;
+        }
+        if (!['normal', 'added', 'modified', 'replaced', 'deleted'].includes(entry.state)) {
+            problems.push(`无法证明提交路径状态：${target}（${entry.state}）`);
+            continue;
+        }
+        const changed = entry.state !== 'normal' || entry.properties === 'modified';
+        if (changed) commitPaths.add(target);
+        if (entry.state === 'deleted') {
+            if (strict && !verifiedDeletions.has(target)) problems.push(`删除未列入核对集合：${target}`);
+            continue;
+        }
+        const stats = await lstat(path.join(this.root, target)).catch(() => null);
+        if (!stats || stats.isSymbolicLink()) {
+            problems.push(`无法核对普通文件或目录：${target}`);
+            continue;
+        }
+        if (stats.isDirectory()) {
+            if (entry.copied) problems.push(`不能证明复制目录的完整提交集合：${target}`);
+            if (strict && changed && ![...verified.keys(), ...verifiedDeletions].some((item) => item.startsWith(`${target}/`))) problems.push(`目录未列入核对集合：${target}`);
+        } else if (strict && changed && !verified.has(target)) {
+            problems.push(`提交条目未列入核对集合：${target}`);
+        }
+        if (!changed && !verified.has(target)) continue;
+        const props = await svn(this.root, ['proplist', '--xml', '--verbose', '--depth', 'empty', '--', target]);
+        if (props.code !== 0) {
+            problems.push(`无法读取提交属性：${target}`);
+            continue;
+        }
+        const currentProperties = svnProperties(props.stdout);
+        propertiesBefore.set(target, currentProperties);
+        const baseProperties = entry.state === 'added' ? null : await svn(this.root, ['proplist', '--xml', '--verbose', '-r', 'BASE', '--depth', 'empty', '--', target]);
+        if (baseProperties && baseProperties.code !== 0) problems.push(`无法读取基线属性：${target}`);
+        const originalProperties = baseProperties ? svnProperties(baseProperties.stdout) : new Map<string, string>();
+        for (const name of new Set([...currentProperties.keys(), ...originalProperties.keys()])) {
+            if (name === 'svn:executable' && verified.get(target)?.mode && process.platform !== 'win32') continue;
+            if (currentProperties.get(name) !== originalProperties.get(name)) problems.push(`属性变更未核对：${target}（${name}）`);
+        }
     }
-    const commit = await svn(this.root, ['commit', '-m', input.message, ...commitPaths]);
+    for (const [target, expected] of verified) {
+        const entry = states.get(target);
+        if (!entry || entry.state === 'deleted') {
+            problems.push(`缺少核对条目：${target}`);
+            continue;
+        }
+        const content = await readFile(path.join(this.root, target)).catch(() => null);
+        if (content) verifiedSizes.set(target, content.length);
+        const props = propertiesBefore.get(target);
+        if (!content || gitBlobHash(content) !== expected.blobHash) problems.push(`提交内容与已审核内容不一致：${target}`);
+        const mode = props?.has('svn:executable') ? '100755' : '100644';
+        if (process.platform !== 'win32' && expected.mode && mode !== expected.mode) problems.push(`提交模式与已审核模式不一致：${target}`);
+        if (props?.has('svn:special')) problems.push(`无法核对 SVN 特殊文件：${target}`);
+        if (content && props?.has('svn:eol-style') && content.includes(13)) problems.push(`SVN 换行转换会改变已审核内容：${target}`);
+        if (content && props?.has('svn:keywords') && /\$[^$\r\n]+:[^$\r\n]*\$/.test(content.toString('utf8'))) problems.push(`SVN 关键词收缩会改变已审核内容：${target}`);
+    }
+    for (const target of verifiedDeletions) {
+        if (states.get(target)?.state !== 'deleted') problems.push(`删除未生效：${target}`);
+    }
+    if (problems.length > 0) return failure(`已审核内容与 SVN 提交不一致，已拒绝提交：\n${problems.slice(0, 20).join('\n')}`);
+    if (commitPaths.size === 0) return failure('没有可提交的改动');
+    for (const target of [...commitPaths]) {
+        let ancestor = path.posix.dirname(target);
+        while (ancestor !== '.') {
+            const state = await svn(this.root, ['status', '--xml', '--depth', 'empty', '--', ancestor]);
+            if (state.code !== 0) return failure(`无法核对提交祖先：${ancestor}`);
+            if (!/item="added"/.test(state.stdout)) break;
+            const props = await svn(this.root, ['proplist', '--xml', '--verbose', '--depth', 'empty', '--', ancestor]);
+            if (props.code !== 0 || svnProperties(props.stdout).size > 0 || /copied="true"/.test(state.stdout)) return failure(`无法核对新增祖先目录：${ancestor}`);
+            commitPaths.add(ancestor);
+            propertiesBefore.set(ancestor, new Map());
+            ancestor = path.posix.dirname(ancestor);
+        }
+    }
+    const rootUrl = await svn(this.root, ['info', '--show-item', 'url', '--', '.']);
+    const prefix = await svn(this.root, ['info', '--show-item', 'relative-url', '--', '.']);
+    if (rootUrl.code !== 0 || prefix.code !== 0) return failure('无法证明 SVN 提交仓库范围');
+    commitStarted = true;
+    const commit = await svn(this.root, ['commit', '--depth', 'empty', '-m', input.message, '--', ...commitPaths]);
     if (commit.code !== 0) {
-      const output = describe(commit);
-      return {
-        success: false,
-        commitRevision: null,
-        outOfDate: /out of date|E160028|E155011|remains in conflict/i.test(output),
-        errorOutput: output,
-      };
+        const output = describe(commit);
+        return { success: false, commitRevision: null, outOfDate: /out of date|E160028|E155011|remains in conflict/i.test(output), errorOutput: output };
     }
-    const match = /Committed revision\s+(\d+)/i.exec(commit.stdout);
-    return { success: true, commitRevision: match?.[1] ?? null, outOfDate: false, errorOutput: '' };
+    const revision = /Committed revision\s+(\d+)/i.exec(commit.stdout)?.[1] ?? null;
+    if (!revision) return failure('SVN 返回成功但无法取得提交版本，必须核验提交结果', null, true);
+    const log = await svn(this.root, ['log', '--xml', '--verbose', '-r', revision, '--', `${rootUrl.stdout.trim()}@${revision}`]);
+    const actual = new Map<string, string>();
+    for (const match of log.stdout.matchAll(/<path\b([^>]*)>([^<]*)<\/path>/g)) {
+        const relative = svnRepoPathToRelative(prefix.stdout, svnXmlText(match[2] ?? ''));
+        if (relative) actual.set(relative, svnXmlAttribute(match[1] ?? '', 'action'));
+    }
+    if (log.code !== 0 || actual.size !== commitPaths.size || [...commitPaths].some((target) => !actual.has(target))) return failure('SVN 实际提交路径与已核对集合不一致，必须人工恢复', revision, true);
+    for (const [target, entry] of verified) {
+        const url = `${rootUrl.stdout.trim()}/${target.split('/').map(encodeURIComponent).join('/')}`;
+        if (await svnContentHash(this.root, revision, url, verifiedSizes.get(target) ?? 0) !== entry.blobHash) return failure(`SVN 实际提交内容与已审核内容不一致：${target}`, revision, true);
+    }
+    for (const target of verifiedDeletions) {
+        if (actual.get(target) !== 'D') return failure(`SVN 实际提交未删除核对路径：${target}`, revision, true);
+    }
+    for (const [target, props] of propertiesBefore) {
+        if (!commitPaths.has(target)) continue;
+        const url = `${rootUrl.stdout.trim()}/${target.split('/').map(encodeURIComponent).join('/')}`;
+        const result = await svn(this.root, ['proplist', '--xml', '--verbose', '-r', revision, '--depth', 'empty', '--', `${url}@${revision}`]);
+        const actualProps = svnProperties(result.stdout);
+        if (result.code !== 0 || props.size !== actualProps.size || [...props].some(([name, value]) => actualProps.get(name) !== value)) return failure(`SVN 实际提交属性与核对属性不一致：${target}`, revision, true);
+    }
+    return { success: true, commitRevision: revision, outOfDate: false, errorOutput: '' };
   }
 }
 

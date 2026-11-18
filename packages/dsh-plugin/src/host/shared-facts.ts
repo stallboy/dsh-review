@@ -167,12 +167,14 @@ export class GitHeadCandidateSource implements SharedCandidateSource {
 }
 
 /**
- * §7.1 共享事实读取源（SVN）：读自工作副本的 BASE 修订（已提交的 pristine 状态），
- * `svn status` 检测本地改动与未版本化目录。一次计算内所有读取绑定同一工作副本。
+ * §7.1 共享事实读取源（SVN）：父目录 BASE 不随子路径提交前进，必须从真实版本化
+ * 子路径选择固定修订，避免漏掉已提交候选，并用同一修订读取候选及档案。
  * 说明：`snapshotId()` 返回 null——SVN 的工作副本根 revision 不随子路径提交前进，
  * 无法仅凭根 revision 证明快照未变化，因此调用方不得据此做跨请求缓存。
  */
 export class SvnBaseCandidateSource implements SharedCandidateSource {
+    private snapshot: Promise<{ revision: string; url: string; files: Set<string> } | null> | undefined;
+
   constructor(private readonly root: string) {}
 
   async snapshotId(): Promise<string | null> {
@@ -180,22 +182,18 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
   }
 
   async listCandidateDirs(): Promise<string[]> {
-    // §7.1：SVN 共享事实读自 BASE——必须显式固定 -r BASE，避免工作区本地改动混入。
-    const result = await svn(this.root, ['list', '-r', 'BASE', '-R', '.ai-review']);
-    if (result.code !== 0) throw new Error(`无法读取 .ai-review 列表：${result.stderr.trim()}`);
-    const dirs = new Set<string>();
-    for (const line of result.stdout.split(/\r?\n/)) {
-      const file = line.trim().replaceAll('\\', '/');
-      const match = /^(\d{4}-\d{2})\/([^/]+)\/review\.md$/.exec(file);
-      if (match && match[1] && match[2]) dirs.add(`${match[1]}/${match[2]}`);
-    }
-    return [...dirs];
+    const snapshot = await this.sharedSnapshot();
+    return [...snapshot?.files ?? []].flatMap((file) => {
+        const match = /^(\d{4}-\d{2})\/([^/]+)\/review\.md$/.exec(file);
+        return match ? [`${match[1]}/${match[2]}`] : [];
+    });
   }
 
   async listDirEntries(month: string, slug: string): Promise<string[] | null> {
-    const result = await svn(this.root, ['list', '-r', 'BASE', `.ai-review/${month}/${slug}`]);
-    if (result.code !== 0) return null;
-    return result.stdout.split(/\r?\n/).map((line) => line.trim().replace(/\/$/, '')).filter((line) => line.length > 0);
+    const snapshot = await this.sharedSnapshot();
+    const prefix = `${month}/${slug}/`;
+    const entries = new Set([...snapshot?.files ?? []].filter((file) => file.startsWith(prefix)).map((file) => file.slice(prefix.length).split('/')[0] ?? ''));
+    return entries.size > 0 ? [...entries] : null;
   }
 
   async readReviewText(month: string, slug: string): Promise<string | null> {
@@ -235,12 +233,8 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
   }
 
   async listAuditDirs(): Promise<string[]> {
-    const result = await svn(this.root, ['list', '-r', 'BASE', '.ai-review/audits']);
-    if (result.code !== 0) return [];
-    return result.stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim().replace(/\/$/, ''))
-      .filter((name) => name.length > 0 && !name.includes('/'));
+    const snapshot = await this.sharedSnapshot();
+    return [...snapshot?.files ?? []].flatMap((file) => /^audits\/([^/]+)\/audit\.md$/.exec(file)?.[1] ?? []);
   }
 
   async readAuditText(dirName: string): Promise<string | null> {
@@ -254,27 +248,67 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
   /**
    * §7.1 SVN 实现准则：先用 `svn info --xml -R` + `svn status --xml` 证明候选目录
    * 处于同一基准 revision 且无本地改动，然后直接读本地工作副本文件；
-   * 仅当无法证明同快照时才回退 `svn cat -r BASE`（绝不逐文件无条件远端读取）。
+   * 仅当无法证明同快照时才回退固定修订的远端读取（绝不逐文件无条件远端读取）。
    */
   private async readSharedFile(relPath: string): Promise<string | null> {
+    const snapshot = await this.sharedSnapshot();
+    if (!snapshot?.files.has(relPath.replace(/^\.ai-review\//, ''))) return null;
     const dir = relPath.includes('/') ? relPath.slice(0, relPath.lastIndexOf('/')) : '.';
-    if (await this.canReadLocalShared(dir)) {
+    if (await this.canReadLocalShared(dir, snapshot.revision)) {
       try {
         return await readFile(path.join(this.root, relPath), 'utf8');
       } catch {
-        // 本地文件缺失：回退 BASE 读取。
+        // 本地文件缺失：回退固定修订读取。
       }
     }
-    const result = await svn(this.root, ['cat', '-r', 'BASE', '--', relPath]);
+    const url = `${snapshot.url}/${relPath.replace(/^\.ai-review\//, '').split('/').map(encodeURIComponent).join('/')}`;
+    const result = await svn(this.root, ['cat', '-r', snapshot.revision, '--', `${url}@${snapshot.revision}`]);
     return result.code === 0 ? result.stdout : null;
   }
 
-  private async canReadLocalShared(dir: string): Promise<boolean> {
+  private async canReadLocalShared(dir: string, revision: string): Promise<boolean> {
     const status = await svn(this.root, ['status', '--xml', '--', dir]);
     if (status.code !== 0 || /<entry\b/.test(status.stdout)) return false;
     const info = await svn(this.root, ['info', '--xml', '-R', '--', dir]);
     if (info.code !== 0) return false;
-    const revisions = [...info.stdout.matchAll(/<commit\s+revision="(\d+)"/g)].map((match) => match[1]);
-    return revisions.length > 0 && revisions.every((revision) => revision === revisions[0]);
+    const revisions = [...info.stdout.matchAll(/<entry\b([^>]*)>/g)].map((match) => /\brevision="(\d+)"/.exec(match[1] ?? '')?.[1]);
+    return revisions.length > 0 && revisions.every((value) => value === revision);
   }
+
+    private sharedSnapshot(): Promise<{ revision: string; url: string; files: Set<string> } | null> {
+        return this.snapshot ??= this.captureSnapshot();
+    }
+
+    private async captureSnapshot(): Promise<{ revision: string; url: string; files: Set<string> } | null> {
+        const info = await svn(this.root, ['info', '--xml', '-R', '--', '.ai-review']);
+        if (info.code !== 0) {
+            const parent = await svn(this.root, ['info', '--xml', '--depth', 'immediates', '--', '.']);
+            const versioned = [...parent.stdout.matchAll(/<entry\b([^>]*)>/g)].some((match) => {
+                const entryPath = /\bpath="([^"]+)"/.exec(match[1] ?? '')?.[1] ?? '';
+                return path.resolve(this.root, entryPath) === path.join(this.root, '.ai-review');
+            });
+            if (parent.code === 0 && !versioned) return null;
+            throw new Error(`无法读取 .ai-review 版本信息：${info.stderr.trim()}`);
+        }
+        let latest = 0;
+        let url = '';
+        for (const match of info.stdout.matchAll(/<entry\b([^>]*)>([\s\S]*?)<\/entry>/g)) {
+            const revision = Number(/\brevision="(\d+)"/.exec(match[1] ?? '')?.[1] ?? 0);
+            if (!Number.isSafeInteger(revision) || revision <= 0 || /<schedule>add<\/schedule>/.test(match[2] ?? '')) continue;
+            latest = Math.max(latest, revision);
+            const entryPath = /\bpath="([^"]+)"/.exec(match[1] ?? '')?.[1]?.replaceAll('\\', '/');
+            if (entryPath === '.ai-review') url = /<url>([^<]+)<\/url>/.exec(match[2] ?? '')?.[1]?.replaceAll('&amp;', '&') ?? '';
+        }
+        if (!latest || !url) return null;
+        const revision = String(latest);
+        const list = await svn(this.root, ['list', '--xml', '-R', '-r', revision, '--', `${url}@${revision}`]);
+        if (list.code !== 0) throw new Error(`无法读取 .ai-review 共享快照：${list.stderr.trim()}`);
+        const files = new Set<string>();
+        for (const match of list.stdout.matchAll(/<entry\b([^>]*)>([\s\S]*?)<\/entry>/g)) {
+            if (!/\bkind="file"/.test(match[1] ?? '')) continue;
+            const name = /<name>([^<]+)<\/name>/.exec(match[2] ?? '')?.[1]?.replace(/&(amp|lt|gt|quot|apos);/g, (_, entity: string) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" })[entity] ?? '');
+            if (name) files.add(name);
+        }
+        return { revision, url, files };
+    }
 }
