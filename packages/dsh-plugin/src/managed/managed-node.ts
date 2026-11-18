@@ -121,6 +121,7 @@ export class ManagedNode {
             const valid = project && project.nodeId === config.nodeId && workspace && project.bindingGeneration === command.bindingGeneration
                 && project.projectConfigRevision === command.projectConfigRevision && workspace.vcsType === project.vcsType && workspace.target === project.target;
             await this.request(`/node-api/v1/commands/${command.commandId}/ack`, { instanceId: this.instanceId });
+            if (this.stopping) return;
             if (!valid) {
                 journal.emit(command.commandId, 'result', undefined, { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '节点项目绑定或执行配置不一致' }, delivery: { state: 'not_required' } });
                 continue;
@@ -189,6 +190,7 @@ export class ManagedNode {
     }
 
     private launch(command: ManagedCommand, cancelled: boolean, project: ProjectRecord): void {
+        if (this.stopping) return;
         const controller = new AbortController();
         if (cancelled) controller.abort();
         this.options.journal.markExecuting(command.commandId);

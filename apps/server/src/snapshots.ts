@@ -36,7 +36,8 @@ export class Snapshots {
     view(projectId: string): JsonRecord {
         const project = this.database.getProject(projectId), node = this.database.getNode(project.nodeId), snapshot = this.get(projectId);
         const received = this.database.sql.prepare('SELECT received_at FROM snapshots WHERE project_id=?').get(projectId);
-        const fresh = received && Date.parse(this.database.now()) - Date.parse(String(received.received_at)) <= 30000;
+        const fresh = snapshot?.bindingGeneration === project.bindingGeneration && snapshot.projectConfigRevision === project.projectConfigRevision
+            && received && Date.parse(this.database.now()) - Date.parse(String(received.received_at)) <= 30000;
         return { project, online: node.online, compatible: node.compatible, vcsSnapshot: snapshot?.vcsSnapshot ?? null,
             collectedAt: snapshot?.collectedAt ?? null, snapshotSequence: snapshot?.snapshotSequence ?? null,
             lastSyncedAt: received?.received_at ?? null,
@@ -46,13 +47,17 @@ export class Snapshots {
 
     query(projectId: string, kind: QueryKind, params: JsonRecord): { status: number; body: JsonRecord } {
         const project = this.database.getProject(projectId), view = this.view(projectId), snapshot = this.get(projectId);
-        if (!snapshot) throw new CentralError(503, 'not_synced', '项目尚未同步');
-        const cacheKey = digest(stableJson({ projectId, generation: project.bindingGeneration, snapshot: snapshot.vcsSnapshot, kind, params }));
+        if (!snapshot || snapshot.bindingGeneration !== project.bindingGeneration || snapshot.projectConfigRevision !== project.projectConfigRevision) throw new CentralError(503, 'not_synced', '项目配置尚未同步');
+        const cacheKey = digest(stableJson({ projectId, generation: project.bindingGeneration, configRevision: project.projectConfigRevision, snapshot: snapshot.vcsSnapshot, kind, params }));
         let row = this.database.sql.prepare('SELECT query_id,state,result FROM queries WHERE cache_key=?').get(cacheKey) as Row | undefined;
+        if (!row && project.projectConfigRevision === 1) {
+            const legacyKey = digest(stableJson({ projectId, generation: project.bindingGeneration, snapshot: snapshot.vcsSnapshot, kind, params }));
+            row = this.database.sql.prepare('SELECT query_id,state,result FROM queries WHERE cache_key=?').get(legacyKey) as Row | undefined;
+            if (row) this.database.sql.prepare('UPDATE queries SET cache_key=? WHERE query_id=?').run(cacheKey, row.query_id);
+        }
         if (row?.state === 'ready') return { status: 200, body: { ...view, data: JSON.parse(row.result) } };
         if (!view.online) throw new CentralError(503, 'node_offline', '节点离线且该版本详情尚未缓存');
-        if (row?.state === 'snapshot_moved') throw new CentralError(409, 'snapshot_moved', '节点版本已经变化，请刷新项目');
-        if (row?.state === 'error') {
+        if (row?.state === 'error' || row?.state === 'snapshot_moved') {
             this.database.sql.prepare("UPDATE queries SET state='retired',cache_key=? WHERE query_id=?").run(`retired:${row.query_id}`, row.query_id);
             row = undefined;
         }

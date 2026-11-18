@@ -26,6 +26,7 @@ interface NodeStatus {
     nodeId: string;
     instanceId: string;
     activeInstance: boolean;
+    online: boolean;
     projects: ProjectRecord[];
     pending: number;
 }
@@ -407,7 +408,8 @@ export class ConnectionController {
             const credentials = this.secrets.nodes[config.centralId];
             try {
                 const status = await this.request(config.centerUrl, 'node-api/v1/status', credentials?.token, {});
-                nodeOnline = status.centralId === config.centralId;
+                nodeOnline = status.centralId === config.centralId && status.nodeId === credentials?.nodeId
+                    && status.online === true && status.activeInstance === true && status.instanceId === this.node.instanceId;
                 if (nodeOnline) for (const workspace of projects) {
                     const project = status.projects.find((value: { workspaceId: string }) => value.workspaceId === workspace.workspaceId);
                     if (project) { workspace.enabled = project.enabled; workspace.label = project.name; }

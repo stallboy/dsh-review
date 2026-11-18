@@ -61,6 +61,7 @@ export interface WorkspaceRegistration {
     label: string;
     vcsType: 'git' | 'svn';
     target: string;
+    executionConfigHash?: string;
 }
 
 export interface NodeRegistration {
@@ -91,6 +92,7 @@ export interface ProjectRecord {
     vcsType: 'git' | 'svn';
     target: string;
     enabled: boolean;
+    executionConfigHash?: string;
 }
 
 export interface ArtifactManifest {
@@ -252,13 +254,14 @@ export function validateRegistration(value: unknown): NodeRegistration {
     const ids = new Set<string>();
     for (const item of input.workspaces) {
         const workspace = record(item, 'workspace');
-        if (Object.keys(workspace).some(key => !['workspaceId', 'label', 'vcsType', 'target'].includes(key))) throw new ProtocolError('workspace');
+        if (Object.keys(workspace).some(key => !['workspaceId', 'label', 'vcsType', 'target', 'executionConfigHash'].includes(key))) throw new ProtocolError('workspace');
         const id = entityId(workspace.workspaceId, 'workspaceId');
         if (ids.has(id)) throw new ProtocolError('重复 workspaceId');
         ids.add(id);
         textValue(workspace.label, 'workspace.label');
         if (workspace.vcsType !== 'git' && workspace.vcsType !== 'svn') throw new ProtocolError('workspace.vcsType');
         textValue(workspace.target, 'workspace.target');
+        if (workspace.executionConfigHash !== undefined && (typeof workspace.executionConfigHash !== 'string' || !/^[a-f0-9]{64}$/.test(workspace.executionConfigHash))) throw new ProtocolError('workspace.executionConfigHash');
     }
     return structuredClone(input) as unknown as NodeRegistration;
 }

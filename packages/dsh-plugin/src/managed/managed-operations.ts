@@ -1,5 +1,6 @@
 import { realpath, mkdir } from 'node:fs/promises';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import type { JsonRecord, ManagedCommand, ManagedOperation, ManagedQuery, ManagedQueryResult, ManagedResult, ProjectRecord, WorkspaceRegistration } from '@dsh-review/protocol';
 import { ReviewApi } from '../host/api.js';
 import { withSharedView } from '../host/api-context.js';
@@ -37,6 +38,18 @@ interface WorkspaceRuntime {
 const object = (value: unknown): JsonRecord => value && typeof value === 'object' && !Array.isArray(value) ? value as JsonRecord : {};
 const unknownResult = (detail: string): ManagedResult => ({ outcome: { status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN', detail }, delivery: { state: 'unknown' } });
 
+function executionConfigHash(config: ManagedWorkspace): string {
+    const settings = { ...DEFAULT_SETTINGS, ...config.settings };
+    return createHash('sha256').update(JSON.stringify({
+        runner: settings.runner,
+        dshCommand: settings.dshCommand,
+        externalCommand: settings.externalCommand,
+        gateTimeoutMs: settings.gateTimeoutMs,
+        syncBeforeApprove: settings.syncBeforeApprove,
+        autoFixOnFailure: settings.autoFixOnFailure,
+    })).digest('hex');
+}
+
 export class ManagedOperations {
     private readonly runtimes = new Map<string, WorkspaceRuntime>();
     private readonly configs = new Map<string, ManagedWorkspace>();
@@ -54,7 +67,7 @@ export class ManagedOperations {
             this.configs.set(config.workspaceId, config);
             if (config.enabled === false) {
                 if ((config.vcsType !== 'git' && config.vcsType !== 'svn') || !config.target) throw new Error('停用 workspace 缺少已验证的 VCS 类型或目标');
-                this.declarations.set(config.workspaceId, { workspaceId: config.workspaceId, label: config.label, vcsType: config.vcsType, target: config.target });
+                this.declarations.set(config.workspaceId, { workspaceId: config.workspaceId, label: config.label, vcsType: config.vcsType, target: config.target, executionConfigHash: executionConfigHash(config) });
             } else await this.initializeWorkspace(config);
         }
     }
@@ -87,7 +100,7 @@ export class ManagedOperations {
             await api.init();
             if (api.lastConfigErrors.length) throw new Error(api.lastConfigErrors.join('；'));
             if (this.stopped) throw new Error('托管执行器已停止');
-            const registration: WorkspaceRegistration = { workspaceId: config.workspaceId, label: config.label, vcsType: type, target };
+            const registration: WorkspaceRegistration = { workspaceId: config.workspaceId, label: config.label, vcsType: type, target, executionConfigHash: executionConfigHash(config) };
             const runtime = { root, api, registration, delivery: new ManagedDelivery({ root, type, target }) };
             this.runtimes.set(config.workspaceId, runtime);
             this.declarations.set(config.workspaceId, registration);
@@ -104,6 +117,7 @@ export class ManagedOperations {
     private async runtime(project: ProjectRecord): Promise<WorkspaceRuntime> {
         const registration = this.declarations.get(project.workspaceId);
         if (!registration || registration.vcsType !== project.vcsType || registration.target !== project.target) throw new Error('项目与节点工作副本不匹配');
+        if (project.executionConfigHash && project.executionConfigHash !== registration.executionConfigHash) throw new Error('本机执行配置与项目快照不一致');
         if (this.stopped) throw new Error('托管执行器已停止');
         const runtime = this.runtimes.get(project.workspaceId);
         if (runtime) return runtime;
@@ -170,17 +184,33 @@ export class ManagedOperations {
 
     async recover(command: ManagedCommand, previous: ManagedResult | undefined, project: ProjectRecord): Promise<ManagedResult> {
         const runtime = await this.runtime(project);
-        await this.checkTarget(runtime);
-        const checkpoint = this.options.journal.recoveryData(command.commandId);
-        const saved = object(checkpoint?.result) as unknown as ManagedResult;
-        const result = saved?.outcome ? structuredClone(saved) : previous?.outcome.status !== 'RECOVERY_REQUIRED' ? structuredClone(previous) : undefined;
-        const commit = result?.delivery.commitRevision ?? await runtime.delivery.findCommandCommit(command.commandId);
-        if (!commit) return result?.delivery.state === 'not_required' ? result : unknownResult('没有足够证据证明原执行结果；请保留现场并人工核验，不会重跑业务操作');
-        const restored = result ?? { outcome: { status: 'RECOVERY_REQUIRED', reason: 'EXECUTION_OUTCOME_UNKNOWN', commitRevision: commit,
-            detail: '已找到原指令的提交，但缺少完整业务结果，不能仅据提交标记推断批准成功' }, delivery: { state: 'pending' as const, commitRevision: commit } };
-        restored.delivery = await runtime.api.withWriteLock(runtime.root, () => runtime.delivery.deliver(commit));
-        this.options.journal.checkpoint(command.commandId, { phase: 'finished', result: restored });
-        return restored;
+        return runtime.api.withWriteLock(runtime.root, async () => {
+            let checkpoint = this.options.journal.recoveryData(command.commandId);
+            if (!previous && !checkpoint && this.options.journal.get(command.commandId)?.phase === 'accepted') {
+                checkpoint = { phase: 'not_started', workspaceId: project.workspaceId };
+                this.options.journal.checkpoint(command.commandId, checkpoint);
+            }
+            await this.checkTarget(runtime);
+            const saved = object(checkpoint?.result) as unknown as ManagedResult;
+            const result = saved?.outcome ? structuredClone(saved) : previous?.outcome.status !== 'RECOVERY_REQUIRED' ? structuredClone(previous) : undefined;
+            const commit = result?.delivery.commitRevision ?? await runtime.delivery.findCommandCommit(command.commandId);
+            if (!commit) {
+                if (result?.delivery.state === 'not_required') return result;
+                if (checkpoint?.phase === 'not_started' && (!previous || previous.outcome.status === 'RECOVERY_REQUIRED')
+                    && !runtime.api.auditLifecycle.blockingLeaseFor(runtime.root)) {
+                    const current = await runtime.api.runtimeFor(new URL('http://managed/'));
+                    const clean = await current.vcs.ensureCleanWorkspace();
+                    if (clean.clean) return { outcome: { status: 'ABORTED', reason: command.operation === 'approve' ? 'COMMIT_FAILED' : 'CANCELLED',
+                        message: '原指令未进入业务执行，已核验工作副本安全；不会重跑业务操作' }, delivery: { state: 'not_required' } };
+                }
+                return unknownResult('没有足够证据证明原执行结果；请保留现场并人工核验，不会重跑业务操作');
+            }
+            const restored = result ?? { outcome: { status: 'RECOVERY_REQUIRED', reason: 'EXECUTION_OUTCOME_UNKNOWN', commitRevision: commit,
+                detail: '已找到原指令的提交，但缺少完整业务结果，不能仅据提交标记推断批准成功' }, delivery: { state: 'pending' as const, commitRevision: commit } };
+            restored.delivery = await runtime.delivery.deliver(commit);
+            this.options.journal.checkpoint(command.commandId, { phase: 'finished', result: restored });
+            return restored;
+        });
     }
 
     async snapshot(project: ProjectRecord) {

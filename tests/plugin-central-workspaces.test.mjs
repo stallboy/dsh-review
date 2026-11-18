@@ -56,7 +56,10 @@ test('停用目录缺失仍声明历史工作副本，旧配置项目继续立�
     const operations = state.operations([inactive, active]);
     await operations.init();
     assert.equal(initialized, 1);
-    assert.deepEqual(operations.registrations(), [inactive, active].map(({ workspaceId, label, vcsType, target }) => ({ workspaceId, label, vcsType, target })));
+    assert.deepEqual(operations.registrations(), [inactive, active].map(({ workspaceId, label, vcsType, target }) => ({
+        workspaceId, label, vcsType, target,
+        executionConfigHash: 'e83155e251ecaf2b9c7eb8b7202a3df891091cdb32d38be46e4c266ff8e0383d',
+    })));
     assert.deepEqual((await operations.snapshot(project(active))).queue, []);
     await assert.rejects(operations.snapshot({ ...project(active), workspaceId: 'unconfigured', root: active.root }), /项目与节点工作副本不匹配/);
 });

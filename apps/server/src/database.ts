@@ -67,6 +67,9 @@ export class CentralDatabase {
         if (!this.sql.prepare('PRAGMA table_info(nodes)').all().some(column => column.name === 'admission_paused')) {
             this.sql.exec('ALTER TABLE nodes ADD COLUMN admission_paused INTEGER NOT NULL DEFAULT 0');
         }
+        if (!this.sql.prepare('PRAGMA table_info(projects)').all().some(column => column.name === 'execution_config_hash')) {
+            this.sql.exec('ALTER TABLE projects ADD COLUMN execution_config_hash TEXT');
+        }
         this.sql.prepare("INSERT OR IGNORE INTO metadata(key,value) VALUES ('central_id',?)").run(randomUUID());
         this.centralId = (this.sql.prepare("SELECT value FROM metadata WHERE key='central_id'").get() as Row).value;
     }
@@ -167,6 +170,22 @@ export class CentralDatabase {
         return this.transaction(() => {
             const node = this.getNode(nodeId);
             if (this.hasActiveNodeInstance(nodeId) && node.instanceId !== registration.instanceId) throw new CentralError(409, 'instance_conflict', '相同节点已有活动实例');
+            for (const project of this.listProjects(nodeId)) {
+                const workspace = registration.workspaces.find(value => value.workspaceId === project.workspaceId);
+                if (!workspace) continue;
+                if (workspace.vcsType !== project.vcsType || workspace.target !== project.target) throw new CentralError(409, 'binding_mismatch', '既有项目的工作副本目标不能变更');
+                if (workspace.executionConfigHash === project.executionConfigHash) continue;
+                if (!workspace.executionConfigHash) throw new CentralError(409, 'configuration_required', '节点必须继续提供已登记的执行配置摘要');
+                if (!project.executionConfigHash) {
+                    this.sql.prepare("UPDATE commands SET cancel_requested=1,updated_at=? WHERE project_id=? AND state IN ('queued','dispatched')").run(this.now(), project.projectId);
+                    this.sql.prepare("UPDATE commands SET state='recovery_required',updated_at=? WHERE project_id=? AND state IN ('accepted','executing')").run(this.now(), project.projectId);
+                    this.sql.prepare('UPDATE projects SET execution_config_hash=? WHERE project_id=?').run(workspace.executionConfigHash, project.projectId);
+                    continue;
+                }
+                if (this.sql.prepare("SELECT 1 FROM commands WHERE project_id=? AND state!='completed'").get(project.projectId)) throw new CentralError(409, 'project_busy', '项目有未决操作，不能更改执行配置');
+                this.sql.prepare('UPDATE projects SET execution_config_hash=?,config_revision=config_revision+1 WHERE project_id=?')
+                    .run(workspace.executionConfigHash ?? null, project.projectId);
+            }
             if (node.instanceId && node.instanceId !== registration.instanceId) {
                 this.sql.prepare("UPDATE commands SET state='recovery_required',updated_at=? WHERE node_id=? AND state IN ('accepted','executing')").run(this.now(), nodeId);
             }
@@ -226,7 +245,8 @@ export class CentralDatabase {
         if (!row) throw new CentralError(404, 'not_found', '项目不存在');
         return { projectId: row.project_id, name: row.name, nodeId: row.node_id, workspaceId: row.workspace_id,
             bindingGeneration: row.binding_generation, projectConfigRevision: row.config_revision,
-            vcsType: row.vcs_type, target: row.target, enabled: Boolean(row.enabled) };
+            vcsType: row.vcs_type, target: row.target, enabled: Boolean(row.enabled),
+            ...(row.execution_config_hash ? { executionConfigHash: row.execution_config_hash } : {}) };
     }
 
     listProjects(nodeId?: string): ProjectRecord[] {
@@ -241,8 +261,8 @@ export class CentralDatabase {
         const workspace = node.workspaces.find(w => w.workspaceId === input.workspaceId);
         if (!workspace || !node.enabled || !node.compatible) throw new CentralError(409, 'workspace_unavailable', '节点没有可绑定的工作副本');
         const id = randomUUID();
-        this.sql.prepare('INSERT INTO projects(project_id,name,node_id,workspace_id,vcs_type,target) VALUES (?,?,?,?,?,?)')
-            .run(id, input.name, input.nodeId, input.workspaceId, workspace.vcsType, workspace.target);
+        this.sql.prepare('INSERT INTO projects(project_id,name,node_id,workspace_id,vcs_type,target,execution_config_hash) VALUES (?,?,?,?,?,?,?)')
+            .run(id, input.name, input.nodeId, input.workspaceId, workspace.vcsType, workspace.target, workspace.executionConfigHash ?? null);
         return this.getProject(id);
     }
 

@@ -290,7 +290,9 @@ export function apply(ctx: HostContext): void {
     directory: path.join(dshHome(), 'dsh-code-review'),
     resolveCredential,
     beforeConfigure: () => {
+      if (initError) throw new Error(`本地评审恢复状态无法核验：${initError.message}`);
       if (localWrites || api?.jobManager.list().some(job => job.status === 'running')) throw new Error('本地评审仍有操作执行中，请先处理后启用中央连接');
+      api?.ensureNoAuditRunning();
       api?.stopScheduler();
     },
     candidates: async sessionId => {

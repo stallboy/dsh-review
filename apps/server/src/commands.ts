@@ -70,6 +70,7 @@ export class Commands {
         const command = this.get(commandId);
         this.authorize(nodeId, command);
         if (command.state === 'queued' || command.state === 'dispatched') {
+            if (!this.database.getNode(nodeId).compatible) throw new CentralError(409, 'protocol_incompatible', '节点协议不兼容，不能受理写指令');
             this.database.sql.prepare("UPDATE commands SET state='accepted',updated_at=? WHERE command_id=?").run(this.database.now(), commandId);
         }
         return this.get(commandId);
