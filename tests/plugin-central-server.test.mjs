@@ -49,7 +49,8 @@ test('中央公开身份在重启后持久且不暴露用户或节点秘密', as
     const info = await app.inject('/api/v1/info');
     assert.equal(info.statusCode, 200, info.body);
     const identity = info.json();
-    assert.deepEqual(Object.keys(identity).sort(), ['centralId', 'protocolVersion']);
+    assert.deepEqual(Object.keys(identity).sort(), ['centralId', 'protocolVersion', 'registrationCapabilities']);
+    assert.deepEqual(identity.registrationCapabilities, { executionConfigHash: true });
     assert.match(identity.centralId, /^[a-zA-Z0-9-]+$/);
     assert.equal(identity.protocolVersion, 1);
     assert.equal(info.body.includes(node.token), false);

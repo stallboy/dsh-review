@@ -32,6 +32,7 @@ function createPanel(status = initialStatus()) {
     let pendingRequest = false;
     let sessionId = 'session-a';
     let failedWrite = '';
+    let testResult;
     let delayNextRead = false;
     let failNextRead = false;
     const delayedReads = [];
@@ -109,7 +110,8 @@ function createPanel(status = initialStatus()) {
                 });
             }
             if (pendingRequest) return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
-            if (failedWrite && init.method === 'POST') return { ok: false, status: 409, text: async () => JSON.stringify({ error: { message: failedWrite } }) };
+            if (failedWrite && init.method === 'POST') return { ok: false, status: 409, text: async () => JSON.stringify({ error: typeof failedWrite === 'string' ? { message: failedWrite } : failedWrite }) };
+            if (testResult && String(url).includes('/connection/test')) return { ok: true, status: 200, text: async () => JSON.stringify(testResult) };
             const value = String(url).includes('/connection') ? activeStatus
                 : String(url).includes('/health') ? { configured: false, counts: {}, diagnostics: [] }
                 : { settings: { owner: '' }, validation: { ok: true, errors: [] }, runners: [] };
@@ -155,7 +157,7 @@ function createPanel(status = initialStatus()) {
     return {
         requests, timers, flush, nodes, text: () => textOf(tree),
         button(label) {
-            const node = nodes().find(node => node.type === 'button' && textOf(node) === label);
+            const node = nodes().find(node => node.type === 'button' && (node.props['aria-label'] ?? textOf(node)) === label);
             assert.ok(node, `缺少按钮：${label}`);
             return node;
         },
@@ -167,6 +169,7 @@ function createPanel(status = initialStatus()) {
         setStatus(next) { activeStatus = next; },
         setSession(next) { sessionId = next; },
         failWrites(message) { failedWrite = message; },
+        setTestResult(value) { testResult = value; },
         async poll() { for (const callback of [...timers.values()]) callback(); await flush(); },
         holdRequests() { pendingRequest = true; },
         releaseRequests() { pendingRequest = false; },
@@ -218,12 +221,12 @@ test('显式应用和测试携带控制令牌，空 Token 保留已有凭据且�
     panel.input('节点 ID').props.onChange({ target: { value: 'node-b' } });
     panel.input('节点 Token').props.onChange({ target: { value: 'node-secret' } });
     await panel.flush();
-    panel.button('测试连接').props.onClick();
+    panel.button('检查连接').props.onClick();
     await panel.flush();
     writes = panel.requests.filter(request => request.init.method === 'POST');
     assert.equal(writes[1].url.pathname, '/dsh-code-review/connection/test');
     assert.deepEqual(writes[1].body, { centerUrl: 'https://central.example', nodeId: 'node-b', token: 'node-secret' });
-    panel.button('应用并连接').props.onClick();
+    panel.button('保存并连接').props.onClick();
     await panel.flush();
     writes = panel.requests.filter(request => request.init.method === 'POST');
     assert.deepEqual(writes[2].body, { mode: 'external', centerUrl: 'https://central.example', nodeId: 'node-b', token: 'node-secret', reviewIdentity: '张三' });
@@ -239,6 +242,58 @@ test('显式应用和测试携带控制令牌，空 Token 保留已有凭据且�
         assert.equal(request.init.headers['x-dsh-review-control'], 'control-secret');
         assert.equal(request.url.searchParams.has('controlToken'), false);
     }
+    panel.unmount();
+});
+
+test('连接检查逐项展示实际结果且修改草稿后清除过时结果', async () => {
+    const panel = createPanel({ ...initialStatus(), configured: false, enabled: false, mode: 'external', phase: 'stopped', hasCredentials: false });
+    panel.setTestResult({ authenticated: false, registrationCompatibility: 'unknown' });
+    await panel.flush();
+    assert.equal(panel.nodes().some(node => node.props['aria-label'] === '审核身份'), false);
+    panel.button('检查连接').props.onClick();
+    await panel.flush();
+    assert.match(panel.text(), /服务器可访问/);
+    assert.match(panel.text(), /节点凭据未验证/);
+    assert.match(panel.text(), /注册兼容性将在连接时验证/);
+    panel.input('中央地址').props.onChange({ target: { value: 'https://another.example' } });
+    await panel.flush();
+    assert.doesNotMatch(panel.text(), /服务器可访问/);
+    panel.setTestResult({ authenticated: true, registrationCompatibility: 'incompatible' });
+    panel.button('检查连接').props.onClick();
+    await panel.flush();
+    assert.match(panel.text(), /节点凭据有效/);
+    assert.equal(panel.button('保存并连接').props.disabled, true);
+    panel.input('中央地址').props.onChange({ target: { value: 'https://third.example' } });
+    await panel.flush();
+    assert.equal(panel.button('保存并连接').props.disabled, false);
+    panel.unmount();
+});
+
+test('注册失败说明原因和处理动作并保留草稿，原始错误仅出现在折叠诊断中', async () => {
+    const panel = createPanel({ ...initialStatus(), configured: false, enabled: false, mode: 'external', phase: 'stopped' });
+    await panel.flush();
+    const message = '中央服务器拒绝了工作副本信息';
+    const issue = { stage: 'registration', code: 'workspace_rejected', detail: 'HTTP 422 · 无效协议字段：workspace' };
+    panel.input('中央地址').props.onChange({ target: { value: 'https://draft.example' } });
+    panel.input('节点 Token').props.onChange({ target: { value: 'draft-token' } });
+    panel.failWrites({ message, ...issue });
+    panel.setStatus({ ...initialStatus(), mode: 'external', phase: 'error', nodeOnline: false, issue, error: message, logs: [`${message}（${issue.detail}）`] });
+    await panel.flush();
+    panel.button('保存并连接').props.onClick();
+    await panel.flush();
+    assert.equal(panel.input('中央地址').props.value, 'https://draft.example');
+    assert.equal(panel.input('节点 Token').props.value, 'draft-token');
+    assert.match(panel.text(), /节点注册失败/);
+    assert.match(panel.text(), /核对中央服务与插件的构建版本/);
+    assert.equal(panel.nodes().filter(node => node.props.role === 'alert' && JSON.stringify(node).includes(message)).length, 1);
+    const details = panel.nodes().find(node => node.type === 'details');
+    assert.ok(details);
+    assert.notEqual(details.props.open, true);
+    assert.equal(panel.text().split('无效协议字段：workspace').length - 1, 1);
+    panel.button('项目接入').props.onClick();
+    await panel.flush();
+    assert.match(panel.text(), /核对中央服务与插件的构建版本/);
+    assert.ok(panel.nodes().some(node => node.type === 'details' && node.props.open !== true));
     panel.unmount();
 });
 
@@ -324,7 +379,7 @@ test('切换会话取消旧请求并解除旧操作忙碌状态，草稿继续�
     await panel.flush();
     panel.button('连接已有中央').props.onClick();
     await panel.flush();
-    panel.input('审核身份').props.onChange({ target: { value: '草稿审核者' } });
+    panel.input('节点 ID').props.onChange({ target: { value: 'draft-node-id' } });
     await panel.flush();
     panel.holdRequests();
     panel.button('应用更改').props.onClick();
@@ -336,7 +391,7 @@ test('切换会话取消旧请求并解除旧操作忙碌状态，草稿继续�
     await panel.flush();
     assert.equal(previousRequest.init.signal.aborted, true);
     assert.equal(panel.button('应用更改').props.disabled, false);
-    assert.equal(panel.input('审核身份').props.value, '草稿审核者');
+    assert.equal(panel.input('节点 ID').props.value, 'draft-node-id');
     assert.equal(panel.requests.at(-1).url.searchParams.get('sessionId'), 'session-b');
     panel.unmount();
 });
@@ -347,7 +402,7 @@ test('轻量插件禁用本机启动但仍允许选择已有中央', async () =>
     assert.equal(panel.button('应用并启动').props.disabled, true);
     panel.button('连接已有中央').props.onClick();
     await panel.flush();
-    assert.equal(panel.button('应用并连接').props.disabled, false);
+    assert.equal(panel.button('保存并连接').props.disabled, false);
     assert.equal(panel.requests.filter(request => request.init.method === 'POST').length, 0);
     panel.unmount();
 });

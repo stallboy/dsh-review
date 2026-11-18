@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { PROTOCOL_VERSION, type ProjectRecord } from '@dsh-review/protocol';
 import { startManagedNode, type ManagedHandle } from '../managed/managed-config.js';
 import { ManagedJournal } from '../managed/managed-journal.js';
+import { NodeRegistrationError } from '../managed/managed-node.js';
 import { normalizeCenterUrl, readJson, saveJson, type Candidate, type ConnectionConfig, type ConnectionSecrets } from './config.js';
 import { CentralGateway, CENTRAL_PREFIX, requestBody } from './gateway.js';
 import { LocalCentralProcess } from './local-process.js';
@@ -31,6 +32,39 @@ interface NodeStatus {
     pending: number;
 }
 
+type RegistrationCompatibility = 'supported' | 'unknown' | 'incompatible';
+
+interface CentralCheck {
+    centralId: string;
+    protocolVersion: number;
+    registrationCompatibility: RegistrationCompatibility;
+}
+
+interface ConnectionIssue {
+    stage: 'address' | 'server' | 'credentials' | 'registration' | 'startup';
+    code: string;
+    detail?: string;
+    registrationCompatibility?: RegistrationCompatibility;
+}
+
+class ConnectionIssueError extends Error implements ConnectionIssue {
+    constructor(readonly stage: ConnectionIssue['stage'], readonly code: string, message: string, readonly detail?: string,
+        readonly registrationCompatibility?: RegistrationCompatibility) {
+        super(message);
+    }
+}
+
+class CentralRequestError extends Error {
+    constructor(readonly status: number, message: string) { super(message); }
+}
+
+function registrationIssue(error: NodeRegistrationError): ConnectionIssueError {
+    const message = error.code === 'workspace_rejected' ? '中央服务器拒绝了工作副本信息'
+        : error.code === 'registration_field_invalid' ? '中央服务器拒绝了节点注册信息' : error.message;
+    const detail = error.protocolField ? `HTTP ${error.status} · ${error.message}` : error.status ? `HTTP ${error.status}` : undefined;
+    return new ConnectionIssueError('registration', error.code, message, detail);
+}
+
 export class ConnectionController {
     private config: ConnectionConfig | null = null;
     private secrets: ConnectionSecrets = { password: randomBytes(32).toString('base64url'), nodes: {} };
@@ -40,6 +74,7 @@ export class ConnectionController {
     private readonly controlToken = randomBytes(32).toString('base64url');
     private phase: 'stopped' | 'starting' | 'ready' | 'error' = 'stopped';
     private error = '';
+    private issue?: ConnectionIssue;
     private generation = 0;
     private queue: Promise<unknown> = Promise.resolve();
     private disposed = false;
@@ -55,7 +90,7 @@ export class ConnectionController {
         this.local = new LocalCentralProcess(options.localEntry, () => {
             if (this.phase === 'ready' && !this.disposed) {
                 this.phase = 'error';
-                this.error = '本机中央已退出，请点击重试；未决任务须核验后恢复';
+                this.fail(new ConnectionIssueError('startup', 'local_exited', '本机中央已退出，请点击重试；未决任务须核验后恢复'), '本机中央已退出');
                 this.gateway.close();
             }
         });
@@ -63,12 +98,34 @@ export class ConnectionController {
 
     get configured(): boolean { return this.config !== null || this.claimed; }
 
-    private record(message: string): void {
-        for (const secret of [this.secrets.password, ...Object.values(this.secrets.nodes).map(node => node.token)]) {
+    private redact(message: string, extraSecret?: string): string {
+        for (const secret of [extraSecret, this.controlToken, this.secrets.password, ...Object.values(this.secrets.nodes).map(node => node.token)]) {
             if (secret) message = message.split(secret).join('[已隐藏]');
         }
-        this.logs.push(message);
+        return message;
+    }
+
+    private record(message: string, detail?: string): void {
+        const entry = this.redact(detail ? `${message}（${detail}）` : message);
+        if (this.logs.at(-1) === entry) return;
+        this.logs.push(entry);
         if (this.logs.length > 80) this.logs.shift();
+    }
+
+    private describe(error: unknown, fallback: string, extraSecret?: string): { message: string; issue?: ConnectionIssue } {
+        const problem = error instanceof NodeRegistrationError ? registrationIssue(error) : error;
+        const message = this.redact(problem instanceof Error ? problem.message : fallback, extraSecret);
+        return problem instanceof ConnectionIssueError
+            ? { message, issue: { stage: problem.stage, code: problem.code, detail: problem.detail ? this.redact(problem.detail, extraSecret) : undefined,
+                registrationCompatibility: problem.registrationCompatibility } }
+            : { message };
+    }
+
+    private fail(error: unknown, fallback: string): void {
+        const failure = this.describe(error, fallback);
+        this.error = failure.message;
+        this.issue = failure.issue;
+        this.record(this.error, this.issue?.detail);
     }
 
     private run<T>(task: () => Promise<T>): Promise<T> {
@@ -97,8 +154,7 @@ export class ConnectionController {
             if (this.config?.enabled) await this.resume();
         })).catch(error => {
             this.phase = 'error';
-            this.error = error instanceof Error ? error.message : '恢复连接失败';
-            this.record(this.error);
+            this.fail(error, '恢复连接失败');
         });
     }
 
@@ -109,23 +165,61 @@ export class ConnectionController {
                 ...(payload === undefined ? {} : { 'content-type': 'application/json' }),
             }, ...(payload === undefined ? {} : { body: JSON.stringify(payload) }), redirect: 'error', signal: AbortSignal.timeout(5000),
         });
-        const value = await response.json() as { error?: { message?: string } };
-        if (!response.ok) throw new Error(value.error?.message ?? `中央请求失败（${response.status}）`);
-        return value;
+        if (!response.ok) {
+            const value = await response.json().catch(() => null) as { error?: { message?: unknown } } | null;
+            const message = value?.error?.message;
+            throw new CentralRequestError(response.status, typeof message === 'string'
+                ? this.redact(message, token) : `中央请求失败（HTTP ${response.status}）`);
+        }
+        return await response.json();
     }
 
-    async test(input: Record<string, unknown>): Promise<{ centralId: string; protocolVersion: number; authenticated: boolean }> {
-        const centerUrl = normalizeCenterUrl(input.centerUrl);
-        const info = await this.request(centerUrl, 'api/v1/info');
-        if (info.protocolVersion !== PROTOCOL_VERSION) throw new Error('中央协议版本不兼容');
-        if (typeof info.centralId !== 'string' || !/^[\w-]{16,128}$/.test(info.centralId)) throw new Error('中央未提供有效持久身份，请升级中央服务');
-        const token = typeof input.token === 'string' && input.token ? input.token : undefined;
-        if (token) {
-            const status = await this.request(centerUrl, 'node-api/v1/status', token, {});
-            if (status.centralId !== info.centralId) throw new Error('中央身份发生变化，请重新核对地址');
-            if (input.nodeId && status.nodeId !== input.nodeId) throw new Error('节点 ID 与接入凭据不匹配');
+    private address(value: unknown): string {
+        try { return normalizeCenterUrl(value); }
+        catch (error) {
+            throw new ConnectionIssueError('address', 'invalid_address', error instanceof TypeError
+                ? '中央地址格式无效，请填写完整的服务地址' : (error as Error).message);
         }
-        return { centralId: info.centralId, protocolVersion: info.protocolVersion, authenticated: Boolean(token) };
+    }
+
+    private async inspectCentral(centerUrl: string): Promise<CentralCheck> {
+        const info = await this.request(centerUrl, 'api/v1/info').catch(error => {
+            throw new ConnectionIssueError('server', 'server_unavailable', '无法读取中央服务器信息',
+                error instanceof CentralRequestError ? `HTTP ${error.status}` : undefined);
+        });
+        if (!info || typeof info.protocolVersion !== 'number' || typeof info.centralId !== 'string' || !/^[\w-]{16,128}$/.test(info.centralId)) {
+            throw new ConnectionIssueError('server', 'invalid_central_info', '此地址未返回有效的中央服务信息');
+        }
+        if (info.protocolVersion !== PROTOCOL_VERSION) throw new ConnectionIssueError('server', 'protocol_mismatch', '中央协议版本不兼容',
+            `中央协议 ${info.protocolVersion} · 插件协议 ${PROTOCOL_VERSION}`);
+        const support = info.registrationCapabilities?.executionConfigHash;
+        return { centralId: info.centralId, protocolVersion: info.protocolVersion,
+            registrationCompatibility: support === true ? 'supported' : support === false ? 'incompatible' : 'unknown' };
+    }
+
+    private async verifyCredentials(centerUrl: string, info: CentralCheck, token: string, nodeId?: string): Promise<void> {
+        const status = await this.request(centerUrl, 'node-api/v1/status', token, {}).catch(error => {
+            const httpStatus = error instanceof CentralRequestError ? error.status : undefined;
+            const rejected = httpStatus === 401 || httpStatus === 403;
+            throw new ConnectionIssueError('credentials', rejected ? 'credential_rejected' : 'credential_check_failed',
+                rejected ? '中央服务器拒绝了节点凭据' : '暂时无法验证节点凭据', httpStatus ? `HTTP ${httpStatus}` : undefined, info.registrationCompatibility);
+        });
+        if (status?.centralId !== info.centralId) throw new ConnectionIssueError('server', 'central_identity_changed', '中央身份发生变化，请重新核对地址');
+        if (typeof status.nodeId !== 'string' || !status.nodeId || (nodeId && status.nodeId !== nodeId)) {
+            throw new ConnectionIssueError('credentials', 'node_id_mismatch', '节点 ID 与接入凭据不匹配', undefined, info.registrationCompatibility);
+        }
+    }
+
+    async test(input: Record<string, unknown>): Promise<CentralCheck & { authenticated: boolean }> {
+        const centerUrl = this.address(input.centerUrl);
+        const info = await this.inspectCentral(centerUrl);
+        const nodeId = typeof input.nodeId === 'string' ? input.nodeId.trim() : '';
+        const saved = this.config?.mode === 'external' && this.config.centerUrl === centerUrl && this.config.centralId === info.centralId
+            ? this.secrets.nodes[info.centralId] : undefined;
+        const supplied = typeof input.token === 'string' ? input.token.trim() : '';
+        const token = supplied || (saved && (!nodeId || nodeId === saved.nodeId) ? saved.token : '');
+        if (token) await this.verifyCredentials(centerUrl, info, token, nodeId || (supplied ? undefined : saved?.nodeId));
+        return { ...info, authenticated: Boolean(token) };
     }
 
     private async acquire(): Promise<void> {
@@ -185,11 +279,14 @@ export class ConnectionController {
         let centralReady = false;
         this.phase = 'starting';
         this.error = '';
+        this.issue = undefined;
         try {
             await this.acquire();
             if (config.mode === 'local') {
                 const ready = await this.local.start({ dataDir: path.join(this.options.directory, 'central'), reviewIdentity: config.reviewIdentity,
-                    password: this.secrets.password, ...(config.centralId && this.secrets.nodes[config.centralId] ? { node: this.secrets.nodes[config.centralId] } : {}) });
+                    password: this.secrets.password, ...(config.centralId && this.secrets.nodes[config.centralId] ? { node: this.secrets.nodes[config.centralId] } : {}) }).catch(error => {
+                    throw new ConnectionIssueError('startup', 'local_start_failed', '本机中央启动失败', this.describe(error, '无法启动本机中央').message);
+                });
                 if (config.centralId && config.centralId !== ready.centralId) throw new Error('本机中央数据身份已变化，拒绝复用旧节点和执行记录');
                 config.centerUrl = normalizeCenterUrl(ready.centerUrl);
                 config.centralId = ready.centralId;
@@ -198,9 +295,11 @@ export class ConnectionController {
                 this.secrets.nodes[ready.centralId] = { nodeId: ready.nodeId, token: ready.token };
             }
             const credentials = this.secrets.nodes[config.centralId];
-            if (!credentials) throw new Error('中央节点凭据缺失，请重新配置接入');
-            const verified = await this.test({ centerUrl: config.centerUrl, ...credentials });
-            if (verified.centralId !== config.centralId) throw new Error('该地址现在属于另一中央，拒绝复用原节点和执行记录');
+            if (!credentials) throw new ConnectionIssueError('credentials', 'credentials_missing', '中央节点凭据缺失，请重新配置接入');
+            const verified = await this.inspectCentral(config.centerUrl);
+            if (verified.centralId !== config.centralId) throw new ConnectionIssueError('server', 'central_identity_changed', '该地址现在属于另一中央，请核对原中央地址');
+            await this.verifyCredentials(config.centerUrl, verified, credentials.token, credentials.nodeId);
+            this.requireRegistrationSupport(verified);
             const profile = config.profiles[config.centralId] ??= { nodeId: credentials.nodeId, workspaces: [] };
             if (profile.nodeId !== credentials.nodeId) throw new Error('节点身份不匹配，拒绝复用原工作副本绑定');
             await this.persist();
@@ -213,8 +312,7 @@ export class ConnectionController {
             this.record(config.mode === 'local' ? '本机中央已就绪，节点已连接' : '已有中央已连接，节点已注册');
         } catch (error) {
             this.phase = 'error';
-            this.error = error instanceof Error ? error.message : '中央连接失败';
-            this.record(this.error);
+            this.fail(error, '中央连接失败');
             if (centralReady && this.local.running) {
                 const node = this.node;
                 this.node = null;
@@ -256,7 +354,11 @@ export class ConnectionController {
         const active = profile.workspaces.filter(workspace => workspace.enabled);
         this.node = await startManagedNode({ centerUrl: config.centerUrl, ...credentials, pauseAdmission: true,
             workspaces: profile.workspaces.map(workspace => ({ ...workspace })) }, path.join(this.options.directory, 'connections', config.centralId),
-            this.options.resolveCredential ?? (async () => undefined), error => this.record(`节点连接异常：${error.message}`));
+            this.options.resolveCredential ?? (async () => undefined), error => {
+                if (this.phase === 'starting') return;
+                const failure = this.describe(error, '节点连接异常');
+                this.record(failure.message, failure.issue?.detail);
+            }).catch(error => { throw error instanceof NodeRegistrationError ? registrationIssue(error) : error; });
         for (const workspace of active) {
             let result = await this.request(config.centerUrl, 'node-api/v1/projects/ensure', credentials.token, {
                 instanceId: this.node.instanceId, workspaceId: workspace.workspaceId, name: workspace.label, enabled: workspace.enabled, restore: true,
@@ -298,6 +400,12 @@ export class ConnectionController {
         return status;
     }
 
+    private requireRegistrationSupport(info: CentralCheck): void {
+        if (info.registrationCompatibility === 'incompatible') {
+            throw new ConnectionIssueError('registration', 'registration_incompatible', '中央服务器不支持工作副本执行配置摘要');
+        }
+    }
+
     async apply(input: Record<string, unknown>): Promise<void> {
         return this.run(() => this.withOwnership(async () => {
             if (input.mode !== 'local' && input.mode !== 'external') throw new Error('请选择中央连接方式');
@@ -308,17 +416,20 @@ export class ConnectionController {
             if (mode === 'local' && this.secrets.localReviewIdentity && reviewIdentity !== this.secrets.localReviewIdentity) {
                 throw new Error('本机审核身份已初始化，不能通过修改连接配置更换操作者');
             }
-            let centerUrl = mode === 'external' ? normalizeCenterUrl(input.centerUrl ?? this.config?.centerUrl) : '';
+            const centerUrl = mode === 'external' ? this.address(input.centerUrl ?? this.config?.centerUrl) : '';
             let centralId = mode === 'local' ? this.secrets.localCentralId ?? (this.config?.mode === 'local' ? this.config.centralId : '') : '';
             let credentials: { nodeId: string; token: string } | undefined;
             if (mode === 'external') {
-                const info = await this.test({ centerUrl });
+                const info = await this.inspectCentral(centerUrl);
                 centralId = info.centralId;
                 const previous = this.secrets.nodes[centralId];
-                credentials = { nodeId: typeof input.nodeId === 'string' && input.nodeId ? input.nodeId.trim() : previous?.nodeId ?? '',
-                    token: typeof input.token === 'string' && input.token ? input.token.trim() : previous?.token ?? '' };
-                if (!/^[\w-]{16,128}$/.test(credentials.nodeId) || !/^[\w-]{20,256}$/.test(credentials.token)) throw new Error('请配置中央签发的节点 ID 和接入凭据');
-                await this.test({ centerUrl, ...credentials });
+                const nodeId = (typeof input.nodeId === 'string' ? input.nodeId.trim() : '') || previous?.nodeId || '';
+                const token = (typeof input.token === 'string' ? input.token.trim() : '') || (nodeId === previous?.nodeId ? previous.token : '');
+                if (!/^[\w-]{16,128}$/.test(nodeId)) throw new ConnectionIssueError('credentials', 'invalid_node_id', '请填写中央签发的节点 ID', undefined, info.registrationCompatibility);
+                if (!/^[\w-]{20,256}$/.test(token)) throw new ConnectionIssueError('credentials', 'invalid_token', '请填写中央签发的节点 Token', undefined, info.registrationCompatibility);
+                credentials = { nodeId, token };
+                await this.verifyCredentials(centerUrl, info, token, nodeId);
+                this.requireRegistrationSupport(info);
                 const saved = this.config?.profiles[centralId];
                 if (saved && saved.nodeId !== credentials.nodeId) throw new Error('该中央已有另一节点绑定，拒绝替换现有节点身份');
             }
@@ -348,6 +459,7 @@ export class ConnectionController {
             await this.persist();
             this.phase = 'stopped';
             this.error = '';
+            this.issue = undefined;
             this.generation++;
         }));
     }
@@ -391,9 +503,10 @@ export class ConnectionController {
                 this.connectGateway();
                 this.phase = 'ready';
                 this.error = '';
+                this.issue = undefined;
             } catch (error) {
                 this.phase = 'error';
-                this.error = error instanceof Error ? error.message : '项目接入失败';
+                this.fail(error, '项目接入失败');
                 throw error;
             }
         }));
@@ -403,29 +516,32 @@ export class ConnectionController {
         const config = this.config;
         const profile = config?.profiles[config.centralId];
         const projects = structuredClone(profile?.workspaces ?? []);
+        let serverReachable: boolean | undefined;
         let nodeOnline = false;
         if (this.phase === 'ready' && this.node && config) {
             const credentials = this.secrets.nodes[config.centralId];
             try {
                 const status = await this.request(config.centerUrl, 'node-api/v1/status', credentials?.token, {});
-                nodeOnline = status.centralId === config.centralId && status.nodeId === credentials?.nodeId
+                serverReachable = status?.centralId === config.centralId;
+                nodeOnline = serverReachable && status.nodeId === credentials?.nodeId
                     && status.online === true && status.activeInstance === true && status.instanceId === this.node.instanceId;
                 if (nodeOnline) for (const workspace of projects) {
                     const project = status.projects.find((value: { workspaceId: string }) => value.workspaceId === workspace.workspaceId);
                     if (project) { workspace.enabled = project.enabled; workspace.label = project.name; }
                 }
-            } catch { nodeOnline = false; }
+            } catch { serverReachable = false; }
         }
         return { controlToken: this.controlToken, configured: this.configured, legacy: this.legacy,
             enabled: config?.enabled ?? false, mode: config?.mode ?? (this.legacy ? 'external' : 'local'), centerUrl: config?.centerUrl ?? this.legacyConnection?.centerUrl ?? '',
             centralId: config?.centralId ?? '', nodeId: profile?.nodeId ?? this.legacyConnection?.nodeId ?? '', reviewIdentity: config?.reviewIdentity ?? '',
-            phase: this.phase, nodeOnline, error: this.error, generation: this.generation,
+            phase: this.phase, serverReachable, nodeOnline, error: this.error, issue: this.issue, generation: this.generation,
             candidates: await this.options.candidates(sessionId), projects,
             logs: [...this.logs], hasCredentials: Boolean(config && this.secrets.nodes[config.centralId]), localAvailable: await this.local.available() };
     }
 
     async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
         const url = new URL(req.url ?? '/', 'http://local');
+        let draftToken: string | undefined;
         try {
             if (url.pathname.startsWith(`${CENTRAL_PREFIX}/`)) {
                 if (this.phase !== 'ready') throw new Error('中央尚未就绪，请先检查连接');
@@ -443,6 +559,7 @@ export class ConnectionController {
                 res.writeHead(403, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: { message: '插件管理请求校验失败，请刷新页面' } })); return;
             }
             const input = JSON.parse((await requestBody(req)).toString('utf8') || '{}') as Record<string, unknown>;
+            draftToken = typeof input?.token === 'string' ? input.token.trim() : undefined;
             let result: unknown = { ok: true };
             if (endpoint === '/test') result = await this.test(input);
             else if (endpoint === '/apply') await this.apply(input);
@@ -453,10 +570,10 @@ export class ConnectionController {
             res.end(JSON.stringify(result));
         } catch (error) {
             if (res.headersSent) { res.end(); return; }
-            const message = error instanceof Error ? error.message : '插件中央操作失败';
-            this.record(message);
+            const { message, issue } = this.describe(error, '插件中央操作失败', draftToken);
+            this.record(message, issue?.detail);
             res.writeHead(409, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-            res.end(JSON.stringify({ error: { message } }));
+            res.end(JSON.stringify({ error: { message, ...issue } }));
         }
     }
 

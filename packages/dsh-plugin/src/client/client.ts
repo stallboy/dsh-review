@@ -50,6 +50,22 @@
         token: string;
         reviewIdentity: string;
     }
+    type RegistrationCompatibility = 'supported' | 'unknown' | 'incompatible';
+    interface ConnectionIssue {
+        stage: 'address' | 'server' | 'credentials' | 'registration' | 'startup';
+        code: string;
+        detail?: string;
+        registrationCompatibility?: RegistrationCompatibility;
+    }
+    interface ConnectionCheck {
+        authenticated: boolean;
+        registrationCompatibility: RegistrationCompatibility;
+    }
+    interface ConnectionFailure {
+        message: string;
+        issue?: ConnectionIssue;
+        forDraft?: boolean;
+    }
     interface ConnectionStatus {
         controlToken: string;
         configured: boolean;
@@ -60,8 +76,10 @@
         nodeId: string;
         reviewIdentity: string;
         phase: 'stopped' | 'starting' | 'ready' | 'error';
+        serverReachable?: boolean;
         nodeOnline: boolean;
         error?: string;
+        issue?: ConnectionIssue;
         generation: number;
         candidates: { id: string; label: string; root: string; vcsType?: string; target?: string; error?: string; current: boolean }[];
         projects: { workspaceId: string; root: string; label: string; enabled: boolean; projectId?: string; vcsType: string; target: string }[];
@@ -170,6 +188,10 @@
     dispose(): void;
   }
 
+  class ApiResponseError extends Error {
+    constructor(message: string, readonly issue?: ConnectionIssue) { super(message); }
+  }
+
   function createApi(sessionId: string, apiRoot = API_ROOT, controlToken?: () => string): ApiClient {
     const inflight = new Set<AbortController>();
     let disposed = false;
@@ -194,7 +216,10 @@
         const text = await response.text();
         let payload: any = null;
         try { payload = text ? JSON.parse(text) : null; } catch { payload = null; }
-        if (!response.ok) throw new Error(payload?.error?.message ?? `HTTP ${String(response.status)}`);
+        if (!response.ok) {
+            const error = payload?.error;
+            throw new ApiResponseError(error?.message ?? `HTTP ${String(response.status)}`, error?.stage ? error : undefined);
+        }
         return payload as T;
       } catch (error) {
         if (controller.signal.aborted) throw new Error('评审面板已卸载');
@@ -402,6 +427,44 @@
 .dcr-central-frame{display:block;flex:1;width:100%;min-height:0;border:0;background:var(--dsw-alias-bg-base)}
 .dcr-central-path{overflow-wrap:anywhere;white-space:normal}
 .dcr-wrap{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
+.dcr-connection{max-width:820px;gap:18px;container-type:inline-size}
+.dcr-connection-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px 16px;flex-wrap:wrap}
+.dcr-connection-head h1{margin:0;font-size:22px;line-height:1.35;font-weight:650}
+.dcr-connection .dcr-connection-card{padding:20px;display:grid;gap:16px;min-width:0}
+.dcr-connection-card h2,.dcr-connection-card p{margin:0}
+.dcr-connection-card h2{font-size:16px;line-height:1.4}
+.dcr-connection-section{display:grid;gap:12px;min-width:0}
+.dcr-connection-modes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.dcr-connection-mode{display:grid;align-content:start;gap:5px;padding:12px 14px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;min-width:0;background:var(--dsw-alias-bg-base);color:inherit;text-align:left;font:inherit;cursor:pointer}
+.dcr-connection-mode:not(:disabled):hover,.dcr-connection-mode[aria-pressed="true"]{border-color:var(--dsw-alias-brand-primary)}
+.dcr-connection-mode[aria-pressed="true"]{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 6%,var(--dsw-alias-bg-base))}
+.dcr-connection-mode:disabled{opacity:.6;cursor:not-allowed}
+.dcr-connection-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.dcr-connection-fields .dcr-field{margin:0;min-width:0}
+.dcr-connection-fields .dcr-field:first-child{grid-column:1/-1}
+.dcr-connection-fields .dcr-input{padding:8px 10px}
+.dcr-connection-fields [aria-invalid="true"]{border-color:var(--dsw-alias-state-error-primary)}
+.dcr-connection-meta{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:8px 16px;margin:0}
+.dcr-connection-meta dt{color:var(--dsw-alias-label-secondary)}
+.dcr-connection-meta dd{margin:0;overflow-wrap:anywhere}
+.dcr-connection-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.dcr-connection-actions .dcr-btn{min-height:34px;white-space:normal}
+.dcr-connection-checks{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;list-style:none;padding:0;margin:0}
+.dcr-connection-checks li{display:flex;gap:7px;align-items:first baseline;padding:8px 10px;line-height:1.45;background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l1);border-radius:6px}
+.dcr-connection-checks .passed span{color:var(--dsw-alias-state-success-primary)}
+.dcr-connection-checks .failed span{color:var(--dsw-alias-state-error-primary)}
+.dcr-connection-feedback{display:grid;gap:8px}
+.dcr-connection-feedback .dcr-banner{padding:12px 14px;color:var(--dsw-alias-label-primary);font-size:13px}
+.dcr-connection-feedback p{margin:4px 0 0}
+.dcr-connection-diagnostics{border-top:1px solid var(--dsw-alias-border-l1);padding:12px 0;min-width:0}
+.dcr-connection-diagnostics summary{width:fit-content;cursor:pointer;color:var(--dsw-alias-label-secondary)}
+.dcr-connection-diagnostics pre{overflow-wrap:anywhere}
+.dcr-connection :is(button,input,summary):focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+@container (max-width:550px){
+    .dcr-connection .dcr-connection-card{padding:14px}
+    .dcr-connection-modes,.dcr-connection-fields,.dcr-connection-checks{grid-template-columns:minmax(0,1fr)}
+    .dcr-connection-meta{gap:8px 12px}
+}
 .dcr-btn{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);border-radius:6px;padding:5px 11px;font:inherit;cursor:pointer;line-height:18px;white-space:nowrap}
 .dcr-btn:hover{border-color:var(--dsw-alias-brand-primary)}
 .dcr-btn[aria-pressed="true"]{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}
@@ -639,9 +702,10 @@
         const [tab, setTab] = useState<'connection' | 'projects' | 'central' | 'local'>('connection');
         const [status, setStatus] = useState<ConnectionStatus | null>(null);
         const [draft, setDraft] = useState<ConnectionDraft>({ mode: 'local', centerUrl: '', nodeId: '', token: '', reviewIdentity: '' });
-        const [error, setError] = useState('');
+        const [failure, setFailure] = useState<ConnectionFailure | null>(null);
         const [loadError, setLoadError] = useState('');
-        const [notice, setNotice] = useState('');
+        const [check, setCheck] = useState<ConnectionCheck | null>(null);
+        const [copyNotice, setCopyNotice] = useState('');
         const [busy, setBusy] = useState(false);
         const [pendingAction, setPendingAction] = useState('');
         const [editing, setEditing] = useState(false);
@@ -649,6 +713,7 @@
         const [framePath, setFramePath] = useState('/dsh-code-review/central/');
         const initialized = useRef(false);
         const edited = useRef(false);
+        const draftRevision = useRef(0);
         const scopeRef = useRef<{ sessionId: string; api: ApiClient; reads: ApiClient; active: boolean; loading: boolean; writing: boolean; ready: boolean; revision: number; token: string } | null>(null);
         const working = busy || status?.phase === 'starting';
         const confirmed = controlReady && scopeRef.current?.sessionId === props.sessionId;
@@ -689,6 +754,9 @@
             scopeRef.current = scope;
             setBusy(false);
             setPendingAction('');
+            setCheck(null);
+            setFailure(null);
+            setCopyNotice('');
             setControlReady(false);
             void refresh();
             const timer = setInterval(() => { void refresh(); }, 3000);
@@ -701,13 +769,20 @@
             };
         }, [props.sessionId, refresh]);
 
+        const clearDraftFeedback = (): void => {
+            draftRevision.current += 1;
+            setCheck(null);
+            setFailure(previous => previous?.forDraft ? null : previous);
+        };
         const edit = (change: Partial<ConnectionDraft>): void => {
             edited.current = true;
+            clearDraftFeedback();
             setDraft(previous => ({ ...previous, ...change }));
         };
-        const write = async (path: string, body: unknown, message = '', clearToken = false): Promise<boolean> => {
+        const write = async (path: string, body: unknown, forDraft = false): Promise<boolean> => {
             const scope = scopeRef.current;
             if (!scope?.active || scope.sessionId !== props.sessionId || !scope.token || !scope.ready || scope.writing || working || status?.legacy) return false;
+            const revision = draftRevision.current;
             scope.writing = true;
             scope.ready = false;
             scope.revision += 1;
@@ -717,17 +792,23 @@
             setControlReady(false);
             setBusy(true);
             setPendingAction(path);
-            setError('');
-            setNotice('');
+            setFailure(null);
+            if (forDraft) setCheck(null);
             try {
-                await scope.api.post(path, body);
+                const result = await scope.api.post<ConnectionCheck>(path, body);
                 if (!scope.active) return false;
-                if (clearToken) setDraft(previous => ({ ...previous, token: '' }));
-                setNotice(message);
+                if (forDraft && revision === draftRevision.current) {
+                    if (path === '/test') setCheck(result);
+                    if (path === '/apply') setDraft(previous => ({ ...previous, token: '' }));
+                }
                 await refresh(true);
                 return scope.active && scope.ready;
             } catch (reason) {
-                if (scope.active) setError(reason instanceof Error ? reason.message : String(reason));
+                if (scope.active && (!forDraft || revision === draftRevision.current)) {
+                    setFailure({ message: reason instanceof Error ? reason.message : String(reason),
+                        issue: reason instanceof ApiResponseError ? reason.issue : undefined, forDraft });
+                    if (forDraft && path === '/apply') setEditing(true);
+                }
                 if (scope.active) await refresh(true);
                 return false;
             } finally {
@@ -744,22 +825,24 @@
             && (draft.mode === 'local' || (draft.centerUrl.trim() === status.centerUrl && draft.nodeId.trim() === status.nodeId && !draft.token)));
         const savedDraft = (): ConnectionDraft => ({ mode: status!.mode, centerUrl: status!.centerUrl, nodeId: status!.nodeId, token: '', reviewIdentity: status!.reviewIdentity });
         const editConnection = (): void => {
+            clearDraftFeedback();
             setDraft(savedDraft());
             edited.current = false;
             setEditing(true);
         };
         const cancelEditing = (): void => {
+            clearDraftFeedback();
             setDraft(savedDraft());
             edited.current = false;
             setEditing(false);
         };
         const apply = (): void => {
-            if (status?.phase === 'ready' && unchanged) return;
+            if ((status?.phase === 'ready' && unchanged) || (draft.mode === 'external' && check?.registrationCompatibility === 'incompatible')) return;
             void write('/apply', {
                 mode: draft.mode,
                 ...(draft.mode === 'external' ? credentials : {}),
                 reviewIdentity: draft.reviewIdentity.trim(),
-            }, '', true).then(applied => { if (applied) { setEditing(false); edited.current = false; } });
+            }, true).then(applied => { if (applied) { setEditing(false); edited.current = false; } });
         };
         const openProject = (projectId: string, event: { preventDefault(): void }): void => {
             event.preventDefault();
@@ -776,21 +859,78 @@
         const disabled = working || !status || !confirmed || Boolean(status.legacy);
         const showForm = Boolean(status && !status.legacy && (!status.configured || editing));
         const applyLabel = busy && pendingAction === '/apply' ? (draft.mode === 'local' ? '正在启动…' : '正在连接…')
-            : status?.configured ? '应用更改' : draft.mode === 'local' ? '应用并启动' : '应用并连接';
-        const phaseTitle = !status ? '正在检查中央连接…' : status.legacy ? '旧托管中央连接'
-            : status.phase === 'starting' || (busy && pendingAction === '/apply') ? '正在启动连接…'
-            : status.phase === 'ready' ? '中央已连接' : status.phase === 'error' ? '中央连接故障' : status.configured ? '中央连接已停止' : '配置中央连接';
+            : status?.configured ? '应用更改' : draft.mode === 'local' ? '应用并启动' : '保存并连接';
+        const starting = status?.phase === 'starting' || (busy && pendingAction === '/apply');
+        const phaseTitle = !status ? '正在读取状态…' : status.legacy ? '旧托管配置'
+            : starting ? '正在连接…' : status.phase === 'error' ? '连接失败'
+            : status.phase === 'ready' ? (status.nodeOnline ? '中央已连接' : status.serverReachable === false ? '连接状态待确认' : '节点离线')
+            : status.configured ? '连接已停止' : '尚未配置';
+        const savedFailure: ConnectionFailure | null = loadError ? { message: loadError } : status?.error ? { message: status.error, issue: status.issue } : null;
+        const visibleFailure = failure ?? savedFailure;
+        const formFailure = visibleFailure?.forDraft ? visibleFailure : null;
+        const issue = formFailure?.issue;
+        const fieldError = issue?.stage === 'address' ? 'centerUrl' : issue?.stage === 'credentials'
+            ? issue.code === 'node_id_mismatch' || issue.code === 'invalid_node_id' ? 'nodeId' : 'token' : undefined;
+        const feedbackId = `dcr-connection-feedback-${encodeURIComponent(props.sessionId)}`;
+        const savedCredentials = status?.hasCredentials && status.mode === 'external' && draft.centerUrl.trim().replace(/\/+$/, '') === status.centerUrl.replace(/\/+$/, '')
+            && (!draft.nodeId.trim() || draft.nodeId.trim() === status.nodeId);
         const field = (label: string, key: 'centerUrl' | 'nodeId' | 'token' | 'reviewIdentity'): any => h('label', { className: 'dcr-field' },
             h('span', null, label),
             h('input', {
                 className: 'dcr-input', 'aria-label': label,
                 type: key === 'token' ? 'password' : 'text',
                 autoComplete: key === 'token' ? 'new-password' : 'off',
+                inputMode: key === 'centerUrl' ? 'url' : undefined,
+                placeholder: key === 'centerUrl' ? 'https://review.example.com' : undefined,
+                'aria-invalid': fieldError === key || undefined,
+                'aria-describedby': fieldError === key ? feedbackId : undefined,
                 value: draft[key], disabled: working,
                 readOnly: key === 'reviewIdentity' && draft.mode === 'local' && status?.configured && status.mode === 'local',
                 onChange: (event: { target: { value: string } }) => edit({ [key]: event.target.value }),
             }),
         );
+        type CheckStep = [string, 'passed' | 'failed' | 'waiting'];
+        const compatibilityStep = (compatibility?: RegistrationCompatibility): CheckStep => compatibility === 'supported' ? ['支持工作副本注册协议', 'passed']
+            : compatibility === 'incompatible' ? ['不支持工作副本注册协议', 'failed'] : compatibility === 'unknown' ? ['注册兼容性将在连接时验证', 'waiting']
+            : ['节点注册未开始', 'waiting'];
+        const steps = (items: CheckStep[]): any => h('ul', { className: 'dcr-connection-checks', 'aria-label': '连接检查结果' },
+            ...items.map(([label, state]) => h('li', { key: label, className: state }, h('span', { 'aria-hidden': true }, { passed: '✓', failed: '!', waiting: '·' }[state]), label)),
+        );
+        const feedback = (problem: ConnectionFailure): any => {
+            const stage = problem.issue?.stage;
+            const code = problem.issue?.code;
+            const guidance = code === 'workspace_rejected' ? '中央版本可能较旧。请管理员核对中央服务与插件的构建版本，然后重试。'
+                : code === 'registration_incompatible' || code === 'protocol_mismatch' ? '请管理员升级中央服务，使它与插件兼容。'
+                : code === 'instance_conflict' ? '确认使用此节点凭据的旧实例已停止，再重试。'
+                : code === 'binding_mismatch' ? '请核对原工作副本及其分支，恢复原目标后重试。'
+                : code === 'project_busy' ? '请先到中央工作台处理该项目的未决任务，再重试。'
+                : code === 'configuration_required' ? '请管理员核对中央服务与插件的构建版本，并检查节点执行配置。'
+                : code === 'registration_field_invalid' ? '展开诊断详情查看被拒绝的字段，请管理员核对节点配置后重试。'
+                : stage === 'registration' ? '请在中央工作台确认此节点的状态，核对后重试。'
+                : stage === 'server' ? '请核对中央地址、服务状态和网络，再重新检查。'
+                : code === 'credential_check_failed' ? '请确认中央服务正常，再重新检查。'
+                : stage === 'credentials' ? '请核对中央管理员签发的节点 ID 和 Token。'
+                : code === 'local_start_failed' ? '展开诊断详情，检查本机中央的运行包和数据目录。' : '';
+            return h('div', { className: 'dcr-connection-feedback' },
+                stage === 'registration' ? steps([['服务器可访问', 'passed'], ['节点凭据有效', 'passed'], code === 'registration_incompatible'
+                    ? compatibilityStep('incompatible') : ['节点注册失败', 'failed']]) : null,
+                stage === 'credentials' ? steps([['服务器可访问', 'passed'], ['凭据验证失败', 'failed'], compatibilityStep(problem.issue?.registrationCompatibility)]) : null,
+                h('div', { className: 'dcr-banner err', role: 'alert', id: feedbackId }, h('strong', null, problem.message), guidance ? h('p', null, guidance) : null),
+            );
+        };
+        const diagnostics = (status?.logs ?? []).map(line => draft.token.trim() ? line.replaceAll(draft.token.trim(), '[已隐藏]') : line).join('\n');
+        const copyDiagnostics = async (): Promise<void> => {
+            try { await navigator.clipboard.writeText(diagnostics); setCopyNotice('诊断已复制'); }
+            catch { setCopyNotice('无法自动复制，请选择下方文本进行复制。'); }
+        };
+        const diagnosticDetails = diagnostics ? h('details', { className: 'dcr-connection-diagnostics' }, h('summary', null, '诊断详情'),
+            h('pre', { className: 'dcr-log' }, diagnostics),
+            h('div', { className: 'dcr-connection-actions' },
+                h('button', { className: 'dcr-btn', onClick: () => { void copyDiagnostics(); } }, '复制诊断'),
+                h('span', { role: 'status' }, copyNotice),
+            ),
+        ) : null;
+        const projectRegistrationFailure = tab === 'projects' && visibleFailure?.issue?.stage === 'registration' ? visibleFailure : null;
         let content: any;
         if (tab === 'local') content = !status || !confirmed || working
             ? h('div', { className: 'dcr-empty' }, '正在检查中央连接状态…')
@@ -813,6 +953,7 @@
                 ? h('iframe', { className: 'dcr-central-frame', title: '中央工作台', src: framePath, key: `${status.generation}:${framePath}` })
                 : h('div', { className: 'dcr-empty' }, '中央尚未就绪，请在中央连接中应用配置或重试。');
         else if (tab === 'projects') content = h('div', { className: 'dcr-body' }, h('div', { className: 'dcr-wrap' },
+            projectRegistrationFailure ? h('section', { className: 'dcr-card dcr-connection-card' }, feedback(projectRegistrationFailure), diagnosticDetails) : null,
             h('div', { className: 'dcr-card' }, h('h2', null, '选择接入项目'), h('p', { className: 'dcr-muted' }, '按工作副本目录独立接入；接入后不会自动发起审查。')),
             ...(status?.candidates ?? []).map(candidate => {
                 const project = status?.projects.find(value => value.root === candidate.root);
@@ -837,51 +978,77 @@
                 ),
             )),
         ));
-        else content = h('div', { className: 'dcr-body' }, h('div', { className: 'dcr-wrap' },
-            h('section', { className: 'dcr-card' },
-                h('div', { className: 'dcr-row' }, h('h2', { className: 'dcr-grow', 'aria-live': 'polite' }, phaseTitle),
-                    h('span', { className: `dcr-chip ${status?.phase === 'ready' && status.nodeOnline ? 'approved' : status?.phase === 'error' ? 'rejected' : 'pending'}` }, status ? ({ stopped: '已停止', starting: '启动中', ready: '服务就绪', error: '连接故障' }[status.phase]) : '加载中'),
-                    status ? h('span', { className: 'dcr-chip' }, status.nodeOnline ? '节点在线' : '节点离线') : null),
-                h('p', { className: 'dcr-muted' }, '此连接由整个 DSH 实例共用。关闭页面或切换会话不会停止服务。'),
-                showForm ? h('div', null,
-                h('div', { className: 'dcr-row' },
-                    h('button', { className: 'dcr-btn', 'aria-pressed': draft.mode === 'local', disabled: working, onClick: () => edit({ mode: 'local' }) }, '本机托管'),
-                    h('button', { className: 'dcr-btn', 'aria-pressed': draft.mode === 'external', disabled: working, onClick: () => edit({ mode: 'external' }) }, '连接已有中央'),
+        else {
+            const hasProjects = status?.projects.some(project => project.enabled);
+            const canEnterWorkbench = status?.legacy || status?.phase === 'ready';
+            const firstProject = status?.phase === 'ready' && status.nodeOnline && !hasProjects;
+            const modeOption = (mode: ConnectionDraft['mode'], label: string, description: string): any => {
+                const id = `${feedbackId}-${mode}`;
+                return h('button', { className: 'dcr-connection-mode', 'aria-label': label, 'aria-pressed': draft.mode === mode,
+                    'aria-describedby': id, disabled: working, onClick: () => edit({ mode }) },
+                    h('strong', null, label), h('span', { id, className: 'dcr-muted' }, description),
+                );
+            };
+            content = h('div', { className: 'dcr-body' }, h('div', { className: 'dcr-wrap dcr-connection' },
+                h('header', { className: 'dcr-connection-head' }, h('h1', null, '中央连接'),
+                    h('span', { 'aria-live': 'polite', className: `dcr-chip ${!starting && status?.nodeOnline ? 'approved' : !starting && status?.phase === 'error' ? 'rejected' : 'pending'}` }, phaseTitle),
                 ),
-                draft.mode === 'external' ? h('div', { className: 'dcr-list', style: { marginTop: 14 } },
-                    field('中央地址', 'centerUrl'), field('节点 ID', 'nodeId'), field('节点 Token', 'token'),
-                    h('p', { className: 'dcr-muted' }, status?.hasCredentials ? '已保存节点凭据。Token 留空时保留已有凭据。' : '填写中央管理员提供的节点 ID 与 Token。'),
-                ) : h('p', { className: 'dcr-muted' }, status?.localAvailable === false ? '当前插件包未包含中央服务，请安装本机整合包或连接已有中央。' : '应用后启动本机中央，关闭页面不会停止服务。'),
-                field('审核身份', 'reviewIdentity'),
-                draft.mode === 'local' && status?.configured && status.mode === 'local' ? h('p', { className: 'dcr-muted' }, '本机审核身份已初始化，修改连接不会更换操作者。') : null,
-                h('div', { className: 'dcr-row', style: { marginTop: 14 } },
-                    draft.mode === 'external' ? h('button', { className: 'dcr-btn', disabled: disabled || !draft.centerUrl.trim(), onClick: () => { void write('/test', credentials, '连接测试通过，配置尚未应用。'); } }, '测试连接') : null,
-                    h('button', { className: 'dcr-btn p', disabled: disabled || (status?.phase === 'ready' && unchanged) || (draft.mode === 'local' ? status?.localAvailable === false || !draft.reviewIdentity.trim() : !draft.centerUrl.trim()), onClick: apply }, applyLabel),
-                    editing ? h('button', { className: 'dcr-btn', disabled: working, onClick: cancelEditing }, '取消修改') : null,
-                ),
-                ) : status?.configured || status?.legacy ? h('div', null,
-                    h('p', null, `${status.mode === 'local' ? '本机托管' : '已有中央'} · 审核身份 ${status.reviewIdentity || '由中央账号决定'}`),
-                    h('p', { className: 'dcr-central-path dcr-mono' }, status.centerUrl || '地址待就绪'),
-                    h('p', { className: 'dcr-small dcr-mono dcr-central-path' }, `中央 ${status.centralId || '未核验'} · 节点 ${status.nodeId || '未分配'}`),
-                    status.phase === 'ready' && !status.nodeOnline ? h('p', { className: 'dcr-banner info', role: 'status' }, '中央服务可访问，节点暂时离线；请检查连接日志，业务操作等待节点恢复。') : null,
-                    status.phase === 'ready' && !status.projects.some(project => project.enabled) ? h('p', { className: 'dcr-muted' }, '中央已就绪，下一步请选择需要接入的项目。') : null,
-                    h('div', { className: 'dcr-row', style: { marginTop: 14 } },
-                        status.phase === 'ready' || status.legacy ? h('button', { className: `dcr-btn ${status.projects.some(project => project.enabled) || status.legacy ? 'p' : ''}`, onClick: () => setTab('central') }, '进入中央工作台') : null,
-                        status.phase === 'ready' && !status.legacy ? h('button', { className: `dcr-btn ${status.projects.some(project => project.enabled) ? '' : 'p'}`, onClick: () => setTab('projects') }, status.projects.some(project => project.enabled) ? '管理项目' : '接入项目') : null,
-                        !status.legacy ? h('button', { className: 'dcr-btn', disabled, onClick: editConnection }, '修改连接') : null,
+                status && (status.configured || status.legacy) ? h('section', { className: 'dcr-card dcr-connection-card' },
+                    h('h2', null, showForm ? '已保存连接' : status.mode === 'local' ? '本机托管' : '已有中央'),
+                    h('dl', { className: 'dcr-connection-meta' },
+                        h('dt', null, '中央地址'), h('dd', { className: 'dcr-mono' }, status.centerUrl || '等待中央启动'),
+                        h('dt', null, '节点 ID'), h('dd', { className: 'dcr-mono' }, status.nodeId || '未分配'),
+                        status.mode === 'local' ? h('dt', null, '审核身份') : null,
+                        status.mode === 'local' ? h('dd', null, status.reviewIdentity || '未设置') : null,
+                    ),
+                    visibleFailure && !formFailure ? feedback(visibleFailure) : null,
+                    status.phase === 'ready' && !status.nodeOnline ? h('p', { className: 'dcr-banner info', role: 'status' }, status.serverReachable === false
+                        ? '无法确认中央服务可用。请检查服务和网络，再刷新连接状态。'
+                        : '中央服务可访问，节点暂时离线。节点恢复后可继续执行评审。') : null,
+                    firstProject && !showForm ? h('p', { className: 'dcr-muted' }, '选择要接入中央评审的工作副本。') : null,
+                    h('div', { className: 'dcr-connection-actions' },
+                        firstProject && !showForm ? h('button', { className: 'dcr-btn p', onClick: () => setTab('projects') }, '接入项目') : null,
+                        canEnterWorkbench && !showForm ? h('button', { className: `dcr-btn${firstProject ? '' : ' p'}`, onClick: () => setTab('central') }, '进入中央工作台') : null,
+                        status.phase === 'ready' && hasProjects && !showForm ? h('button', { className: 'dcr-btn', onClick: () => setTab('projects') }, '管理项目') : null,
+                        !status.legacy && (status.phase === 'error' || status.phase === 'stopped') ? h('button', { className: `dcr-btn${showForm ? '' : ' p'}`, disabled,
+                            onClick: () => { void write('/apply', { mode: status.mode, reviewIdentity: status.reviewIdentity, ...(status.mode === 'external' ? { centerUrl: status.centerUrl, nodeId: status.nodeId } : {}) }); } },
+                            status.phase === 'error' ? '重试已保存连接' : '启动已保存连接') : null,
+                        !status.legacy && !showForm ? h('button', { className: 'dcr-btn', disabled, onClick: editConnection }, '修改连接') : null,
+                        status.configured && !status.legacy && !showForm ? h('button', { className: 'dcr-btn d', disabled: disabled || !status.enabled, onClick: () => { void write('/stop', {}); } },
+                            busy && pendingAction === '/stop' ? '正在停止…' : '停止连接') : null,
+                    ),
+                ) : visibleFailure && !showForm ? feedback(visibleFailure) : null,
+                showForm ? h('section', { className: 'dcr-card dcr-connection-card', 'aria-busy': working },
+                    h('h2', null, status?.configured ? '修改配置' : '选择连接方式'),
+                    h('div', { className: 'dcr-connection-modes', role: 'group', 'aria-label': '连接方式' },
+                        modeOption('local', '本机托管', '由插件在这台机器上启动中央服务。'),
+                        modeOption('external', '连接已有中央', '使用管理员提供的地址和节点凭据。'),
+                    ),
+                    draft.mode === 'external' ? h('div', { className: 'dcr-connection-section' },
+                        h('div', { className: 'dcr-connection-fields' }, field('中央地址', 'centerUrl'), field('节点 ID', 'nodeId'), field('节点 Token', 'token')),
+                        savedCredentials ? h('p', { className: 'dcr-muted' }, 'Token 留空时使用为此节点保存的凭据。') : null,
+                    ) : h('div', { className: 'dcr-connection-section' },
+                        h('div', { className: 'dcr-connection-fields' }, field('审核身份', 'reviewIdentity')),
+                        status?.localAvailable === false ? h('p', { className: 'dcr-muted' }, '此插件包未包含本机中央服务。请使用本机整合包，或连接已有中央。') : null,
+                        status?.configured && status.mode === 'local' ? h('p', { className: 'dcr-muted' }, '本机审核身份已初始化。') : null,
+                    ),
+                    visibleFailure && (formFailure || !status?.configured) ? feedback(visibleFailure) : null,
+                    check ? h('div', { className: 'dcr-connection-feedback', role: 'status' },
+                        steps([['服务器可访问', 'passed'], check.authenticated ? ['节点凭据有效', 'passed'] : ['节点凭据未验证', 'waiting'],
+                            compatibilityStep(check.registrationCompatibility)]),
+                        check.registrationCompatibility === 'incompatible' ? h('p', { className: 'dcr-banner warn' }, '请管理员升级中央服务，再重新检查。') : null,
+                    ) : null,
+                    h('div', { className: 'dcr-connection-actions' },
+                        h('button', { className: 'dcr-btn p', disabled: disabled || (status?.phase === 'ready' && unchanged)
+                            || (draft.mode === 'local' ? status?.localAvailable === false || !draft.reviewIdentity.trim() : !draft.centerUrl.trim() || check?.registrationCompatibility === 'incompatible'), onClick: apply }, applyLabel),
+                        draft.mode === 'external' ? h('button', { className: 'dcr-btn', disabled: disabled || !draft.centerUrl.trim(), onClick: () => { void write('/test', credentials, true); } },
+                            pendingAction === '/test' ? '正在检查…' : '检查连接') : null,
+                        editing && status?.configured ? h('button', { className: 'dcr-btn g', disabled: working, onClick: cancelEditing }, '取消修改') : null,
                     ),
                 ) : null,
-                status?.configured ? h('div', { className: 'dcr-row', style: { marginTop: 14 } },
-                    status.phase === 'error' || status.phase === 'stopped' ? h('button', { className: 'dcr-btn p', disabled, onClick: () => { void write('/apply', { mode: status.mode, reviewIdentity: status.reviewIdentity, ...(status.mode === 'external' ? { centerUrl: status.centerUrl, nodeId: status.nodeId } : {}) }); } }, status.phase === 'error' ? '重试已保存连接' : '启动已保存连接') : null,
-                    h('button', { className: 'dcr-btn d', disabled: disabled || !status.enabled, onClick: () => { void write('/stop', {}); } }, busy && pendingAction === '/stop' ? '正在停止…' : '停止连接'),
-                ) : null,
-            ),
-            showForm && status?.configured ? h('section', { className: 'dcr-card' }, h('h3', null, '已保存连接'),
-                h('p', { className: 'dcr-central-path' }, `${status.mode === 'local' ? '本机托管' : '已有中央'} · ${status.enabled ? '已启用' : '已停用'} · ${status.centerUrl || '地址待就绪'}`),
-                h('p', { className: 'dcr-small dcr-mono dcr-central-path' }, `中央 ${status.centralId || '未核验'} · 节点 ${status.nodeId || '未分配'}`),
-            ) : null,
-            status?.logs.length ? h('details', { className: 'dcr-card', open: status.phase === 'error' ? true : undefined }, h('summary', null, '连接日志'), h('pre', { className: 'dcr-log' }, status.logs.join('\n'))) : null,
-        ));
+                diagnosticDetails,
+            ));
+        }
         return h('div', { className: 'dcr', [VIEW_ATTR]: 'code-review' },
             h('nav', { className: 'dcr-central-nav', 'aria-label': '评审入口' },
                 ...([['connection', '中央连接'], ['projects', '项目接入'], ['central', '中央工作台'], ...(showLocal ? [['local', '本地评审']] : [])] as [typeof tab, string][]).map(([key, label]) => h('button', { className: 'dcr-btn', key, 'aria-selected': tab === key, onClick: () => { if (key === 'central') setFramePath('/dsh-code-review/central/'); setTab(key); } }, label)),
@@ -889,9 +1056,8 @@
                 currentProject?.projectId ? projectLink(currentProject.projectId, '打开当前项目') : currentCandidate ? h('button', { className: 'dcr-btn', onClick: () => setTab('projects') }, '当前项目') : null,
                 h('button', { className: 'dcr-btn g', disabled: busy, onClick: () => { void refresh(); } }, '刷新连接'),
             ),
-            error || loadError || status?.error ? h('div', { className: 'dcr-banner err', role: 'alert' }, error || loadError || status?.error) : null,
+            tab !== 'connection' && visibleFailure && !projectRegistrationFailure ? h('div', { className: 'dcr-banner err', role: 'alert' }, visibleFailure.message) : null,
             status?.legacy ? h('div', { className: 'dcr-banner info', role: 'status' }, '当前正在使用旧托管配置（managed-node.json）。请先在原中央处理未决任务，再停用旧托管配置并重启插件，然后设置新中央连接。') : null,
-            notice ? h('div', { className: 'dcr-banner info', role: 'status' }, notice) : null,
             content,
         );
     }

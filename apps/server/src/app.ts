@@ -71,7 +71,8 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
     });
 
     app.get('/health', async () => ({ status: 'ok', service: 'dsh-review-central', protocolVersion: 1 }));
-    app.get('/api/v1/info', async () => ({ centralId: database.centralId, protocolVersion: PROTOCOL_VERSION }));
+    app.get('/api/v1/info', async () => ({ centralId: database.centralId, protocolVersion: PROTOCOL_VERSION,
+        registrationCapabilities: { executionConfigHash: true } }));
     app.post('/api/v1/auth/login', async (req, reply) => {
         const input = body(req);
         const result = database.login(textValue(input.username, 'username', 80), textValue(input.password, 'password', 256));

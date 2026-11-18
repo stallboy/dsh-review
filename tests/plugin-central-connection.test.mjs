@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import test from 'node:test';
 import { createGitFixture } from './helpers.mjs';
 import { setupCentral } from './central-helpers.mjs';
@@ -67,6 +68,127 @@ test('中央地址拒绝非回环HTTP、URL秘密和非HTTP协议', async t => {
     for (const centerUrl of ['http://example.com/', 'https://u:p@example.com/', 'file:///etc/passwd', 'https://example.com/?token=secret']) {
         await assert.rejects(value.test({ centerUrl }));
     }
+});
+
+test('连接预检报告凭据与注册能力且不注册节点或保存配置', async t => {
+    const { app } = await setupCentral(t);
+    const centerUrl = await app.listen({ host: '127.0.0.1', port: 0 });
+    const node = app.database.createNode('预检节点');
+    const { value, directory } = await controller(t);
+    assert.deepEqual(await value.test({ centerUrl }), {
+        centralId: app.database.centralId, protocolVersion: 1, authenticated: false, registrationCompatibility: 'supported',
+    });
+    assert.equal((await value.test({ centerUrl, ...node })).authenticated, true);
+    await assert.rejects(value.test({ centerUrl, nodeId: node.nodeId, token: 'wrong-credential-never-log' }),
+        { stage: 'credentials', code: 'credential_rejected', registrationCompatibility: 'supported' });
+    assert.equal(app.database.getNode(node.nodeId).instanceId, '');
+    assert.equal(existsSync(path.join(directory, 'connection.json')), false);
+    await value.apply({ mode: 'external', centerUrl, ...node });
+    assert.equal((await value.test({ centerUrl, nodeId: node.nodeId })).authenticated, true);
+    assert.equal((await value.test({ centerUrl, nodeId: 'unrelated-node-id' })).authenticated, false);
+    let credentialSent = false;
+    const otherAddress = createServer((req, res) => {
+        credentialSent ||= Boolean(req.headers.authorization);
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ centralId: app.database.centralId, protocolVersion: 1, nodeId: node.nodeId }));
+    });
+    await new Promise(resolve => otherAddress.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise(resolve => otherAddress.close(resolve)));
+    const unchecked = await value.test({ centerUrl: `http://127.0.0.1:${otherAddress.address().port}/`, nodeId: node.nodeId });
+    assert.equal(unchecked.authenticated, false);
+    assert.equal(credentialSent, false);
+});
+
+test('注册被活动实例阻止时保留可行动的诊断', async t => {
+    const { app } = await setupCentral(t);
+    const centerUrl = await app.listen({ host: '127.0.0.1', port: 0 });
+    const node = app.database.createNode('独占节点');
+    const first = await controller(t);
+    const second = await controller(t);
+    await first.value.apply({ mode: 'external', centerUrl, ...node });
+    await assert.rejects(second.value.apply({ mode: 'external', centerUrl, ...node }),
+        { stage: 'registration', code: 'instance_conflict', message: '相同节点已有活动实例' });
+    assert.equal((await first.value.status()).nodeOnline, true);
+    assert.match((await second.value.status()).logs.join('\n'), /相同节点已有活动实例/);
+});
+
+test('明确不兼容的中央在保存或切换前被拦截', async t => {
+    const centralId = 'different-central-id';
+    const nodeId = 'different-node-id';
+    const token = 'different-credential-value';
+    const server = createServer((req, res) => {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify(req.url === '/api/v1/info'
+            ? { centralId, protocolVersion: 1, registrationCapabilities: { executionConfigHash: false } }
+            : { centralId, nodeId }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise(resolve => server.close(resolve)));
+    const centerUrl = `http://127.0.0.1:${server.address().port}/`;
+    const { value, directory } = await controller(t);
+    await value.apply({ mode: 'local', reviewIdentity: '当前审核者' });
+    const original = await readFile(path.join(directory, 'connection.json'), 'utf8');
+    assert.equal((await value.test({ centerUrl, nodeId, token })).registrationCompatibility, 'incompatible');
+    await assert.rejects(value.apply({ mode: 'external', centerUrl, nodeId, token }),
+        { stage: 'registration', code: 'registration_incompatible' });
+    assert.equal(await readFile(path.join(directory, 'connection.json'), 'utf8'), original);
+    assert.equal((await value.status()).nodeOnline, true);
+});
+
+test('旧中央拒绝新版工作副本字段时报告注册阶段且只记一条诊断', async t => {
+    const centralId = 'legacy-central-id';
+    const nodeId = 'legacy-workspace-node';
+    const token = 'legacy-workspace-secret';
+    let registration;
+    let rejectedField = 'workspace';
+    const server = createServer(async (req, res) => {
+        res.setHeader('content-type', 'application/json');
+        if (req.url === '/api/v1/info') return res.end(JSON.stringify({ centralId, protocolVersion: 1 }));
+        if (req.url === '/node-api/v1/status') return res.end(JSON.stringify({ centralId, nodeId, projects: [], pending: 0 }));
+        if (req.url === '/node-api/v1/register') {
+            registration = await new Response(Readable.toWeb(req)).json();
+            res.statusCode = 422;
+            return res.end(JSON.stringify({ error: { code: 'bad_request', message: `无效协议字段：${rejectedField}` } }));
+        }
+        res.end('{}');
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise(resolve => server.close(resolve)));
+    const centerUrl = `http://127.0.0.1:${server.address().port}/`;
+    const root = await createGitFixture();
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const { discoverCandidates } = await import('../packages/dsh-plugin/dist/connection/config.js');
+    const [candidate] = await discoverCandidates([{ root }]);
+    const { value, directory, ConnectionController } = await controller(t);
+    await value.stop();
+    await writeFile(path.join(directory, 'connection.json'), JSON.stringify({ version: 1, mode: 'external', enabled: false, centerUrl, centralId,
+        reviewIdentity: '', profiles: { [centralId]: { nodeId, workspaces: [{ workspaceId: 'workspace-a', root, label: '项目',
+            target: candidate.target, vcsType: 'git', enabled: true }] } } }));
+    const runtime = new ConnectionController({ directory, candidates: async () => [] });
+    t.after(() => runtime.stop());
+    await runtime.init();
+    assert.equal((await runtime.test({ centerUrl, nodeId, token })).registrationCompatibility, 'unknown');
+    const plugin = createServer((req, res) => { void runtime.handle(req, res); });
+    await new Promise(resolve => plugin.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise(resolve => plugin.close(resolve)));
+    const response = await fetch(`http://127.0.0.1:${plugin.address().port}/dsh-code-review/connection/apply`, {
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-dsh-review-control': (await runtime.status()).controlToken },
+        body: JSON.stringify({ mode: 'external', centerUrl, nodeId, token }),
+    });
+    assert.equal(response.status, 409);
+    const { error } = await response.json();
+    assert.equal(error.stage, 'registration');
+    assert.equal(error.code, 'workspace_rejected');
+    assert.equal(error.message, '中央服务器拒绝了工作副本信息');
+    assert.match(registration.workspaces[0].executionConfigHash, /^[a-f0-9]{64}$/);
+    const status = await runtime.status();
+    assert.equal(status.phase, 'error');
+    assert.equal(status.issue.code, 'workspace_rejected');
+    assert.equal(status.logs.filter(log => log.includes('无效协议字段：workspace')).length, 1);
+    assert.equal(JSON.stringify(status).includes(token), false);
+    rejectedField = 'workspace.target';
+    await assert.rejects(runtime.apply({ mode: 'external', centerUrl, nodeId, token }),
+        { stage: 'registration', code: 'registration_field_invalid', detail: 'HTTP 422 · 无效协议字段：workspace.target' });
 });
 
 test('不同项目分别接入，同目录会话合并，项目变化保持同一中央进程且接入幂等', async t => {

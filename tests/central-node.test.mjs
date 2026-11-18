@@ -26,6 +26,16 @@ async function nodeRuntime(t, app, registration, execute, extra = {}) {
     return { node, journal, transport };
 }
 
+test('直接托管节点的错误消息保留中央明确拒绝的注册字段', async t => {
+    const { app } = await setupCentral(t);
+    const registration = await registerNode(app);
+    const { node } = await nodeRuntime(t, app, registration, async () => { throw new Error('unused'); }, {
+        config: { centerUrl: 'http://127.0.0.1:3081', nodeId: registration.nodeId, token: registration.token, instanceId: registration.instanceId,
+            workspaces: [{ workspaceId: registration.workspaceId, label: '工作副本', vcsType: 'git', target: '' }] },
+    });
+    await assert.rejects(node.tick(), { message: '无效协议字段：workspace.target' });
+});
+
 test('ACK 已落库但响应丢失后可继续执行，受理记录不会永久卡住或重复启动', async t => {
     const { app, headers } = await setupCentral(t);
     const registration = await registerNode(app);

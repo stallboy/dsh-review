@@ -32,6 +32,26 @@ interface PollResult {
     queries: ManagedQuery[];
 }
 
+const registrationFailures = {
+    instance_conflict: '相同节点已有活动实例',
+    binding_mismatch: '既有项目的工作副本目标不能变更',
+    configuration_required: '节点必须继续提供已登记的执行配置摘要',
+    project_busy: '项目有未决操作，不能更改执行配置',
+};
+const registrationFields = ['registration', 'protocolVersion', 'instanceId', 'pluginVersion', 'dshVersion', 'platform', 'workspaces',
+    'workspace', 'workspaceId', '重复 workspaceId', 'workspace.label', 'workspace.vcsType', 'workspace.target', 'workspace.executionConfigHash',
+    'workspace.supportsScheduledAudit'];
+
+export class NodeRegistrationError extends Error {
+    readonly code: keyof typeof registrationFailures | 'registration_rejected' | 'workspace_rejected' | 'registration_field_invalid';
+
+    constructor(readonly status?: number, rejection?: keyof typeof registrationFailures, readonly protocolField?: string) {
+        super(protocolField ? `无效协议字段：${protocolField}`
+            : rejection ? registrationFailures[rejection] : status ? '中央服务器拒绝注册节点' : '节点注册请求失败');
+        this.code = rejection ?? (protocolField === 'workspace' ? 'workspace_rejected' : protocolField ? 'registration_field_invalid' : 'registration_rejected');
+    }
+}
+
 export class ManagedNode {
     readonly instanceId: string;
     private readonly transport: typeof globalThis.fetch;
@@ -61,12 +81,21 @@ export class ManagedNode {
                 ...(pathname === '/node-api/v1/register' && this.options.config.pauseAdmission ? { 'x-dsh-review-admission': 'paused' } : {}) },
             body: JSON.stringify(payload), signal: AbortSignal.timeout(10000),
         });
-        const result = await response.json() as { error?: { message?: string } };
         if (!response.ok) {
             if (response.status === 401 || response.status === 409) this.registered = false;
-            throw new Error(result.error?.message ?? `中央通信失败（${response.status}）`);
+            const result = await response.json().catch(() => null) as { error?: { code?: unknown; message?: string } } | null;
+            if (pathname === '/node-api/v1/register') {
+                const code = result?.error?.code;
+                const field = response.status === 422 ? registrationFields.find(field => `无效协议字段：${field}` === result?.error?.message) : undefined;
+                const rejection = response.status === 409 && typeof code === 'string' && Object.hasOwn(registrationFailures, code)
+                    ? code as keyof typeof registrationFailures : undefined;
+                throw new NodeRegistrationError(response.status, rejection, field);
+            }
+            const message = result?.error?.message;
+            throw new Error(typeof message === 'string' && this.options.config.token
+                ? message.replaceAll(this.options.config.token, '[已隐藏]') : `中央通信失败（${response.status}）`);
         }
-        return result as T;
+        return await response.json() as T;
     }
 
     async start(): Promise<void> {
@@ -103,7 +132,9 @@ export class ManagedNode {
         if (!this.registered) {
             await this.request('/node-api/v1/register', { protocolVersion: PROTOCOL_VERSION, instanceId: this.instanceId,
                 pluginVersion: config.pluginVersion ?? '0.3.0', dshVersion: config.dshVersion ?? 'unknown',
-                platform: process.platform, workspaces: workspaces.map(({ supportsScheduledAudit: _capability, ...workspace }) => workspace) });
+                platform: process.platform, workspaces: workspaces.map(({ supportsScheduledAudit: _capability, ...workspace }) => workspace) }).catch(error => {
+                throw error instanceof NodeRegistrationError ? error : new NodeRegistrationError();
+            });
             this.registered = true;
         }
         const scheduledAuditWorkspaces = this.active.size || this.background.size || config.pauseAdmission ? [] :
