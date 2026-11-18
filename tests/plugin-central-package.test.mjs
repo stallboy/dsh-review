@@ -80,10 +80,12 @@ test('本机整合插件离线隔离安装后保留 DSH 身份并实际完成中
     const expected = await realpath(path.join(pluginRoot, 'central-runtime/server/dist/owned.js'));
     const script = `
         import assert from 'node:assert/strict';
+        import { realpath } from 'node:fs/promises';
         import { LocalCentralProcess } from './node_modules/dsh-code-review/dist/connection/local-process.js';
         const process = new LocalCentralProcess();
         assert.equal(await process.available(), true);
-        assert.equal(process.entry.href, ${JSON.stringify(pathToFileURL(expected).href)});
+        assert.ok(process.entry instanceof URL);
+        assert.equal(await realpath(process.entry), ${JSON.stringify(expected)});
     `;
     const probe = spawnSync(process.execPath, ['--input-type=module', '-e', script], { cwd: directory, encoding: 'utf8', windowsHide: true,
         env: { ...process.env, NODE_PATH: '', NODE_OPTIONS: '' } });

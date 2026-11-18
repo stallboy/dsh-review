@@ -51,6 +51,7 @@ export async function createGitFixture() {
   runCommand('git', ['init', '-q'], root);
   runCommand('git', ['config', '--local', 'user.name', fixtureGitName], root);
   runCommand('git', ['config', '--local', 'user.email', fixtureGitEmail], root);
+  runCommand('git', ['config', '--local', 'core.autocrlf', 'false'], root);
   runCommand('git', ['add', '-A'], root);
   runCommand('git', ['commit', '-q', '-m', 'baseline'], root);
   return root;
