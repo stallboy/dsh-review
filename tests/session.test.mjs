@@ -81,7 +81,8 @@ test('audit session falls back to cwd when no workspace owns the directory', asy
 });
 
 test('audit session matches a workspace by path when resolveByPath is unavailable', async () => {
-  const workspace = { id: 'workspace-2', path: CWD.replaceAll('/', '\\') };
+  const workspacePath = process.platform === 'win32' ? CWD.replaceAll('\\', '/') : `${CWD}/.`;
+  const workspace = { id: 'workspace-2', path: workspacePath };
   const registry = { list: () => [workspace] };
   const { host, calls } = createHost({ registry });
 

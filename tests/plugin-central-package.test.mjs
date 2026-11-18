@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { fork, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -77,7 +77,7 @@ test('本机整合插件离线隔离安装后保留 DSH 身份并实际完成中
     assert.equal(manifest.name, 'dsh-code-review');
     assert.equal(manifest.dsh.client.platform, 'web');
     assert.equal(Object.hasOwn(manifest, 'private'), false, '整合包应可由 npm 仓库分发');
-    const expected = path.join(pluginRoot, 'central-runtime/server/dist/owned.js');
+    const expected = await realpath(path.join(pluginRoot, 'central-runtime/server/dist/owned.js'));
     const script = `
         import assert from 'node:assert/strict';
         import { LocalCentralProcess } from './node_modules/dsh-code-review/dist/connection/local-process.js';

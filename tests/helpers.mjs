@@ -15,6 +15,8 @@ process.env.GIT_CONFIG_KEY_0 ??= 'core.fsmonitor';
 process.env.GIT_CONFIG_VALUE_0 ??= 'false';
 
 const fixturesDir = path.dirname(fileURLToPath(import.meta.url));
+const fixtureGitName = 'audit-test';
+const fixtureGitEmail = 'audit-test@example.com';
 
 export function runCommand(command, args, cwd, input) {
   const result = spawnSync(command, args, {
@@ -23,10 +25,10 @@ export function runCommand(command, args, cwd, input) {
     input,
     env: {
       ...process.env,
-      GIT_AUTHOR_NAME: 'audit-test',
-      GIT_AUTHOR_EMAIL: 'audit-test@example.com',
-      GIT_COMMITTER_NAME: 'audit-test',
-      GIT_COMMITTER_EMAIL: 'audit-test@example.com',
+      GIT_AUTHOR_NAME: fixtureGitName,
+      GIT_AUTHOR_EMAIL: fixtureGitEmail,
+      GIT_COMMITTER_NAME: fixtureGitName,
+      GIT_COMMITTER_EMAIL: fixtureGitEmail,
     },
   });
   if (result.error) throw result.error;
@@ -47,6 +49,8 @@ export async function createGitFixture() {
     'utf8',
   );
   runCommand('git', ['init', '-q'], root);
+  runCommand('git', ['config', '--local', 'user.name', fixtureGitName], root);
+  runCommand('git', ['config', '--local', 'user.email', fixtureGitEmail], root);
   runCommand('git', ['add', '-A'], root);
   runCommand('git', ['commit', '-q', '-m', 'baseline'], root);
   return root;

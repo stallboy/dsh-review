@@ -11,6 +11,7 @@ import { writeCandidate } from './fixtures/contract.mjs';
 async function fixture(t, audit = false) {
     const root = await createGitFixture();
     t.after(() => rm(root, { recursive: true, force: true }));
+    runCommand('git', ['config', '--local', 'core.autocrlf', 'false'], root);
     runCommand('git', ['config', 'user.name', 'tester'], root);
     runCommand('git', ['config', 'user.email', 'tester@example.com'], root);
     const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
@@ -19,6 +20,7 @@ async function fixture(t, audit = false) {
     runCommand('git', ['commit', '-qm', 'candidate'], root);
     const api = new ReviewApi({ settings: { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType: 'git',
         runner: audit ? 'external' : 'manual', externalCommand: `"${process.execPath}" "${reportOnlyAgentPath()}"`, syncBeforeApprove: false, autoFixOnFailure: false },
+        statePath: path.join(root, '.git', 'dsh-review-runtime-state.json'),
         saveSettings: async value => value, decorateVcs: vcs => new Proxy(vcs, { get(target, key) {
             if (key === 'atomicCommit') return async input => {
                 const result = await target.atomicCommit(input);

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -272,7 +272,7 @@ for (const state of ['dirty', 'lease', 'executing', 'checkpoint']) {
         if (state === 'checkpoint') journal.checkpoint(command.commandId, { phase: 'invoking', workspaceId: 'workspace-a' });
         if (state === 'dirty') await writeFile(path.join(root, 'src/math.js'), '外部执行中的现场\n');
         if (state === 'lease') await writeFile(path.join(directory, 'workspace-a-runtime.json'), JSON.stringify({ leases: [{
-            auditId: 'blocking-audit', root, targetPath: '', trigger: 'manual', baseRevision: head, owner: '审核者',
+            auditId: 'blocking-audit', root: await realpath(root), targetPath: '', trigger: 'manual', baseRevision: head, owner: '审核者',
             createdAt: new Date().toISOString(), candidateIdsBefore: [], state: 'releasable',
         }] }));
         operations = new ManagedOperations({ dataDir: directory, journal, workspaces: [{ workspaceId: 'workspace-a', label: '项目', root, target }] });
