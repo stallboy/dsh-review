@@ -9,6 +9,8 @@
 
 本包提供 DeepSeek Harness 的评审标签、审核执行能力和中央托管节点。插件标识仍为 `dsh-code-review`。未配置托管节点时使用本地模式；配置后由中央工作台统一发起操作，节点执行实际门禁、Agent 和 Git/SVN 写入。
 
-在仓库根目录执行 `npm ci`、`npm run build:plugin`，然后通过 DSH Plugin Manager 安装 `packages/dsh-plugin` 的绝对路径。也可执行 `npm run pack:plugin`，分发根目录 `dist/dsh-code-review-0.3.0.tgz`；安装包自带所需协议依赖，不包含中央服务或中央 Web。
+整合包包含本机中央服务和 Web 工作台。安装并启用后，打开「评审 → 中央连接」，选择「本机托管」，填写审核身份并点击「应用并启动」。开发阶段可在仓库根目录运行 `npm run preview:market`，从隔离的 DSH 测试环境走一遍市场安装。
+
+开发轻量插件时，在仓库根目录执行 `npm ci`、`npm run build:plugin`，然后通过 DSH Plugin Manager 安装 `packages/dsh-plugin` 的绝对路径。`npm run pack:plugin` 生成可分发给远程执行节点的轻量包，内含插件与协议依赖。
 
 `src/host` 保存审核执行能力与 DSH 接入，`src/managed` 保存中央通信、持久化执行记录和交付适配，`src/client` 保存 DSH 内嵌界面。插件加载入口为 `dist/index.js`，浏览器入口为 `dist/client.js`。

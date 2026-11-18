@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { fork, spawnSync } from 'node:child_process';
-import { copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { fork, spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -75,6 +76,7 @@ test('本机整合插件离线隔离安装后保留 DSH 身份并实际完成中
     const manifest = JSON.parse(await readFile(path.join(pluginRoot, 'package.json'), 'utf8'));
     assert.equal(manifest.name, 'dsh-code-review');
     assert.equal(manifest.dsh.client.platform, 'web');
+    assert.equal(Object.hasOwn(manifest, 'private'), false, '整合包应可由 npm 仓库分发');
     const expected = path.join(pluginRoot, 'central-runtime/server/dist/owned.js');
     const script = `
         import assert from 'node:assert/strict';
@@ -103,6 +105,50 @@ test('本机整合插件离线隔离安装后保留 DSH 身份并实际完成中
     assert.equal(restarted.ready.centralId, owned.ready.centralId);
     restarted.child.disconnect();
     await stopped(restarted, '父 IPC 断开');
+
+    await t.test('从开发市场索引按包名和版本安装后能启动中央', async t => {
+        const { servePreviewMarket } = await import('../scripts/preview-market.mjs');
+        const archive = await readFile(path.join(root, 'dist', `dsh-code-review-local-${manifest.version}.tgz`));
+        const { server, origin } = await servePreviewMarket(manifest, archive);
+        t.after(() => new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
+        assert.match(origin, /^http:\/\/127\.0\.0\.1:\d+$/);
+        const indexUrl = new URL('/index.json', origin);
+        const response = await fetch(indexUrl);
+        assert.equal(response.status, 200);
+        const index = await response.json();
+        assert.equal(index.format, 1);
+        const [plugin] = index.plugins;
+        const [version] = plugin.versions;
+        assert.equal(plugin.name, 'dsh-code-review');
+        assert.equal(version.version, manifest.version);
+        assert.deepEqual(version.source, { type: 'npm', registry: origin });
+        assert.equal(Number.isInteger(version.publishTimestamp), true);
+        assert.equal((await fetch(indexUrl, { method: 'PUT' })).status, 405);
+
+        const installRoot = path.join(directory, 'registry-install');
+        await mkdir(installRoot);
+        await writeFile(path.join(installRoot, 'package.json'), JSON.stringify({ private: true,
+            dependencies: { [plugin.name]: version.version } }));
+        const installer = spawn('npm install --ignore-scripts --no-audit --no-fund --cache ./cache', {
+            cwd: installRoot, shell: true, windowsHide: true, timeout: 25000, stdio: ['ignore', 'pipe', 'pipe'],
+            env: { ...process.env, NODE_PATH: '', NODE_OPTIONS: '', npm_config_registry: version.source.registry,
+                npm_config_fetch_retries: '0' },
+        });
+        let output = '';
+        installer.stdout.on('data', bytes => { output += bytes; });
+        installer.stderr.on('data', bytes => { output += bytes; });
+        assert.equal((await once(installer, 'close'))[0], 0, output);
+
+        const installedRoot = path.join(installRoot, 'node_modules', plugin.name);
+        const { apply } = await import(pathToFileURL(path.join(installedRoot, 'dist', 'index.js')).href);
+        assert.equal(typeof apply, 'function');
+        const installedCentral = await startOwned(t, path.join(installedRoot, 'central-runtime', 'server', 'dist', 'owned.js'), installRoot);
+        const health = await fetch(new URL('/health', installedCentral.ready.centerUrl));
+        assert.equal((await health.json()).service, 'dsh-review-central');
+        assert.equal((await fetch(installedCentral.ready.centerUrl)).status, 200);
+        installedCentral.child.send({ type: 'stop' });
+        await stopped(installedCentral, '完成市场安装后停止');
+    });
 });
 
 test('普通插件离线安装仍不携带中央运行目录或 fastify，源码 manifest 不受整合打包修改', async t => {
@@ -122,5 +168,8 @@ test('普通插件离线安装仍不携带中央运行目录或 fastify，源码
         env: { ...process.env, NODE_PATH: '', NODE_OPTIONS: '' } });
     assert.equal(probe.status, 0, probe.stderr);
     const manifest = JSON.parse(await readFile(path.join(root, 'packages/dsh-plugin/package.json'), 'utf8'));
+    assert.equal(manifest.private, true);
+    const installed = JSON.parse(await readFile(path.join(directory, 'node_modules/dsh-code-review/package.json'), 'utf8'));
+    assert.equal(installed.private, true);
     assert.equal(manifest.files.includes('central-runtime'), false);
 });

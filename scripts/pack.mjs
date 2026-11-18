@@ -2,14 +2,16 @@ import { spawnSync } from 'node:child_process';
 import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { servePreviewMarket } from './preview-market.mjs';
 
 const workspaces = {
     plugin: { name: 'dsh-code-review', directory: 'packages/dsh-plugin' },
     central: { name: '@dsh-review/server', directory: 'apps/server' },
 };
-const local = process.argv[2] === 'plugin-local';
+const preview = process.argv[2] === 'plugin-local-preview';
+const local = preview || process.argv[2] === 'plugin-local';
 const workspace = workspaces[local ? 'plugin' : process.argv[2]];
-if (!workspace || !process.env.npm_execpath) throw new Error('请通过 npm run pack:plugin、npm run pack:central 或 npm run pack:local 打包');
+if (!workspace || !process.env.npm_execpath) throw new Error('请通过 npm run pack:plugin、npm run pack:central、npm run pack:local 或 npm run preview:market 打包');
 const root = path.resolve(fileURLToPath(new URL('../', import.meta.url)));
 const destination = fileURLToPath(new URL('../dist/', import.meta.url));
 await mkdir(destination, { recursive: true });
@@ -41,10 +43,12 @@ async function stageWorkspace(workspace, stage) {
 const scratch = path.join(root, '.tmp');
 await mkdir(scratch, { recursive: true });
 const stage = await mkdtemp(path.join(scratch, 'pack-'));
+let previewPackage;
 try {
     const manifest = await stageWorkspace(workspace, stage);
     if (local) {
         await stageWorkspace(workspaces.central, path.join(stage, 'central-runtime', 'server'));
+        delete manifest.private;
         manifest.files = [...manifest.files, 'central-runtime'];
         await writeFile(path.join(stage, 'package.json'), `${JSON.stringify(manifest, null, 4)}\n`);
     }
@@ -54,11 +58,17 @@ try {
     if (local) {
         const packed = JSON.parse(output);
         const filename = `dsh-code-review-local-${manifest.version}.tgz`;
-        await rename(path.join(packDestination, packed[0].filename), path.join(destination, filename));
+        const archivePath = path.join(packDestination, packed[0].filename);
+        if (preview) previewPackage = { manifest, archive: await readFile(archivePath) };
+        await rename(archivePath, path.join(destination, filename));
         packed[0].filename = filename;
         output = `${JSON.stringify(packed, null, 4)}\n`;
     }
     process.stdout.write(output);
 } finally {
     await rm(stage, { recursive: true, force: true });
+}
+if (previewPackage) {
+    const { origin } = await servePreviewMarket(previewPackage.manifest, previewPackage.archive);
+    console.log(`DSH 市场预览索引：${origin}/index.json`);
 }

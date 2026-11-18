@@ -45,6 +45,25 @@
 | `dsh-code-review-local-0.3.0.tgz` | 本机整合插件，包含独立中央服务、Web 和运行依赖；可在插件内启动本机中央，也可连接已有中央。 |
 | `dsh-review-server-0.1.0.tgz` | 独立中央，适合长期运行或供其他机器访问，继续使用本文第 2 节的安装方式。 |
 
+#### 通过 DSH 市场预览安装
+
+在仓库根目录运行 `npm ci`，再运行 `npm run preview:market`。构建结束后会输出 `http://127.0.0.1:<端口>/index.json`。该地址只在命令运行期间可用。
+
+如果使用 Windows 上的 DSH Web，可在另一个 PowerShell 窗口启动临时环境。
+
+```powershell
+$env:DSH_HOME = Join-Path ([IO.Path]::GetTempPath()) ('dsh-review-market-' + [Guid]::NewGuid().ToString('N'))
+dsh web --port 0
+```
+
+1. 在同一台机器上用独立的 `DSH_HOME` 运行 DSH 测试 profile。连接配置按 `DSH_HOME` 保存，仅切换 profile 仍会读取原来的连接配置。打开「插件」，启用实验插件「自定义插件索引」，再到「发现 → 添加索引源」粘贴输出地址。
+2. 找到「代码评审」，确认安装来源为本机预览仓库，完成安装并启用。DSH 会按索引中的版本下载完整整合包。
+3. 在「评审 → 中央连接」选择「本机托管」，填写审核身份，点击「应用并启动」。服务就绪后即可打开中央工作台。
+
+每轮预览使用新的测试环境，以首次安装为验收目标。预览仓库会随命令停止，重启后会使用新的地址。DSH 版本没有「发现」页时，可按下节安装整合包。[DSH 自定义插件索引说明](https://deepseek-harness.github.io/deepseek-harness/en/guide/plugin-market)
+
+#### 使用整合包安装
+
 在构建机器的仓库根目录执行：
 
 ```powershell
