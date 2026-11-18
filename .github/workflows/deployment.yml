@@ -24,8 +24,23 @@ jobs:
               with:
                   node-version: 24
                   cache: npm
-            - if: runner.os == 'Windows'
-              run: choco install sliksvn --version=1.14.5 --yes --no-progress
+            - name: Prepare Subversion on Windows
+              if: runner.os == 'Windows'
+              shell: pwsh
+              run: |
+                  $archive = Join-Path $env:RUNNER_TEMP 'Slik-Subversion-1.14.5-x64.msi'
+                  $destination = Join-Path $env:RUNNER_TEMP 'dsh-review-svn'
+                  Invoke-WebRequest -Uri 'https://sliksvn.com/pub/Slik-Subversion-1.14.5-x64.msi' -OutFile $archive -TimeoutSec 60 -MaximumRetryCount 2 -RetryIntervalSec 3
+                  if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne '21AA09EC9DB9868CD56A378C44D276643171BCF5FCD8AA4877DEE60C2B756200') {
+                      throw 'SlikSVN SHA-256 mismatch'
+                  }
+                  $installer = Start-Process msiexec.exe -ArgumentList @('/a', ('"{0}"' -f $archive), '/quiet', '/norestart', ('TARGETDIR="{0}"' -f $destination)) -WindowStyle Hidden -PassThru -Wait
+                  if ($installer.ExitCode -ne 0) { throw "SlikSVN extraction failed ($($installer.ExitCode))" }
+                  $svnBin = Join-Path $destination 'PFiles/bin'
+                  if (-not (Test-Path (Join-Path $svnBin 'svn.exe')) -or -not (Test-Path (Join-Path $svnBin 'svnadmin.exe'))) {
+                      throw 'SlikSVN extraction did not produce svn and svnadmin'
+                  }
+                  Add-Content -LiteralPath $env:GITHUB_PATH -Value $svnBin -Encoding utf8
             - if: runner.os == 'Linux'
               run: |
                   if ! command -v svn || ! command -v svnadmin; then
