@@ -15,7 +15,7 @@ import {
 } from './audit-lifecycle.js';
 import { AuditArchive } from './audit-archive.js';
 import { SCHEDULED_AUDIT_ACTOR } from '@dsh-review/protocol';
-import { matchesAuditTarget, scheduledReviewDataClean, syncScheduledAudit } from './scheduled-audit-vcs.js';
+import { assertScheduledCheckout, matchesAuditTarget, scheduledReviewDataClean, syncScheduledAudit } from './scheduled-audit-vcs.js';
 import { wrapAgentPrompt } from './runner.js';
 import { loadReviewers } from './reviewers.js';
 import { dshHome } from './settings.js';
@@ -403,24 +403,44 @@ export class AuditRuntime {
             if (!await scheduledReviewDataClean(runtime)) {
                 throw new ApiError(409, 'conflict', '评审目录有未提交的改动，已跳过本轮定时审查并保留现场', { reason: 'SCHEDULE_WORKSPACE_DIRTY' });
             }
-            const baseRevision = await syncScheduledAudit(runtime, scheduled.target, scheduled.signal);
-            if (scheduled.signal.aborted) throw new ApiError(409, 'conflict', '定时审查在启动 Runner 前已取消', { reason: 'CANCELLED' });
-            if (!await scheduledReviewDataClean(runtime)) {
-                throw new ApiError(409, 'conflict', '同步后评审目录出现未提交改动，需要核验现场', {
-                    status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', detail: '无法证明同步后的评审数据与共享基线一致',
-                });
-            }
-            const candidateSource = await sharedSourceFor(runtime);
-            if (!candidateSource || (runtime.vcsType === 'git' && await candidateSource.snapshotId() !== baseRevision)) {
-                throw new ApiError(409, 'conflict', '无法固定同步后的审查基线', {
-                    status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', detail: '共享快照与同步结果无法对应',
-                });
-            }
+            const before = await runtime.vcs.getCurrentBase();
+            if (!before) throw new ApiError(412, 'not_configured', '定时审查缺少可用的仓库基线', { reason: 'SCHEDULE_WORKSPACE_NO_BASE' });
+            await assertScheduledCheckout(runtime);
             const owner = await this.host.ownerFor(runtime.root);
-            const { auditId } = await this.beginAuditLeaseUnderLock(
-                runtime, { targetPath: '', baseRevision, owner, now: new Date(), trigger: 'scheduled' }, clean,
+            const now = new Date();
+            const { auditId: reservedId } = await this.beginAuditLeaseUnderLock(
+                runtime, { targetPath: '', baseRevision: before, owner, now, trigger: 'scheduled' }, clean,
             );
-            const lease = this.auditLifecycle.find(auditId)!;
+            let activeId = reservedId;
+            const { candidateSource, lease } = await (async () => {
+                const baseRevision = await syncScheduledAudit(runtime, scheduled.target, before, scheduled.signal);
+                if (scheduled.signal.aborted) throw new ApiError(409, 'conflict', '定时审查在启动 Runner 前已取消', { reason: 'CANCELLED' });
+                if (!await scheduledReviewDataClean(runtime)) {
+                    throw new ApiError(409, 'conflict', '同步后评审目录出现未提交改动，需要核验现场', {
+                        status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', detail: '无法证明同步后的评审数据与共享基线一致',
+                    });
+                }
+                const candidateSource = await sharedSourceFor(runtime);
+                if (!candidateSource || (runtime.vcsType === 'git' && await candidateSource.snapshotId() !== baseRevision)) {
+                    throw new ApiError(409, 'conflict', '无法固定同步后的审查基线', {
+                        status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', detail: '共享快照与同步结果无法对应',
+                    });
+                }
+                const auditId = await new AuditArchive(runtime.root).nextAuditId('', now);
+                const lease = { ...this.auditLifecycle.find(reservedId)!, auditId, baseRevision,
+                    candidateIdsBefore: await runtime.store.listCandidateIds() };
+                await this.upsertLease(lease);
+                activeId = auditId;
+                if (reservedId !== activeId) await this.releaseLeaseById(reservedId);
+                return { candidateSource, lease };
+            })().catch(async error => {
+                const details = error instanceof ApiError ? error.details : null;
+                const recovery = !(error instanceof ApiError) || error.status >= 500
+                    || (details !== null && typeof details === 'object' && 'status' in details && details.status === 'RECOVERY_REQUIRED');
+                await this.releaseLeaseById(activeId, recovery ? 'releasable' : 'released');
+                throw error;
+            });
+            const { auditId } = lease;
             let execution: Promise<unknown> | undefined;
             const job = this.host.jobManager.start('audit', (log, jobId, signal) => {
                 this.host.auditJobLeases.set(jobId, auditId);

@@ -227,7 +227,7 @@ export interface AuditOutcome {
   report: AuditReportInfo | null;
   commitRevision: string | null;
   /** §7.7：RECOVERY_REQUIRED 必含 reason/detail。 */
-  reason?: 'COMMIT_OUTCOME_UNKNOWN' | 'SYNC_STATE_UNKNOWN' | 'SCHEDULE_RECHECK_DIRTY';
+  reason?: 'COMMIT_OUTCOME_UNKNOWN' | 'SYNC_STATE_UNKNOWN' | 'SCHEDULE_RECHECK_DIRTY' | 'SCHEDULE_SCAN_DIRTY';
   detail?: string;
   baseRevision: string;
   targetPath: string;

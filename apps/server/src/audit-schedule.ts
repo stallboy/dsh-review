@@ -8,6 +8,7 @@ const EXPIRED_MESSAGE = '30 分钟等待期已结束，本轮未启动';
 const CHANGED_REASON = 'SCHEDULE_CHANGED';
 const CHANGED_MESSAGE = '定时设置已修改，本轮未启动';
 const SCHEDULE_KEY_PREFIX = 'scheduled-audit:';
+const UNACCEPTED_SCHEDULED = "state IN ('queued','dispatched') AND json_extract(envelope,'$.scheduledAudit') IS NOT NULL";
 
 interface SchedulePolicy {
     enabled: boolean;
@@ -82,8 +83,7 @@ export class AuditSchedules {
                 start_time=excluded.start_time,time_zone=excluded.time_zone,effective_at=excluded.effective_at,
                 review_identity=excluded.review_identity,last_missed_at=excluded.last_missed_at`)
                 .run(project.projectId, Number(enabled), startTime, zone, now, user.reviewIdentity, missed);
-            db.sql.prepare(`UPDATE commands SET state='completed',updated_at=?,result=? WHERE project_id=?
-                AND state IN ('queued','dispatched') AND json_extract(envelope,'$.scheduledAudit') IS NOT NULL`)
+            db.sql.prepare(`UPDATE commands SET state='completed',updated_at=?,result=? WHERE project_id=? AND ${UNACCEPTED_SCHEDULED}`)
                 .run(now, this.skipped(CHANGED_REASON, CHANGED_MESSAGE), project.projectId);
         });
         return this.view(project);
@@ -94,8 +94,32 @@ export class AuditSchedules {
     }
 
     expire(now = this.database.now()): void {
-        this.database.sql.prepare(`UPDATE commands SET state='completed',updated_at=?,result=? WHERE state!='completed' AND state IN ('queued','dispatched')
-            AND json_extract(envelope,'$.scheduledAudit.expiresAt')<=?`).run(now, this.skipped(EXPIRED_REASON, EXPIRED_MESSAGE), now);
+        const expired = `state!='completed' AND state IN ('queued','dispatched') AND json_extract(envelope,'$.scheduledAudit.expiresAt')<=?`;
+        if (!this.database.sql.prepare(`SELECT 1 FROM commands WHERE ${expired} LIMIT 1`).get(now)) return;
+        this.database.sql.prepare(`UPDATE commands SET state='completed',updated_at=?,result=? WHERE ${expired}`)
+            .run(now, this.skipped(EXPIRED_REASON, EXPIRED_MESSAGE), now);
+    }
+
+    rememberMissedWindow(project: ProjectRecord): void {
+        const missed = this.view(project)?.lastRun;
+        if (missed?.state === 'skipped' && !missed.commandId) {
+            this.database.sql.prepare('UPDATE audit_schedules SET last_missed_at=? WHERE project_id=?').run(missed.scheduledAt, project.projectId);
+        }
+    }
+
+    blocksManual(projectId: string): boolean {
+        return Boolean(this.database.sql.prepare(`SELECT 1 FROM commands WHERE project_id=? AND state!='completed'
+            AND NOT (${UNACCEPTED_SCHEDULED})`).get(projectId));
+    }
+
+    yieldToManual(projectId: string, now: string): void {
+        // 保留原指令供节点确认，同时让未主动取消的计划在本轮窗口内重新派发。
+        this.database.sql.prepare(`UPDATE commands SET state='completed',updated_at=?,
+            idempotency_key=CASE WHEN cancel_requested=1 THEN idempotency_key ELSE 'retired-scheduled:' || command_id END,
+            result=CASE WHEN cancel_requested=1 THEN ? ELSE ? END
+            WHERE project_id=? AND ${UNACCEPTED_SCHEDULED}`).run(now,
+            this.skipped('CANCELLED', '执行前已取消，没有产生副作用'),
+            this.skipped('SCHEDULE_MANUAL_PRIORITY', '本次派发已让位于手动任务'), projectId);
     }
 
     private run(projectId: string, slot?: Slot): Run | null {
@@ -112,7 +136,8 @@ export class AuditSchedules {
     private runView(run: Run, now: string) {
         const outcome = run.result?.outcome;
         const unacceptedExpired = (run.state === 'queued' || run.state === 'dispatched') && now >= run.expiresAt;
-        const skipReasons = [EXPIRED_REASON, CHANGED_REASON, 'SCHEDULE_WORKSPACE_BUSY', 'SCHEDULE_WORKSPACE_DIRTY', 'SCHEDULE_WORKSPACE_NO_BASE', 'RUNNER_UNAVAILABLE'];
+        const skipReasons = [EXPIRED_REASON, CHANGED_REASON, 'SCHEDULE_WORKSPACE_BUSY', 'SCHEDULE_WORKSPACE_DIRTY', 'SCHEDULE_WORKSPACE_NO_BASE',
+            'SCHEDULE_WORKSPACE_INCOMPLETE', 'RUNNER_UNAVAILABLE'];
         const skipped = unacceptedExpired || (typeof outcome?.reason === 'string' && skipReasons.includes(outcome.reason));
         const reason = outcome?.message ?? outcome?.detail ?? outcome?.reason;
         return { commandId: run.commandId, scheduledAt: run.scheduledAt, state: skipped ? 'skipped' as const : run.state,

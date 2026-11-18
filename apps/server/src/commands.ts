@@ -28,15 +28,17 @@ export class Commands {
         if ('scheduledAudit' in input) throw new CentralError(422, 'bad_request', '定时审查标识由中央生成');
         const requestHash = digest(stableJson({ operation: input.operation, payload: input.payload, guard: input.guard, actor: user.userId }));
         return db.transaction(() => {
-            this.schedules.expire();
+            const now = db.now();
+            this.schedules.expire(now);
             const existing = db.sql.prepare('SELECT command_id,request_hash FROM commands WHERE project_id=? AND idempotency_key=?').get(projectId, key) as Row | undefined;
             if (existing) {
                 if (existing.request_hash !== requestHash) throw new CentralError(409, 'idempotency_conflict', '同一幂等键已用于不同操作');
                 return this.get(existing.command_id);
             }
-            if (db.sql.prepare("SELECT 1 FROM commands WHERE project_id=? AND state!='completed'").get(projectId)) throw new CentralError(409, 'project_busy', '项目有未决操作');
+            if (this.schedules.blocksManual(projectId)) throw new CentralError(409, 'project_busy', '项目有未决操作');
             const node = db.getNode(project.nodeId);
             if (!project.enabled || !node.online || !node.compatible) throw new CentralError(503, 'node_unavailable', '执行节点离线、停用或协议不兼容');
+            this.schedules.yieldToManual(projectId, now);
             return this.insert(project, key, input, { userId: user.userId, reviewIdentity: user.reviewIdentity }, requestHash);
         });
     }
@@ -73,7 +75,9 @@ export class Commands {
             const running = all.some(c => c.state === 'accepted' || c.state === 'executing' || c.state === 'recovery_required');
             const dispatchable = all.filter(c => !c.scheduledAudit || scheduledAuditWorkspaces.has(db.getProject(c.projectId).workspaceId));
             const accepted = dispatchable.filter(c => c.state === 'accepted');
-            const commands = accepted.length ? accepted : running ? [] : dispatchable.filter(c => c.state === 'queued' || c.state === 'dispatched').slice(0, 1);
+            const waiting = dispatchable.filter(c => c.state === 'queued' || c.state === 'dispatched');
+            const next = waiting.find(c => !c.scheduledAudit) ?? waiting[0];
+            const commands = accepted.length ? accepted : !running && next ? [next] : [];
             for (const command of commands) {
                 if (command.state === 'accepted') continue;
                 db.sql.prepare("UPDATE commands SET state='dispatched',updated_at=? WHERE command_id=?").run(db.now(), command.commandId);
@@ -91,9 +95,11 @@ export class Commands {
             const now = db.now();
             this.schedules.expire(now);
             const command = this.get(commandId);
-            this.authorize(nodeId, command);
+            this.authorize(nodeId, command, !(command.scheduledAudit && command.state === 'completed'));
             if (command.state === 'queued' || command.state === 'dispatched') {
                 if (!db.getNode(nodeId).compatible) throw new CentralError(409, 'protocol_incompatible', '节点协议不兼容，不能受理写指令');
+                if (command.scheduledAudit && db.sql.prepare(`SELECT 1 FROM commands WHERE node_id=? AND state!='completed'
+                    AND json_extract(envelope,'$.scheduledAudit') IS NULL`).get(nodeId)) return command;
                 db.sql.prepare("UPDATE commands SET state='accepted',updated_at=? WHERE command_id=?").run(now, commandId);
             }
             return this.get(commandId);
@@ -113,8 +119,9 @@ export class Commands {
         return command;
     }
 
-    private authorize(nodeId: string, command: CommandRecord): void {
+    private authorize(nodeId: string, command: CommandRecord, verifyBinding = true): void {
         if (command.nodeId !== nodeId) throw new CentralError(403, 'forbidden', '任务不属于该节点');
+        if (!verifyBinding) return;
         const project = this.database.assertNodeProject(nodeId, command.projectId);
         if (project.bindingGeneration !== command.bindingGeneration || project.projectConfigRevision !== command.projectConfigRevision) throw new CentralError(409, 'binding_mismatch', '任务绑定或配置已变化');
     }

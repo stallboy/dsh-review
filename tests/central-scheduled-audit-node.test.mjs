@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -70,7 +70,7 @@ async function writeArchive(root, id, base, scope, items = [], candidates = []) 
 }
 
 test('托管定时审查同步绑定分支，在同一基线上先复查，再归档全仓结果和稳定 finding ID', async t => {
-    const { root, writer, remote, target, operations, journal } = await setup(t);
+    const { root, writer, remote, target, operations, journal, directory } = await setup(t);
     const original = runCommand('git', ['rev-parse', 'HEAD'], writer).stdout.trim();
     await writeCandidate(writer, 'approved-last-round', {
         review: {
@@ -78,6 +78,7 @@ test('托管定时审查同步绑定分支，在同一基线上先复查，再�
             approval: '{approved_by: tester, approved_at: "2026-11-01T11:00:00+08:00", gate_checks: ["node --version"], gate_results: [{command: "node --version", exit_code: 0, duration_ms: 10}], confirmed_decisions: [], waived_decisions: [], commit_revision: null}',
         },
     });
+    await writeCandidate(writer, 'linked-pending', { review: { baseRevision: JSON.stringify(original) } });
     const item = (findingId, title, status = 'pending') => ({
         findingId, kind: 'confirm', title, summary: '需要核实历史问题', targetFiles: ['src/math.js'], dependsOn: null, status, candidate: null,
     });
@@ -85,13 +86,21 @@ test('托管定时审查同步绑定分支，在同一基线上先复查，再�
         item('historical-fixed', '加法误用减号'),
         item('historical-unverified', '未知边界'),
         item('historical-dismissed', '已人工排除', 'dismissed'),
+        item('historical-unrelated-file', '需要相关代码证据'),
+        { ...item('historical-linked', '已关联边界问题', 'converted'), candidate: '2026-11/linked-pending' },
     ], ['2026-11/approved-last-round']);
     await writeArchive(writer, '20261117-100000-src', original, 'src');
     await writeFile(path.join(writer, 'src', 'math.js'), 'export const add = (a, b) => a + b;\n');
+    await writeFile(path.join(writer, 'UNRELATED.md'), '# 无关说明\n');
     runCommand('git', ['add', '-A'], writer);
     runCommand('git', ['commit', '-qm', '上游修复与共享审查档案'], writer);
     runCommand('git', ['push', '-q', 'origin', target], writer);
     const upstream = runCommand('git', ['rev-parse', 'HEAD'], writer).stdout.trim();
+    const hook = path.join(root, '.git/hooks/post-merge');
+    const syncLease = path.join(directory, 'lease-during-sync.json');
+    const shellPath = value => `'${value.replaceAll('\\', '/').replaceAll("'", "'\\''")}'`;
+    await writeFile(hook, `#!/bin/sh\nif test -f ${shellPath(path.join(directory, `${workspaceId}-runtime.json`))}; then\n  cp ${shellPath(path.join(directory, `${workspaceId}-runtime.json`))} ${shellPath(syncLease)}\nfi\n`);
+    await chmod(hook, 0o755);
     let now = new Date('2026-11-18T07:59:00Z');
     const clock = () => now;
     const { app, headers } = await setupCentral(t, { clock });
@@ -136,17 +145,25 @@ test('托管定时审查同步绑定分支，在同一基线上先复查，再�
     const { result } = task;
     assert.equal(result.outcome.status, 'COMMITTED', JSON.stringify(result));
     assert.equal(result.delivery.state, 'delivered');
+    const leaseDuringSync = JSON.parse(await readFile(syncLease, 'utf8')).leases.at(-1);
+    assert.equal(leaseDuringSync.state, 'active');
+    assert.equal(leaseDuringSync.baseRevision, original);
     const committed = runCommand('git', ['show', `refs/heads/${target}:${result.outcome.report.path}`], remote).stdout;
     const record = parseAuditMarkdown(committed);
     assert.equal(record.meta.trigger, 'scheduled');
     assert.equal(record.meta.baseRevision, upstream);
     assert.equal(record.meta.previousAudit, '20261117-090000-repo');
-    assert.deepEqual(record.meta.items.map(({ findingId, status }) => [findingId, status]), [['historical-fixed', 'resolved']], record.body);
+    assert.deepEqual(record.meta.items.map(({ findingId, status, candidate }) => [findingId, status, candidate]),
+        [['historical-fixed', 'resolved', null], ['historical-linked', 'converted', '2026-11/linked-pending']], record.body);
     assert.match(record.meta.items[0].summary, /src\/math\.js:1/);
     assert.match(record.body, /approved-last-round.*已核实/);
+    assert.match(record.body, /historical-linked.*仍存在.*相关边界/);
     assert.doesNotMatch(record.body, /AI 报告不应覆盖/);
     const snapshot = await operations.snapshot(project);
     assert.equal(snapshot.findings.find(finding => finding.findingId === 'historical-unverified').lastObservedAudit, '20261117-090000-repo');
+    assert.equal(snapshot.findings.find(finding => finding.findingId === 'historical-linked').candidate, '2026-11/linked-pending');
+    assert.equal(snapshot.findings.find(finding => finding.findingId === 'historical-unrelated-file').lastObservedAudit, '20261117-090000-repo');
+    assert.equal(snapshot.findings.find(finding => finding.findingId === 'historical-dismissed').state, 'dismissed');
     await node.drain();
 });
 
@@ -203,6 +220,36 @@ test('工作副本有未提交的评审配置时跳过定时审查并保留草�
     assert.equal(result.outcome.reason, 'SCHEDULE_WORKSPACE_DIRTY');
     assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), before);
     assert.equal(await readFile(reviewers, 'utf8'), 'default_owner: 草稿负责人\n');
+});
+
+test('只读复查遇到业务改动时保留已跟踪和未跟踪文件并停止全量扫描', async t => {
+    const { root, remote, target, execute } = await setup(t, 'external', 'write-business-during-recheck');
+    const before = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+    await writeArchive(root, '20261117-090000-repo', before, '.');
+    runCommand('git', ['add', '.ai-review'], root);
+    runCommand('git', ['commit', '-qm', '共享历史档案'], root);
+    runCommand('git', ['push', '-q', 'origin', target], root);
+    const shared = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+    const result = await execute(commandFor('recheck-business-changed'));
+    assert.equal(result.outcome.status, 'RECOVERY_REQUIRED', JSON.stringify(result));
+    assert.equal(result.outcome.reason, 'SCHEDULE_RECHECK_DIRTY');
+    assert.equal(result.delivery.state, 'unknown');
+    assert.equal(runCommand('git', ['rev-parse', `refs/heads/${target}`], remote).stdout.trim(), shared);
+    assert.equal(await readFile(path.join(root, 'src/math.js'), 'utf8'), '// 复查期间出现的业务改动\n');
+    assert.equal(await readFile(path.join(root, 'local-note.txt'), 'utf8'), '复查期间出现的未跟踪文件\n');
+    assert.deepEqual((await new AuditArchive(root).list()).map(record => record.meta.auditId), ['20261117-090000-repo']);
+});
+
+test('定时审查发现 Git 稀疏检出时跳过且不扩展检出范围', async t => {
+    const { root, execute } = await setup(t);
+    runCommand('git', ['sparse-checkout', 'set', '--no-cone', '/package.json'], root);
+    await assert.rejects(readFile(path.join(root, 'src/math.js'), 'utf8'), { code: 'ENOENT' });
+    const result = await execute(commandFor('scheduled-sparse-git'));
+    assert.equal(result.outcome.status, 'ABORTED', JSON.stringify(result));
+    assert.equal(result.outcome.reason, 'SCHEDULE_WORKSPACE_INCOMPLETE');
+    assert.equal(result.delivery.state, 'not_required');
+    await assert.rejects(readFile(path.join(root, 'src/math.js'), 'utf8'), { code: 'ENOENT' });
+    await assert.rejects(readFile(path.join(root, '.ai-review/reviewers.yml'), 'utf8'), { code: 'ENOENT' });
 });
 
 test('定时命令在确认期间被中央结束时收敛本地记录且不启动', async t => {

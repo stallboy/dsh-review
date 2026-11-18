@@ -4,9 +4,10 @@ import path from 'node:path';
 import { record, textValue, validateSnapshot, type JsonRecord, type ManagedQuery, type ProjectSnapshot, type QueryKind } from '@dsh-review/protocol';
 import { digest, stableJson } from './auth.js';
 import { CentralDatabase, CentralError, type Row } from './database.js';
+import type { AuditSchedules } from './audit-schedule.js';
 
 export class Snapshots {
-    constructor(private readonly database: CentralDatabase) {}
+    constructor(private readonly database: CentralDatabase, private readonly schedules: AuditSchedules) {}
 
     get(projectId: string): ProjectSnapshot | null {
         this.database.getProject(projectId);
@@ -42,7 +43,7 @@ export class Snapshots {
             collectedAt: snapshot?.collectedAt ?? null, snapshotSequence: snapshot?.snapshotSequence ?? null,
             lastSyncedAt: received?.received_at ?? null,
             freshness: !snapshot ? 'not_synced' : !node.online ? 'offline' : fresh ? 'synced' : 'stale',
-            writable: Boolean(project.enabled && node.online && node.compatible && fresh && !this.database.sql.prepare("SELECT 1 FROM commands WHERE project_id=? AND state!='completed'").get(projectId)) };
+            writable: Boolean(project.enabled && node.online && node.compatible && fresh && !this.schedules.blocksManual(projectId)) };
     }
 
     query(projectId: string, kind: QueryKind, params: JsonRecord): { status: number; body: JsonRecord } {

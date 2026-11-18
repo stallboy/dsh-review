@@ -206,7 +206,7 @@ export class ManagedOperations {
             const result = saved?.outcome ? structuredClone(saved) : previous?.outcome.status !== 'RECOVERY_REQUIRED' ? structuredClone(previous) : undefined;
             const commit = result?.delivery.commitRevision ?? await runtime.delivery.findCommandCommit(command.commandId);
             if (!commit) {
-                if (command.scheduledAudit && result?.outcome.reason === 'SCHEDULE_RECHECK_DIRTY') {
+                if (command.scheduledAudit && (result?.outcome.reason === 'SCHEDULE_RECHECK_DIRTY' || result?.outcome.reason === 'SCHEDULE_SCAN_DIRTY')) {
                     const { auditId, baseRevision } = result.outcome;
                     const lease = typeof auditId === 'string' ? runtime.api.leaseLookup(auditId) : undefined;
                     const releaseStarted = checkpoint?.phase === 'recheck_releasing';
@@ -222,8 +222,8 @@ export class ManagedOperations {
                     this.options.journal.checkpoint(command.commandId, { phase: 'recheck_releasing', result });
                     await runtime.api.leaseTransition(lease.auditId, 'released');
                     const recovered: ManagedResult = {
-                        outcome: { status: 'ABORTED', reason: 'SCHEDULE_RECHECK_DIRTY_RECOVERED', auditId, baseRevision,
-                            message: '已确认历史复查未产生提交，且绑定工作副本已还原，租约已释放' },
+                        outcome: { status: 'ABORTED', reason: `${result.outcome.reason}_RECOVERED`, auditId, baseRevision,
+                            message: '已确认本轮审查未产生提交，且绑定工作副本已还原，租约已释放' },
                         delivery: { state: 'not_required' },
                     };
                     this.options.journal.checkpoint(command.commandId, { phase: 'finished', result: recovered });

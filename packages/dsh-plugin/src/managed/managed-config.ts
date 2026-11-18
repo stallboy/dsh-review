@@ -31,7 +31,8 @@ export async function startManagedNode(input: ManagedConfiguration, directory: s
     const operations = new ManagedOperations({ dataDir: directory, journal, workspaces: input.workspaces, resolveCredential });
     try {
         await operations.init();
-        const node = new ManagedNode({ config: { centerUrl: input.centerUrl, nodeId: input.nodeId, token: input.token, workspaces: operations.registrations(), pauseAdmission: input.pauseAdmission }, journal,
+        const node = new ManagedNode({ config: { centerUrl: input.centerUrl, nodeId: input.nodeId, token: input.token,
+            get workspaces() { return operations.registrations(); }, pauseAdmission: input.pauseAdmission }, journal,
             execute: (...args) => operations.execute(...args), read: (...args) => operations.read(...args), snapshot: project => operations.snapshot(project),
             recover: (...args) => operations.recover(...args), onError });
         await node.start();

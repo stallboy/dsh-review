@@ -97,3 +97,44 @@ test('中央定时 SVN 首轮使用同步后的基线并直接交付审查档案
     assert.equal(report.meta.previousAudit, null);
     assert.match(await readFile(path.join(root, 'content.md'), 'utf8'), /审查对象/);
 });
+
+test('中央定时审查遇到稀疏 SVN 检出时保留原范围并跳过', async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'central-sparse-svn-'));
+    let journal, operations;
+    t.after(async () => {
+        operations?.stop();
+        journal?.close();
+        await rm(directory, { recursive: true, force: true });
+    });
+    const repo = path.join(directory, 'repo'), root = path.join(directory, 'wc'), writer = path.join(directory, 'writer');
+    const url = pathToFileURL(repo).href;
+    await mkdir(repo);
+    await mkdir(root);
+    await mkdir(writer);
+    runCommand('svnadmin', ['create', 'repo'], directory);
+    runCommand('svn', ['checkout', '-q', url, 'writer'], directory);
+    await writeFile(path.join(writer, 'content.md'), '# 审查对象\n');
+    runCommand('svn', ['add', 'content.md'], writer);
+    runCommand('svn', ['commit', '-qm', '业务基线'], writer);
+    runCommand('svn', ['checkout', '-q', '--depth', 'empty', url, 'wc'], directory);
+    const runner = fileURLToPath(new URL('./fixtures/report-only-agent.mjs', import.meta.url));
+    journal = new ManagedJournal(path.join(directory, 'journal.sqlite'));
+    operations = new ManagedOperations({ dataDir: path.join(directory, 'state'), journal,
+        workspaces: [{ workspaceId: 'svn-wc', label: 'SVN 项目', root, target: '^/',
+            settings: { runner: 'external', externalCommand: `"${process.execPath}" "${runner}"` } }] });
+    await operations.init();
+    const project = { projectId: 'svn-project', nodeId: 'svn-node', name: 'SVN', workspaceId: 'svn-wc',
+        bindingGeneration: 1, projectConfigRevision: 1, vcsType: 'svn', target: '^/', enabled: true };
+    const start = Date.now();
+    const command = { commandId: 'svn-sparse-scheduled-audit', requestHash: 'b'.repeat(64), projectId: project.projectId, nodeId: project.nodeId,
+        bindingGeneration: 1, projectConfigRevision: 1, operation: 'audit', payload: { targetPath: '.' },
+        actor: { userId: 'system-scheduled-audit', reviewIdentity: 'tester' }, createdAt: new Date(start).toISOString(),
+        scheduledAudit: { scheduledAt: new Date(start).toISOString(), expiresAt: new Date(start + 30 * 60_000).toISOString() } };
+    journal.accept(command);
+    const result = await operations.execute(command, new AbortController().signal, () => {}, project);
+    assert.equal(result.outcome.status, 'ABORTED', JSON.stringify(result));
+    assert.equal(result.outcome.reason, 'SCHEDULE_WORKSPACE_INCOMPLETE');
+    assert.equal(result.delivery.state, 'not_required');
+    assert.equal(runCommand('svn', ['info', '--show-item', 'depth', '.'], root).stdout.trim(), 'empty');
+    await assert.rejects(readFile(path.join(root, 'content.md'), 'utf8'), { code: 'ENOENT' });
+});

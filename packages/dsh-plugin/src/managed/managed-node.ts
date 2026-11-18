@@ -99,14 +99,15 @@ export class ManagedNode {
             }
             this.initialized = true;
         }
+        const { workspaces } = config;
         if (!this.registered) {
             await this.request('/node-api/v1/register', { protocolVersion: PROTOCOL_VERSION, instanceId: this.instanceId,
                 pluginVersion: config.pluginVersion ?? '0.3.0', dshVersion: config.dshVersion ?? 'unknown',
-                platform: process.platform, workspaces: config.workspaces.map(({ supportsScheduledAudit: _capability, ...workspace }) => workspace) });
+                platform: process.platform, workspaces: workspaces.map(({ supportsScheduledAudit: _capability, ...workspace }) => workspace) });
             this.registered = true;
         }
         const scheduledAuditWorkspaces = this.active.size || this.background.size || config.pauseAdmission ? [] :
-            config.workspaces.filter(workspace => workspace.supportsScheduledAudit).map(workspace => workspace.workspaceId);
+            workspaces.filter(workspace => workspace.supportsScheduledAudit).map(workspace => workspace.workspaceId);
         const poll = await this.request<PollResult>('/node-api/v1/commands/poll', { instanceId: this.instanceId, scheduledAuditWorkspaces });
         if (this.stopping) return;
         for (const commandId of poll.cancellations) this.active.get(commandId)?.controller.abort();
@@ -120,7 +121,7 @@ export class ManagedNode {
             const saved = journal.accept(command);
             if (saved.record.phase !== 'accepted') continue;
             const project = poll.projects.find(p => p.projectId === command.projectId);
-            const workspace = project && config.workspaces.find(w => w.workspaceId === project.workspaceId);
+            const workspace = project && workspaces.find(w => w.workspaceId === project.workspaceId);
             const valid = project && project.nodeId === config.nodeId && workspace && project.bindingGeneration === command.bindingGeneration
                 && project.projectConfigRevision === command.projectConfigRevision && workspace.vcsType === project.vcsType && workspace.target === project.target
                 && (!command.scheduledAudit || workspace.supportsScheduledAudit);

@@ -9,6 +9,7 @@ const RECHECK_RESULT = 'DSH_AUDIT_RECHECK=';
 interface AuditHistory {
     previous: AuditRecord | undefined;
     findings: Map<string, AuditItem & { observedIn: string }>;
+    protectedFindings: AuditItem[];
     candidates: Map<string, string>;
 }
 
@@ -33,17 +34,23 @@ export async function loadAuditHistory(store: ReviewStore, source: SharedCandida
         return item ? { status: item.status, reopenedFrom: item.reopenedFrom ?? null, broken: Boolean(item.parseError) } : null;
     }, [...shared.keys()]);
     const findings = new Map<string, AuditItem & { observedIn: string }>();
+    const protectedFindings: AuditItem[] = [];
     for (const finding of projected) {
-        if (finding.state !== 'open' && finding.state !== 'reopened') continue;
         const last = byId.get(finding.lastObservedAudit)?.meta.items.find(item => item.findingId === finding.findingId);
-        if (last) findings.set(finding.findingId, { ...last, observedIn: finding.lastObservedAudit });
+        if (!last) continue;
+        if (finding.state === 'open' || finding.state === 'reopened') {
+            findings.set(finding.findingId, { ...last, observedIn: finding.lastObservedAudit });
+            protectedFindings.push(last);
+        } else if (finding.state === 'dismissed') {
+            protectedFindings.push(last);
+        }
     }
     const candidates = new Map<string, string>();
     for (const id of previous?.meta.candidates ?? []) {
         const item = shared.get(id);
         if (item?.status === 'approved' && !item.parseError) candidates.set(id, item.title);
     }
-    return { previous, findings, candidates };
+    return { previous, findings, protectedFindings, candidates };
 }
 
 export function auditRecheckPrompt(history: AuditHistory, base: string): string | null {
@@ -113,12 +120,13 @@ export async function verifyAuditRecheck(history: AuditHistory, output: string, 
     const reportLines: string[] = [];
     const observations: AuditItem[] = [];
     const files = new Map<string, Promise<string | null>>();
-    const evidenceAtBase = async (value: unknown): Promise<string | null> => {
+    const evidenceAtBase = async (value: unknown, targetFiles: string[] = []): Promise<string | null> => {
         const { file, line, excerpt, reason } = record(value);
         if (typeof file !== 'string' || !isRepoRelativePath(file) || /[:\r\n\0]/.test(file) || /(?:^|\/)\.(?:ai-review|git|svn)(?:\/|$)/.test(file)
             || typeof line !== 'number' || !Number.isSafeInteger(line) || line < 1
             || typeof excerpt !== 'string' || !excerpt.trim() || excerpt.length > 1000
-            || typeof reason !== 'string' || !reason.trim() || reason.length > 1000) return null;
+            || typeof reason !== 'string' || !reason.trim() || reason.length > 1000
+            || (targetFiles.length > 0 && !targetFiles.includes(file))) return null;
         if (!files.has(file)) files.set(file, vcs.readFileAt(base, file).catch(() => null));
         const text = await files.get(file);
         if (!text?.split(/\r?\n/)[line - 1]?.includes(excerpt.trim())) return null;
@@ -127,13 +135,15 @@ export async function verifyAuditRecheck(history: AuditHistory, output: string, 
     for (const [id, { observedIn: _observedIn, ...finding }] of history.findings) {
         const entry = findingResults.get(id);
         const status = entry?.status;
-        const evidence = status === 'resolved' || status === 'pending' ? await evidenceAtBase(entry?.evidence) : null;
+        const evidence = status === 'resolved' || status === 'pending' ? await evidenceAtBase(entry?.evidence, finding.targetFiles) : null;
         if (!evidence || (status !== 'resolved' && status !== 'pending')) {
             reportLines.push(`- Finding \`${id}\` 未核实，保留原观察。`);
             continue;
         }
         const label = status === 'resolved' ? '已确认消失' : '仍存在';
-        observations.push({ ...finding, status, candidate: null, summary: status === 'resolved' ? evidence : `${finding.summary}。本轮复查：${evidence}` });
+        observations.push(status === 'pending' && finding.status === 'converted' ? finding : {
+            ...finding, status, candidate: null, summary: status === 'resolved' ? evidence : finding.summary,
+        });
         reportLines.push(`- Finding \`${id}\` ${label}。${evidence}`);
     }
     for (const id of history.candidates.keys()) {
@@ -144,7 +154,7 @@ export async function verifyAuditRecheck(history: AuditHistory, output: string, 
     }
     return {
         previousAudit: history.previous?.meta.auditId ?? null,
-        knownFindings: [...history.findings.values()],
+        knownFindings: history.protectedFindings,
         observations,
         reportLines: reportLines.length > 0 ? reportLines : ['- 无需要复查的历史事项。'],
     };

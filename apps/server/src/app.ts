@@ -35,7 +35,7 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
     const app = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024 });
     const database = new CentralDatabase(options.dataDir, options.clock);
     const schedules = new AuditSchedules(database);
-    const commands = new Commands(database, schedules), snapshots = new Snapshots(database);
+    const commands = new Commands(database, schedules), snapshots = new Snapshots(database, schedules);
     app.decorate('database', database);
     app.decorateRequest('actor', null);
     app.decorateRequest('nodeId', null);
@@ -58,7 +58,7 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
                 throw new CentralError(403, 'csrf_mismatch', '请求校验失败，请刷新登录状态');
             }
         }
-        if (req.actor || req.nodeId) schedules.expire();
+        if (req.nodeId || (req.actor && /^\/api\/v1\/(?:projects|tasks|commands|nodes|workbench)(?:\/|$)/.test(pathname))) schedules.expire();
     });
 
     app.setErrorHandler((error, _req, reply) => {
@@ -98,10 +98,19 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
         return reply.status(201).send({ project });
     });
     app.put('/api/v1/projects/:projectId', async req => {
+        const projectId = params(req).projectId!;
         const input = body(req);
         if (Object.keys(input).some(key => !['name', 'enabled'].includes(key))) throw new CentralError(422, 'bad_request', '首期只能修改项目名称或启停状态，不能在线迁移绑定');
         if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new CentralError(422, 'bad_request', '项目启停值无效');
-        return { project: database.updateProject(params(req).projectId!, { ...(input.name !== undefined ? { name: textValue(input.name, 'name', 160) } : {}), ...(input.enabled !== undefined ? { enabled: input.enabled as boolean } : {}) }) };
+        const updates = { ...(input.name !== undefined ? { name: textValue(input.name, 'name', 160) } : {}),
+            ...(input.enabled !== undefined ? { enabled: input.enabled } : {}) };
+        if (updates.enabled !== false) return { project: database.updateProject(projectId, updates) };
+        return { project: database.transaction(() => {
+            const previous = database.getProject(projectId);
+            const project = database.updateProject(projectId, updates);
+            if (previous.enabled) schedules.rememberMissedWindow(previous);
+            return project;
+        }) };
     });
     app.get('/api/v1/projects/:projectId', async req => {
         const projectId = params(req).projectId!;
@@ -148,10 +157,15 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
             || (input.restore !== undefined && typeof input.restore !== 'boolean')) {
             throw new CentralError(422, 'bad_request', '项目接入参数无效');
         }
-        return { project: database.ensureNodeProject((req as RequestContext).nodeId!, {
-            instanceId: entityId(input.instanceId, 'instanceId'), workspaceId: entityId(input.workspaceId, 'workspaceId'),
+        const nodeId = (req as RequestContext).nodeId!;
+        const workspaceId = entityId(input.workspaceId, 'workspaceId');
+        const previous = input.enabled ? undefined : database.listProjects(nodeId).find(project => project.workspaceId === workspaceId);
+        const project = database.ensureNodeProject(nodeId, {
+            instanceId: entityId(input.instanceId, 'instanceId'), workspaceId,
             name: textValue(input.name, 'name', 160), enabled: input.enabled, restore: input.restore as boolean | undefined,
-        }) };
+        });
+        if (previous?.enabled && !project.enabled) schedules.rememberMissedWindow(previous);
+        return { project };
     });
     app.post('/node-api/v1/quiesce', async req => {
         database.quiesceNode((req as RequestContext).nodeId!, entityId(body(req).instanceId, 'instanceId'));
