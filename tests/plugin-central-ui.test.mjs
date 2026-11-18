@@ -22,7 +22,7 @@ function initialStatus() {
     };
 }
 
-function createPanel(status = initialStatus()) {
+function createPanel(status = initialStatus(), confirm = () => { throw new Error('意外的下载确认'); }) {
     let current = null;
     let dirty = false;
     let tree;
@@ -83,7 +83,7 @@ function createPanel(status = initialStatus()) {
         createElement: () => ({ setAttribute() {}, remove() {} }),
     };
     const context = vm.createContext({
-        window: { __ModuleLoader__: { load(registration) {
+        window: { confirm, __ModuleLoader__: { load(registration) {
             const plugin = registration.factory(() => react);
             plugin.apply({
                 locale: { register: () => () => {}, bind: () => key => key },
@@ -350,6 +350,40 @@ test('轻量插件禁用本机启动但仍允许选择已有中央', async () =>
     assert.equal(panel.button('应用并连接').props.disabled, false);
     assert.equal(panel.requests.filter(request => request.init.method === 'POST').length, 0);
     panel.unmount();
+});
+
+test('可下载版沿用两个启动入口，取消保留草稿，确认只提交当前运行包摘要', async () => {
+    const source = { version: '0.1.0', url: 'https://download.example.test/central.tgz', size: 1048576, sha256: 'a'.repeat(64) };
+    const downloadStatus = { ...initialStatus(), localAvailable: false, enabled: false, phase: 'stopped', localRuntimeDownload: source };
+    const dialogs = [];
+    const confirm = message => { dialogs.push(message); return dialogs.length > 1; };
+    const panel = createPanel({ ...downloadStatus, configured: false }, confirm);
+    await panel.flush();
+    panel.input('审核身份').props.onChange({ target: { value: '自选审核者' } });
+    await panel.flush();
+    assert.equal(panel.button('应用并启动').props.disabled, false);
+    panel.button('应用并启动').props.onClick();
+    await panel.flush();
+    assert.equal(panel.requests.some(request => request.init.method === 'POST'), false);
+    assert.equal(panel.input('审核身份').props.value, '自选审核者');
+    for (const piece of ['0.1.0', source.url, '1.00 MiB']) assert.ok(dialogs[0].includes(piece));
+    panel.button('应用并启动').props.onClick();
+    await panel.flush();
+    const posts = panel.requests.filter(request => request.init.method === 'POST');
+    assert.equal(posts.length, 1);
+    assert.deepEqual(posts[0].body, { mode: 'local', reviewIdentity: '自选审核者', confirmRuntimeDownload: source.sha256 });
+    panel.unmount();
+
+    const saved = createPanel(downloadStatus, confirm);
+    await saved.flush();
+    saved.button('启动已保存连接').props.onClick();
+    await saved.flush();
+    assert.equal(dialogs.length, 3);
+    assert.equal(saved.requests.find(request => request.init.method === 'POST').body.confirmRuntimeDownload, source.sha256);
+    saved.setStatus({ ...initialStatus(), localRuntimeUpdate: { currentVersion: '0.1.0', latestVersion: '0.2.0' } });
+    await saved.poll();
+    assert.match(saved.text(), /中央运行包.*0\.1\.0.*0\.2\.0|中央运行包.*0\.2\.0.*0\.1\.0/);
+    saved.unmount();
 });
 
 test('存在已保存中央配置时隐藏本地评审，不加载旧可写面板', async () => {

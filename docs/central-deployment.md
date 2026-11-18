@@ -1,13 +1,14 @@
 # 中央评审服务部署与运维
 
 > **任务来源**: 用户要求修订拆包后的部署文档，提供三平台独立部署脚本，并增加插件内本机中央、已有中央连接及多项目接入。
-> **任务内容**: 说明普通插件与本机整合插件的选择、显式连接与恢复、脚本及手工安装、节点接入和备份恢复。
+> **任务内容**: 说明普通插件、本机整合包与可下载版的选择、显式连接与恢复、脚本及手工安装、节点接入和备份恢复。
 > **参考文档**:
 > - `../SPEC.md` — 中央模式职责、身份、执行与恢复契约。
 > - `../package.json` — 构建、打包及启动命令。
 > - `../scripts/pack.mjs` — 普通插件、独立中央与本机整合包的依赖收集。
 > - `superpowers/specs/2026-11-17-plugin-central-design.md` — 插件内中央连接、项目接入与进程生命周期设计。
 > - `superpowers/plans/2026-11-17-plugin-central.md` — 本轮实施与验收计划。
+> - `superpowers/plans/2026-11-18-central-runtime-download.md` — 可下载版的实施与验收计划。
 > - `../packages/dsh-plugin/src/connection/controller.ts` — 连接持久化、恢复、旧配置保护及工作台网关。
 > - `../apps/server/src/cli.ts` — 中央 CLI 参数及环境变量。
 > - `../packages/dsh-plugin/src/managed/managed-config.ts` — 节点配置与凭据加载。
@@ -42,6 +43,7 @@
 | 安装包 | 使用场景 |
 | --- | --- |
 | `dsh-code-review-0.3.0.tgz` | 普通插件，不包含中央运行目录；可使用原本地评审或连接已有中央。 |
+| `dsh-code-review-downloadable-0.3.0.tgz` | 首次启动本机中央时确认下载，之后可离线启动。 |
 | `dsh-code-review-local-0.3.0.tgz` | 本机整合插件，包含独立中央服务、Web 和运行依赖；可在插件内启动本机中央，也可连接已有中央。 |
 | `dsh-review-server-0.1.0.tgz` | 独立中央，适合长期运行或供其他机器访问，继续使用本文第 2 节的安装方式。 |
 
@@ -61,6 +63,22 @@ dsh web --port 0
 3. 在「评审 → 中央连接」选择「本机托管」，填写审核身份，点击「应用并启动」。服务就绪后即可打开中央工作台。
 
 每轮预览使用新的测试环境，以首次安装为验收目标。预览仓库会随命令停止，重启后会使用新的地址。DSH 版本没有「发现」页时，可按下节安装整合包。[DSH 自定义插件索引说明](https://deepseek-harness.github.io/deepseek-harness/en/guide/plugin-market)
+
+#### 预览轻量插件的首次启动
+
+```powershell
+npm run preview:market -- --lightweight
+```
+
+按同样的步骤在 DSH 添加这次输出的索引并安装插件。保持预览进程运行，选择「本机托管」、填写审核身份后点击「应用并启动」。确认框显示中央运行包的版本、来源和大小。确认后插件下载、校验 SHA-256 并启动中央。取消或下载失败可从同一入口重试，原连接配置会保留。已成功下载的运行包在 `<DSH_HOME>/dsh-code-review/central-runtimes/` 缓存，完整且协议兼容的缓存可在插件升级后和离线时继续使用。发现缓存损坏时，可在原启动入口再次确认下载。
+
+#### 构建可通过 HTTPS 分发的轻量插件
+
+```powershell
+npm run pack:downloadable -- 'https://github.com/stallboy/dsh-review/releases/download/<固定标签>' 'https://github.com/stallboy/dsh-review/releases/latest/download/dsh-review-central-version.json'
+```
+
+把示例地址替换为计划使用的 HTTPS 地址。命令在 `dist/` 生成可下载版插件、中央归档和 `dsh-review-central-version.json`。分发时，中央归档的文件名和内容必须与这一轮打包结果一致，放在指定附件目录；版本 JSON 放在第二个地址。版本文件的 `version` 使用 `主版本.次版本.修订号` 格式。本机中央启动后会在后台读取该文件，新版仅显示提示。上述命令在本仓库内生成产物，实际上传由发布流程执行。
 
 #### 使用整合包安装
 
