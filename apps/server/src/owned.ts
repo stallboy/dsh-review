@@ -1,5 +1,5 @@
 import { entityId, record, textValue } from '@dsh-review/protocol';
-import { createCentralApp, type CentralApp } from './app.js';
+import { createOwnedCentralApp, type CentralApp } from './app.js';
 import { CentralError } from './database.js';
 
 let app: CentralApp | undefined;
@@ -38,11 +38,11 @@ async function start(value: unknown): Promise<void> {
         const credential = record(input.node, 'node');
         node = { nodeId: entityId(credential.nodeId, 'nodeId'), token: textValue(credential.token, 'token', 256) };
     }
-    app = await createCentralApp({ dataDir });
+    const owned = await createOwnedCentralApp(dataDir, { reviewIdentity, password, node });
+    app = owned.app;
     if (stopping) return;
-    const credential = app.database.initializeOwned({ reviewIdentity, password, node });
     const centerUrl = await app.listen({ host: '127.0.0.1', port: 0 });
-    if (!stopping) await send({ type: 'ready', centerUrl, centralId: app.database.centralId, ...credential });
+    if (!stopping) await send({ type: 'ready', centerUrl, centralId: app.database.centralId, ...owned.node, localAccess: true });
 }
 
 if (!process.connected || !process.send) process.exitCode = 1;

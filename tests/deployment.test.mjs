@@ -5,6 +5,7 @@ import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'nod
 import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createGitFixture, runCommand } from './helpers.mjs';
@@ -73,15 +74,25 @@ async function launch(t, target) {
     const args = process.platform === 'win32' ? ['/d', '/s', '/c', `""${path.join(target, 'start.cmd')}""`] : [];
     const child = spawn(command, args, { cwd: os.tmpdir(), stdio: ['ignore', 'pipe', 'pipe'], windowsVerbatimArguments: process.platform === 'win32' });
     processes.set(t, [...(processes.get(t) ?? []), { child, target }]);
-    const url = await new Promise((resolve, reject) => {
-        let stderr = '';
+    const listening = await new Promise((resolve, reject) => {
+        let stderr = '', stdout = '';
         const timer = setTimeout(() => reject(new Error('启动超时')), 15000);
         child.once('error', reject);
         child.stderr.on('data', data => { stderr += data; });
-        child.stdout.on('data', data => { const match = /http:\/\/127\.0\.0\.1:\d+/.exec(data.toString()); if (match) { clearTimeout(timer); resolve(match[0]); } });
+        child.stdout.on('data', data => {
+            stdout += data;
+            const match = /(?:http:\/\/|监听地址：)(127\.0\.0\.1|0\.0\.0\.0):(\d+)\r?\n/.exec(stdout);
+            if (match) { clearTimeout(timer); resolve({ child, host: match[1], url: `http://127.0.0.1:${match[2]}` }); }
+        });
         child.once('exit', code => { clearTimeout(timer); reject(new Error(`启动提前结束：${code}\n${stderr}`)); });
     });
-    return { child, url };
+    const marker = path.join(target, '.running.json');
+    const deadline = Date.now() + 5000;
+    while (!existsSync(marker)) {
+        assert.ok(Date.now() < deadline && child.exitCode === null && child.signalCode === null, '启动脚本未发布运行标记');
+        await delay(25);
+    }
+    return listening;
 }
 
 test('部署和启动是不同入口，启动拒绝 Git 更新参数，Node 低版本被拒绝', async () => {
@@ -150,6 +161,7 @@ test('中央重复部署替换全部程序但保留数据库、账号和配置�
     const { target, archive } = await deployCentral(t);
     const manifest = path.join(target, 'deployment.json');
     const config = JSON.parse(await readFile(manifest, 'utf8'));
+    assert.equal(config.host, '127.0.0.1');
     assert.equal(config.port, 0);
     await writeFile(path.join(target, 'app/obsolete.txt'), 'old program');
     await writeFile(path.join(config.dataDir, 'keep.txt'), '业务数据');
@@ -160,11 +172,38 @@ test('中央重复部署替换全部程序但保留数据库、账号和配置�
     assert.doesNotMatch(await readFile(manifest, 'utf8'), /deployment-test-password/);
     const { url } = await launch(t, target);
     assert.equal((await (await fetch(`${url}/health`)).json()).service, 'dsh-review-central');
+    assert.equal((await fetch(`${url}/api/v1/auth/session`)).status, 401);
     const login = await fetch(`${url}/api/v1/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'reviewer', password }) });
     assert.equal(login.status, 200);
     assert.equal((await fetch(url)).status, 200);
     assert.notEqual(run(start, ['--target', target]).status, 0);
     assert.notEqual(run(deploy, ['--role', 'central', '--target', target, '--package', archive]).status, 0);
+});
+
+test('独立中央以 HTTPS 公开地址默认监听外部网卡，缺省监听配置时仍须登录', async t => {
+    const publicUrl = 'https://review.example.test';
+    const { target } = await deployCentral(t, ['--public-url', publicUrl]);
+    const manifest = path.join(target, 'deployment.json');
+    const config = JSON.parse(await readFile(manifest, 'utf8'));
+    assert.equal(config.host, '0.0.0.0');
+    await t.test('显式回环监听优先并继续要求登录', async t => {
+        const { target: explicitTarget, archive } = await deployCentral(t, ['--public-url', publicUrl]);
+        successful(run(deploy, ['--target', explicitTarget, '--package', archive, '--host', '127.0.0.1']));
+        assert.equal(JSON.parse(await readFile(path.join(explicitTarget, 'deployment.json'), 'utf8')).host, '127.0.0.1');
+        const explicit = await launch(t, explicitTarget);
+        assert.equal(explicit.host, '127.0.0.1');
+        assert.equal((await fetch(`${explicit.url}/api/v1/workbench`)).status, 401);
+    });
+    delete config.host;
+    await writeFile(manifest, JSON.stringify(config));
+    const { host, url } = await launch(t, target);
+    assert.equal(host, '0.0.0.0');
+    assert.equal((await fetch(`${url}/api/v1/workbench`)).status, 401);
+    const login = await fetch(`${url}/api/v1/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'reviewer', password }) });
+    assert.equal(login.status, 200);
+    assert.match(login.headers.get('set-cookie'), /; Secure/);
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+    assert.equal((await fetch(`${url}/api/v1/workbench`, { headers: { cookie } })).status, 200);
 });
 
 test('安装失败不破坏旧部署，数据目录与程序重叠时拒绝', async t => {

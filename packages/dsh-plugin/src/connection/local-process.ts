@@ -7,6 +7,7 @@ export interface LocalReady {
     centralId: string;
     nodeId: string;
     token: string;
+    localAccess?: true;
 }
 
 export class LocalCentralProcess {

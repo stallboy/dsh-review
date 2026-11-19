@@ -95,18 +95,23 @@ export class CentralDatabase {
         return user;
     }
 
-    login(username: string, password: string): { user: User; token: string; csrfToken: string } {
+    authenticateUser(username: string, password: string): User {
         if (typeof password !== 'string' || password.length > 256) throw new CentralError(401, 'unauthorized', '账号或密码错误');
         const row = this.sql.prepare('SELECT * FROM users WHERE username=?').get(username) as Row | undefined;
         const salt = row?.salt ?? 'missing-user';
         const hash = row?.password_hash ?? '00'.repeat(64);
         const matches = passwordMatches(password, salt, hash);
         if (!row || !matches) throw new CentralError(401, 'unauthorized', '账号或密码错误');
+        return { userId: row.user_id, username: row.username, reviewIdentity: row.review_identity };
+    }
+
+    login(username: string, password: string): { user: User; token: string; csrfToken: string } {
+        const user = this.authenticateUser(username, password);
         const token = secret(), csrfToken = secret();
         this.sql.prepare('DELETE FROM sessions WHERE expires_at<=?').run(this.now());
-        this.sql.prepare('INSERT INTO sessions VALUES (?,?,?,?)').run(digest(token), row.user_id, csrfToken,
+        this.sql.prepare('INSERT INTO sessions VALUES (?,?,?,?)').run(digest(token), user.userId, csrfToken,
             new Date(this.clock().getTime() + 12 * 60 * 60 * 1000).toISOString());
-        return { user: { userId: row.user_id, username: row.username, reviewIdentity: row.review_identity }, token, csrfToken };
+        return { user, token, csrfToken };
     }
 
     session(token: string): { user: User; csrfToken: string } {
@@ -125,21 +130,20 @@ export class CentralDatabase {
         return { nodeId, token };
     }
 
-    initializeOwned(input: { reviewIdentity: string; password: string; node?: { nodeId: string; token: string } }): { nodeId: string; token: string } {
+    initializeOwned(input: { reviewIdentity: string; password: string; node?: { nodeId: string; token: string } }): { user: User; node: { nodeId: string; token: string } } {
         textValue(input.reviewIdentity, 'reviewIdentity', 160);
         textValue(input.password, 'password', 256);
         return this.transaction(() => {
             const existing = this.sql.prepare("SELECT * FROM users WHERE username='local'").get() as Row | undefined;
-            if (existing) {
-                if (existing.review_identity !== input.reviewIdentity || !passwordMatches(input.password, existing.salt, existing.password_hash)) {
-                    throw new CentralError(401, 'identity_mismatch', '本机账号凭据或审核身份不一致');
-                }
-            } else this.createUser({ username: 'local', password: input.password, reviewIdentity: input.reviewIdentity });
-            if (input.node) {
-                if (this.nodeIdentity(input.node.token) !== input.node.nodeId) throw new CentralError(401, 'identity_mismatch', '本机节点身份不一致');
-                return input.node;
+            if (existing && (existing.review_identity !== input.reviewIdentity || !passwordMatches(input.password, existing.salt, existing.password_hash))) {
+                throw new CentralError(401, 'identity_mismatch', '本机账号凭据或审核身份不一致');
             }
-            return this.createNode('本机插件节点');
+            const user = existing ? { userId: existing.user_id, username: existing.username, reviewIdentity: existing.review_identity }
+                : this.createUser({ username: 'local', password: input.password, reviewIdentity: input.reviewIdentity });
+            if (input.node && this.nodeIdentity(input.node.token) !== input.node.nodeId) {
+                throw new CentralError(401, 'identity_mismatch', '本机节点身份不一致');
+            }
+            return { user, node: input.node ?? this.createNode('本机插件节点') };
         });
     }
 

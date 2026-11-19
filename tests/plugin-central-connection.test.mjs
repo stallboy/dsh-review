@@ -4,8 +4,10 @@ import { createServer } from 'node:http';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { Readable } from 'node:stream';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 import { createGitFixture } from './helpers.mjs';
 import { setupCentral } from './central-helpers.mjs';
 
@@ -61,6 +63,39 @@ test('已启用配置随插件恢复，手动停用持久保存且不会恢复',
     await disabled.init();
     assert.equal((await disabled.status()).phase, 'stopped');
     assert.equal((await disabled.status()).enabled, false);
+});
+
+test('旧本机运行包仍由网关建立登录会话', async t => {
+    const fixture = await mkdtemp(path.join(os.tmpdir(), 'plugin-legacy-entry-'));
+    t.after(() => rm(fixture, { recursive: true, force: true }));
+    const localEntry = pathToFileURL(path.join(fixture, 'legacy.mjs'));
+    const appEntry = new URL('../apps/server/dist/app.js', import.meta.url);
+    await writeFile(localEntry, `
+        import { createCentralApp } from ${JSON.stringify(appEntry.href)};
+        let app;
+        process.on('message', async input => {
+            if (input.type === 'stop') {
+                await app?.close();
+                process.disconnect();
+                return;
+            }
+            app = await createCentralApp({ dataDir: input.dataDir });
+            const { node } = app.database.initializeOwned(input);
+            const centerUrl = await app.listen({ host: '127.0.0.1', port: 0 });
+            process.send({ type: 'ready', centerUrl, centralId: app.database.centralId, ...node });
+        });
+    `);
+    const { value } = await controller(t, { localEntry });
+    await value.apply({ mode: 'local', reviewIdentity: '旧运行包审核者' });
+    const status = await value.status();
+    assert.equal((await fetch(new URL('api/v1/auth/session', status.centerUrl))).status, 401);
+    const server = createServer((req, res) => { void value.handle(req, res); });
+    try {
+        await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+        const response = await fetch(`http://127.0.0.1:${server.address().port}/dsh-code-review/central/api/v1/auth/session`);
+        assert.equal(response.status, 200);
+        assert.equal((await response.json()).user.reviewIdentity, '旧运行包审核者');
+    } finally { await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); }
 });
 
 test('中央地址拒绝非回环HTTP、URL秘密和非HTTP协议', async t => {
@@ -396,7 +431,12 @@ test('节点初始化失败后可在无未决任务时停用故障项目并恢�
         await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
         const response = await fetch(`http://127.0.0.1:${server.address().port}/dsh-code-review/central/api/v1/auth/session`);
         assert.equal(response.status, 200);
-        assert.equal((await response.json()).user.username, 'local');
+        const session = await response.json();
+        assert.equal(session.user.username, 'local');
+        assert.equal(session.localAccess, true);
+        const database = new DatabaseSync(path.join(directory, 'central', 'central.sqlite'), { readOnly: true });
+        try { assert.equal(database.prepare('SELECT COUNT(*) AS count FROM sessions').get().count, 0); }
+        finally { database.close(); }
     } finally { await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); }
 });
 
