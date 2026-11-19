@@ -38,7 +38,7 @@ flowchart TD
     REPORT -->|"人工转换 / 依赖满足"| CAND
     CAND --> QUEUE["人类审核队列"]
     QUEUE --> DETAIL["查看方案、判断项、门禁与差异"]
-    DETAIL -->|"评论 / 微调 / Rebase"| FIX["生成新的完整补丁版本"]
+    DETAIL -->|"按意见 AI 修复 / Rebase"| FIX["生成新的完整补丁版本"]
     FIX --> QUEUE
     DETAIL -->|"批准"| GATE["在批准时基线上应用补丁<br/>重新执行全部门禁"]
     GATE -->|"全部通过"| COMMIT["原子提交业务代码与批准记录<br/>业务提交由 VCS 历史派生"]
@@ -117,9 +117,9 @@ flowchart TD
 ### 3.3 人工审核循环
 1. **审阅详情**：Owner 查看问题描述、根因、当前修复方案、人工判断项、门禁验证证据和代码差异。
 2. **发表评论**：Owner 可添加总体评论或行内评论；一旦新增未解决评论，候选状态由 `pending` 转为 `changes_requested`。
-3. **迭代新版本**：通过 AI 修复、人工微调补丁或 Rebase 生成新的完整补丁版本后，候选状态回到 `pending`。
+3. **迭代新版本**：通过按意见 AI 修复或 Rebase 生成新的完整补丁版本后，候选状态回到 `pending`。
 4. **失败保护与人工转回**：AI 修复失败不得破坏已有的共享状态；Owner 可选择重试，也可通过 `/resume` 接口显式将状态转回 `pending`。
-5. **决策流转**：Owner 可接管候选、上传人工补丁、拒绝候选，或在所有前置条件满足后正式批准。
+5. **决策流转**：Owner 可接管候选、提交审核意见、拒绝候选，或在所有前置条件满足后正式批准。需要人工修改业务代码时，在本工具之外按目标仓库的流程完成。
 
 ### 3.4 批准与单次原子提交
 批准绝非简单地修改状态字段，而是一次完整的**机器重验与原子合入事务**：
@@ -498,7 +498,7 @@ Finding 的当前全局状态由历史审查档案和候选共享事实实时计
 ```text
 [*] ──新建──> pending
 pending ──新增未解决评论──> changes_requested
-pending / changes_requested ──AI 修复 / 人工微调 / Rebase──> pending
+pending / changes_requested ──AI 修复 / Rebase──> pending
 changes_requested ──Owner 显式执行 /resume──> pending
 pending ──门禁全过且原子提交成功──> approved
 pending / changes_requested ──拒绝 / 超时归档──> rejected
@@ -512,7 +512,7 @@ rejected ──人工重开──> 另一活跃候选记录 reopened_from
 
 ### 5.2 版本演进与作者标识
 * AI 自动修复（Mode B/C）和 AI Rebase 产生的新版本，`revision.author` 均记为 `ai`。
-* 人类通过 `/manual-revision` 上传人工补丁产生的新版本，`revision.author` 记为 `human`。
+* 既有 `revision.author: human` 的历史版本继续参与读取、展示和提交说明。
 * 任何新版本必须以追加方式写入 `revisions[]` 并推进 `current_revision`，严禁覆盖历史版本；只要修复方案、影响范围、门禁命令或残余风险发生变化，就必须产生新版本并重新审核。
 
 ### 5.3 评论状态流转
@@ -572,7 +572,7 @@ AI 必须将所有无法由机器测试自证的业务语义、架构/性能折�
 
 #### (2) 元数据独立提交
 
-其余评审元数据操作必须产生仅包含相关 `.ai-review/` 路径的独立提交，包括评论、评论状态、接管、人工转回、AI 修复、人工微调、Rebase、拒绝、重开、转换和忽略 finding。
+其余评审元数据操作必须产生仅包含相关 `.ai-review/` 路径的独立提交，包括评论、评论状态、接管、人工转回、AI 修复、Rebase、拒绝、重开、转换和忽略 finding。
 
 批量评论是一次例外：整批评论在**一次共享写入与一次提交**中完成，而不是逐条各提交一次。
 
@@ -738,8 +738,8 @@ Git 与 SVN 适配器对核心流程提供统一的底层能力（所有 VCS 子
 * **Job 模型与容量**：类型包括 `approve` / `ai_fix` / `audit` / `reject` / `feedback`；外层状态为 `running` / `succeeded` / `failed`；最小 JSON 结构为 `{id, type, status, startedAt, finishedAt?, log: string[], result?, error?}`。内存中最多保留 40 个 Job（超出时优先淘汰最早开始的已完成 Job），单 Job 最多保留 4000 行日志（使用单调递增绝对序号，截断不丢后续日志）。
 * **业务结果判别（`result.status`）**：除 §7.5 的 `ApprovalOutcome`（仅属 `approve` Job）外，通用业务 Job 取值为 `COMMITTED`、`MANUAL_REQUIRED`、`VALIDATION_FAILED`、`ABORTED` 与 `RECOVERY_REQUIRED`：
   * `audit` Job 若有任何候选校验失败，即使合法候选和档案已提交，也必须返回 `VALIDATION_FAILED` 并携带 `commitRevision` 与逐候选错误。
-  * `ai_fix` Job（含 `/rebase`、`/manual-revision`、`/candidate/finalize`、`/ai-fix`）返回 `ABORTED` 时，其 `reason` 枚举为：`REBASE_CONFLICT` / `GATE_CHECK_FAILED` / `BASE_UNCHANGED` / `DIRTY_WORKSPACE` / `CONCURRENCY_MISMATCH` / `STATE_CONFLICT` / `INVALID_CANDIDATE` / `SYNC_FAILED` / `COMMIT_FAILED` / `RUNNER_FAILED` / `CANCELLED`（严禁将 `REBASE_CONFLICT` 或 `BASE_UNCHANGED` 混入 §7.5 的 `ApprovalOutcome`）。
-* **Repo 级互斥与定时调度**：所有共享写和工作区事务经同一 repo 级进程内锁串行。`audit`（含会话与手动租约）运行中禁止 `approve`、`ai-fix`、`rebase`、`manual-revision`、`fix-session` 和其他 `sync`；新 `audit` 要求无任何运行中 Job。定时审查由中央工作台按项目配置，默认关闭。每日到点等待节点最多 30 分钟，受理后可正常收尾。执行节点同步基线后先复查上轮，再扫描全仓。正式契约见 `SPEC.md` 的中央定时审查部分。
+  * `ai_fix` Job（含 `/rebase`、`/candidate/finalize`、`/ai-fix`）返回 `ABORTED` 时，其 `reason` 枚举为：`REBASE_CONFLICT` / `GATE_CHECK_FAILED` / `BASE_UNCHANGED` / `DIRTY_WORKSPACE` / `CONCURRENCY_MISMATCH` / `STATE_CONFLICT` / `INVALID_CANDIDATE` / `SYNC_FAILED` / `COMMIT_FAILED` / `RUNNER_FAILED` / `CANCELLED`（严禁将 `REBASE_CONFLICT` 或 `BASE_UNCHANGED` 混入 §7.5 的 `ApprovalOutcome`）。
+* **Repo 级互斥与定时调度**：所有共享写和工作区事务经同一 repo 级进程内锁串行。`audit`（含会话与手动租约）运行中禁止 `approve`、`ai-fix`、`rebase`、`fix-session` 和其他 `sync`；新 `audit` 要求无任何运行中 Job。定时审查由中央工作台按项目配置，默认关闭。每日到点等待节点最多 30 分钟，受理后可正常收尾。执行节点同步基线后先复查上轮，再扫描全仓。正式契约见 `SPEC.md` 的中央定时审查部分。
 * **Job 取消语义（`POST /jobs/:id/cancel`）**：只请求停止后续执行，终止进程树或会话并等待清理后，按实际提交进度返回结果（已证明未提交返回 `ABORTED`；已提交返回对应 `COMMITTED`/`VALIDATION_FAILED`；结果不明返回 `RECOVERY_REQUIRED`；手动租约不随取消自动释放）。
 * **Rebase 编排（运行于 `ai_fix` Job）**：
   1. **前置检查**：工作区必须干净；读取当前基线，若**有效业务基线未变**则返回 `ABORTED / BASE_UNCHANGED`。
@@ -826,7 +826,6 @@ API 优先根据请求 query 中的 `sessionId` 解析会话 `cwd` 作为仓库�
 | `POST /convert` | `{auditId, findingId, candidateId}`（不传候选 guard） | `200 {audit, candidateId, commitRevision}`；按 §7.6 校验并原子提交。 |
 | `POST /dismiss-finding` | `{auditId, findingId, reason}`（不传候选 guard） | `200 {audit, commitRevision}`；按 §7.6 留痕并独立提交该档案。 |
 | `POST /rebase` | `{id, ...guard}` | `202 {jobId, job}`（Job 类型 `ai_fix`），按 §7.7 执行两段式 Rebase。 |
-| `POST /manual-revision` | `{id, ...guard, patchText}`（非空全量 Unified Diff） | `202 {jobId, job}`；验证与门禁通过后追加 `human` revision。**自 2026-11-12 起 Client 不再提供面板入口，端点语义保持不变**，仍可由脚本或后续界面调用。 |
 | `POST /fix-session` | `{id}`；候选须解析有效、非归档、操作者为 Owner、存在未 resolved 评论且业务工作区干净 | `202 {sessionId, title, candidateId, revision, prompt}`；按 §7.4「新 DSH 会话」创建会话并投递修复提示词。不创建执行租约，不提交候选。 |
 | `POST /approve` | `{id, ...guard, confirmedDecisions?: string[], waivedDecisions?: {id, reason}[], commitMessage?: string, commitDetail?: 'simple'\|'detailed'}` | `202 {jobId, job}`；若提供 `commitMessage` 则首行须等于 `title`，在批准原子提交中一并更新 `review.md`；`commitDetail` 按 §5.6「提交信息详略」决定业务提交说明的组成，非法取值返回 `422`，未提供时使用候选 `commit_message` 全文。最终结果读取 `job.result`。 |
 | `POST /ai-fix` | `{id, ...guard}`（必须存在未 resolved 评论） | `202 {jobId, job}`；无 `unresolved`/`partial` 评论时在创建 Job 前返回 `409`。 |
@@ -877,7 +876,7 @@ API 优先根据请求 query 中的 `sessionId` 解析会话 `cwd` 作为仓库�
 * **诊断展示与日志轮询**：显示 `patchCheck` 诊断（`conflicted` 时提供 Rebase 入口但不禁用批准）；已批准候选显示派生业务提交版本与 `approvalCommitLookup` 诊断（`ambiguous`/`unknown` 只显示提示，不显示为失败）。Job 日志轮询使用绝对偏移，收到 `logResetRequired` 时必须丢弃旧日志并按返回快照重建。
 * **批准面板的提交信息选项**：批准前，面板要让用户选「简略信息」还是「详细」，并把将要提交的结构预览出来。首行综述由 Host 按 §5.6 生成、原样展示，不让用户在面板里手写——否则 §4.3 与 §5.6 的首行一致性校验就失去了意义。
 * **修复执行方式**：总体意见区要提供「新建 DSH 会话」与「导出提示词」两种执行方式。前者保存意见后调用 `/fix-session`，会话会出现在侧边栏，页内也能看到会话标识；后者保留“只生成提示词 + 复制”的手动路径，供粘贴到 codex 等外部 Agent。两种方式都不得自动提交候选版本。提示词绑定候选的当前版本，候选一旦推进版本就必须重新生成。
-* **已移除的面板入口**：详情页不再提供「上传人工补丁」「超时归档」「从重开来源恢复」这三个按钮。对应的 `/manual-revision`、`/archive-stale`、`/reopen` 端点按 §8.3 继续提供，供脚本或后续界面使用。
+* 本地详情页的超时归档和从重开来源恢复可通过 §8.3 的 `/archive-stale` 和 `/reopen` 调用。中央和本地面板均通过审核意见驱动 AI 修复，已撤除人工补丁提交（旧 `POST /manual-revision` 返回 404）。
 
 ### 10.3 批准进度展示
 批准界面依次展示：**工作区检查 → 同步 → 应用补丁与门禁 → 业务原子提交**，并实时轮询 Job 增量日志。业务提交成功后直接显示 `commitRevision`（无“待回填”阶段）。

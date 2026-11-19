@@ -1,12 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { entityId, positiveInteger, record, SCHEDULED_AUDIT_ACTOR, textValue, validateCommand, type Actor, type CommandRecord,
+import { entityId, positiveInteger, ProtocolError, record, RETIRED_MANUAL_REVISION, retiredManualRevisionResult, SCHEDULED_AUDIT_ACTOR, textValue, validateCommand, type Actor, type CommandRecord,
     type JsonRecord, type ManagedResult, type NodeEvent, type ProjectRecord, type ScheduledAudit } from '@dsh-review/protocol';
 import { digest, stableJson } from './auth.js';
 import { CentralDatabase, CentralError, type Row, type User } from './database.js';
 import { AuditSchedules } from './audit-schedule.js';
 
 export class Commands {
-    constructor(private readonly database: CentralDatabase, private readonly schedules: AuditSchedules) {}
+    constructor(private readonly database: CentralDatabase, private readonly schedules: AuditSchedules) {
+        database.sql.prepare(`UPDATE commands SET state='completed',result=?,updated_at=?
+            WHERE state IN ('queued','dispatched') AND json_extract(envelope,'$.operation')=?`)
+            .run(JSON.stringify(retiredManualRevisionResult()), database.now(), RETIRED_MANUAL_REVISION);
+    }
 
     get(commandId: string): CommandRecord {
         const row = this.database.sql.prepare('SELECT * FROM commands WHERE command_id=?').get(commandId) as Row | undefined;
@@ -22,6 +26,7 @@ export class Commands {
     }
 
     create(projectId: string, input: JsonRecord, user: User): CommandRecord {
+        if (input.operation === RETIRED_MANUAL_REVISION) throw new ProtocolError('operation');
         const db = this.database;
         const project = db.getProject(projectId);
         const key = entityId(input.idempotencyKey, 'idempotencyKey');
@@ -95,14 +100,16 @@ export class Commands {
             const now = db.now();
             this.schedules.expire(now);
             const command = this.get(commandId);
-            this.authorize(nodeId, command, !(command.scheduledAudit && command.state === 'completed'));
+            this.authorize(nodeId, command, !(command.state === 'completed' && (command.scheduledAudit || command.operation === RETIRED_MANUAL_REVISION)));
             if (command.state === 'queued' || command.state === 'dispatched') {
                 if (!db.getNode(nodeId).compatible) throw new CentralError(409, 'protocol_incompatible', '节点协议不兼容，不能受理写指令');
                 if (command.scheduledAudit && db.sql.prepare(`SELECT 1 FROM commands WHERE node_id=? AND state!='completed'
                     AND json_extract(envelope,'$.scheduledAudit') IS NULL`).get(nodeId)) return command;
                 db.sql.prepare("UPDATE commands SET state='accepted',updated_at=? WHERE command_id=?").run(now, commandId);
             }
-            return this.get(commandId);
+            const acknowledged = this.get(commandId);
+            return acknowledged.operation === RETIRED_MANUAL_REVISION && acknowledged.state === 'accepted'
+                ? { ...acknowledged, cancelRequested: true } : acknowledged;
         });
     }
 

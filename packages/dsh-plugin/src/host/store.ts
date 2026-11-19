@@ -909,7 +909,7 @@ export class ReviewStore {
   /** 调用方负责隔离工作区并运行门禁。此处写入评审数据和补丁。 */
   async appendRevision(
     id: string,
-    input: { author: 'ai' | 'human'; baseRevision: string; patchText: string },
+    input: { baseRevision: string; patchText: string },
     guard: ConcurrencyGuard,
   ): Promise<ReviewCandidate> {
     const { month, slug } = this.resolveCandidateDir(id);
@@ -922,7 +922,7 @@ export class ReviewStore {
     const patchPath = path.join(candidate.dirPath, patchName);
     await this.ensureSafeWriteTarget(patchPath);
     await writePatchFile(patchPath, input.patchText, 'utf8');
-    candidate.meta.revisions.push({ id: nextId, baseRevision: input.baseRevision, patch: patchName, author: input.author });
+    candidate.meta.revisions.push({ id: nextId, baseRevision: input.baseRevision, patch: patchName, author: 'ai' });
     candidate.meta.currentRevision = nextId;
     candidate.meta.status = 'pending';
     candidate.meta.approval = null;

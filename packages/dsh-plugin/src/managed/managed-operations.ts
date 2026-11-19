@@ -1,7 +1,7 @@
 import { realpath, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import type { JsonRecord, ManagedCommand, ManagedOperation, ManagedQuery, ManagedQueryResult, ManagedResult, ProjectRecord, WorkspaceRegistration } from '@dsh-review/protocol';
+import { RETIRED_MANUAL_REVISION, retiredManualRevisionResult, type JsonRecord, type ManagedCommand, type ManagedOperation, type ManagedQuery, type ManagedQueryResult, type ManagedResult, type ProjectRecord, type WorkspaceRegistration } from '@dsh-review/protocol';
 import { ReviewApi } from '../host/api.js';
 import { withSharedView } from '../host/api-context.js';
 import { AuditArchive } from '../host/audit-archive.js';
@@ -25,7 +25,7 @@ export interface ManagedWorkspace {
 
 const routes: Record<ManagedOperation, string> = {
     approve: '/approve', comments: '/comments', 'comments-batch': '/comments/batch', 'comment-status': '/comment-status', takeover: '/takeover', reject: '/reject', resume: '/resume',
-    rebase: '/rebase', 'ai-fix': '/ai-fix', 'manual-revision': '/manual-revision', reopen: '/reopen', 'archive-stale': '/archive-stale', audit: '/audit',
+    rebase: '/rebase', 'ai-fix': '/ai-fix', reopen: '/reopen', 'archive-stale': '/archive-stale', audit: '/audit',
     'audit-finalize': '/audit/finalize', 'audit-release': '/audit/release', 'candidate-finalize': '/candidate/finalize', convert: '/convert', 'dismiss-finding': '/dismiss-finding', sync: '/sync',
 };
 
@@ -138,6 +138,7 @@ export class ManagedOperations {
     }
 
     async execute(command: ManagedCommand, signal: AbortSignal, emit: (line: string) => void, project: ProjectRecord): Promise<ManagedResult> {
+        if (command.operation === RETIRED_MANUAL_REVISION) return retiredManualRevisionResult();
         const runtime = await this.runtime(project);
         if (!command.scheduledAudit) await this.checkTarget(runtime);
         if (command.projectId !== project.projectId || command.bindingGeneration !== project.bindingGeneration || command.projectConfigRevision !== project.projectConfigRevision) throw new Error('执行配置已过期');

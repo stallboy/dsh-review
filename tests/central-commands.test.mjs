@@ -2,6 +2,44 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setupCentral, registerNode, bindProject, approvePayload } from './central-helpers.mjs';
 
+test('中央拒绝新建人工补丁任务，节点不收到指令', async t => {
+    const { app, headers } = await setupCentral(t);
+    const node = await registerNode(app);
+    const project = await bindProject(app, headers, node);
+    const { payload, ...request } = approvePayload('retired');
+    const response = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.projectId}/commands`, headers,
+        payload: { ...request, operation: 'manual-revision', payload: { ...payload, patchText: 'diff --git a/foo b/foo\n' } } });
+    assert.equal(response.statusCode, 422, response.body);
+    assert.match(response.json().error.message, /operation/);
+    assert.deepEqual((await app.inject({ method: 'POST', url: '/node-api/v1/commands/poll', headers: node.headers,
+        payload: { instanceId: node.instanceId } })).json().commands, []);
+});
+
+test('中央重启后释放未受理的旧人工补丁任务占用，保留已开始执行的记录', async t => {
+    const { app, headers, dataDir, createCentralApp } = await setupCentral(t);
+    const states = ['queued', 'dispatched', 'executing'];
+    const saved = [];
+    for (const state of states) {
+        const node = await registerNode(app, state, `workspace-${state}`);
+        const project = await bindProject(app, headers, node);
+        const response = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.projectId}/commands`, headers, payload: approvePayload() });
+        assert.equal(response.statusCode, 202, response.body);
+        const commandId = response.json().command.commandId;
+        app.database.sql.prepare("UPDATE commands SET state=?,envelope=json_set(envelope,'$.operation','manual-revision') WHERE command_id=?").run(state, commandId);
+        saved.push({ state, commandId });
+    }
+    const upgraded = await createCentralApp({ dataDir });
+    for (const { state, commandId } of saved) {
+        const result = (await upgraded.inject({ url: `/api/v1/commands/${commandId}`, headers })).json().command;
+        if (state === 'executing') assert.equal(result.state, 'executing');
+        else {
+            assert.equal(result.state, 'completed');
+            assert.equal(result.result.outcome.reason, 'CANCELLED');
+            assert.equal(result.result.delivery.state, 'not_required');
+        }
+    }
+});
+
 test('指令幂等、项目写互斥，节点只能领取自己的项目', async t => {
     const { app, headers } = await setupCentral(t);
     const a = await registerNode(app, 'a', 'repo-a');

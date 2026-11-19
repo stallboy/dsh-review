@@ -72,7 +72,7 @@ revisions:
   - id: 1
     base_revision: "<生成该版本时的 VCS 基线字符串>"
     patch: "001.patch"
-    author: ai # AI 修复/Rebase 为 ai；人工补丁为 human
+    author: ai # 新版本为 ai，历史版本保留原作者
 gate_checks:
   - "<实际执行且通过的非交互式门禁命令>"
 comments: []

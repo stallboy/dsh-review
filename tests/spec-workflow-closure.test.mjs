@@ -519,7 +519,7 @@ test('§10/AC-UI-01：Client 包含审查租约、取消、修复会话/导出�
   assert.match(source, /query\.set\(key, filter\[key\]\)/);
 });
 
-test('§10.2（2026-11-12）：详情页移除「上传人工补丁 / 超时归档 / 从重开来源恢复」三个按钮（后端端点保留）', async () => {
+test('§10.2：本地详情页没有上传人工补丁、超时归档和从重开来源恢复按钮', async () => {
   const source = await readFile(new URL('../packages/dsh-plugin/dist/client.js', import.meta.url), 'utf8');
   for (const label of ['上传人工补丁', '超时归档', '从重开来源恢复']) {
     assert.ok(!source.includes(label), `详情页不应再出现按钮「${label}」`);

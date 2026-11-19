@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { PROTOCOL_VERSION, validateCommand, type CommandRecord, type ManagedCommand, type ManagedQuery,
+import { PROTOCOL_VERSION, RETIRED_MANUAL_REVISION, retiredManualRevisionResult, validateCommand, type CommandRecord, type ManagedCommand, type ManagedQuery,
     type ManagedQueryResult, type ManagedResult, type ProjectRecord, type ProjectSnapshot, type WorkspaceRegistration } from '@dsh-review/protocol';
 import { ManagedJournal } from './managed-journal.js';
 
@@ -142,9 +142,9 @@ export class ManagedNode {
         const poll = await this.request<PollResult>('/node-api/v1/commands/poll', { instanceId: this.instanceId, scheduledAuditWorkspaces });
         if (this.stopping) return;
         for (const commandId of poll.cancellations) this.active.get(commandId)?.controller.abort();
-        const unconfirmed = journal.awaitingScheduledAcknowledgement().filter(command => !poll.commands.some(value => value.commandId === command.commandId));
+        const unconfirmed = journal.awaitingAcknowledgement().filter(command => !poll.commands.some(value => value.commandId === command.commandId));
         for (const value of [...poll.commands, ...unconfirmed]) {
-            const command = validateCommand(value);
+            const command = validateCommand(value, true);
             if (command.nodeId !== config.nodeId) throw new Error('拒绝不属于本节点的指令');
             if (this.active.has(command.commandId)) continue;
             if (this.active.size > 0) break;
@@ -166,6 +166,10 @@ export class ManagedNode {
             if (this.stopping) return;
             if (!valid) {
                 journal.emit(command.commandId, 'result', undefined, { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '节点项目绑定或执行配置不一致' }, delivery: { state: 'not_required' } });
+                continue;
+            }
+            if (command.operation === RETIRED_MANUAL_REVISION) {
+                journal.emit(command.commandId, 'result', undefined, retiredManualRevisionResult());
                 continue;
             }
             this.launch(command, acknowledged?.cancelRequested === true || poll.cancellations.includes(command.commandId), project);

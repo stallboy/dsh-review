@@ -152,7 +152,7 @@ Host 端在 `/dsh-code-review/api` 下注册：
 - `POST /archive-stale`（§18.1 显式归档过期候选：`system:stale` + 乐观锁只写一次；队列 `isStale` 只提示不写）
 - `POST /reopen`（§4.8 人工重开：`from` 指向 rejected 候选，理由必填，豁免负向记忆窗口）
 - `POST /convert`（§6.2 B/Deferred 转候选：depends_on 满足判定 + 档案/候选两侧同一提交）
-- `POST /rebase` / `POST /manual-revision`（§6.5/§6.4：新版本 + 门禁重跑，返回 job）
+- `POST /rebase`（生成新版本并重跑门禁，返回 job）
 - `GET /audits`、`GET /findings`（§3 目录式审查档案与 §3.4 finding 投影；旧扁平报告不参与）
 - `POST /approve`（返回 jobId；body 支持 `confirmedDecisions`/`waivedDecisions`，§4.7 判断项全覆盖校验；可选 `commitDetail: simple|detailed` 控制业务提交信息详略）、`POST /ai-fix`（显式启动同一 AI 修复 job，返回 jobId；UI 不再单独暴露按钮，保留给自动化）、`GET /jobs/:id`、`POST /sync`
 - `POST /fix-session`（§7.4：新建 DSH 会话并投递修复提示词，返回 sessionId；UI「提交意见并新建修复会话」使用，不占用审查租约、不提交候选）
@@ -162,7 +162,7 @@ Host 端在 `/dsh-code-review/api` 下注册：
 - `POST /audit`（可选 headless 审查，返回 jobId；插件负责复核与提交，UI 不使用）
 - `GET /fix-prompt?id=&mode=`、`GET /reviewers`、`GET /client-entry`
 
-> 2026-11-12：详情页移除了「上传人工补丁 / 超时归档 / 从重开来源恢复」三个按钮。对应端点 `/manual-revision`、`/archive-stale`、`/reopen` 仍然提供（语义见上面两条），只是不再占用面板位置。
+> 评审员提交意见，由 AI 生成修复版本。需要人工改代码时，直接按目标仓库的流程处理。历史人工修订仍可在候选中查看。
 
 ## 已知边界 / 与设计文档的差异
 
@@ -171,7 +171,7 @@ Host 端在 `/dsh-code-review/api` 下注册：
 3. **SVN 增量 diff 为 hunk 级**：SVN 无三方合并能力，跨版本增量直接退化为 hunk 对比并显示警告。
 4. **契约数据模型已落地（schema_version 1）**：`review.md` 核心字段（module/audit_type 9 值/updated_at/target_files/human_decisions/rejection/commit_message/reopened_*）、固定键序、不变量校验（队列 broken 隔离）、负向记忆指纹与窗口阻止、批准留痕（门禁快照/逐条结果/判断项确认）、检出级写互斥均已实现并有测试（`tests/contract-*.test.mjs`）。新增的 `rejection.category` / `rejection.related_symbols`、`comments[].anchor`、`patchCheck`、`approvalCommitRevision`/`approvalCommitLookup` 与 `/comments/batch` 尚未实现（SPEC 附录 A G18、G37–G42）。
 5. **仓库审查写入端仍为旧扁平报告**：`audits/<时间戳>-<范围>.md`；新目录式档案（`audits/<audit_id>/audit.md` + items/finding）的读取、投影、转换（`/convert`）已就绪，审查会话提示词改写为新格式属下一步。审查提示词已注入负向记忆摘要（§7.5/7.6）。
-6. **UI 未覆盖新端点**：`/archive-stale`、`/reopen`、`/convert`、`/rebase`、`/manual-revision`、`/audits`、`/findings` 目前仅 API + 测试，客户端面板待补；`/comments/batch` 与 `patchCheck` 仍是 SPEC 目标契约，尚未实现。
+6. **UI 未覆盖新端点**：`/archive-stale`、`/reopen`、`/convert`、`/rebase`、`/audits`、`/findings` 目前仅 API + 测试，客户端面板待补；`/comments/batch` 与 `patchCheck` 仍是 SPEC 目标契约，尚未实现。
 7. **无批量批准、无真实鉴权**：owner 是本地约定，适合小团队试点；真正的权限需要仓库/服务端能力。检出级互斥为进程内实现，多克隆并发与"批准后跨实例重复 approved 检测"（§18.8 后半）不在保证范围。Jira 等外部 Ticket 自动抓取尚未接入（远期方向）。
 7a. **§14 共享事实过滤未实现**：队列/投影/负向记忆当前直接读工作区文件，未按 `git status` 排除未提交改动（本地视图）；提交失败回滚机制为主要缓解，完整实现待做。
 8. **UI 使用中文文案**（locale 命名空间已注册，便于后续补英文/日文）。

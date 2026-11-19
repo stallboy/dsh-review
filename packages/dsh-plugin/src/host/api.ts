@@ -279,7 +279,6 @@ export class ReviewApi implements ApiHost {
     { method: 'POST', path: '/dismiss-finding', kind: 'candidate-write', handler: ({ req, res, url }) => this.writers.dismissFinding(req, res, url) },
     { method: 'POST', path: '/candidate/finalize', kind: 'candidate-write', handler: ({ req, res, url }) => this.writers.candidateFinalize(req, res, url) },
     { method: 'POST', path: '/rebase', kind: 'workspace-txn', handler: ({ req, res, url }) => this.writers.rebase(req, res, url) },
-    { method: 'POST', path: '/manual-revision', kind: 'workspace-txn', handler: ({ req, res, url }) => this.writers.manualRevision(req, res, url) },
     // 创建会话可能长时间等待。路由仍检查审查互斥，由 FixSessions 单独占用该仓库，避免阻塞其他写事务。
     { method: 'POST', path: '/fix-session', kind: 'workspace-txn', handler: ({ req, res, url }) => this.fixSessions.create(req, res, url) },
     { method: 'POST', path: '/approve', kind: 'job-start', handler: ({ req, res, url }) => this.approve(req, res, url) },
@@ -485,7 +484,7 @@ export class ReviewApi implements ApiHost {
         settings: this.settings,
         makeRunner: (request) => new Runner(request),
         checkDuplicate,
-        validateNewRevision: (previous, latest) => this.writers.validateNewRevision(runtime, previous, latest, 'ai'),
+        validateNewRevision: (previous, latest) => this.writers.validateNewRevision(runtime, previous, latest),
         sharedSource: () => sharedSourceFor(runtime),
         shouldCancel: () => Boolean((job as { cancelRequested?: boolean }).cancelRequested),
         ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
@@ -595,7 +594,7 @@ export class ReviewApi implements ApiHost {
         );
       }
       const latest = await store.get(id, null);
-      const validationErrors = await this.writers.validateNewRevision(runtime, candidate, latest.candidate, 'ai');
+      const validationErrors = await this.writers.validateNewRevision(runtime, candidate, latest.candidate);
       if (validationErrors.length > 0) {
         await this.writers.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
         return this.writers.aborted('INVALID_CANDIDATE', `AI 新版本未通过提交前校验，已恢复：\n${validationErrors.join('\n')}`, jobId);

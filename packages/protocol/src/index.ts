@@ -3,10 +3,11 @@ export * from './review.js';
 export const PROTOCOL_VERSION = 1;
 export const SCHEDULED_AUDIT_ACTOR = 'system-scheduled-audit';
 export const SCHEDULED_AUDIT_WAIT_MS = 30 * 60_000;
+export const RETIRED_MANUAL_REVISION = 'manual-revision';
 
 export const OPERATIONS = [
     'approve', 'comments', 'comments-batch', 'comment-status', 'takeover', 'reject', 'resume', 'rebase',
-    'ai-fix', 'manual-revision', 'reopen', 'archive-stale', 'audit', 'audit-finalize',
+    'ai-fix', 'reopen', 'archive-stale', 'audit', 'audit-finalize',
     'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'sync',
 ] as const;
 
@@ -38,7 +39,7 @@ export interface ManagedCommand {
     nodeId: string;
     bindingGeneration: number;
     projectConfigRevision: number;
-    operation: ManagedOperation;
+    operation: ManagedOperation | typeof RETIRED_MANUAL_REVISION;
     actor: Actor;
     payload: JsonRecord;
     guard?: Guard;
@@ -55,6 +56,10 @@ export interface DeliveryResult {
 export interface ManagedResult {
     outcome: JsonRecord & { status: string };
     delivery: DeliveryResult;
+}
+
+export function retiredManualRevisionResult(): ManagedResult {
+    return { outcome: { status: 'ABORTED', reason: 'CANCELLED', message: '人工补丁提交已撤除' }, delivery: { state: 'not_required' } };
 }
 
 export interface CommandRecord extends ManagedCommand {
@@ -184,7 +189,7 @@ export function timestamp(value: unknown, field: string): string {
     return result;
 }
 
-export function validateCommand(value: unknown): ManagedCommand {
+export function validateCommand(value: unknown, allowRetiredManualRevision = false): ManagedCommand {
     const input = record(value, 'command');
     entityId(input.commandId, 'commandId');
     if (typeof input.requestHash !== 'string' || !/^[a-f0-9]{64}$/.test(input.requestHash)) throw new ProtocolError('requestHash');
@@ -192,11 +197,13 @@ export function validateCommand(value: unknown): ManagedCommand {
     entityId(input.nodeId, 'nodeId');
     positiveInteger(input.bindingGeneration, 'bindingGeneration');
     positiveInteger(input.projectConfigRevision, 'projectConfigRevision');
-    if (!OPERATIONS.includes(input.operation as ManagedOperation)) throw new ProtocolError('operation');
+    const operation = input.operation as ManagedCommand['operation'];
+    if (operation === RETIRED_MANUAL_REVISION ? !allowRetiredManualRevision : !OPERATIONS.includes(operation)) throw new ProtocolError('operation');
     const actor = record(input.actor, 'actor');
     entityId(actor.userId, 'actor.userId');
     textValue(actor.reviewIdentity, 'actor.reviewIdentity', 160);
-    validatePayload(input.operation as ManagedOperation, record(input.payload, 'payload'));
+    const payload = record(input.payload, 'payload');
+    if (operation !== RETIRED_MANUAL_REVISION) validatePayload(operation, payload);
     if (input.scheduledAudit !== undefined) {
         const schedule = record(input.scheduledAudit, 'scheduledAudit');
         const start = timestamp(schedule.scheduledAt, 'scheduledAudit.scheduledAt');
@@ -221,14 +228,14 @@ function validatePayload(operation: ManagedOperation, payload: JsonRecord): void
     const fields: Record<ManagedOperation, string[]> = {
         approve: ['id', 'confirmedDecisions', 'waivedDecisions', 'commitMessage', 'commitDetail'], comments: ['id', 'content', 'revision', 'file', 'line', 'side', 'anchor'],
         'comments-batch': ['id', 'comments'], 'comment-status': ['id', 'commentId', 'status'], takeover: ['id'], reject: ['id', 'reason', 'category'], resume: ['id'],
-        rebase: ['id'], 'ai-fix': ['id'], 'manual-revision': ['id', 'patchText'], reopen: ['id', 'from', 'reason'], 'archive-stale': ['id'],
+        rebase: ['id'], 'ai-fix': ['id'], reopen: ['id', 'from', 'reason'], 'archive-stale': ['id'],
         audit: ['targetPath', 'note'], 'audit-finalize': ['auditId'], 'audit-release': ['auditId', 'confirmStopped'], 'candidate-finalize': ['id'],
         convert: ['auditId', 'findingId', 'candidateId'], 'dismiss-finding': ['auditId', 'findingId', 'reason'], sync: [],
     };
     for (const key of Object.keys(payload)) if (!fields[operation].includes(key)) throw new ProtocolError(`payload.${key}`);
     for (const key of ['id', 'from', 'candidateId']) if (payload[key] !== undefined && (typeof payload[key] !== 'string' || !/^\d{4}-\d{2}\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(payload[key]))) throw new ProtocolError(`payload.${key}`);
     if (payload.auditId !== undefined && (typeof payload.auditId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(payload.auditId))) throw new ProtocolError('payload.auditId');
-    for (const key of ['content', 'file', 'side', 'commentId', 'status', 'reason', 'category', 'patchText', 'targetPath', 'note', 'findingId', 'commitMessage', 'commitDetail']) {
+    for (const key of ['content', 'file', 'side', 'commentId', 'status', 'reason', 'category', 'targetPath', 'note', 'findingId', 'commitMessage', 'commitDetail']) {
         if (payload[key] !== undefined && typeof payload[key] !== 'string') throw new ProtocolError(`payload.${key}`);
     }
     if (payload.revision !== undefined) positiveInteger(payload.revision, 'payload.revision');

@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { validateCommand, type ManagedCommand, type ManagedResult, type NodeEvent } from '@dsh-review/protocol';
+import { RETIRED_MANUAL_REVISION, validateCommand, type ManagedCommand, type ManagedResult, type NodeEvent } from '@dsh-review/protocol';
 
 export interface JournalCommand {
     command: ManagedCommand;
@@ -40,7 +40,7 @@ export class ManagedJournal {
     }
 
     accept(value: ManagedCommand): { fresh: boolean; record: JournalCommand } {
-        const command = validateCommand(value);
+        const command = validateCommand(value, true);
         return this.transaction(() => {
             const previous = this.get(command.commandId);
             if (previous) {
@@ -58,10 +58,10 @@ export class ManagedJournal {
         if (result.changes !== 1) throw new Error('指令尚未受理或已经执行，拒绝重复启动');
     }
 
-    awaitingScheduledAcknowledgement(): ManagedCommand[] {
+    awaitingAcknowledgement(): ManagedCommand[] {
         return this.database.prepare("SELECT envelope FROM commands WHERE phase='accepted'").all()
-            .map(row => validateCommand(JSON.parse(String(row.envelope))))
-            .filter(command => command.scheduledAudit);
+            .map(row => validateCommand(JSON.parse(String(row.envelope)), true))
+            .filter(command => command.scheduledAudit || command.operation === RETIRED_MANUAL_REVISION);
     }
 
     settleBeforeExecution(commandId: string, result: ManagedResult): void {

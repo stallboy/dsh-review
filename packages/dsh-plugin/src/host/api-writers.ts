@@ -92,7 +92,6 @@ export class Writers {
     runtime: Runtime,
     previous: ReviewCandidate,
     latest: ReviewCandidate,
-    author: 'ai' | 'human',
   ): Promise<string[]> {
     const errors: string[] = [];
     if (latest.parseError) errors.push(latest.parseError);
@@ -171,7 +170,7 @@ export class Writers {
       errors.push('新版本缺少当前 revision 条目');
       return errors;
     }
-    if (current.author !== author) errors.push(`新版本 author 必须为 ${author}`);
+    if (current.author !== 'ai') errors.push('新版本 author 必须为 ai');
     if (!current.baseRevision.trim()) errors.push('新版本 base_revision 不能为空');
     errors.push(...await runtime.store.validateFullCandidate(latest, undefined, sharedSource));
     let patchText: string | null = null;
@@ -850,7 +849,7 @@ export class Writers {
         const latestBase = latest.candidate.meta.revisions.find(
           (revision) => revision.id === latest.candidate.meta.currentRevision,
         )?.baseRevision;
-        const errors = await this.validateNewRevision(runtime, candidate, latest.candidate, 'ai');
+        const errors = await this.validateNewRevision(runtime, candidate, latest.candidate);
         if (latestBase !== base) errors.push(`Mode C 新版本必须使用最新基线 ${base}，实际为 ${latestBase ?? '(缺失)'}`);
         if (errors.length > 0) {
           await this.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
@@ -866,9 +865,9 @@ export class Writers {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
         if (!verifyApply.ok) return this.aborted('INVALID_CANDIDATE', `新补丁无法在新基线严格应用：${verifyApply.message}`, jobId);
         updated = await store.appendRevision(id, {
-          author: 'ai', baseRevision: base, patchText: deterministicPatch,
+          baseRevision: base, patchText: deterministicPatch,
         }, guard);
-        const errors = await this.validateNewRevision(runtime, candidate, updated, 'ai');
+        const errors = await this.validateNewRevision(runtime, candidate, updated);
         if (errors.length > 0) {
           await this.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
           return this.aborted('INVALID_CANDIDATE', `Rebase 新版本未通过提交前校验：\n${errors.join('\n')}`, jobId);
@@ -899,91 +898,6 @@ export class Writers {
         return this.aborted('COMMIT_FAILED', `提交失败，已恢复操作前版本：${result.detail}`, jobId, result.detail);
       }
       return this.committed(`已 Rebase 到基线 ${base.slice(0, 12)}，新版本 ${String(updated.meta.currentRevision)}`, jobId, {
-        commitRevision: result.commitRevision,
-        newRevision: updated.meta.currentRevision,
-      });
-    }));
-    sendJson(res, 202, { jobId: job.id, job });
-  }
-
-  async manualRevision(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
-    const runtime = await this.host.runtimeFor(url);
-    const { store, vcs } = runtime;
-    const body = await readJson(req);
-    const id = stringField(body, 'id');
-    const guard = guardFrom(body);
-    const patchText = stringField(body, 'patchText');
-    if (!patchText.trim()) throw new ApiError(422, 'bad_request', 'patchText 不能为空');
-    await this.requireOwnerOf(store, id);
-    await this.requireSharedCandidate(runtime, id);
-    const detail = await store.get(id, null);
-    await store.ensureWriteAllowed(detail.candidate, guard);
-    const job = this.host.jobManager.start('ai_fix', (log, jobId, signal): Promise<AiFixOutcome> => this.host.withWriteLock(store.repoRoot, async () => {
-      const source = await sharedSourceFor(runtime);
-      if (!source) return this.aborted('INVALID_CANDIDATE', '无法建立共享快照', jobId);
-      const fresh = await store.get(id, null, source);
-      const candidate = fresh.candidate;
-      if (candidate.parseError) return this.aborted('INVALID_CANDIDATE', candidate.parseError, jobId);
-      if (candidate.meta.currentRevision !== guard.expectedRevision || candidate.meta.owner !== guard.expectedOwner
-        || new Date(candidate.meta.updatedAt).getTime() !== new Date(guard.expectedUpdatedAt).getTime()) {
-        return this.aborted('CONCURRENCY_MISMATCH', '候选在排队期间已更新', jobId);
-      }
-      if (candidate.meta.status !== 'pending' && candidate.meta.status !== 'changes_requested') {
-        return this.aborted('STATE_CONFLICT', `当前状态 ${candidate.meta.status} 不允许人工微调`, jobId);
-      }
-      const clean = await vcs.ensureCleanWorkspace();
-      if (!clean.clean) return this.aborted('DIRTY_WORKSPACE', `工作区不干净：${clean.message}`, jobId);
-      const base = await vcs.getCurrentBase().catch(() => null);
-      if (!base) return this.aborted('SYNC_FAILED', '无法读取当前基线', jobId);
-      const applied = await this.applyPatchText(vcs, patchText, false);
-      if (!applied.ok) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
-        return this.aborted('INVALID_CANDIDATE', `补丁无法应用：${applied.message}`, jobId);
-      }
-      log('重跑门禁');
-      const report = await runGateChecks(candidate.meta.gateChecks, {
-        cwd: store.repoRoot, baseRevision: base, timeoutMs: this.host.currentSettings().gateTimeoutMs,
-        onLine: (line) => { if (line.trim()) log(`  ${line.slice(0, 300)}`); },
-        signal,
-      });
-      await vcs.revertBusinessWorkspace().catch(() => undefined);
-      if (signal.aborted) return this.aborted('CANCELLED', '人工微调门禁已取消，未产生共享提交', jobId);
-      if (!report.allPassed) {
-        return this.aborted('GATE_CHECK_FAILED', `门禁未通过，未产生新版本：\n${report.formattedEvidenceMarkdown}`, jobId);
-      }
-      const { readFile: readFs, readdir } = await import('node:fs/promises');
-      const reviewBackup = await readFs(candidate.reviewPath, 'utf8');
-      const entriesBefore = new Set(await readdir(candidate.dirPath).catch(() => [] as string[]));
-      const updated = await store.appendRevision(id, { author: 'human', baseRevision: base, patchText }, guard);
-      const validationErrors = await this.validateNewRevision(runtime, candidate, updated, 'human');
-      if (validationErrors.length > 0) {
-        await this.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
-        return this.aborted('INVALID_CANDIDATE', `人工微调未通过提交前校验：\n${validationErrors.join('\n')}`, jobId);
-      }
-      const writtenReview = await readFs(updated.reviewPath, 'utf8').catch(() => null);
-      const result = await this.commitAndClassify({
-        runtime,
-        message: `review(${id}): manual tweak (rev ${String(updated.meta.currentRevision)})`,
-        paths: [relative(store.repoRoot, updated.dirPath)],
-        probePaths: [relative(store.repoRoot, updated.reviewPath)],
-        expectedFiles: [
-          ...(writtenReview !== null ? [{ relPath: relative(store.repoRoot, updated.reviewPath), text: writtenReview }] : []),
-          { relPath: relative(store.repoRoot, path.join(updated.dirPath, `${String(updated.meta.currentRevision).padStart(3, '0')}.patch`)), text: patchText },
-        ],
-      });
-      if (!result.landed) {
-        if (result.outcome === 'RECOVERY_REQUIRED') {
-          return this.recoveryRequired(
-            'COMMIT_OUTCOME_UNKNOWN',
-            `人工微调新版本提交结果无法确定，现场保留待人工核对：${result.detail}`,
-            jobId,
-            result.detail,
-          );
-        }
-        await this.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
-        return this.aborted('COMMIT_FAILED', `提交失败，已恢复操作前版本：${result.detail}`, jobId, result.detail);
-      }
-      return this.committed(`人工微调完成，新版本 ${String(updated.meta.currentRevision)}`, jobId, {
         commitRevision: result.commitRevision,
         newRevision: updated.meta.currentRevision,
       });

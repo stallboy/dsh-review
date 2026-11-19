@@ -62,17 +62,16 @@ function assertAiFixOutcomeShape(result, label) {
   }
 }
 
-test('§7.7：/manual-revision 的结果是 AiFixOutcome 判别形状（坏补丁 → ABORTED + INVALID_CANDIDATE）', async () => {
+test('§8.3：旧人工补丁接口返回 404，不创建修复任务', async () => {
   const root = await createGitFixture();
   const candidate = await commitCandidate(root, '20261111-manual-rev-shape');
   const { base } = await startApi(root);
 
   const res = await post(base, '/manual-revision', { ...guardFixture(candidate.id), patchText: 'not a patch\n' });
-  assert.equal(res.status, 202, JSON.stringify(await res.clone().json().catch(() => ({}))));
-  const job = await waitJob(base, (await res.json()).jobId);
-  assertAiFixOutcomeShape(job.result, 'manual-revision');
-  assert.equal(job.result.status, 'ABORTED');
-  assert.equal(job.result.reason, 'INVALID_CANDIDATE');
+  const body = await res.json();
+  assert.equal(res.status, 404, JSON.stringify(body));
+  assert.equal(body.error.code, 'not_found');
+  assert.equal(body.jobId, undefined);
 });
 
 test('§7.7：/candidate/finalize 的结果是 AiFixOutcome 判别形状（校验失败 → VALIDATION_FAILED + errors）', async () => {

@@ -39,7 +39,7 @@ flowchart TD
     REPORT -->|"人工转换 / 依赖满足"| CAND
     CAND --> QUEUE["人类审核队列"]
     QUEUE --> DETAIL["查看方案、判断项、门禁与差异"]
-    DETAIL -->|"评论 / 微调 / Rebase"| FIX["生成新的完整补丁版本"]
+    DETAIL -->|"按意见 AI 修复 / Rebase"| FIX["生成新的完整补丁版本"]
     FIX --> QUEUE
     DETAIL -->|"批准"| GATE["在批准时基线上应用补丁<br/>重新执行全部门禁"]
     GATE -->|"全部通过"| COMMIT["原子提交业务代码与批准记录<br/>业务提交由 VCS 历史派生"]
@@ -127,9 +127,9 @@ flowchart TD
 
 1. Owner 查看问题、根因、当前方案、人工判断项、门禁证据和代码差异。
 2. Owner 可添加总体或行内评论；新增未解决评论使 `pending` 变为 `changes_requested`。
-3. AI 修复、人工微调或 Rebase 产生新的完整补丁版本，候选回到 `pending`。
+3. 按意见 AI 修复或 Rebase 产生新的完整补丁版本，候选回到 `pending`。
 4. AI 修复失败不得破坏已有共享状态；Owner 可重试，也可通过 `/resume` 显式转回 `pending`。
-5. Owner 可接管候选、上传人工补丁、拒绝候选，或在所有条件满足后批准。
+5. Owner 可接管候选、提交审核意见、拒绝候选，或在所有条件满足后批准。需要人工修改业务代码时，在本工具之外按目标仓库的流程完成。
 
 ### 3.4 批准与提交
 
@@ -232,7 +232,7 @@ audit_smoke_commands: []
 | `status` | 是 | enum | `pending / changes_requested / approved / rejected`。 |
 | `target_files` | 是 | string[] | 当前补丁实际触及的业务文件；唯一、仓库相对、正斜杠。活跃候选必须非空，重命名同时包含旧、新路径，归档后保留。 |
 | `current_revision` | 是 | 正整数 | 等于最高 revision id。 |
-| `revisions[]` | 是 | 非空列表 | 每项必含正整数 `id`、非空 string `base_revision`、string `patch`、`author`。id 从 1 连续递增且与补丁编号一致；author 为 `ai` 或 `human`。YAML 数字基线不得隐式转换为字符串。 |
+| `revisions[]` | 是 | 非空列表 | 每项必含正整数 `id`、非空 string `base_revision`、string `patch`、`author`。id 从 1 连续递增且与补丁编号一致；author 为 `ai` 或 `human`（历史版本）。YAML 数字基线不得隐式转换为字符串。 |
 | `gate_checks` | 是 | string[] | 批准时顺序执行；列表非空，每条 trim 后非空。 |
 | `comments[]` | 是 | 列表 | 可为 `[]`；精确形状见下表。 |
 | `human_decisions[]` | 是 | 列表 | 可为 `[]`；每项含候选内唯一稳定、非空 string `id`、非空 string `question`，以及可选 string `note`。 |
@@ -555,7 +555,7 @@ Host 可以在内存中缓存同一 VCS 快照的投影结果，但缓存不是�
 ```text
 [*] ──新建──> pending
 pending ──新增未解决评论──> changes_requested
-pending / changes_requested ──AI 修复 / 人工微调 / Rebase──> pending
+pending / changes_requested ──AI 修复 / Rebase──> pending
 changes_requested ──Owner 显式执行 /resume──> pending
 pending ──门禁全过且原子提交成功──> approved
 pending / changes_requested ──拒绝 / 超时归档──> rejected
@@ -572,7 +572,7 @@ rejected ──人工重开──> 另一活跃候选记录 reopened_from
 ### 5.2 版本与作者
 
 - AI 修复和 AI Rebase 的 revision `author` 为 `ai`。
-- `/manual-revision` 上传人工补丁的 author 为 `human`。
+- 既有 `author: human` 的历史版本继续参与读取、展示和提交说明。
 - 新版本必须追加而非覆盖历史；`current_revision` 随之推进。
 - 方案、范围、门禁或风险发生变化时必须产生新版本并重新审核。
 
@@ -630,7 +630,7 @@ Git 在触及该候选目录 `review.md` 的提交历史中（如 `git log -- <c
 - 事实正文只能来自共享快照、只读 VCS 命令与 `reviewers.yml`：任一来源不可读时该小节写“不可用/未填写”，不得猜测或编造；`review.md` 不记录 `audit_id`，因此不得凭日期或范围推断审查档案路径。
 - 非法 `commitDetail` 取值返回 422 `bad_request`，不得静默降级为其中一种。
 
-其余评审元数据操作必须产生仅包含相关 `.ai-review/` 路径的独立提交，包括评论、评论状态、接管、人工转回、AI 修复、人工微调、Rebase、拒绝、重开、转换和忽略 finding。批量评论在一次共享写入与一次提交中完成。每次共享写操作只有在对应提交成功后才算完成。任何提交失败或结果不明都统一按以下顺序处理：
+其余评审元数据操作必须产生仅包含相关 `.ai-review/` 路径的独立提交，包括评论、评论状态、接管、人工转回、AI 修复、Rebase、拒绝、重开、转换和忽略 finding。批量评论在一次共享写入与一次提交中完成。每次共享写操作只有在对应提交成功后才算完成。任何提交失败或结果不明都统一按以下顺序处理：
 
 1. 查询 VCS 并确认提交存在且内容匹配：按成功继续，不得恢复旧文件。
 2. 已证明提交不存在：恢复操作前文件并返回失败，不得保留本地写入或返回成功。
@@ -813,7 +813,7 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 - 最多保留 40 个 Job，超出时优先淘汰最早开始的已完成 Job；单 Job 最多保留 4000 行日志。日志偏移和累计行数使用单调递增的绝对序号，截断不得让客户端丢失后续日志；协议见 §8.2。
 - 本地模式 Job 仅保存在内存；中央托管模式必须另按 §16 持久化指令、执行阶段、事件与结果。Host 重启后不得将中断 Job 当作成功；批准恢复以共享事实和 §5.5 的提交派生结果为准。若崩溃后工作区状态或提交结果无法确定，必须阻止自动写操作并要求人工恢复，不得猜测回滚。
 - 所有共享写和工作区事务必须经同一 repo 级进程内锁串行；guard 校验、同步、应用补丁、门禁、Runner、还原和提交位于同一锁临界区。`/sync` 在其他工作区事务运行时必须排队，不得改变其基线。手动审查的执行租约同样参与互斥。
-- audit（包括会话与手动租约 Job）运行中禁止 approve、ai-fix、rebase、manual-revision、fix-session 和其他 sync；新 audit 与 audit/session/manual 要求无任何运行中 Job。
+- audit（包括会话与手动租约 Job）运行中禁止 approve、ai-fix、rebase、fix-session 和其他 sync；新 audit 与 audit/session/manual 要求无任何运行中 Job。
 - 定时审查由中央管理并默认关闭（§16.11）。节点检查租约、活动 Job、工作区和基线后才启动执行。
 - `POST /jobs/:id/cancel` 只请求停止后续执行，不强行把业务结果改为 ABORTED。Host 终止完整进程树或结束会话并等待清理后：已证明共享提交不存在才返回 ABORTED；普通共享提交已存在则返回对应 COMMITTED/VALIDATION_FAILED；批准业务提交已存在则返回 COMMITTED，并返回该提交的 VCS 版本号；结果不明返回 RECOVERY_REQUIRED 且禁止恢复。已结束 Job 直接返回原结果。手动租约不得随取消自动释放，必须按 §7.6 经人工确认停止后释放。不得靠 Host 重启释放锁。
 
@@ -826,7 +826,7 @@ Rebase 由插件自身以 ai_fix Job 执行：读取当前基线，基线未变�
 - 若差异中**只有** `.ai-review/` 变更，判定为业务基线未变：`isBaseBehind = false`，且 `/rebase` 命中“基线未变”分支返回 `ABORTED / BASE_UNCHANGED`；
 - 无法证明是否变化（浅克隆、版本不可读等）时不得猜测为“未变”，`/rebase` 按无法确定处理并中止。
 
-**ai_fix Job 的 Outcome 边界（2026-11-10 澄清）**：§7.5 的 `ApprovalOutcome`（含其封闭的 ABORTED 原因表）**只属于 approve Job**；批准流程中遇到补丁冲突或门禁失败必须返回 `FALLBACK_TO_PENDING`（reason 为 `PATCH_CONFLICT` / `GATE_CHECK_FAILED`），绝不返回 ABORTED。`/rebase`、`/manual-revision`、`/candidate/finalize` 与显式 `/ai-fix` 运行在 ai_fix Job 下，使用 §7.7 第二条的通用业务取值（`COMMITTED / MANUAL_REQUIRED / VALIDATION_FAILED / ABORTED / RECOVERY_REQUIRED`），其 ABORTED 的 reason 取值为 `REBASE_CONFLICT / GATE_CHECK_FAILED / BASE_UNCHANGED / DIRTY_WORKSPACE / CONCURRENCY_MISMATCH / STATE_CONFLICT / INVALID_CANDIDATE / SYNC_FAILED / COMMIT_FAILED / RUNNER_FAILED / CANCELLED`。因此 `REBASE_CONFLICT` 与 `BASE_UNCHANGED` **不属于** §7.5 的审批原因枚举，实现不得把它们写进 ApprovalOutcome。
+**ai_fix Job 的 Outcome 边界（2026-11-10 澄清）**：§7.5 的 `ApprovalOutcome`（含其封闭的 ABORTED 原因表）**只属于 approve Job**；批准流程中遇到补丁冲突或门禁失败必须返回 `FALLBACK_TO_PENDING`（reason 为 `PATCH_CONFLICT` / `GATE_CHECK_FAILED`），绝不返回 ABORTED。`/rebase`、`/candidate/finalize` 与显式 `/ai-fix` 运行在 ai_fix Job 下，使用 §7.7 第二条的通用业务取值（`COMMITTED / MANUAL_REQUIRED / VALIDATION_FAILED / ABORTED / RECOVERY_REQUIRED`），其 ABORTED 的 reason 取值为 `REBASE_CONFLICT / GATE_CHECK_FAILED / BASE_UNCHANGED / DIRTY_WORKSPACE / CONCURRENCY_MISMATCH / STATE_CONFLICT / INVALID_CANDIDATE / SYNC_FAILED / COMMIT_FAILED / RUNNER_FAILED / CANCELLED`。因此 `REBASE_CONFLICT` 与 `BASE_UNCHANGED` **不属于** §7.5 的审批原因枚举，实现不得把它们写进 ApprovalOutcome。
 
 ### 7.8 会话级仓库解析
 
@@ -915,7 +915,6 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 | POST | `/convert` | `{auditId, findingId, candidateId}`，均非空；不传候选 guard | 200 `{audit, candidateId, commitRevision}`；按 §7.6 校验并原子提交。 |
 | POST | `/dismiss-finding` | `{auditId, findingId, reason}`，均非空；不传候选 guard | 200 `{audit, commitRevision}`；按 §7.6 留痕并独立提交。 |
 | POST | `/rebase` | `{id, ...guard}` | 202 `{jobId, job}`，Job 类型 ai_fix。 |
-| POST | `/manual-revision` | `{id, ...guard, patchText}`；非空全量 Unified Diff | 202 `{jobId, job}`；验证与门禁通过后追加 human revision。**2026-11-12 起 Client 不再提供面板入口，端点语义不变。** |
 | POST | `/fix-session` | `{id}`；候选须解析有效、非归档、Owner 匹配、有未 resolved 评论且工作区干净 | 202 `{sessionId, title, candidateId, revision, prompt}`；按 §7.4「新 DSH 会话」创建会话并投递修复提示词，不创建执行租约、不提交候选。 |
 | POST | `/approve` | `{id, ...guard, confirmedDecisions?: string[], waivedDecisions?: {id, reason}[], commitMessage?: string, commitDetail?: 'simple'\|'detailed'}`；缺省数组按 `[]`；`commitMessage` 可选，提供时非空且首行必须等于 title（否则按 §7.5 返回 `COMMIT_MESSAGE_MISMATCH`），批准原子提交中一并更新 `review.md` 的 `commit_message`；`commitDetail` 可选，按 §5.6「提交信息详略」决定业务提交说明的组成，非法取值 422，未提供时使用候选 `commit_message` 全文 | 202 `{jobId, job}`；最终结果读取 job.result。 |
 | POST | `/ai-fix` | `{id, ...guard}`；必须有未 resolved 评论 | 202 `{jobId, job}`；无 unresolved/partial 评论时在创建 Job 前返回 409。 |
@@ -970,7 +969,7 @@ stale、duplicate、local 和基线冲突必须使用不同徽标；local 不计
 - 底部提供总体意见、批准、提出改进意见和必填原因的放弃；changes_requested 提供“转回待审核”。
 - **批准面板的提交信息选项（2026-11-12）**：批准前必须可选「简略信息 / 详细」并展示将要提交的结构预览；首行综述由 Host 按 §5.6 生成并在预览中原样展示，不让用户在面板里手写首行。
 - **修复执行方式（2026-11-12）**：总体意见区必须可选「新建 DSH 会话」与「导出提示词」两种执行方式：前者保存意见后调用 `/fix-session`（会话出现在侧边栏、可在页内看到会话标识）；后者保留「只生成提示词 + 复制」的手动路径，供粘贴到 codex 等外部 Agent。两种方式都不得自动提交候选版本。提示词绑定候选当前版本，候选推进版本后必须重新生成。
-- **已移除的面板入口（2026-11-12）**：详情页不再提供“上传人工补丁 / 超时归档 / 从重开来源恢复”三个按钮；对应端点（`/manual-revision`、`/archive-stale`、`/reopen`）按 §8.3 继续提供，供脚本或后续界面使用。
+- 本地详情页的超时归档和从重开来源恢复可通过 §8.3 的 `/archive-stale` 和 `/reopen` 调用。中央和本地面板均通过审核意见驱动 AI 修复，已撤除人工补丁提交（旧 `POST /manual-revision` 返回 404）。
 - 行内评论模型必须保存 side；删除侧行创建 LEFT，新增/上下文新侧创建 RIGHT，展示和线程匹配同时比较 file + line + side。
 - 行内评论可携带 `anchor`；跨版本展示时先按 `file + line + side` 匹配，内容不匹配再用 `anchor.snippet` 重定位；无 anchor 或重定位失败时回退到原版本视图并以原评论位置展示，任何情况下都不得改写原评论。
 - 多条评论可以本地草稿批量提交；提交时一次发送，候选状态只在批次内转换一次。存在未提交本地草稿且用户触发 AI 修复时，必须通过 `/comments/batch` 携带 `autoFix: true` 一次性完成评论提交与修复触发；无本地草稿时才直接调用 `/ai-fix`，不得拆成串行的两个请求徒增锁竞争。
@@ -1256,7 +1255,9 @@ projectId、nodeId、workspaceId 必须明确区分。节点本地配置 workspa
 
 写指令必须包含 commandId、requestHash、projectId、nodeId、bindingGeneration、projectConfigRevision、受信操作者、固定操作类型、业务参数、适用的 guard 及创建时间。禁止通用任意命令执行入口。
 
-中央以持久化事务保存指令与项目占用。同一项目至多一条未决写指令；不同节点可并行。相同幂等键和参数返回原指令，不同参数复用同一键返回 409。
+中央以持久化事务保存指令与项目占用。同一项目至多一条未决写指令；不同节点可并行。对仍受支持的操作，相同幂等键和参数返回原指令，不同参数复用同一键返回 409。
+
+旧 `manual-revision` 请求返回 422。中央启动时直接结清已排队或已派发但未确认受理的同类任务。节点对仅有受理记录的同类任务直接记录取消结果。已有执行记录按 §16.6 核验与恢复。
 
 节点必须先持久化受理记录，再确认、执行。重复投递同一 commandId 不得产生第二次副作用；节点重启时不得仅凭内存 Map 判断是否执行过。
 

@@ -39,19 +39,21 @@ const PATCH = (sign) => [
   '',
 ].join('\n');
 
-async function writeCandidate(root, base) {
+async function writeCandidate(root, base, humanHistory = false) {
   const dir = path.join(root, '.ai-review', '2026-11', '20261105-net-rb');
   await mkdir(dir, { recursive: true });
   await writeFile(path.join(dir, 'review.md'), [
     '---', 'schema_version: 1', 'title: "net: 修复加法"', 'module: net', 'audit_type: bugfix',
     'created_at: "2026-11-05T09:00:00+08:00"', 'updated_at: "2026-11-05T09:00:00+08:00"', 'owner: tester',
-    'tags: []', 'status: pending', 'ticket: null', 'target_files: [src/math.js]', 'current_revision: 1',
+    'tags: []', 'status: pending', 'ticket: null', 'target_files: [src/math.js]', `current_revision: ${humanHistory ? 2 : 1}`,
     'revisions:', `  - id: 1`, `    base_revision: "${base}"`, '    patch: 001.patch', '    author: ai',
+    ...(humanHistory ? ['  - id: 2', `    base_revision: "${base}"`, '    patch: 002.patch', '    author: human'] : []),
     'gate_checks: ["node --version"]', 'comments: []', 'human_decisions: []', 'approval: null', 'rejection: null',
     'commit_message: "net: 修复加法"',
     '---', '', '# 问题与影响', '', '# 需人工判断项', '- 无', '',
   ].join('\n'), 'utf8');
   await writeFile(path.join(dir, '001.patch'), PATCH('+'), 'utf8');
+  if (humanHistory) await writeFile(path.join(dir, '002.patch'), PATCH('+'), 'utf8');
 }
 
 async function runJob(base, route, payload) {
@@ -97,32 +99,30 @@ test('P8: Rebase——基线落后时产生新版本（author ai）；基线最�
   assert.equal(status, '');
 });
 
-test('P8: 人工微调——补丁可应用且门禁通过时产生版本（author human）；坏补丁不留半版本', async () => {
+test('P8: 既有人工版本和补丁仍可读取，合法补丁也不能手工追加', async () => {
   const root = await createGitFixture();
   const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  await writeCandidate(root, base);
+  await writeCandidate(root, base, true);
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const { base: apiBase } = await startApi(root);
-  const dir = path.join(root, '.ai-review', '2026-11', '20261105-net-rb');
-
-  const bad = await runJob(apiBase, '/manual-revision', {
-    id: '2026-11/20261105-net-rb', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-05T09:00:00+08:00',
-    patchText: 'not a patch\n',
+  const id = '2026-11/20261105-net-rb';
+  const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout;
+  const removed = await fetch(`${apiBase}/manual-revision`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      id, expectedRevision: 2, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-05T09:00:00+08:00', patchText: PATCH('*'),
+    }),
   });
-  assert.equal(bad.job.result.status, 'ABORTED');
-  assert.ok(!existsSync(path.join(dir, '002.patch')));
-
-  const ok = await runJob(apiBase, '/manual-revision', {
-    id: '2026-11/20261105-net-rb', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-05T09:00:00+08:00',
-    patchText: PATCH('+'),
-  });
-  assert.equal(ok.job.result.status, 'COMMITTED', JSON.stringify(ok.job.result));
-  assert.equal(ok.job.result.newRevision, 2);
-  const text = await readFile(path.join(dir, 'review.md'), 'utf8');
-  assert.match(text, /author: human/);
-  const patch2 = await readFile(path.join(dir, '002.patch'), 'utf8');
-  assert.match(patch2, /\+export const add = \(a, b\) => a \+ b;/);
-  const status = runCommand('git', ['status', '--porcelain', 'src'], root).stdout.trim();
-  assert.equal(status, '');
+  assert.equal(removed.status, 404, await removed.text());
+  const detail = await fetch(`${apiBase}/candidate?id=${id}`);
+  assert.equal(detail.status, 200);
+  const { candidate, jobs } = await detail.json();
+  assert.equal(candidate.meta.currentRevision, 2);
+  assert.equal(candidate.meta.revisions[1].author, 'human');
+  assert.deepEqual(jobs, []);
+  const patch = await fetch(`${apiBase}/patch?id=${id}&name=002.patch`);
+  assert.equal(patch.status, 200);
+  assert.equal((await patch.json()).text, PATCH('+'));
+  assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout, head);
+  assert.equal(runCommand('git', ['status', '--porcelain'], root).stdout, '');
 });

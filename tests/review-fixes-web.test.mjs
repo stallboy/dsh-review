@@ -137,6 +137,12 @@ test('AC-UI-01 候选页有未提交意见时禁用直接 AI 修复并保留草�
     assert.deepEqual(JSON.parse(JSON.stringify(view.commands)), [['p', 'ai-fix', { id: 'candidate-a' }, { expectedRevision: 2, expectedOwner: '张三', expectedUpdatedAt: 'now' }]]);
 });
 
+test('中央候选详情提供按意见修复入口，移除人工补丁表单', () => {
+    const view = candidateFixture();
+    assert.ok(view.button('让 AI 处理未解决意见'));
+    assert.doesNotMatch(view.text(), /人工提交新补丁|校验并保存人工版本|Unified Diff/);
+});
+
 test('AC-UI-01 候选页只有未提交行定位时也不能忽略草稿直接 AI 修复', () => {
     const view = candidateFixture();
     view.selectAnchor();
