@@ -11,6 +11,7 @@ import { NodeRegistrationError } from '../managed/managed-node.js';
 import { normalizeCenterUrl, readJson, saveJson, type Candidate, type ConnectionConfig, type ConnectionSecrets } from './config.js';
 import { CentralGateway, CENTRAL_PREFIX, requestBody } from './gateway.js';
 import { LocalCentralProcess } from './local-process.js';
+import { LocalCentralRuntime } from './local-runtime.js';
 
 export const CONNECTION_PREFIX = '/dsh-code-review/connection';
 
@@ -70,6 +71,8 @@ export class ConnectionController {
     private secrets: ConnectionSecrets = { password: randomBytes(32).toString('base64url'), nodes: {} };
     private node: ManagedHandle | null = null;
     private readonly local: LocalCentralProcess;
+    private readonly runtime: LocalCentralRuntime;
+    private runtimeUpdate: Awaited<ReturnType<LocalCentralRuntime['newerVersion']>>;
     private readonly gateway: CentralGateway;
     private readonly controlToken = randomBytes(32).toString('base64url');
     private phase: 'stopped' | 'starting' | 'ready' | 'error' = 'stopped';
@@ -87,6 +90,7 @@ export class ConnectionController {
 
     constructor(private readonly options: ControllerOptions) {
         this.gateway = new CentralGateway(options.directory);
+        this.runtime = new LocalCentralRuntime(options.directory);
         this.local = new LocalCentralProcess(options.localEntry, () => {
             if (this.phase === 'ready' && !this.disposed) {
                 this.phase = 'error';
@@ -274,17 +278,24 @@ export class ConnectionController {
         }
     }
 
-    private async resume(): Promise<void> {
+    private async localEntry(verifyCache: boolean): Promise<URL | undefined> {
+        return await this.local.available() ? this.local.entry : this.runtime.cached(verifyCache);
+    }
+
+    private async resume(entry?: URL): Promise<void> {
         const config = this.config!;
         let centralReady = false;
         this.phase = 'starting';
         this.error = '';
         this.issue = undefined;
+        this.runtimeUpdate = undefined;
         try {
             await this.acquire();
             if (config.mode === 'local') {
+                entry ??= await this.localEntry(true);
+                if (!entry && await this.runtime.offer()) throw new Error('缺少已校验的中央运行包，请在中央连接中启动并确认下载');
                 const ready = await this.local.start({ dataDir: path.join(this.options.directory, 'central'), reviewIdentity: config.reviewIdentity,
-                    password: this.secrets.password, ...(config.centralId && this.secrets.nodes[config.centralId] ? { node: this.secrets.nodes[config.centralId] } : {}) }).catch(error => {
+                    password: this.secrets.password, ...(config.centralId && this.secrets.nodes[config.centralId] ? { node: this.secrets.nodes[config.centralId] } : {}) }, entry).catch(error => {
                     throw new ConnectionIssueError('startup', 'local_start_failed', '本机中央启动失败', this.describe(error, '无法启动本机中央').message);
                 });
                 if (config.centralId && config.centralId !== ready.centralId) throw new Error('本机中央数据身份已变化，拒绝复用旧节点和执行记录');
@@ -310,6 +321,12 @@ export class ConnectionController {
             this.phase = 'ready';
             this.generation++;
             this.record(config.mode === 'local' ? '本机中央已就绪，节点已连接' : '已有中央已连接，节点已注册');
+            if (entry) {
+                const generation = this.generation;
+                void this.runtime.newerVersion(entry).then(update => {
+                    if (!this.disposed && this.phase === 'ready' && this.generation === generation) this.runtimeUpdate = update;
+                });
+            }
         } catch (error) {
             this.phase = 'error';
             this.fail(error, '中央连接失败');
@@ -434,19 +451,19 @@ export class ConnectionController {
                 if (saved && saved.nodeId !== credentials.nodeId) throw new Error('该中央已有另一节点绑定，拒绝替换现有节点身份');
             }
             const same = Boolean(this.config && this.config.mode === mode && (mode === 'local' || this.config.centralId === centralId));
-            if (!same) await this.idle();
-            else if (this.phase === 'ready') {
-                if (mode === 'local' || this.config!.centerUrl === centerUrl) return;
-                await this.idle();
-            }
+            if (same && this.phase === 'ready' && (mode === 'local' || this.config!.centerUrl === centerUrl)) return;
+            const entry = mode === 'local' ? await this.localEntry(true) ?? await this.runtime.download(input.confirmRuntimeDownload) : undefined;
+            if (this.disposed) throw new Error('插件正在停止');
+            if (!same || this.phase === 'ready') await this.idle();
             const profiles = this.config?.profiles ?? {};
             this.options.beforeConfigure?.();
             this.claimed = true;
             await this.shutdown(false);
+            await this.runtime.discardReplaced();
             this.config = { version: 1, enabled: true, mode, centerUrl, centralId, reviewIdentity, profiles };
             if (credentials) this.secrets.nodes[centralId] = credentials;
             await this.persist();
-            await this.resume();
+            await this.resume(entry);
         }));
     }
 
@@ -531,12 +548,15 @@ export class ConnectionController {
                 }
             } catch { serverReachable = false; }
         }
+        const localAvailable = Boolean(await this.localEntry(false));
+        const localRuntimeDownload = localAvailable ? undefined : await this.runtime.offer();
         return { controlToken: this.controlToken, configured: this.configured, legacy: this.legacy,
             enabled: config?.enabled ?? false, mode: config?.mode ?? (this.legacy ? 'external' : 'local'), centerUrl: config?.centerUrl ?? this.legacyConnection?.centerUrl ?? '',
             centralId: config?.centralId ?? '', nodeId: profile?.nodeId ?? this.legacyConnection?.nodeId ?? '', reviewIdentity: config?.reviewIdentity ?? '',
             phase: this.phase, serverReachable, nodeOnline, error: this.error, issue: this.issue, generation: this.generation,
             candidates: await this.options.candidates(sessionId), projects,
-            logs: [...this.logs], hasCredentials: Boolean(config && this.secrets.nodes[config.centralId]), localAvailable: await this.local.available() };
+            logs: [...this.logs], hasCredentials: Boolean(config && this.secrets.nodes[config.centralId]), localAvailable,
+            localRuntimeDownload, localRuntimeUpdate: config?.mode === 'local' && this.phase === 'ready' ? this.runtimeUpdate : undefined };
     }
 
     async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -588,6 +608,7 @@ export class ConnectionController {
 
     async stop(): Promise<void> {
         this.disposed = true;
+        this.runtime.stop();
         await this.queue.catch(() => {});
         await this.shutdown();
     }

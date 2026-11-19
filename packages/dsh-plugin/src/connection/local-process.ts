@@ -18,15 +18,15 @@ export class LocalCentralProcess {
 
     get running(): boolean { return this.child !== null; }
 
-    async available(): Promise<boolean> {
-        try { await access(this.entry); return true; } catch { return false; }
+    async available(entry = this.entry): Promise<boolean> {
+        try { await access(entry); return true; } catch { return false; }
     }
 
-    async start(input: { dataDir: string; reviewIdentity: string; password: string; node?: { nodeId: string; token: string } }): Promise<LocalReady> {
+    async start(input: { dataDir: string; reviewIdentity: string; password: string; node?: { nodeId: string; token: string } }, entry = this.entry): Promise<LocalReady> {
         if (this.child) throw new Error('本机中央已经启动');
         if (Number(process.versions.node.split('.')[0]) < 24) throw new Error('本机中央需要 Node.js 24 或更新运行时');
-        if (!await this.available()) throw new Error('当前插件未包含中央运行包，请安装本机整合插件包，或连接已有中央');
-        const child = spawn(process.execPath, [fileURLToPath(this.entry)], { windowsHide: true, shell: false,
+        if (!await this.available(entry)) throw new Error('当前插件未包含中央运行包，请安装本机整合插件包，或连接已有中央');
+        const child = spawn(process.execPath, [fileURLToPath(entry)], { windowsHide: true, shell: false,
             env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
         this.child = child;
         this.exited = new Promise(resolve => child.once('exit', () => {

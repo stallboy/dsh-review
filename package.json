@@ -16,6 +16,7 @@
         "test": "npm run build && node --test --test-concurrency=1 --test-reporter=tap tests/*.test.mjs",
         "pack:plugin": "npm run build:plugin && node scripts/pack.mjs plugin",
         "pack:local": "npm run build && node scripts/pack.mjs plugin-local",
+        "pack:downloadable": "npm run build && node scripts/pack.mjs plugin-downloadable",
         "preview:market": "npm run build && node scripts/pack.mjs plugin-local-preview",
         "pack:central": "npm run build:central && node scripts/pack.mjs central",
         "deploy": "node scripts/deploy.mjs",

@@ -86,6 +86,8 @@
         logs: string[];
         hasCredentials: boolean;
         localAvailable: boolean;
+        localRuntimeDownload?: { version: string; url: string; size: number; sha256: string };
+        localRuntimeUpdate?: { currentVersion: string; latestVersion: string };
         legacy?: boolean;
     }
   interface Health {
@@ -836,9 +838,20 @@
             edited.current = false;
             setEditing(false);
         };
+        const localDownload = status?.localRuntimeDownload;
+        const localUnavailable = status?.localAvailable === false && !localDownload;
+        const startConnection = async (body: { mode: ConnectionDraft['mode']; reviewIdentity: string }, forDraft = false): Promise<boolean> => {
+            if (scopeRef.current?.writing || working) return false;
+            const download = body.mode === 'local' ? localDownload : undefined;
+            if (download) {
+                const size = download.size < 1024 * 1024 ? `${Math.ceil(download.size / 1024)} KiB` : `${(download.size / (1024 * 1024)).toFixed(2)} MiB`;
+                if (!window.confirm(`启动需要下载中央运行包 ${download.version}（${size}）。\n来源：${download.url}\n确认下载并启动？`)) return false;
+            }
+            return write('/apply', { ...body, ...(download ? { confirmRuntimeDownload: download.sha256 } : {}) }, forDraft);
+        };
         const apply = (): void => {
             if ((status?.phase === 'ready' && unchanged) || (draft.mode === 'external' && check?.registrationCompatibility === 'incompatible')) return;
-            void write('/apply', {
+            void startConnection({
                 mode: draft.mode,
                 ...(draft.mode === 'external' ? credentials : {}),
                 reviewIdentity: draft.reviewIdentity.trim(),
@@ -858,7 +871,8 @@
         const currentProject = status?.projects.find(project => project.root === currentCandidate?.root);
         const disabled = working || !status || !confirmed || Boolean(status.legacy);
         const showForm = Boolean(status && !status.legacy && (!status.configured || editing));
-        const applyLabel = busy && pendingAction === '/apply' ? (draft.mode === 'local' ? '正在启动…' : '正在连接…')
+        const localStartLabel = localDownload ? '正在下载并启动…' : '正在启动…';
+        const applyLabel = busy && pendingAction === '/apply' ? (draft.mode === 'local' ? localStartLabel : '正在连接…')
             : status?.configured ? '应用更改' : draft.mode === 'local' ? '应用并启动' : '保存并连接';
         const starting = status?.phase === 'starting' || (busy && pendingAction === '/apply');
         const phaseTitle = !status ? '正在读取状态…' : status.legacy ? '旧托管配置'
@@ -1002,6 +1016,8 @@
                         status.mode === 'local' ? h('dd', null, status.reviewIdentity || '未设置') : null,
                     ),
                     visibleFailure && !formFailure ? feedback(visibleFailure) : null,
+                    status.localRuntimeUpdate ? h('p', { className: 'dcr-banner info', role: 'status' },
+                        `中央运行包有新版本 ${status.localRuntimeUpdate.latestVersion}，当前运行 ${status.localRuntimeUpdate.currentVersion}。`) : null,
                     status.phase === 'ready' && !status.nodeOnline ? h('p', { className: 'dcr-banner info', role: 'status' }, status.serverReachable === false
                         ? '无法确认中央服务可用。请检查服务和网络，再刷新连接状态。'
                         : '中央服务可访问，节点暂时离线。节点恢复后可继续执行评审。') : null,
@@ -1010,9 +1026,11 @@
                         firstProject && !showForm ? h('button', { className: 'dcr-btn p', onClick: () => setTab('projects') }, '接入项目') : null,
                         canEnterWorkbench && !showForm ? h('button', { className: `dcr-btn${firstProject ? '' : ' p'}`, onClick: () => setTab('central') }, '进入中央工作台') : null,
                         status.phase === 'ready' && hasProjects && !showForm ? h('button', { className: 'dcr-btn', onClick: () => setTab('projects') }, '管理项目') : null,
-                        !status.legacy && (status.phase === 'error' || status.phase === 'stopped') ? h('button', { className: `dcr-btn${showForm ? '' : ' p'}`, disabled,
-                            onClick: () => { void write('/apply', { mode: status.mode, reviewIdentity: status.reviewIdentity, ...(status.mode === 'external' ? { centerUrl: status.centerUrl, nodeId: status.nodeId } : {}) }); } },
-                            status.phase === 'error' ? '重试已保存连接' : '启动已保存连接') : null,
+                        !status.legacy && (status.phase === 'error' || status.phase === 'stopped') ? h('button', { className: `dcr-btn${showForm ? '' : ' p'}`,
+                            disabled: disabled || (status.mode === 'local' && localUnavailable),
+                            onClick: () => { void startConnection({ mode: status.mode, reviewIdentity: status.reviewIdentity, ...(status.mode === 'external' ? { centerUrl: status.centerUrl, nodeId: status.nodeId } : {}) }); } },
+                            busy && pendingAction === '/apply' && status.mode === 'local' && localDownload ? localStartLabel
+                                : status.phase === 'error' ? '重试已保存连接' : '启动已保存连接') : null,
                         !status.legacy && !showForm ? h('button', { className: 'dcr-btn', disabled, onClick: editConnection }, '修改连接') : null,
                         status.configured && !status.legacy && !showForm ? h('button', { className: 'dcr-btn d', disabled: disabled || !status.enabled, onClick: () => { void write('/stop', {}); } },
                             busy && pendingAction === '/stop' ? '正在停止…' : '停止连接') : null,
@@ -1029,7 +1047,8 @@
                         savedCredentials ? h('p', { className: 'dcr-muted' }, 'Token 留空时使用为此节点保存的凭据。') : null,
                     ) : h('div', { className: 'dcr-connection-section' },
                         h('div', { className: 'dcr-connection-fields' }, field('审核身份', 'reviewIdentity')),
-                        status?.localAvailable === false ? h('p', { className: 'dcr-muted' }, '此插件包未包含本机中央服务。请使用本机整合包，或连接已有中央。') : null,
+                        localDownload ? h('p', { className: 'dcr-muted' }, '首次启动需确认下载本机中央运行包。')
+                            : localUnavailable ? h('p', { className: 'dcr-muted' }, '此插件包未包含本机中央服务。请使用本机整合包，或连接已有中央。') : null,
                         status?.configured && status.mode === 'local' ? h('p', { className: 'dcr-muted' }, '本机审核身份已初始化。') : null,
                     ),
                     visibleFailure && (formFailure || !status?.configured) ? feedback(visibleFailure) : null,
@@ -1040,7 +1059,7 @@
                     ) : null,
                     h('div', { className: 'dcr-connection-actions' },
                         h('button', { className: 'dcr-btn p', disabled: disabled || (status?.phase === 'ready' && unchanged)
-                            || (draft.mode === 'local' ? status?.localAvailable === false || !draft.reviewIdentity.trim() : !draft.centerUrl.trim() || check?.registrationCompatibility === 'incompatible'), onClick: apply }, applyLabel),
+                            || (draft.mode === 'local' ? localUnavailable || !draft.reviewIdentity.trim() : !draft.centerUrl.trim() || check?.registrationCompatibility === 'incompatible'), onClick: apply }, applyLabel),
                         draft.mode === 'external' ? h('button', { className: 'dcr-btn', disabled: disabled || !draft.centerUrl.trim(), onClick: () => { void write('/test', credentials, true); } },
                             pendingAction === '/test' ? '正在检查…' : '检查连接') : null,
                         editing && status?.configured ? h('button', { className: 'dcr-btn g', disabled: working, onClick: cancelEditing }, '取消修改') : null,

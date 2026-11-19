@@ -2,12 +2,19 @@ import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 
-export async function servePreviewMarket(manifest, archive) {
+export const CENTRAL_ARCHIVE_PATH = '/central-runtime.tgz';
+export const CENTRAL_VERSION_PATH = '/central-version.json';
+
+export async function servePreviewMarket(manifest, archive, central) {
     const server = createServer();
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
 
     const origin = `http://127.0.0.1:${server.address().port}`;
+    if (typeof archive === 'function') {
+        try { archive = await archive(origin); }
+        catch (error) { server.close(); throw error; }
+    }
     const { name, version, description } = manifest;
     const tarballPath = `/${name}/-/${name}-${version}.tgz`;
     const startedAt = new Date();
@@ -41,6 +48,10 @@ export async function servePreviewMarket(manifest, archive) {
         [`/${name}`, ['application/json', Buffer.from(JSON.stringify(metadata))]],
         [tarballPath, ['application/octet-stream', archive]],
     ]);
+    if (central) {
+        routes.set(CENTRAL_ARCHIVE_PATH, ['application/octet-stream', central.archive]);
+        routes.set(CENTRAL_VERSION_PATH, ['application/json', Buffer.from(JSON.stringify({ version: central.version }))]);
+    }
     server.on('request', (request, response) => {
         if (request.method !== 'GET' && request.method !== 'HEAD') {
             response.writeHead(405, { Allow: 'GET, HEAD' }).end();

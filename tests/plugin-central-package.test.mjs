@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
 import { fork, spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
+import { existsSync } from 'node:fs';
 import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { setupCentral } from './central-helpers.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 
@@ -174,4 +179,123 @@ test('普通插件离线安装仍不携带中央运行目录或 fastify，源码
     const installed = JSON.parse(await readFile(path.join(directory, 'node_modules/dsh-code-review/package.json'), 'utf8'));
     assert.equal(installed.private, true);
     assert.equal(manifest.files.includes('central-runtime'), false);
+});
+
+test('可下载插件隔离安装后须明确确认，校验失败保留原连接，成功后可离线恢复', async t => {
+    npm('npm run pack:downloadable -- https://example.test/releases/download/v0.1.0 https://example.test/releases/latest/download/dsh-review-central-version.json', root);
+    let controller;
+    let repair;
+    let offline;
+    t.after(async () => { await offline?.stop(); await repair?.stop(); await controller?.stop(); });
+    const directory = await install(t, 'dsh-code-review-downloadable-0.3.0.tgz');
+    const runtimeArchive = await readFile(path.join(root, 'dist/dsh-review-server-0.1.0.tgz'));
+    const versionFile = JSON.parse(await readFile(path.join(root, 'dist/dsh-review-central-version.json'), 'utf8'));
+    const pluginRoot = path.join(directory, 'node_modules', 'dsh-code-review');
+    const sourceFile = path.join(pluginRoot, 'assets/central-runtime-source.json');
+    const source = JSON.parse(await readFile(sourceFile, 'utf8'));
+    assert.deepEqual(source, {
+        version: versionFile.version, size: runtimeArchive.length, sha256: createHash('sha256').update(runtimeArchive).digest('hex'),
+        url: 'https://example.test/releases/download/v0.1.0/dsh-review-server-0.1.0.tgz',
+        versionUrl: 'https://example.test/releases/latest/download/dsh-review-central-version.json',
+    });
+    assert.equal(existsSync(path.join(pluginRoot, 'central-runtime')), false);
+    assert.equal(existsSync(path.join(pluginRoot, 'node_modules', 'tar', 'package.json')), true);
+
+    const corrupted = Buffer.from(runtimeArchive);
+    corrupted[corrupted.length - 1] ^= 1;
+    let corrupt = true;
+    let count = 0;
+    let versionResponse;
+    const server = createServer((request, response) => {
+        if (request.url === '/central.tgz') {
+            count++;
+            response.end(corrupt ? corrupted : runtimeArchive);
+        } else if (request.url === '/latest.json') {
+            versionResponse = response;
+        } else response.writeHead(404).end();
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const closeSource = async () => {
+        if (!server.listening) return;
+        server.closeAllConnections();
+        await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    };
+    t.after(closeSource);
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    await writeFile(sourceFile, JSON.stringify({ ...source, url: `${origin}/central.tgz`, versionUrl: `${origin}/latest.json` }));
+
+    const { app } = await setupCentral(t);
+    const centerUrl = await app.listen({ host: '127.0.0.1', port: 0 });
+    const node = app.database.createNode('安装包下载测试');
+    const { ConnectionController } = await import(pathToFileURL(path.join(pluginRoot, 'dist/connection/controller.js')).href);
+    const data = path.join(directory, 'dsh-state');
+    controller = new ConnectionController({ directory: data, candidates: async () => [] });
+    await controller.init();
+    const status = await controller.status();
+    assert.equal(status.localAvailable, false);
+    assert.equal(status.localRuntimeDownload.sha256, source.sha256);
+    await controller.apply({ mode: 'external', centerUrl, ...node });
+    const configFile = path.join(data, 'connection.json');
+    const previous = await readFile(configFile, 'utf8');
+    const local = { mode: 'local', reviewIdentity: '按需启动审核者' };
+    await assert.rejects(controller.apply(local), /确认下载/);
+    await assert.rejects(controller.apply({ ...local, confirmRuntimeDownload: '0'.repeat(64) }), /确认下载/);
+    assert.equal(count, 0);
+    const confirmed = { ...local, confirmRuntimeDownload: source.sha256 };
+    await assert.rejects(controller.apply(confirmed), /SHA-256 校验失败/);
+    assert.equal(count, 1);
+    assert.equal(await readFile(configFile, 'utf8'), previous);
+    const preserved = await controller.status();
+    assert.equal(preserved.mode, 'external');
+    assert.equal(preserved.phase, 'ready');
+    assert.equal(preserved.nodeOnline, true);
+
+    corrupt = false;
+    await controller.apply(confirmed);
+    const ready = await controller.status();
+    assert.equal(ready.phase, 'ready');
+    assert.equal(ready.nodeOnline, true);
+    assert.equal(ready.localAvailable, true);
+    assert.equal(ready.localRuntimeDownload, undefined);
+    assert.equal(ready.localRuntimeUpdate, undefined);
+    assert.equal((await fetch(new URL('/', ready.centerUrl))).status, 200);
+    for (let attempt = 0; !versionResponse && attempt < 20; attempt++) await delay(25);
+    assert.ok(versionResponse, '中央已就绪后应检查版本');
+    versionResponse.end(JSON.stringify({ version: '0.2.0' }));
+    let update;
+    for (let attempt = 0; !update && attempt < 20; attempt++) {
+        update = (await controller.status()).localRuntimeUpdate;
+        if (!update) await delay(25);
+    }
+    assert.deepEqual(update, { currentVersion: source.version, latestVersion: '0.2.0' });
+    assert.equal(count, 2);
+
+    await controller.stop();
+    const cacheRoot = path.join(data, 'central-runtimes');
+    const { folder } = JSON.parse(await readFile(path.join(cacheRoot, 'installed.json'), 'utf8'));
+    await writeFile(path.join(cacheRoot, folder, 'package/node_modules/fastify/package.json'), '{}');
+    repair = new ConnectionController({ directory: data, candidates: async () => [] });
+    await repair.init();
+    const damaged = await repair.status();
+    assert.equal(damaged.phase, 'error');
+    assert.equal(damaged.localAvailable, false);
+    assert.equal(damaged.localRuntimeDownload.sha256, source.sha256);
+    assert.equal(count, 2, '自动恢复不能下载损坏的运行包');
+    await repair.apply(confirmed);
+    assert.equal((await repair.status()).centralId, ready.centralId);
+    assert.equal(count, 3);
+    await repair.stop();
+
+    await closeSource();
+    await writeFile(sourceFile, JSON.stringify({
+        ...source, version: '0.2.0', sha256: '0'.repeat(64), url: `${origin}/new-central.tgz`, versionUrl: `${origin}/latest.json`,
+    }));
+    offline = new ConnectionController({ directory: data, candidates: async () => [] });
+    await offline.init();
+    const restored = await offline.status();
+    assert.equal(restored.phase, 'ready');
+    assert.equal(restored.centralId, ready.centralId);
+    assert.equal(restored.nodeId, ready.nodeId);
+    assert.equal(restored.localAvailable, true);
 });
