@@ -186,7 +186,7 @@ Invoke-RestMethod http://127.0.0.1:3081/health
 npx --no-install dsh-review-central serve --data-dir C:/dsh-review-data --host 127.0.0.1 --port 3081 --public-url https://review.example.com
 ```
 
-配置 HTTPS 的 `--public-url` 后，省略 `--host` 默认监听 `0.0.0.0`。反向代理与中央部署在同一台机器时，可像上例一样显式指定 `--host 127.0.0.1`。独立中央始终要求登录。证书与 HTTPS 由反向代理提供。
+配置 HTTPS 的 `--public-url` 后，省略 `--host` 默认监听 `0.0.0.0`。反向代理与中央部署在同一台机器时，可像上例一样显式指定 `--host 127.0.0.1`。独立中央始终要求登录。证书与 HTTPS 由反向代理提供，中央后端使用 HTTP。后端监听非回环地址时，将端口访问限制为受信反向代理的来源地址，浏览器通过 HTTPS 公开地址访问。
 
 代理请求体上限至少允许 8 MiB。中央普通 JSON 上限 2 MiB，附件上限 8 MiB。用服务管理器维护进程，并固定数据目录、启动参数与服务账号。
 

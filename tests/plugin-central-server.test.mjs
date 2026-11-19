@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { get } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { approvePayload, bindProject, registerNode, setupCentral } from './central-helpers.mjs';
 
@@ -410,11 +411,19 @@ test('本机中央经 IPC 零项目启动并在父 IPC 断开后退出', async t
     assert.equal(typeof ready.token, 'string');
     const info = await fetch(`${ready.centerUrl}/api/v1/info`).then(response => response.json());
     assert.equal(info.centralId, ready.centralId);
-    const response = await fetch(`${ready.centerUrl}/api/v1/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'local', password }) });
+    const login = value => fetch(`${ready.centerUrl}/api/v1/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'local', password: value }) });
+    const response = await login(password);
+    const denied = await login('incorrect-password-123');
     assert.equal(response.status, 200);
     assert.equal((await response.json()).user.reviewIdentity, reviewIdentity);
+    await denied.arrayBuffer();
     owned.child.disconnect();
     assert.deepEqual(await boundedExit(owned), { code: 0, signal: null });
+    assert.equal(denied.status, 401);
+    assert.equal(response.headers.has('set-cookie'), false);
+    const database = new DatabaseSync(path.join(dataDir, 'central.sqlite'), { readOnly: true });
+    try { assert.equal(database.prepare('SELECT COUNT(*) AS count FROM sessions').get().count, 0); }
+    finally { database.close(); }
     assert.equal(owned.output().includes(password), false);
     assert.equal(owned.output().includes(ready.token), false);
     await assert.rejects(fetch(`${ready.centerUrl}/health`));

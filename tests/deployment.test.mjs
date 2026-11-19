@@ -5,6 +5,7 @@ import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'nod
 import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
+import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createGitFixture, runCommand } from './helpers.mjs';
@@ -73,7 +74,7 @@ async function launch(t, target) {
     const args = process.platform === 'win32' ? ['/d', '/s', '/c', `""${path.join(target, 'start.cmd')}""`] : [];
     const child = spawn(command, args, { cwd: os.tmpdir(), stdio: ['ignore', 'pipe', 'pipe'], windowsVerbatimArguments: process.platform === 'win32' });
     processes.set(t, [...(processes.get(t) ?? []), { child, target }]);
-    return await new Promise((resolve, reject) => {
+    const listening = await new Promise((resolve, reject) => {
         let stderr = '', stdout = '';
         const timer = setTimeout(() => reject(new Error('启动超时')), 15000);
         child.once('error', reject);
@@ -85,6 +86,13 @@ async function launch(t, target) {
         });
         child.once('exit', code => { clearTimeout(timer); reject(new Error(`启动提前结束：${code}\n${stderr}`)); });
     });
+    const marker = path.join(target, '.running.json');
+    const deadline = Date.now() + 5000;
+    while (!existsSync(marker)) {
+        assert.ok(Date.now() < deadline && child.exitCode === null && child.signalCode === null, '启动脚本未发布运行标记');
+        await delay(25);
+    }
+    return listening;
 }
 
 test('部署和启动是不同入口，启动拒绝 Git 更新参数，Node 低版本被拒绝', async () => {
@@ -173,19 +181,19 @@ test('中央重复部署替换全部程序但保留数据库、账号和配置�
 });
 
 test('独立中央以 HTTPS 公开地址默认监听外部网卡，缺省监听配置时仍须登录', async t => {
-    const { target, archive } = await deployCentral(t, ['--public-url', 'https://review.example.test']);
+    const publicUrl = 'https://review.example.test';
+    const { target } = await deployCentral(t, ['--public-url', publicUrl]);
     const manifest = path.join(target, 'deployment.json');
     const config = JSON.parse(await readFile(manifest, 'utf8'));
     assert.equal(config.host, '0.0.0.0');
-    successful(run(deploy, ['--target', target, '--package', archive, '--host', '127.0.0.1']));
-    assert.equal(JSON.parse(await readFile(manifest, 'utf8')).host, '127.0.0.1');
-    const explicit = await launch(t, target);
-    assert.equal(explicit.host, '127.0.0.1');
-    assert.equal((await fetch(`${explicit.url}/api/v1/workbench`)).status, 401);
-    const { childPid } = JSON.parse(await readFile(path.join(target, '.running.json'), 'utf8'));
-    const stopped = once(explicit.child, 'exit');
-    process.kill(childPid, 'SIGTERM');
-    await stopped;
+    await t.test('显式回环监听优先并继续要求登录', async t => {
+        const { target: explicitTarget, archive } = await deployCentral(t, ['--public-url', publicUrl]);
+        successful(run(deploy, ['--target', explicitTarget, '--package', archive, '--host', '127.0.0.1']));
+        assert.equal(JSON.parse(await readFile(path.join(explicitTarget, 'deployment.json'), 'utf8')).host, '127.0.0.1');
+        const explicit = await launch(t, explicitTarget);
+        assert.equal(explicit.host, '127.0.0.1');
+        assert.equal((await fetch(`${explicit.url}/api/v1/workbench`)).status, 401);
+    });
     delete config.host;
     await writeFile(manifest, JSON.stringify(config));
     const { host, url } = await launch(t, target);

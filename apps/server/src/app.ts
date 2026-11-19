@@ -96,9 +96,15 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
         registrationCapabilities: { executionConfigHash: true } }));
     app.post('/api/v1/auth/login', async (req, reply) => {
         const input = body(req);
-        const result = database.login(textValue(input.username, 'username', 80), textValue(input.password, 'password', 256));
+        const username = textValue(input.username, 'username', 80);
+        const password = textValue(input.password, 'password', 256);
+        if (localSession) {
+            database.authenticateUser(username, password);
+            return { ...localSession, localAccess: true };
+        }
+        const result = database.login(username, password);
         reply.header('set-cookie', `dsh_review_session=${result.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${options.secureCookies ? '; Secure' : ''}`);
-        return localSession ? { ...localSession, localAccess: true } : { user: result.user, csrfToken: result.csrfToken };
+        return { user: result.user, csrfToken: result.csrfToken };
     });
     app.get('/api/v1/auth/session', async req => {
         const context = req as RequestContext;
