@@ -7,6 +7,7 @@ import { CentralDatabase, CentralError, type User } from './database.js';
 import { Commands } from './commands.js';
 import { Snapshots } from './snapshots.js';
 import { AuditSchedules } from './audit-schedule.js';
+import { secret } from './auth.js';
 
 interface RequestContext extends FastifyRequest {
     actor: User | null;
@@ -32,8 +33,24 @@ const params = (req: FastifyRequest): Record<string, string> => req.params as Re
 const body = (req: FastifyRequest): JsonRecord => record(req.body, 'body');
 
 export async function createCentralApp(options: CentralOptions): Promise<CentralApp> {
+    return buildCentralApp(options, new CentralDatabase(options.dataDir, options.clock));
+}
+
+export async function createOwnedCentralApp(dataDir: string, input: Parameters<CentralDatabase['initializeOwned']>[0]) {
+    const database = new CentralDatabase(dataDir);
+    try {
+        const { user, node } = database.initializeOwned(input);
+        const app = await buildCentralApp({ dataDir }, database, user);
+        return { app, node };
+    } catch (error) {
+        database.close();
+        throw error;
+    }
+}
+
+async function buildCentralApp(options: CentralOptions, database: CentralDatabase, localUser?: User): Promise<CentralApp> {
     const app = Fastify({ logger: false, bodyLimit: 2 * 1024 * 1024 });
-    const database = new CentralDatabase(options.dataDir, options.clock);
+    const localSession = localUser && { user: localUser, csrfToken: secret() };
     const schedules = new AuditSchedules(database);
     const commands = new Commands(database, schedules), snapshots = new Snapshots(database, schedules);
     app.decorate('database', database);
@@ -46,12 +63,16 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
     app.addHook('onRequest', async (raw, reply) => {
         const req = raw as RequestContext;
         reply.header('x-content-type-options', 'nosniff').header('x-frame-options', 'SAMEORIGIN').header('cache-control', 'no-store');
+        if (localSession && (req.raw.socket.localAddress !== '127.0.0.1'
+            || req.headers.host !== `127.0.0.1:${req.raw.socket.localPort}`)) {
+            throw new CentralError(403, 'forbidden', '本机中央只接受回环地址访问');
+        }
         const pathname = req.routeOptions.url ?? new URL(req.url, 'http://local').pathname;
         if (pathname.startsWith('/node-api/')) {
             const token = /^Bearer ([a-zA-Z0-9_-]+)$/.exec(String(req.headers.authorization ?? ''))?.[1] ?? '';
             req.nodeId = database.nodeIdentity(token);
         } else if (pathname.startsWith('/api/v1/') && !['/api/v1/auth/login', '/api/v1/info'].includes(pathname)) {
-            const session = database.session(sessionToken(req));
+            const session = localSession ?? database.session(sessionToken(req));
             req.actor = session.user;
             req.csrfToken = session.csrfToken;
             if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method) && req.headers['x-csrf-token'] !== session.csrfToken) {
@@ -77,11 +98,11 @@ export async function createCentralApp(options: CentralOptions): Promise<Central
         const input = body(req);
         const result = database.login(textValue(input.username, 'username', 80), textValue(input.password, 'password', 256));
         reply.header('set-cookie', `dsh_review_session=${result.token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${options.secureCookies ? '; Secure' : ''}`);
-        return { user: result.user, csrfToken: result.csrfToken };
+        return localSession ? { ...localSession, localAccess: true } : { user: result.user, csrfToken: result.csrfToken };
     });
     app.get('/api/v1/auth/session', async req => {
         const context = req as RequestContext;
-        return { user: context.actor, csrfToken: context.csrfToken };
+        return { user: context.actor, csrfToken: context.csrfToken, ...(localSession && { localAccess: true }) };
     });
     app.post('/api/v1/auth/logout', async (req, reply) => {
         database.logout(sessionToken(req));

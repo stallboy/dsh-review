@@ -19,11 +19,11 @@ function independentData(target, directory) {
 }
 
 async function centralConfig(values, previous, target) {
-    const host = values.host ?? previous?.host ?? '127.0.0.1';
     const port = Number(values.port ?? previous?.port ?? 3081);
     if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('端口须为 0～65535 的整数');
     const publicUrl = values['public-url'] ?? previous?.publicUrl ?? '';
     if (publicUrl && new URL(publicUrl).protocol !== 'https:') throw new Error('public-url 必须使用 HTTPS');
+    const host = values.host ?? previous?.host ?? (publicUrl ? '0.0.0.0' : '127.0.0.1');
     if (!['127.0.0.1', '::1', 'localhost'].includes(host) && !publicUrl) throw new Error('非回环地址必须配置 --public-url https://... 和 TLS 反向代理');
     return { schemaVersion: 1, role: 'central', dataDir: independentData(target, values['data-dir'] ?? previous?.dataDir ?? path.join(target, 'data')),
         host, port, publicUrl };

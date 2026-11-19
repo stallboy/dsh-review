@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { fork } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { get } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -417,6 +418,38 @@ test('本机中央经 IPC 零项目启动并在父 IPC 断开后退出', async t
     assert.equal(owned.output().includes(password), false);
     assert.equal(owned.output().includes(ready.token), false);
     await assert.rejects(fetch(`${ready.centerUrl}/health`));
+});
+
+test('本机工作台无需账号会话，写请求仍校验 CSRF，节点仍校验凭据', async t => {
+    const dataDir = await ownedDirectory(t);
+    const owned = ownedProcess(t, { type: 'start', dataDir, password, reviewIdentity });
+    const ready = await owned.message;
+    assert.equal(ready.type, 'ready');
+    const url = ready.centerUrl;
+    const session = await fetch(`${url}/api/v1/auth/session`);
+    assert.equal(session.status, 200);
+    assert.equal(session.headers.has('set-cookie'), false);
+    const access = await session.json();
+    assert.equal(access.localAccess, true);
+    assert.equal(access.user.reviewIdentity, reviewIdentity);
+    assert.ok(access.csrfToken);
+    assert.deepEqual(await fetch(`${url}/api/v1/workbench`).then(response => response.json()), { projects: [] });
+    const rejectedHost = await new Promise((resolve, reject) => {
+        get(`${url}/api/v1/auth/session`, { headers: { host: 'other.example' } }, response => {
+            response.resume();
+            resolve(response.statusCode);
+        }).on('error', reject);
+    });
+    assert.equal(rejectedHost, 403);
+    const post = (route, body, headers) => fetch(`${url}${route}`, {
+        method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body),
+    });
+    assert.equal((await post('/api/v1/nodes', { name: '本地节点' })).status, 403);
+    assert.equal((await post('/api/v1/nodes', { name: '本地节点' }, { 'x-csrf-token': access.csrfToken })).status, 201);
+    assert.equal((await post('/node-api/v1/status', {})).status, 401);
+    assert.equal((await post('/node-api/v1/status', {}, { authorization: `Bearer ${ready.token}` })).status, 200);
+    owned.child.disconnect();
+    assert.deepEqual(await boundedExit(owned), { code: 0, signal: null });
 });
 
 test('本机中央重启核验已有身份和节点，停止消息释放进程', async t => {

@@ -125,21 +125,20 @@ export class CentralDatabase {
         return { nodeId, token };
     }
 
-    initializeOwned(input: { reviewIdentity: string; password: string; node?: { nodeId: string; token: string } }): { nodeId: string; token: string } {
+    initializeOwned(input: { reviewIdentity: string; password: string; node?: { nodeId: string; token: string } }): { user: User; node: { nodeId: string; token: string } } {
         textValue(input.reviewIdentity, 'reviewIdentity', 160);
         textValue(input.password, 'password', 256);
         return this.transaction(() => {
             const existing = this.sql.prepare("SELECT * FROM users WHERE username='local'").get() as Row | undefined;
-            if (existing) {
-                if (existing.review_identity !== input.reviewIdentity || !passwordMatches(input.password, existing.salt, existing.password_hash)) {
-                    throw new CentralError(401, 'identity_mismatch', '本机账号凭据或审核身份不一致');
-                }
-            } else this.createUser({ username: 'local', password: input.password, reviewIdentity: input.reviewIdentity });
-            if (input.node) {
-                if (this.nodeIdentity(input.node.token) !== input.node.nodeId) throw new CentralError(401, 'identity_mismatch', '本机节点身份不一致');
-                return input.node;
+            if (existing && (existing.review_identity !== input.reviewIdentity || !passwordMatches(input.password, existing.salt, existing.password_hash))) {
+                throw new CentralError(401, 'identity_mismatch', '本机账号凭据或审核身份不一致');
             }
-            return this.createNode('本机插件节点');
+            const user = existing ? { userId: existing.user_id, username: existing.username, reviewIdentity: existing.review_identity }
+                : this.createUser({ username: 'local', password: input.password, reviewIdentity: input.reviewIdentity });
+            if (input.node && this.nodeIdentity(input.node.token) !== input.node.nodeId) {
+                throw new CentralError(401, 'identity_mismatch', '本机节点身份不一致');
+            }
+            return { user, node: input.node ?? this.createNode('本机插件节点') };
         });
     }
 

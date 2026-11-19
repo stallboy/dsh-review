@@ -71,6 +71,7 @@ export class ConnectionController {
     private secrets: ConnectionSecrets = { password: randomBytes(32).toString('base64url'), nodes: {} };
     private node: ManagedHandle | null = null;
     private readonly local: LocalCentralProcess;
+    private localAccess = false;
     private readonly runtime: LocalCentralRuntime;
     private runtimeUpdate: Awaited<ReturnType<LocalCentralRuntime['newerVersion']>>;
     private readonly gateway: CentralGateway;
@@ -299,6 +300,7 @@ export class ConnectionController {
                     throw new ConnectionIssueError('startup', 'local_start_failed', '本机中央启动失败', this.describe(error, '无法启动本机中央').message);
                 });
                 if (config.centralId && config.centralId !== ready.centralId) throw new Error('本机中央数据身份已变化，拒绝复用旧节点和执行记录');
+                this.localAccess = ready.localAccess === true;
                 config.centerUrl = normalizeCenterUrl(ready.centerUrl);
                 config.centralId = ready.centralId;
                 this.secrets.localCentralId = ready.centralId;
@@ -345,7 +347,8 @@ export class ConnectionController {
 
     private connectGateway(): void {
         const config = this.config!;
-        this.gateway.connect(config.centerUrl, config.centralId, config.mode === 'local' ? async () => {
+        // 已缓存的旧版运行包仍依赖网关代登录。
+        this.gateway.connect(config.centerUrl, config.centralId, config.mode === 'local' && !this.localAccess ? async () => {
             const response = await fetch(new URL('api/v1/auth/login', config.centerUrl), { method: 'POST',
                 headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: 'local', password: this.secrets.password }),
                 redirect: 'error', signal: AbortSignal.timeout(5000) });
@@ -599,6 +602,7 @@ export class ConnectionController {
 
     private async shutdown(releaseLock = true): Promise<void> {
         this.phase = 'stopped';
+        this.localAccess = false;
         this.gateway.close();
         const node = this.node;
         this.node = null;

@@ -8,7 +8,7 @@ import { CentralDatabase } from './database.js';
 async function main(): Promise<void> {
     const { positionals, values } = parseArgs({ allowPositionals: true, options: {
         'data-dir': { type: 'string' }, username: { type: 'string' }, 'review-identity': { type: 'string' },
-        name: { type: 'string' }, host: { type: 'string', default: '127.0.0.1' },
+        name: { type: 'string' }, host: { type: 'string' },
         port: { type: 'string', default: '3081' }, 'public-url': { type: 'string' },
     } });
     const command = positionals[0] ?? 'serve';
@@ -30,14 +30,18 @@ async function main(): Promise<void> {
     if (command !== 'serve') throw new Error('命令须为 serve、user-add 或 node-add');
     const port = Number(values.port);
     if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('端口无效');
-    const host = values.host!;
-    const local = ['127.0.0.1', '::1', 'localhost'].includes(host);
     const publicUrl = values['public-url'] ? new URL(values['public-url']) : undefined;
-    if (!local && publicUrl?.protocol !== 'https:') throw new Error('跨机器部署需要 --public-url https://...，并配置 TLS 反向代理');
-    const app = await createCentralApp({ dataDir, secureCookies: publicUrl?.protocol === 'https:' });
+    const secureCookies = publicUrl?.protocol === 'https:';
+    const host = values.host ?? (secureCookies ? '0.0.0.0' : '127.0.0.1');
+    if (!['127.0.0.1', '::1', 'localhost'].includes(host) && !secureCookies) throw new Error('跨机器部署需要 --public-url https://...，并配置 TLS 反向代理');
+    const app = await createCentralApp({ dataDir, secureCookies });
     for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => { void app.close(); });
     const address = await app.listen({ host, port });
     console.log(`DSH 评审中央服务：${publicUrl?.href ?? address}`);
+    const bound = app.server.address();
+    if (publicUrl && bound && typeof bound !== 'string') {
+        console.log(`监听地址：${bound.family === 'IPv6' ? `[${bound.address}]` : bound.address}:${bound.port}`);
+    }
 }
 
 main().catch(error => {

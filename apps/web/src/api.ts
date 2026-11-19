@@ -2,7 +2,7 @@ import type { CommandRecord, ProjectRecord, ProjectSnapshot, NodeRecord } from '
 import type { CandidateSummary } from '@dsh-review/protocol';
 import type { QueryClient } from '@tanstack/react-query';
 
-export interface Session { user: { userId: string; username: string; reviewIdentity: string }; csrfToken: string }
+export interface Session { user: { userId: string; username: string; reviewIdentity: string }; csrfToken: string; localAccess?: true }
 export interface ProjectView { project: ProjectRecord; online: boolean; compatible: boolean; freshness: 'not_synced' | 'synced' | 'offline' | 'stale'; writable: boolean; lastSyncedAt: string | null; vcsSnapshot: string | null; snapshot?: ProjectSnapshot }
 export interface AuditScheduleSettings { enabled: boolean; startTime: string; timeZone: string }
 export interface AuditSchedule extends AuditScheduleSettings {

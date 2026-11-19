@@ -25,7 +25,8 @@ async function main() {
         await assertStopped(target);
         const cli = path.join(target, 'app/node_modules/@dsh-review/server/dist/cli.js');
         let command = process.execPath;
-        let args = ['serve', '--data-dir', config.dataDir, '--host', config.host, '--port', String(config.port)];
+        let args = ['serve', '--data-dir', config.dataDir, '--port', String(config.port)];
+        if (config.host !== undefined) args.push('--host', config.host);
         if (config.publicUrl) args.push('--public-url', config.publicUrl);
         if (config.role === 'central') {
             if (!existsSync(cli)) throw new Error('中央程序不完整，请重新部署');
