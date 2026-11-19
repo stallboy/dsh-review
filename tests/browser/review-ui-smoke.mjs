@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import { readFile, writeFile, mkdtemp, rm, mkdir, access } from 'node:fs/promises';
 import path from 'node:path';
 import { build } from 'esbuild';
+import { parseSections } from '../../packages/dsh-plugin/dist/host/frontmatter.js';
 
 const root = process.cwd();
 const browser = process.env.DSH_REVIEW_BROWSER ?? 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
@@ -10,6 +11,13 @@ await access(browser).catch(() => { throw new Error('请通过 DSH_REVIEW_BROWSE
 await mkdir(path.join(root, '.tmp'), { recursive: true });
 const profile = await mkdtemp(path.join(root, '.tmp', 'edge-review-'));
 const patch = ['a.ts', 'b.ts'].map(name => `diff --git a/${name} b/${name}\n--- a/${name}\n+++ b/${name}\n@@ -1 +1 @@\n-old\n+new\n`).join('');
+const sections = parseSections([
+    '# 问题与影响', '- 第一项', '- 第二项', '',
+    '# 根因', '**状态检查缺少同步**', '',
+    '# 当前修复方案', '1. **统一状态流转**', '2. 补充测试', '',
+    '<div data-raw-html>原始 HTML</div>', '',
+    '# 验证证据', '```sh', '# 保留命令注释', '  npm test', '```',
+].join('\n'));
 const bootstrap = `
 import React from 'react';
 import {createRoot} from 'react-dom/client';
@@ -37,7 +45,7 @@ window.fetch=async(url,init={})=>{
         }
         value={...status};
     }else if(String(url).includes('/candidate?')){
-        value={data:{candidate:{id:'2026-11/demo',meta:{title:'Demo',owner:'张三',status:'pending',currentRevision:2,updatedAt:'2026-11-17T00:00:00Z',humanDecisions:[],comments:[],revisions:[{id:1},{id:2}],gateChecks:[],approval:null},sections:{},humanJudgmentDeclared:true,humanJudgment:[]},patchText:patch,comments:[],validation:[],isBaseBehind:false}};
+        value={data:{candidate:{id:'2026-11/demo',meta:{title:'Demo',owner:'张三',status:'pending',currentRevision:2,updatedAt:'2026-11-17T00:00:00Z',humanDecisions:[],comments:[],revisions:[{id:1},{id:2}],gateChecks:[],approval:null},sections:{...${JSON.stringify(sections)},...(test.emptySolution ? {solution:""} : {})},humanJudgmentDeclared:true,humanJudgment:[]},patchText:patch,comments:[],validation:[],isBaseBehind:false}};
     }else if(String(url).includes('/diff?')) value={data:{unifiedDiff:patch}};
     else value={project:{projectId:'project-a',name:'Demo',target:'main',vcsType:'git'},writable:true,vcsSnapshot:'v1',freshness:'synced',online:true};
     return new Response(JSON.stringify(value),{status:200,headers:{'content-type':'application/json'}});
@@ -107,6 +115,12 @@ try {
     await evaluate('test.root.unmount();for(const clean of test.cleanups.reverse())clean();test.mountCandidate()');
     await check('卸载移除样式并恢复底部', `document.getElementById('seat').offsetHeight===180&&!document.querySelector('style[data-dsh-code-review]')`);
     await waitFor(`document.body.textContent.includes('方案与证据')`);
+    await check('问题描述渲染无序列表', `[...document.querySelectorAll('#candidate-mount article ul > li')].map(item=>item.textContent).join(',')==='第一项,第二项'`);
+    await check('根本原因、修复方案渲染加粗和有序列表', `[...document.querySelectorAll('#candidate-mount article strong')].map(item=>item.textContent).join(',')==='状态检查缺少同步,统一状态流转' && document.querySelectorAll('#candidate-mount article ol > li').length===2`);
+    await check('验证证据渲染代码块并保留注释和缩进', `document.querySelector('#candidate-mount article pre > code.language-sh')?.textContent==='# 保留命令注释\\n  npm test\\n'`);
+    await check('原始 HTML 不渲染', `!document.querySelector('[data-raw-html]') && !document.querySelector('#candidate-mount').textContent.includes('原始 HTML')`);
+    await evaluate('test.emptySolution=true;test.queryClient.invalidateQueries()');
+    await waitFor(`[...document.querySelectorAll('#candidate-mount article p')].some(item=>item.textContent==='未提供')`);
     await click('代码差异');
     await waitFor(`document.querySelectorAll('#candidate-mount details:has(> summary > span)[open]').length===2`);
     await evaluate(`document.querySelector('#candidate-mount details:has(> summary > span) summary').focus()`);

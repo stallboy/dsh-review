@@ -93,6 +93,13 @@ a.projectCard:hover { text-decoration: none; border-color: #8fc4c5; }
 .document h3 { margin-bottom: 10px; }
 .document p { white-space: pre-wrap; font-size: 13px; color: #48596a; }
 .document pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; color: #4c5b69; margin: 15px 0; }
+.markdown { font-size: 13px; color: #48596a; }
+.markdown p { white-space: normal; color: inherit; }
+.markdown p + p { margin-top: 10px; }
+.markdown :is(ol, ul) { padding-inline-start: 1.5em; }
+.markdown pre { padding: 12px; border-radius: 6px; background: #f6f7f9; white-space: pre; overflow-x: auto; overflow-wrap: normal; }
+.markdown > :first-child { margin-top: 0; }
+.markdown > :last-child { margin-bottom: 0; }
 .taskColumns { display: grid; grid-template-columns: minmax(280px,.8fr) minmax(0,1.7fr); gap: 22px; align-items: start; }
 .logs { background: #18232e; border-radius: 6px; color: #d5e2e6; padding: 17px; font-size: 12px; line-height: 1.8; max-height: 500px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
 .mono { font-family: Consolas, monospace; font-size: 11px; overflow-wrap: anywhere; }

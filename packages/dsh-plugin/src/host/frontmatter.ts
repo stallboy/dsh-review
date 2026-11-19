@@ -454,19 +454,26 @@ export function parseSections(body: string): ReviewSections {
   const lines = body.replace(/\r\n/g, '\n').split('\n');
   let current: keyof ReviewSections | null = null;
   let buffer: string[] = [];
+  let fence = '';
   const flush = (): void => {
     if (current === null) return;
     sections[current] = buffer.join('\n').trim();
   };
   for (const line of lines) {
-    const heading = /^#\s+(.+?)\s*$/.exec(line);
-    const name = heading?.[1];
-    if (name) {
-      flush();
-      const known = SECTION_NAMES.find(([, title]) => title === name);
-      current = known ? known[0] : null;
-      buffer = [];
-      continue;
+    const [, marker = '', info = ''] = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line) ?? [];
+    if (fence) {
+        if (marker[0] === fence[0] && marker.length >= fence.length && !info.trim()) fence = '';
+    } else if (marker && (marker[0] === '~' || !info.includes('`'))) {
+        fence = marker;
+    } else {
+        const name = /^#\s+(.+?)\s*$/.exec(line)?.[1];
+        if (name) {
+            flush();
+            const known = SECTION_NAMES.find(([, title]) => title === name);
+            current = known ? known[0] : null;
+            buffer = [];
+            continue;
+        }
     }
     if (current !== null) buffer.push(line);
   }

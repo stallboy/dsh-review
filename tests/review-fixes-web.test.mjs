@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 import * as jsx from 'react/jsx-runtime';
+import Markdown from 'react-markdown';
 import ts from 'typescript';
 import { parseDiff } from '../apps/web/src/diff-parser.ts';
 
@@ -62,7 +63,7 @@ function candidateFixture(extra = {}) {
             : options.queryKey[0] === 'candidate' ? { data: value } : {},
         command: (...args) => { commands.push(args); return Promise.resolve({}); },
         sessionStorage: { getItem: key => saved.get(key) ?? null, setItem: (key, item) => saved.set(key, item), removeItem: key => saved.delete(key) },
-        Diff, Link: () => null, Heading: () => null, Panel: () => null, ErrorBox: () => null,
+        Diff, Markdown, Link: () => null, Heading: () => null, Panel: () => null, ErrorBox: () => null,
         Empty: () => null, Badge: () => null, label: item => item, time: item => item, s: {},
     });
     const render = () => { for (let turn = 0; turn < 2; turn++) { index = 0; tree = context.Page(); while (effects.length) effects.shift()(); } };

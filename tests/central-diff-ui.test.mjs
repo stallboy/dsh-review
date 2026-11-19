@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 import * as jsx from 'react/jsx-runtime';
+import Markdown from 'react-markdown';
 import ts from 'typescript';
 import { parseDiff } from '../apps/web/src/diff-parser.ts';
 
@@ -114,7 +115,7 @@ function candidateFixture() {
         useQueryClient: () => ({}), useNavigate: () => () => {}, useMutation: () => ({}),
         useQuery: options => options.queryKey[0] === 'project' ? { data: { project: { name: 'test' }, writable: true, vcsSnapshot: 'snapshot', freshness: 'synced' } }
             : options.queryKey[0] === 'candidate' ? { data: available ? value : undefined } : options.queryKey[0] === 'comparison' ? { data: { unifiedDiff: patch } } : {},
-        sessionStorage: { getItem: () => null }, Diff, Link: () => null, Heading: () => null, Panel: () => null,
+        sessionStorage: { getItem: () => null }, Diff, Markdown, Link: () => null, Heading: () => null, Panel: () => null,
         ErrorBox: () => null, Empty: () => null, Badge: () => null, label: item => item, time: item => item, s: {},
     });
     vm.runInContext(script, context);
