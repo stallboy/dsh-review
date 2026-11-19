@@ -8,8 +8,6 @@ import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { fingerprintOf, normalizeTitle, findDuplicate, entryFromCandidate, topPerModule, formatMemorySummary } from '../packages/dsh-plugin/dist/host/memory.js';
 import { createGitFixture, fakeAuditAgentPath, runCommand } from './helpers.mjs';
 
-/** P4 验收：§7 负向记忆指纹/窗口/阻止/重开豁免 + §4.8 人工重开 API。 */
-
 const servers = [];
 after(async () => {
   await Promise.all(servers.map((server) => server.close()));
@@ -108,9 +106,9 @@ test('P4: 指纹规范化——规范 JSON 数组、UTF-8 字节序排序、titl
   const a = fingerprintOf(meta());
   const b = fingerprintOf(meta({ targetFiles: ['a.js', 'b.js'], title: 't' }));
   assert.equal(a, b);
-  // §6.1：确定性指纹使用无分隔符碰撞的规范 JSON 数组。
+  // 规范 JSON 数组保留字段边界，避免内容中的分隔符造成指纹碰撞。
   assert.equal(a, '["net",["a.js","b.js"],"bugfix","t"]');
-  // UTF-8 字节序：'B'(0x42) < 'a'(0x61)，大写排前。
+  // `B` 的 UTF-8 字节值小于 `a`，用反序输入区分字节排序和本地化排序。
   assert.equal(
     fingerprintOf(meta({ targetFiles: ['a.js', 'B.js'] })),
     '["net",["B.js","a.js"],"bugfix","t"]',
@@ -131,15 +129,11 @@ test('P4: 窗口内完全重复被阻止；窗口外/换写法不阻止（链豁
   assert.ok(rejected);
   const memory = [rejected];
   const now = Date.now();
-  // 完全相同、窗口内 → 阻止；duplicateOf 取 rejected_at 倒序第一条未豁免匹配。
   assert.equal(findDuplicate({ candidateId: 'n1', meta: meta({ targetFiles: ['a.js'], title: 't' }) }, memory, 30, now)?.candidateId, '2026-10/old');
-  // 换写法（title 不同）→ 不阻止。
   assert.equal(findDuplicate({ candidateId: 'n2', meta: meta({ targetFiles: ['a.js'], title: 'other' }) }, memory, 30, now), null);
-  // 窗口外 → 不阻止。
   const old = [{ ...rejected, rejectedAtMs: now - 60 * 86_400_000 }];
   assert.equal(findDuplicate({ candidateId: 'n3', meta: meta({ targetFiles: ['a.js'] }) }, old, 30, now), null);
-  // §6.2（2026-11-10）：豁免判定上移到 store 的重开链计算——findDuplicate 本身返回匹配，
-  // store.list 会把合法链上祖先从 duplicateOf 候选中剔除（见“队列标记 duplicateOf”测试）。
+  // 合法重开祖先的豁免取决于候选链，由队列读取时处理。因此底层指纹匹配仍可命中原候选。
   assert.equal(findDuplicate({ candidateId: 'n4', meta: meta({ targetFiles: ['a.js'], reopenedFrom: '2026-10/old' }) }, memory, 30, now)?.candidateId, '2026-10/old');
 });
 
@@ -182,7 +176,6 @@ test('P4: POST /reopen——合法重开成功；非 rejected 目标与空理由
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const { base } = await startApi(root);
 
-  // 目标不是 rejected → 409。
   const badTarget = await fetch(`${base}/reopen`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -190,7 +183,6 @@ test('P4: POST /reopen——合法重开成功；非 rejected 目标与空理由
   });
   assert.equal(badTarget.status, 409);
 
-  // 空理由 → 422。
   const noReason = await fetch(`${base}/reopen`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -198,7 +190,6 @@ test('P4: POST /reopen——合法重开成功；非 rejected 目标与空理由
   });
   assert.equal(noReason.status, 422);
 
-  // 合法重开 → 成功并留痕。
   const ok = await fetch(`${base}/reopen`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

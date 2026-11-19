@@ -2,21 +2,10 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { runCommand } from '../helpers.mjs';
 
-/**
- * 契约夹具库（架构改进 A8）。
- *
- * 历史问题：24 个测试文件各自手写 review.md / 补丁夹具，SPEC 一变就要逐文件改，
- * 而“顺手放宽断言”很容易在改动中发生（缺陷 B4 就是这样删掉了 Rebase 的拒绝断言）。
- *
- * 设计原则：
- * - 只描述**差异维度**（状态、版本、判断项、评论、锚点…），公共形状由本文件提供；
- * - 每个夹具都可通过 `commit()` 固化进共享事实，避免“本地草稿”与“共享候选”混淆；
- * - 断言侧提供 `assertInvariant`，让 I1–I16 的正反例可以数据驱动。
- */
+/** 集中提供评审数据的公共形状，让各用例只需构造与断言相关的差异。 */
 
 const DEFAULT_PATCH_FILE = 'src/math.js';
 
-/** 单文件补丁：把 `-` 改成给定运算符。 */
 export function patchFixture(options = {}) {
   const file = options.file ?? DEFAULT_PATCH_FILE;
   const from = options.from ?? 'export const add = (a, b) => a - b;';
@@ -32,7 +21,6 @@ export function patchFixture(options = {}) {
   ].join('\n');
 }
 
-/** 删除文件的补丁（用于 anchor / 禁止路径等边界用例）。 */
 export function deleteFilePatchFixture(file) {
   return [
     `diff --git a/${file} b/${file}`,
@@ -45,7 +33,6 @@ export function deleteFilePatchFixture(file) {
   ].join('\n');
 }
 
-/** 新建文件的补丁。 */
 export function newFilePatchFixture(file, content = 'export const x = 1;') {
   return [
     `diff --git a/${file} b/${file}`,
@@ -58,15 +45,11 @@ export function newFilePatchFixture(file, content = 'export const x = 1;') {
   ].join('\n');
 }
 
-/** 多文件补丁：同时改两个文件（用于 Hunk 解析与 I5）。 */
 export function multiFilePatchFixture(files) {
   return files.map((file) => patchFixture({ file })).join('');
 }
 
-/**
- * review.md 夹具。默认是一个合法的 pending 候选（rev1、无评论、无判断项）。
- * `overrides` 直接覆盖字段片段，便于构造非法/边界数据。
- */
+/** overrides 可直接提供 YAML 字段片段，以便构造解析器应拒绝的数据。 */
 export function reviewFixture(slug, overrides = {}) {
   const base = {
     schemaVersion: 1,
@@ -127,12 +110,10 @@ export function reviewFixture(slug, overrides = {}) {
   ].join('\n');
 }
 
-/** 人工判断项 YAML 片段。 */
 export function humanDecisionsFixture(items) {
   return `[${items.map((item) => `{id: ${item.id}, question: ${JSON.stringify(item.question ?? '是否接受行为变化？')}}`).join(', ')}]`;
 }
 
-/** 行内评论 YAML 片段。 */
 export function commentFixture(items) {
   return items.map((item) => [
     `  - id: ${item.id ?? 'c1'}`,
@@ -148,9 +129,6 @@ export function commentFixture(items) {
   ].join('\n')).join('\n');
 }
 
-/**
- * 在仓库中写入一个候选目录（默认不提交）。返回目录与路径信息。
- */
 export async function writeCandidate(root, slug, options = {}) {
   const month = options.month ?? '2026-11';
   const dir = path.join(root, '.ai-review', month, slug);
@@ -161,7 +139,6 @@ export async function writeCandidate(root, slug, options = {}) {
   return { id: `${month}/${slug}`, dir, reviewPath: path.join(dir, 'review.md'), month, slug };
 }
 
-/** 把候选写入并提交为共享事实。 */
 export async function commitCandidate(root, slug, options = {}) {
   const info = await writeCandidate(root, slug, options);
   if (options.commit !== false) {
@@ -171,7 +148,6 @@ export async function commitCandidate(root, slug, options = {}) {
   return info;
 }
 
-/** 标准并发 guard。 */
 export function guardFixture(id, overrides = {}) {
   return {
     id,
@@ -182,10 +158,6 @@ export function guardFixture(id, overrides = {}) {
   };
 }
 
-/**
- * 不变量断言辅助：把候选交给实现的校验器，断言错误中包含/不包含指定编号。
- * 让 AC-DATA-01 的正反例可以数据驱动，而不是每个测试重写一套断言。
- */
 export async function assertInvariant(store, candidate, invariant, { expectError = true } = {}) {
   const errors = await store.validateFullCandidate(candidate);
   const hit = errors.some((error) => error.includes(invariant) || error.startsWith(`${invariant}:`));

@@ -7,7 +7,6 @@ const MAX_LOG_LINES = 4000;
 
 export class JobManager {
   private readonly jobs = new Map<string, JobRecord>();
-  /** §7.7：运行中 Job 的取消信号，用于终止 Runner 进程树。 */
   private readonly controllers = new Map<string, AbortController>();
 
   start(type: JobType, task: (log: (line: string) => void, id: string, signal: AbortSignal) => Promise<unknown>): JobRecord {
@@ -29,7 +28,7 @@ export class JobManager {
       if (record.log.length > MAX_LOG_LINES) {
         const dropped = record.log.length - MAX_LOG_LINES;
         record.log.splice(0, dropped);
-        // §8.2/G36：日志偏移使用单调递增绝对序号——截断不丢失后续行。
+        // G36：截断只移动日志窗口，绝对偏移保持递增以免轮询漏行。
         record.logStartOffset += dropped;
       }
     };
@@ -49,7 +48,6 @@ export class JobManager {
     return record;
   }
 
-  /** §7.7：请求取消运行中的 Job（终止 Runner 进程树/会话）。 */
   abort(id: string): boolean {
     const controller = this.controllers.get(id);
     if (!controller) return false;

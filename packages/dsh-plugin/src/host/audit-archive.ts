@@ -5,10 +5,7 @@ import process from 'node:process';
 import { load, dump } from './yaml.js';
 import { isRepoRelativePath } from './invariants.js';
 
-/**
- * §3 audit.md 新契约：目录式审查档案（audits/<audit_id>/audit.md）+ §3.4 finding 投影。
- * 旧扁平 audits/*.md 不参与新流程（§10 开发期数据删除重建）。
- */
+/** 审查档案的读写、校验与审查项投影。档案以 audits/<audit_id>/audit.md 为单位。 */
 
 export class AuditFormatError extends Error {
   constructor(message: string) {
@@ -47,7 +44,6 @@ export interface AuditFrontmatter {
 export interface AuditRecord {
   meta: AuditFrontmatter;
   body: string;
-  /** 档案所在目录名（应等于 audit_id）。 */
   dirName: string;
   reviewPath: string;
   parseError?: string;
@@ -61,7 +57,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function asString(value: unknown, field: string): string {
-  // §2.2：接受 YAML 裸 ISO 时间对象并规范化为 UTC（Z）ISO 字符串。
+  // YAML 解析器可能已经把未加引号的时间戳转换成 Date。
   if (value instanceof Date) return value.toISOString();
   if (typeof value !== 'string') throw new AuditFormatError(`${field} 必须是字符串`);
   return value;
@@ -156,7 +152,6 @@ export function serializeAuditMarkdown(meta: AuditFrontmatter, body: string): st
   return `---\n${yamlText}\n---\n${body.startsWith('\n') ? body : `\n${body}`}`;
 }
 
-/** §13.2 读取审查：I1（audit 部分）、I9、I10、I13。返回错误列表；空即有效。 */
 export function auditInvariantErrors(meta: AuditFrontmatter, dirName: string): string[] {
   const errors: string[] = [];
   if (!AUDIT_DIR_PATTERN.test(dirName)) errors.push(`I1: audit 目录名非法：${dirName}`);
@@ -164,23 +159,18 @@ export function auditInvariantErrors(meta: AuditFrontmatter, dirName: string): s
   const findingIds = new Set<string>();
   for (const item of meta.items) {
     const at = `items[${item.findingId}]`;
-    // I1：finding_id 必须匹配规范且同一档案内唯一。
     if (!FINDING_ID_PATTERN.test(item.findingId)) errors.push(`I1: ${at} finding_id 非法`);
     if (findingIds.has(item.findingId)) errors.push(`I1: ${at} finding_id 在同一档案内重复`);
     findingIds.add(item.findingId);
-    // I12：item.target_files 必须是合法仓库相对路径（空数组允许）。
     for (const target of item.targetFiles) {
       if (!isRepoRelativePath(target)) errors.push(`I12: ${at} target_files 含非法路径：${target}`);
     }
-    // I9：converted ⟺ candidate 非空。
     if (item.status === 'converted' && !item.candidate) errors.push(`I9: ${at} converted 但 candidate 为空`);
     if (item.status !== 'converted' && item.candidate) errors.push(`I9: ${at} 非 converted 但 candidate 非空`);
-    // I10：deferred 必须有依赖且不得自依赖；confirm 必须没有。
     if (item.kind === 'deferred' && !item.dependsOn) errors.push(`I10: ${at} deferred 缺少 depends_on`);
     if (item.kind === 'deferred' && item.dependsOn === item.findingId) errors.push(`I10: ${at} deferred 不得自依赖`);
     if (item.kind === 'confirm' && item.dependsOn) errors.push(`I10: ${at} confirm 不应有 depends_on`);
   }
-  // I10：pending 依赖环必须报告。
   const pendingDeps = new Map<string, string>();
   for (const item of meta.items) {
     if (item.kind === 'deferred' && item.status === 'pending' && item.dependsOn) {
@@ -203,7 +193,7 @@ export function auditInvariantErrors(meta: AuditFrontmatter, dirName: string): s
       current = pendingDeps.get(current);
     }
   }
-  // I13：audit_id 时间戳与 created_at 的 UTC 日历时刻一致（§4.7：与创建/读取机器时区无关）。
+  // 用 UTC 比较档案编号与创建时间，避免跨时区读取时误报。
   const stamp = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/.exec(meta.auditId);
   if (stamp) {
     const created = new Date(meta.createdAt);
@@ -217,7 +207,6 @@ export function auditInvariantErrors(meta: AuditFrontmatter, dirName: string): s
   return errors;
 }
 
-/** §7.1：共享快照读取源（Git HEAD / SVN BASE）——投影等读端只能使用共享事实。 */
 export interface AuditSnapshotSource {
   listAuditDirs(): Promise<string[]>;
   readAuditText(dirName: string): Promise<string | null>;
@@ -230,10 +219,7 @@ export class AuditArchive {
     return path.join(this.repoRoot, '.ai-review', 'audits');
   }
 
-  /**
-   * 列出目录式档案（目录名合法且含 audit.md）；旧扁平 *.md 不参与。
-   * 传入共享快照源时只读该快照；否则读工作区（写路径使用）。
-   */
+  /** 写路径可省略 source 检查工作区。共享读路径须传入快照，而且不会扫描旧的扁平报告。 */
   async list(source?: AuditSnapshotSource): Promise<AuditRecord[]> {
     const records: AuditRecord[] = [];
     let dirs: string[] = [];
@@ -300,7 +286,6 @@ export class AuditArchive {
     }
   }
 
-  /** 写入新档案（§4.7：创建前校验目录不存在，冲突即失败）。 */
   async write(meta: AuditFrontmatter, body: string): Promise<AuditRecord> {
     const errors = auditInvariantErrors(meta, meta.auditId);
     if (errors.length > 0) throw new AuditFormatError(errors.join('；'));
@@ -311,10 +296,7 @@ export class AuditArchive {
     return this.writeExisting(meta, body);
   }
 
-  /**
-   * 收尾覆写：目录已由 Agent 创建（报告正文先写入 audit.md），
-   * Host 在原位写入完整档案（frontmatter + 正文 + 复核块）。仍执行全部不变量校验。
-   */
+  /** 仅用于 Host 收尾。要求 Agent 已在目标目录写入报告，再用验证过的完整档案覆盖。 */
   async writeExisting(meta: AuditFrontmatter, body: string): Promise<AuditRecord> {
     const errors = auditInvariantErrors(meta, meta.auditId);
     if (errors.length > 0) throw new AuditFormatError(errors.join('；'));
@@ -328,7 +310,6 @@ export class AuditArchive {
     return { meta, body, dirName: meta.auditId, reviewPath };
   }
 
-  /** 生成下一个未占用的 audit_id（UTC 时间戳 + scope slug；同秒冲突追加 -2/-3）。 */
   async nextAuditId(scope: string, now: Date): Promise<string> {
     const stamp = now.toISOString().replace(/[-:T]/g, '').slice(0, 15).replace(/^(\d{14})(\d)$/, '$1');
     const compact = `${stamp.slice(0, 8)}-${stamp.slice(8, 14)}`;
@@ -347,7 +328,6 @@ export class AuditArchive {
     return auditId;
   }
 
-  /** 人工转换审查项时更新 item（§3.4：只改 status/candidate，不重写其他历史）。 */
   async updateItem(
     dirName: string,
     findingId: string,
@@ -363,7 +343,6 @@ export class AuditArchive {
     item.candidate = candidate;
     const errors = auditInvariantErrors(record.meta, dirName);
     if (errors.length > 0) throw new AuditFormatError(errors.join('；'));
-    // §7.6 /dismiss-finding：在正文 `# 审查项处理记录` 追加时间、操作者与理由。
     const body = note
       ? `${record.body.replace(/\s+$/, '')}\n\n# 审查项处理记录\n\n- ${note}\n`
       : record.body;
@@ -375,14 +354,11 @@ export class AuditArchive {
   }
 }
 
-// ---------- §4.8 投影 ----------
 
 export type ProjectedState = 'open' | 'closed' | 'dismissed' | 'reopened';
 
-/** §4.8 投影所需的候选事实（由调用方从共享事实供给）。 */
 export interface CandidateChainInfo {
   status: 'pending' | 'changes_requested' | 'approved' | 'rejected';
-  /** §4.8：该候选的 reopened_from 指向（null 表示非重开）。 */
   reopenedFrom: string | null;
   broken?: boolean;
 }
@@ -409,11 +385,7 @@ function scopeCovers(scope: string, targetFiles: string[]): boolean {
   return targetFiles.every((file) => file === scope || file.startsWith(prefix));
 }
 
-/**
- * §4.8 投影（2026-11-10 对齐 SPEC）：覆盖判定 → 最新观察 → 基础状态映射 →
- * 重开链判定（converted+rejected 时沿 reopened_from 查找唯一替代候选，
- * candidate/candidateStatus 指向链上当前候选；多替代/缺失/broken/环 → errors 报告）。
- */
+/** 审查项被拒绝的旧候选可能已有替代者。只有能确定唯一有效重开链时，投影才可沿链定位当前候选。 */
 export function projectFindings(
   audits: AuditRecord[],
   candidateInfoById: (candidateId: string) => CandidateChainInfo | null,
@@ -421,7 +393,7 @@ export function projectFindings(
 ): { findings: FindingProjection[]; errors: string[] } {
   const errors: string[] = [];
   const valid = audits.filter((audit) => !audit.parseError);
-  // 覆盖判定 + 最新观察（时间点最新，同刻以 audit_id 为次序键）。
+  // 观察时间相同时用档案编号打破平局，使最新观察的选择不依赖枚举顺序。
   const latest = new Map<string, { audit: AuditRecord; item: AuditItem }>();
   for (const audit of valid) {
     for (const item of audit.meta.items) {
@@ -471,7 +443,6 @@ export function projectFindings(
     for (;;) {
       if (current.status === 'approved') { pushBase(findingId, entry, 'closed', { id: currentId, status: current.status }); break; }
       if (current.status === 'pending' || current.status === 'changes_requested') { pushBase(findingId, entry, 'open', { id: currentId, status: current.status }); break; }
-      // rejected：查找 reopened_from 指向它的直接替代候选（应最多一个）。
       const replacements = candidateIds
         .map((id) => ({ id, info: candidateInfoById(id) }))
         .filter((next): next is { id: string; info: CandidateChainInfo } => next.info !== null && next.info.reopenedFrom === currentId);

@@ -9,13 +9,6 @@ import { GitHeadCandidateSource } from '../packages/dsh-plugin/dist/host/shared-
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
-/**
- * §7.1 / G10 / G41 共享事实与投影缓存：
- * - finding 投影、/audits、负向记忆、已存在候选注入只能读同一 VCS 快照（HEAD），
- *   工作区未提交改动不得影响共享读端；
- * - 投影缓存键与读取源同源：新提交后缓存必须失效并反映新档案状态。
- */
-
 const servers = [];
 after(async () => {
   await Promise.all(servers.map((server) => server.close()));
@@ -103,29 +96,25 @@ test('§7.1/G41：finding 投影读 HEAD 快照，本地篡改不可见；新提
   assert.equal(first.findings.length, 1);
   assert.equal(first.findings[0].state, 'open', 'pending item 投影为 open');
 
-  // 未提交地篡改共享档案：投影/档案列表都必须仍读 HEAD。
   const auditPath = path.join(root, '.ai-review', 'audits', '20261110-100000-repo', 'audit.md');
   const shared = await (await import('node:fs/promises')).readFile(auditPath, 'utf8');
   await writeFile(auditPath, shared.replace('status: pending', 'status: dismissed'), 'utf8');
   const second = await (await fetch(`${base}/findings`)).json();
   assert.equal(second.findings[0].state, 'open', '本地篡改不得进入投影（必须读共享快照）');
 
-  // 本地新增未提交档案（不同 finding）：/audits 也不得列出。
   await writeAudit(root, '20261110-110000-local', '.', 'pending', 'f-bbbbbbbbbb');
   const auditsLocal = await (await fetch(`${base}/audits`)).json();
   assert.deepEqual(auditsLocal.audits.map((entry) => entry.auditId), ['20261110-100000-repo'], '本地档案不是共享事实');
 
-  // 只提交被篡改的共享档案：新快照必须让投影缓存失效并反映 dismissed。
+  // 只提交被修改的共享档案，保留新档案为本地草稿，以区分缓存失效与工作区泄漏。
   runCommand('git', ['add', '.ai-review/audits/20261110-100000-repo'], root);
   runCommand('git', ['commit', '-q', '-m', 'dismiss finding'], root);
   const third = await (await fetch(`${base}/findings`)).json();
   assert.equal(third.findings[0].state, 'dismissed', '新提交后投影缓存必须失效');
 
-  // 本地档案仍未提交，仍不得出现在共享档案列表。
   const auditsStillOne = await (await fetch(`${base}/audits`)).json();
   assert.deepEqual(auditsStillOne.audits.map((entry) => entry.auditId), ['20261110-100000-repo']);
 
-  // 提交本地档案后才进入共享列表。
   runCommand('git', ['add', '.ai-review/audits/20261110-110000-local'], root);
   runCommand('git', ['commit', '-q', '-m', 'second audit'], root);
   const auditsCommitted = await (await fetch(`${base}/audits`)).json();
@@ -148,7 +137,6 @@ test('§7.1/G10：非全仓 scope 的空 target_files 会排除 item（buildAudi
   assert.match(warnings[0], /target_files/);
   assert.match(warnings[0], /无路径线索/);
 
-  // 全仓 scope 下空 target_files 合法，不告警。
   const warningsAll = [];
   buildAuditItems([{ label: '全仓问题', text: '无路径', category: 'confirm' }], warningsAll, '.');
   assert.equal(warningsAll.length, 0);
@@ -162,7 +150,6 @@ test('§7.1/G10：负向记忆与已存在候选注入只读共享快照（本�
   commitAll(root, 'shared candidates');
   const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
 
-  // 本地未提交的 rejected/pending 草稿。
   await writeCandidate(root, '20261109-local-rejected', { title: 'net: 本地被拒方案', status: 'rejected', rejection: true });
   await writeCandidate(root, '20261109-local-pending', { title: 'net: 本地待审方案', status: 'pending' });
 

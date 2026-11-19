@@ -1,3 +1,5 @@
+/** 供各 API 子模块共用的宿主接口和请求上下文。宿主通过 ApiHost 注入，以免形成模块依赖环。 */
+
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { IncomingMessage, IncomingHttpHeaders } from 'node:http';
 import type { ManagedCommand } from '@dsh-review/protocol';
@@ -11,10 +13,6 @@ import type { SharedCandidateSource } from './shared-facts.js';
 import { GitHeadCandidateSource, SvnBaseCandidateSource } from './shared-facts.js';
 import type { VcsAdapter } from './vcs.js';
 
-/**
- * 本模块是拆分后的**叶子**：只依赖 `./types.js` 等既有模块，不 import 任何 `api-*` 模块。
- * 所有反向依赖都通过下面的 `ApiHost` 窄接口注入，保证 import 图无环。
- */
 
 export const API_PREFIX = '/dsh-code-review/api';
 export const APP_VERSION = '0.3.0';
@@ -79,34 +77,25 @@ export interface ApiDeps {
   saveSettings: (settings: AppSettings) => Promise<AppSettings>;
   resolveCredential?: (reference: string) => Promise<string | undefined>;
   decorateVcs?: (vcs: VcsAdapter) => VcsAdapter;
-  /** Resolve the working directory of the Session that owns the review tab. */
   resolveSessionCwd?: (sessionId: string) => string | undefined;
-  /** Create a real DSH session (through the host `sessionController`) and send the audit prompt into it. */
   createAuditSession?: (input: {
     cwd: string;
     title: string;
     prompt: string;
-    /** Session that owns the review tab; its permission/approval policy is inherited. */
+    /** 新会话继承面板所属会话的权限预设与审批策略。 */
     ownerSessionId?: string;
   }) => Promise<{ sessionId: string }>;
-  /**
-   * §7.4（2026-11-12）：创建承载「AI 修复」任务的独立会话。
-   *
-   * 与 `createAuditSession` 走同一条 sessionController 序列，但没有审查租约：修复会话
-   * 产出的是候选新版本，`.ai-review/` 的提交仍由 Host 在用户点「提交并让 AI 修复」时完成。
-   * 为空表示当前 Host 不支持会话执行器，`/fix-session` 返回 500 诊断。
-   */
+  /** 未注入时宿主没有交互式修复执行器，受理端会返回诊断。 */
   createFixSession?: (input: {
     cwd: string;
     title: string;
     prompt: string;
     ownerSessionId?: string;
   }) => Promise<{ sessionId: string }>;
-  /** Host 的真实 turn 结束通知；不得用文件/状态轮询模拟。 */
+  /** 依赖宿主的真实 turn 结束事件，避免把仍在写入的会话误判为已结束。 */
   onAuditTurnEnd?: (sessionId: string, callback: () => void) => () => void;
-  /** Diagnostic: the live client-module graph entry for this package, if any. */
   clientEntry?: () => unknown;
-  /** §7.6 审查租约持久化文件；缺省为 DSH_HOME/dsh-code-review/runtime-state.json（测试可注入临时路径）。 */
+  /** 缺省落在 DSH_HOME/dsh-code-review/runtime-state.json，使未释放的租约在宿主重启后仍能阻塞写入。 */
   statePath?: string;
 }
 
@@ -117,7 +106,6 @@ export interface Runtime {
   vcsType: VcsType;
 }
 
-/** §7.6 手动/会话审查执行租约：参与全部互斥；持久化在 DSH_HOME 运行时状态中。 */
 export interface AuditLease {
   auditId: string;
   root: string;
@@ -126,26 +114,17 @@ export interface AuditLease {
   baseRevision: string;
   owner: string;
   createdAt: string;
-  /** 开始执行时的候选快照：finalize 只校验此后新增的候选。 */
   candidateIdsBefore: string[];
   state: 'active' | 'releasable' | 'released';
-  /** 会话模式创建的 DSH 审查会话 id（其余模式缺省）。 */
   sessionId?: string;
 }
 
-/** §7.1：为一次共享读取创建绑定共享快照的数据源；每次请求重建，不跨快照复用（Git=HEAD、SVN=BASE）。 */
 export interface SharedView {
   source: SharedCandidateSource;
-  /** 该源实际绑定的快照标识（SVN 根 revision 不可证明快照，返回 null → 不缓存）。 */
   snapshot: string | null;
 }
 
-/**
- * §7.1 共享快照的**唯一**读取入口。
- *
- * 拆分后的所有模块（读模型、写事务、审查生命周期）都必须经由此函数获取共享事实源，
- * 不允许各自重建 —— 否则「一次计算内的档案与候选事实来自同一快照」的语义会被破坏。
- */
+/** 一次计算应复用同一份视图读取候选与档案，以免混用不同提交的事实。 */
 export async function sharedViewFor(runtime: Runtime): Promise<SharedView | undefined> {
   const managed = sharedContext.getStore();
   if (managed?.root === runtime.root) return managed.view;
@@ -221,7 +200,6 @@ export function guardFrom(body: Record<string, unknown>): ConcurrencyGuard {
   if (expectedRevision <= 0 || !expectedOwner) {
     throw new ApiError(400, 'bad_request', '缺少并发校验信息（expectedRevision / expectedOwner）');
   }
-  // §8.1：完整 guard 必含 expectedUpdatedAt，且必须是可解析的 ISO-8601 时间点。
   if (!expectedUpdatedAt || Number.isNaN(new Date(expectedUpdatedAt).getTime())) {
     throw new ApiError(400, 'bad_request', '缺少或非法的并发校验信息（expectedUpdatedAt）');
   }
@@ -289,23 +267,12 @@ export function filterFrom(url: URL, owner: string): ReviewFilter {
   return filter;
 }
 
-/**
- * §12.1 进程内 repo 级锁：同一检出的共享写与工作区事务串行化。
- *
- * 该锁**不可重入**：handler 在同一临界区内再次取锁会永久等待（历史缺陷：`/audit`
- * 被路由整体持锁后又在 handler 内 withWriteLock）。为避免这种自死锁，
- * `withRepoLock` 用 AsyncLocalStorage 标记“当前异步上下文中是否已持锁”，
- * 重入时直接抛出可诊断错误。
- *
- * 注意：不能用全局 Set 记录“已持锁”——并发请求会在第一个成功获取锁期间
- * 被误判为重入（真实回归：P10 并发归档 500）。
- */
+/** 同一异步调用链内重入会死锁，因此用 AsyncLocalStorage 检查重入。跨请求共享持锁标记会误拒绝正常排队者。 */
 export class RepoLock {
   private writeLocks = new Map<string, Promise<unknown>>();
-  /** §12.1：标记“当前异步上下文已持有该仓库的 repo 锁”，用于把锁重入变成可诊断错误而不是死锁。 */
   private readonly lockContext = new AsyncLocalStorage<string>();
 
-  /** 按仓库根串行化；被串行化的函数本身抛错不影响后续排队者继续执行。 */
+  /** 前一项失败不应使已排队的后续写入失去执行机会。 */
   withWriteLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.writeLocks.get(repoRoot) ?? Promise.resolve();
     const next = previous.then(fn, fn);
@@ -313,7 +280,6 @@ export class RepoLock {
     return next;
   }
 
-  /** 共享写路由统一加锁（§12.1：同一检出的写操作串行化）。 */
   async withRepoLock<T>(url: URL, runtimeFor: (url: URL) => Promise<Runtime>, fn: () => Promise<T>): Promise<T> {
     return runtimeFor(url).then(
       (runtime) => {
@@ -327,45 +293,28 @@ export class RepoLock {
   }
 }
 
-/**
- * 拆分后各子模块对 `ReviewApi` 的**唯一**反向依赖面。
- *
- * 子模块只拿得到这里声明的窄接口；`api.ts` 实现它，并在构造时把 `this` 传给各
- * `setup*()` 装配函数。这样 `api-readmodels.ts` / `api-writers.ts` / `api-audit.ts`
- * 都不需要 import `api.ts`，import 图保持单向（context ← readmodels ← writers ← audit ← api）。
- */
 export interface ApiHost {
-  /** 当前副作用的宿主依赖（设置、会话解析、凭据、租约状态文件路径…）。 */
   readonly deps: ApiDeps;
-  /** 当前生效的设置（reconfigure 会整体替换，因此必须经 getter 读取而非快照）。 */
+  /** 重配置会替换设置对象，长生命周期调用方须每次读取。 */
   currentSettings(): AppSettings;
   readonly jobManager: JobManager;
-  /** 最近一次 reconfigure 的校验错误（/settings 降级返回时使用）。 */
   readonly lastConfigErrors: readonly string[];
-  /** reconfigure 时探测到的 VCS 类型（未配置仓库时可为 null）。 */
   readonly detectedVcsType: VcsType | null;
 
-  /** 按请求解析仓库 runtime（带缓存）；未配置/非仓库时抛 412。 */
+  /** 未配置仓库或目录不受版本控制时抛出 412。 */
   runtimeFor(url: URL): Promise<Runtime>;
-  /** §12.2 当前操作者（owner）：设置里显式配置优先，否则按仓库推断。 */
+  /** 显式设置优先于仓库推断的身份。 */
   ownerFor(root: string): Promise<string>;
-  /** §12.1 进程内 repo 锁。 */
   withWriteLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T>;
 
-  /** §7.6 审查租约状态机（唯一迁移入口）；未初始化时抛 500。 */
   readonly auditLifecycle: AuditLifecycle;
-  /** §7.7 运行中的审查 Job / 未释放租约一律阻止自动写。 */
   ensureNoAuditRunning(root?: string): void;
-  /** §7.6 只读或迁移单个租约的窄接口（读模型与写事务共用）。 */
   leaseLookup(auditId: string): AuditLeaseRecord | undefined;
   leaseTransition(auditId: string, state: 'released' | 'releasable'): Promise<void>;
-  /** 会话/手动/定时审查跟踪 Job 的完成回调（仅内存；重启后由 finalize 直接新建 Job）。 */
+  /** 回调只在内存中保存，宿主重启后收尾需创建新 Job。 */
   readonly auditJobFinishes: Map<string, (result?: unknown) => void>;
-  /** 跟踪 Job id → auditId，供 /jobs/:id/cancel 把租约转为 releasable。 */
   readonly auditJobLeases: Map<string, string>;
 
-  /** 启动一个 ai_fix Job（/ai-fix 与 /comments 的 autoFix 链共用同一次受理结论）。 */
   startAiFixJob(runtime: Runtime, id: string, guard: ConcurrencyGuard): Promise<JobRecord>;
-  /** §7.4：同仓修复会话的占用记录（`/fix-session` 的并发控制与诊断入口）。 */
   readonly fixSessionGuard: { activeFor(root: string): { candidateId: string; sessionId: string } | undefined };
 }

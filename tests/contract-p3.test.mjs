@@ -9,8 +9,6 @@ import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
 import { createGitFixture, fakeAuditAgentPath, runCommand } from './helpers.mjs';
 
-/** P3 验收：§18.1 超时归档——队列只提示；显式归档写 system:stale；只写一次；未过期拒绝。 */
-
 const servers = [];
 after(async () => {
   await Promise.all(servers.map((server) => server.close()));
@@ -106,7 +104,6 @@ test('P3: 队列只提示过期，不产生共享提交', async () => {
   const freshItem = queue.items.find((item) => item.id.endsWith('net-fresh'));
   assert.equal(staleItem?.isStale, true);
   assert.equal(freshItem?.isStale, undefined);
-  // 读队列不产生共享提交。
   const commitAfter = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   assert.equal(commitAfter, commitBefore);
   assert.notEqual(base, HEAD_BEFORE);
@@ -125,7 +122,6 @@ test('P3: 显式归档写 system:stale + 删补丁 + 只写一次；未过期候
   const { base: apiUrl } = await startApi(root);
   const staleDir = path.join(root, '.ai-review', '2026-11', '20261104-net-stale');
 
-  // 未过期候选：409 拒绝。
   const tooFresh = await fetch(`${apiUrl}/archive-stale`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -134,7 +130,6 @@ test('P3: 显式归档写 system:stale + 删补丁 + 只写一次；未过期候
   assert.equal(tooFresh.status, 409);
   assert.match((await tooFresh.json()).error.message, /未超过 stale_days/);
 
-  // 过期候选：归档成功，rejection=system:stale，补丁删除。
   const ok = await fetch(`${apiUrl}/archive-stale`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -147,7 +142,6 @@ test('P3: 显式归档写 system:stale + 删补丁 + 只写一次；未过期候
   assert.match(candidate.meta.rejection.reason, /超时/);
   assert.ok(!existsSync(path.join(staleDir, '001.patch')), '归档后补丁应删除');
 
-  // 第二次归档：终态拒绝（乐观锁 + 已归档），只写一次。
   const again = await fetch(`${apiUrl}/archive-stale`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -155,7 +149,6 @@ test('P3: 显式归档写 system:stale + 删补丁 + 只写一次；未过期候
   });
   assert.equal(again.status, 409);
 
-  // store 层直读验证 rejection 留痕。
   const store = new ReviewStore(root);
   const detail = await store.get('2026-11/20261104-net-stale', null);
   assert.equal(detail.candidate.meta.rejection.rejectedBy, 'system:stale');

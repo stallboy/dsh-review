@@ -7,8 +7,6 @@ import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
-/** G38（拒绝分类/相关符号）、G22（/dismiss-finding）、G40（patchCheck）验收。 */
-
 const servers = [];
 after(async () => { await Promise.all(servers.map((server) => server.close())); });
 
@@ -55,9 +53,7 @@ test('G38：/reject 携带 category 并提取 related_symbols；人工 stale 被
   const post = (body) => fetch(`${base}/reject`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: '2026-11/20261109-cat', ...guard(), ...body }),
   });
-  // 人工使用 stale → 422。
   assert.equal((await post({ reason: 'x', category: 'stale' })).status, 422);
-  // 合法分类 → 留痕 category 与 hunk header 提取的相关符号。
   const ok = await post({ reason: '方案有回归风险', category: 'high_risk' });
   assert.equal(ok.status, 200);
   const text = await readFile(path.join(root, '.ai-review', '2026-11', '20261109-cat', 'review.md'), 'utf8');
@@ -68,7 +64,6 @@ test('G38：/reject 携带 category 并提取 related_symbols；人工 stale 被
 test('G22：/dismiss-finding 仅最新观察 pending 可忽略并留痕；旧观察/非 pending 拒绝', async () => {
   const root = await createGitFixture();
   await writeCandidate(root, '20261109-fc', 'rejected');
-  // 两份档案：旧观察 1100、最新观察 1200，同 finding。
   const mk = async (auditId, createdAt) => {
     const dir = path.join(root, '.ai-review', 'audits', auditId);
     await mkdir(dir, { recursive: true });
@@ -87,17 +82,13 @@ test('G22：/dismiss-finding 仅最新观察 pending 可忽略并留痕；旧观
   const dismiss = (body) => fetch(`${base}/dismiss-finding`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   });
-  // 旧观察 → 409。
   assert.equal((await dismiss({ auditId: '20261109-110000-repo', findingId: 'auth-legacy', reason: 'x' })).status, 409);
-  // 缺理由 → 422。
   assert.equal((await dismiss({ auditId: '20261109-120000-repo', findingId: 'auth-legacy', reason: '  ' })).status, 422);
-  // 最新观察 pending → 200，正文留痕。
   const ok = await dismiss({ auditId: '20261109-120000-repo', findingId: 'auth-legacy', reason: '确认不再处理' });
   assert.equal(ok.status, 200);
   const text = await readFile(path.join(root, '.ai-review', 'audits', '20261109-120000-repo', 'audit.md'), 'utf8');
   assert.match(text, /dismiss auth-legacy：确认不再处理/);
   assert.match(text, /status: dismissed/);
-  // 重复忽略 → 409（非 pending）。
   assert.equal((await dismiss({ auditId: '20261109-120000-repo', findingId: 'auth-legacy', reason: 'again' })).status, 409);
 });
 

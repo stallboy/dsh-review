@@ -8,8 +8,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { reviewFixture } from './fixtures/contract.mjs';
 
-/** P1 验收：契约 §2.3 键序、全字段往返、未知键保留、reviewers.yml 扩展配置。 */
-
 const FULL_FM = [
   '---',
   'schema_version: 1',
@@ -98,7 +96,6 @@ test('P1: 往返序列化不丢字段且键序符合 §2.3', () => {
   assert.equal(reparsed.meta.humanDecisions[0].question, parsed.meta.humanDecisions[0].question);
   assert.equal(reparsed.meta.extra['custom_unknown_field'], 'keep-me');
   assert.equal(reparsed.meta.commitMessage, parsed.meta.commitMessage);
-  // 键序：§2.3 固定顺序，未知字段在末尾。
   const keyOrder = /^---\n([\s\S]*?)\n---/.exec(out)?.[1]
     ?.split('\n')
     .filter((line) => /^[a-z_]+:/.test(line))
@@ -120,7 +117,6 @@ test('P1: reopened 字段同时出现或同时缺省（I16 读侧形态）', () 
   assert.equal(parsed.meta.reopenedReason, '此前拒绝为误判');
   const out = serializeReviewMarkdown(parsed.meta, parsed.body);
   assert.ok(out.includes('reopened_from: 2026-11/20261103-net-other'));
-  // 缺省时序列化不写这两个键。
   const plain = parseReviewMarkdown(FULL_FM.replace(/reopened_from: null\nreopen_reason: null\n/, ''));
   const outPlain = serializeReviewMarkdown(plain.meta, plain.body);
   assert.ok(!outPlain.includes('reopened_from:'));
@@ -187,7 +183,6 @@ test('P1: reviewers.yml 解析扩展配置（白名单/时间窗/上限）', asy
   assert.equal(config.staleDays, 14);
   assert.equal(config.rejectionMemoryDays, 45);
   assert.equal(config.maxAntiPatterns, 5);
-  // 缺省回退默认值。
   await writeFile(reviewersPath(root), 'default_owner: a\n', 'utf8');
   const fallback = await loadReviewers(root);
   assert.equal(fallback.staleDays, null);

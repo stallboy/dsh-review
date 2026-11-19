@@ -22,11 +22,7 @@ import type { VcsAdapter } from './vcs.js';
 
 export const MAX_COMMIT_RETRIES = 2;
 
-/**
- * §5.4/I8：human_decisions 精确集合校验。
- * confirmed/waived 的 id 必须属于当前判断项，两集合互不相交，各自无重复，
- * 并集恰好覆盖全部判断项；每项 waive 必须有非空理由。
- */
+/** I8 要求每项人工判断恰好有一个决定，并记录知悉的理由以便追溯。 */
 export function checkDecisionCoverage(
   decisions: { id: string; question: string }[],
   confirmed: string[],
@@ -66,7 +62,6 @@ export function checkDecisionCoverage(
   return errors;
 }
 
-/** §4.9：commit_message 首行必须与 title 完全一致。 */
 export function checkCommitMessage(title: string, commitMessage: string): string | null {
   const firstLine = commitMessage.split('\n')[0]?.trim() ?? '';
   if (!firstLine) return 'commit_message 为空：批准前必须填写提交信息';
@@ -78,18 +73,9 @@ export interface RunnerLike {
   run(): Promise<RunnerExecutionResult>;
 }
 
-/**
- * §5.6/§10.2（2026-11-12）：批准业务提交信息的显式输入。
- *
- * - `commitDetail` 缺省时保持旧语义：业务提交使用候选 `commit_message` 全文；
- * - `commitDetail: 'simple'` 只写规范单行 `review(<id>): <title>`；
- * - `commitDetail: 'detailed'` 写「规范单行 + 空行 + 事实正文」；
- * - `commitMessage` 仍按 §7.5 步骤 3 先替换候选 `commit_message` 再校验首行。
- */
 export interface ApprovalCommitInput {
   commitMessage?: string;
   commitDetail?: CommitMessageDetail;
-  /** Host 在受理阶段生成的详细正文；`detailed` 时必须非空。 */
   commitMessageBody?: string;
 }
 
@@ -99,14 +85,13 @@ export interface ApprovalDeps {
   settings: AppSettings;
   makeRunner: (request: RunnerRequest) => RunnerLike | Runner;
   resolveCredential?: (reference: string) => Promise<string | undefined>;
-  /** §7.1：批准流程内部重读共享事实的数据源（每次重建，绑定当前 VCS 快照）。 */
+  /** 每次重读都绑定当前共享快照，以免工作区草稿参与批准判定。 */
   sharedSource?: () => Promise<CandidateSource | undefined>;
-  /** §7.5 重复候选复检：返回窗口内同指纹被拒候选 id（duplicateOf），无重复返回 null。 */
+  /** 返回阻止批准的被拒候选 ID。窗口与人工重开豁免由提供者判定。 */
   checkDuplicate?: () => Promise<string | null>;
   validateNewRevision?: (previous: ReviewCandidate, latest: ReviewCandidate) => Promise<string[]>;
-  /** §7.7/G30：取消请求轮询；在安全检查点（未产生共享提交前）读取并中止。 */
+  /** 只在仍可安全中止的检查点轮询。 */
   shouldCancel?: () => boolean;
-  /** §7.7：取消信号，用于终止批准回退中的 Runner。 */
   signal?: AbortSignal;
 }
 
@@ -118,10 +103,9 @@ interface Backup {
 
 interface ReloadResult {
   candidate: ReviewCandidate | null;
-  /** guard（版本/负责人/updated_at/解析失败）或 state（非 pending）冲突；成功为 null。 */
   conflict: 'guard' | 'state' | null;
   status?: string;
-  /** 本次重读绑定的共享快照源；补丁内容必须与 review.md 来自同一源。 */
+  /** 当前补丁与评审数据必须取自这次读取绑定的同一快照。 */
   source?: CandidateSource;
 }
 
@@ -130,7 +114,6 @@ interface BusinessFileSnapshot {
   mode: string;
 }
 
-/** §7.5 步骤 9：比较门禁前后的业务快照（内容 blob + 模式），返回发生变化的路径。 */
 function diffBusinessSnapshot(
   before: Map<string, BusinessFileSnapshot | null>,
   after: Map<string, BusinessFileSnapshot | null>,
@@ -160,15 +143,7 @@ export class ApprovalOrchestrator {
     commitMessage?: string,
     commitInput?: ApprovalCommitInput,
   ): Promise<ApprovalOutcome> {
-    // §5.6：commitInput 是 commitMessage 的完整形态；调用方可能只传旧参数。
     const messageOverride = commitInput?.commitMessage !== undefined ? commitInput.commitMessage : commitMessage;
-    /**
-     * 业务提交说明：显式 detail 时用 Host 生成的规范单行（+ 事实正文），否则沿用候选全文。
-     *
-     * 正文必须由本方法在**锁内、同步后**用同一份 `fresh` 快照生成：
-     * - 受理阶段生成会在 §7.5 步骤 6 同步重绑共享快照后过期（正文描述旧补丁、却提交新补丁）；
-     * - 提交针对的就是 fresh，正文与提交对象必须是同一次读取。
-     */
     const businessMessageFor = async (candidate: ReviewCandidate): Promise<string | undefined> => {
       const detail = commitInput?.commitDetail;
       if (!detail) return undefined;
@@ -180,11 +155,9 @@ export class ApprovalOrchestrator {
     let lastCommitError = '';
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       log(`批准流程开始（第 ${String(attempt)}/${String(maxAttempts)} 次）`);
-      // §7.7：取消请求在安全检查点读取——尚未产生任何共享提交，可安全中止。
       if (this.deps.shouldCancel?.()) {
         return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: '已按取消请求中止（未产生共享提交）', jobId };
       }
-      // §7.5 步骤 1-4：重读共享事实 → guard/状态 → 判断项 → 提交信息 → 完整性；重复候选 ①。
       const pre = await this.runPrechecks(id, guard, decisions, jobId, log, messageOverride);
       if ('outcome' in pre) return pre.outcome;
       let candidate = pre.candidate;
@@ -208,7 +181,6 @@ export class ApprovalOrchestrator {
         const sync = await vcs.syncAndGetLatestBase();
         log(sync.message);
         if (sync.failed) {
-          // §7.5：已知且可安全恢复的同步失败返回 SYNC_FAILED。
           return {
             status: 'ABORTED',
             reason: 'SYNC_FAILED',
@@ -217,7 +189,6 @@ export class ApprovalOrchestrator {
           };
         }
         if (sync.uncertain || sync.base === null || sync.base === undefined) {
-          // §7.5：部分同步或基线状态无法确定 → 禁止自动重试，人工恢复。
           return {
             status: 'RECOVERY_REQUIRED',
             reason: 'SYNC_STATE_UNKNOWN',
@@ -226,7 +197,7 @@ export class ApprovalOrchestrator {
             jobId,
           };
         }
-        // §7.5 步骤 6：同步后重新绑定共享快照，重跑步骤 1-4（含负向记忆）→ 重复候选 ②。
+        // 同步可能推进共享快照，基于原快照的预检结果随之失效。
         const resync = await this.runPrechecks(id, guard, decisions, jobId, log, messageOverride);
         if ('outcome' in resync) return resync.outcome;
         candidate = resync.candidate;
@@ -246,7 +217,6 @@ export class ApprovalOrchestrator {
       if (!base) {
         return { status: 'ABORTED', reason: 'SYNC_FAILED', message: '无法读取当前基线版本', jobId };
       }
-      // §7.1/§7.5 步骤 7：补丁必须与 review.md 来自同一共享快照，不得读取工作区本地补丁。
       const patch = sharedSource
         ? await store.currentPatch(candidate, sharedSource)
         : await store.currentPatch(candidate);
@@ -262,7 +232,7 @@ export class ApprovalOrchestrator {
         };
       }
       log(`严格应用版本 ${String(candidate.meta.currentRevision)} 的补丁（基线 ${base.slice(0, 12)}）`);
-      // git/svn apply 都以文件为输入：把共享快照中的补丁文本物化到仓库外临时文件。
+      // VCS 接受补丁文件。放在仓库外可避免把中间文件写入业务工作区。
       const tempPatch = path.join(tmpdir(), `dcr-approval-${String(process.pid)}-${String(Date.now())}.patch`);
       await writeFile(tempPatch, patch.text, 'utf8');
       let applied;
@@ -282,7 +252,6 @@ export class ApprovalOrchestrator {
           base,
         );
       }
-      // §7.5 步骤 7：记录目标业务文件的内容（blob）与模式快照。
       const businessPaths = touchedPaths.filter((file) => !isAiReviewPath(file));
       const businessSnapshot = await this.snapshotBusiness(businessPaths);
       log('补丁已应用，开始执行门禁检查');
@@ -304,8 +273,7 @@ export class ApprovalOrchestrator {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
         return this.fixOrFallback('GATE_CHECK_FAILED', report.formattedEvidenceMarkdown, candidate, jobId, log, base);
       }
-      // §7.5 步骤 9：门禁后重新校验 guard、重复候选（③）与业务内容快照，防止门禁期间夹带未审核代码。
-      // 先确认门禁期间基线未漂移（HEAD/相关事实未变化）。
+      // AC-APPROVE-01 要求门禁后重新验证共享事实和业务内容，防止门禁期间的改动混入提交。
       const baseAfterGates = await vcs.getCurrentBase();
       if (baseAfterGates === null || baseAfterGates !== base) {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
@@ -342,8 +310,6 @@ export class ApprovalOrchestrator {
         };
       }
       const fresh = freshReload.candidate;
-      // §7.5 步骤 3/10：请求体 commitMessage 先替换候选 commit_message 再校验；
-      // 校验通过的值随本次原子提交一并写入 review.md，并作为业务提交说明。
       if (messageOverride !== undefined) {
         fresh.meta.commitMessage = messageOverride;
         const replacedMessageError = checkCommitMessage(fresh.meta.title, fresh.meta.commitMessage);
@@ -371,13 +337,11 @@ export class ApprovalOrchestrator {
         };
       }
       const backup = await this.backup(fresh);
-      // §12.1：approvedBy 是实际批准的操作者，不是并发期望值 expectedOwner。
       await store.applyApproval(fresh, operator?.trim() || guard.expectedOwner, report, decisions);
       const patchPaths = fresh.meta.revisions.map((revision) =>
         relative(store.repoRoot, path.join(fresh.dirPath, revision.patch)),
       );
       const reviewRelPath = relative(store.repoRoot, fresh.reviewPath);
-      // §7.5 步骤 9/10：提交前把“已审核内容”的 blob/模式作为强制核对输入。
       const reviewText = await readFile(fresh.reviewPath, 'utf8');
       const reviewStat = await stat(fresh.reviewPath);
       const verifyEntries = businessPaths.flatMap((rel) => {
@@ -393,15 +357,10 @@ export class ApprovalOrchestrator {
         ...patchPaths,
         ...businessPaths.filter((rel) => !snapshotAfter.get(rel)),
       ])];
-      // §5.6：缺省用候选 commit_message 全文（首行已校验等于 title）；显式 commitDetail 时
-      // 改用 Host 生成的规范单行（简单）/ 规范单行 + 事实正文（详细）。
-      // 首行校验仍由 §7.5 步骤 3/10 覆盖：detail 模式不会放宽或跳过它，本分支只是在
-      // 校验通过之后决定「用哪一份已通过校验的信息去写提交说明」。
       const businessMessage = (await businessMessageFor(fresh))
         ?? (fresh.meta.commitMessage || `review(${id}): approve rev ${String(fresh.meta.currentRevision)}`);
       if (commitInput?.commitDetail) log(`提交信息模式：${commitInput.commitDetail === 'detailed' ? '详细（单行综述 + 空行 + 事实正文）' : '简略（单行）'}`);
       const probePaths = [reviewRelPath, ...patchPaths];
-      // §5.6：提交探针按目标路径取值——SVN 的根 revision 不随子路径提交前进（H1）。
       const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
       const commit = await vcs.atomicCommit({
         message: businessMessage,
@@ -417,7 +376,6 @@ export class ApprovalOrchestrator {
       if (!commit.success) {
         lastCommitError = commit.errorOutput;
         log(`提交失败：${commit.errorOutput}`);
-        // §5.6 三分支：提交失败后先查询 VCS，确认提交是否实际存在，不得猜测回滚。
         const outcome = await this.classifyCommitFailure({
           probeBefore,
           probePaths,
@@ -433,11 +391,11 @@ export class ApprovalOrchestrator {
           log,
         });
         if (outcome) return outcome;
-        continue; // 撞车且已证明提交不存在：已恢复快照，进入下一次尝试
+        continue;
       }
       let commitRevision: string = commit.commitRevision ?? '';
       if (!commitRevision) {
-        // 提交成功但无法读取版本号：用路径级探针兜底；仍无法证明则结果不明。
+        // 提交成功但适配器未提供版本号时，用提交探针补充定位。
         const probeAfter = await vcs.getCommitProbe(probePaths).catch(() => null);
         if (probeAfter === null || probeAfter === probeBefore) {
           return {
@@ -451,8 +409,6 @@ export class ApprovalOrchestrator {
         commitRevision = probeAfter;
       }
       log(`批准提交成功：${commitRevision.slice(0, 12)}`);
-      // §5.5（2026-11-09 修订）：单次原子提交完成；不再有第二次 commit_revision 回填提交，
-      // review.md 不保存提交哈希，后续读取按 deriveApprovalCommit 从历史派生。
       return {
         status: 'COMMITTED',
         message: `已批准并原子提交版本 ${String(fresh.meta.currentRevision)}`,
@@ -469,8 +425,7 @@ export class ApprovalOrchestrator {
   }
 
   /**
-   * §5.6 三分支判定：提交命令失败后查询 VCS。
-   * 返回 null 表示"已证明提交不存在且已恢复快照，可以安全重试"。
+   * 只有证明提交未落地才允许恢复备份。返回 null 表示已经恢复，可安全重试。
    */
   private async classifyCommitFailure(input: {
     probeBefore: string | null;
@@ -487,7 +442,6 @@ export class ApprovalOrchestrator {
     log: (line: string) => void;
   }): Promise<ApprovalOutcome | null> {
     const { vcs } = this.deps;
-    // §5.6：路径级提交探针——Git=HEAD；SVN=相关路径 last-changed-revision（根 revision 不随子路径提交前进）。
     const probeAfter = await vcs.getCommitProbe(input.probePaths).catch(() => null);
     if (input.probeBefore === null || probeAfter === null) {
       return {
@@ -526,7 +480,6 @@ export class ApprovalOrchestrator {
         jobId: input.jobId,
       };
     }
-    // 探针未前进 → 证明业务提交不存在：恢复操作前快照（§5.6 分支 2）。
     input.log('已证明业务提交不存在，恢复操作前快照');
     await this.restore(input.backup);
     await vcs.revertBusinessWorkspace().catch(() => undefined);
@@ -536,7 +489,6 @@ export class ApprovalOrchestrator {
     }
     return {
       status: 'ABORTED',
-      // §7.5/AC-RETRY-01：非撞车的明确失败是 COMMIT_FAILED；只有真实耗尽才是 MAX_RETRIES_EXCEEDED。
       reason: input.outOfDate ? 'MAX_RETRIES_EXCEEDED' : 'COMMIT_FAILED',
       message: `原子提交失败，已恢复到批准前状态${input.outOfDate ? '（基线竞争且重试已耗尽）' : ''}：\n${input.errorOutput}`,
       jobId: input.jobId,
@@ -549,7 +501,6 @@ export class ApprovalOrchestrator {
     log: (line: string) => void,
   ): Promise<ReloadResult> {
     try {
-      // §7.1：批准流程重读候选必须使用共享快照源（本地未提交改动不得参与 guard/状态判定）。
       const source = this.deps.sharedSource ? await this.deps.sharedSource() : undefined;
       if (source) {
         const { month, slug } = this.deps.store.resolveCandidateDir(id);
@@ -572,13 +523,12 @@ export class ApprovalOrchestrator {
         log(`负责人已从 ${guard.expectedOwner} 变为 ${candidate.meta.owner}`);
         return { candidate: null, conflict: 'guard' };
       }
-      // §7.5 步骤 1：guard 三字段完整校验（updated_at 检出不推进版本的写入）。
+      // 评论等共享写入不会推进补丁版本，仍须用时间戳检出。
       const expectedAt = new Date(guard.expectedUpdatedAt).getTime();
       if (expectedAt !== new Date(candidate.meta.updatedAt).getTime()) {
         log(`候选已在其他写入中更新（updated_at ${candidate.meta.updatedAt}）`);
         return { candidate: null, conflict: 'guard' };
       }
-      // §7.5/G19：只有 pending 可批准；changes_requested 等非 pending 是状态冲突而非并发冲突。
       if (candidate.meta.status !== 'pending') {
         log(`候选状态是 ${candidate.meta.status}，不是 pending`);
         return { candidate: null, conflict: 'state', status: candidate.meta.status };
@@ -590,7 +540,6 @@ export class ApprovalOrchestrator {
     }
   }
 
-  /** §7.5 步骤 1-4：guard/状态 → 判断项 → 提交信息 → 候选完整性。 */
   private async runPrechecks(
     id: string,
     guard: ConcurrencyGuard,
@@ -622,9 +571,7 @@ export class ApprovalOrchestrator {
       };
     }
     const candidate = reload.candidate;
-    // §7.5 步骤 3：/approve 提供 commitMessage 时先替换候选 commit_message，再做首行校验。
     if (commitMessage !== undefined) candidate.meta.commitMessage = commitMessage;
-    // §4.7/I8：人工判断项必须逐项确认或知悉（waived 带理由）。
     const decisionErrors = checkDecisionCoverage(candidate.meta.humanDecisions, decisions.confirmed, decisions.waived);
     if (decisionErrors.length > 0) {
       return {
@@ -636,7 +583,6 @@ export class ApprovalOrchestrator {
         },
       };
     }
-    // §4.9：commit_message 首行 == title。
     const messageError = checkCommitMessage(candidate.meta.title, candidate.meta.commitMessage);
     if (messageError) {
       return { outcome: { status: 'ABORTED', reason: 'COMMIT_MESSAGE_MISMATCH', message: messageError, jobId } };
@@ -656,14 +602,11 @@ export class ApprovalOrchestrator {
   }
 
   /**
-   * §5.6（2026-11-12）：「详细」提交信息的事实正文，只读取**即将提交的同一份快照**。
-   *
-   * 调用点必须在锁内、§7.5 步骤 6 同步重绑之后；任一来源不可读时只降级对应小节，
-   * 不猜测数字（作者统计不可用就写不可用）。
+   * 在锁内且同步重绑后生成正文，避免正文描述旧补丁而提交新补丁。
+   * 部分数据不可读时降级对应小节。
    */
   private async buildDetailBody(candidate: ReviewCandidate): Promise<string> {
     const { store, vcs, settings } = this.deps;
-    // §7.1：补丁必须与即将提交的 review.md 来自同一共享快照。
     const source = this.deps.sharedSource ? await this.deps.sharedSource() : undefined;
     const patch = await store.currentPatch(candidate, source).catch(() => null);
     const touched = patch ? parsePatch(patch.text).paths : [];
@@ -677,7 +620,6 @@ export class ApprovalOrchestrator {
     });
   }
 
-  /** §7.5 步骤 7/9：目标业务文件的内容（Git blob）与模式快照；缺失为 null。 */
   private async snapshotBusiness(businessPaths: string[]): Promise<Map<string, BusinessFileSnapshot | null>> {
     const snapshot = new Map<string, BusinessFileSnapshot | null>();
     for (const rel of businessPaths) {
@@ -703,7 +645,7 @@ export class ApprovalOrchestrator {
       try {
         patches.push({ path: file, text: await readFile(file, 'utf8') });
       } catch {
-        // Missing patch is a validation error handled earlier.
+        // 缺失补丁已由批准预检处理。
       }
     }
     return { reviewPath: candidate.reviewPath, reviewText, patches };
@@ -716,7 +658,7 @@ export class ApprovalOrchestrator {
     }
   }
 
-  /** §5.6(2)：恢复操作前文件，并删除本次 Runner 新生成、操作前不存在的文件。 */
+  /** Runner 可能创建备份中没有的文件，单纯覆盖备份不能还原候选目录。 */
   private async restoreWithCleanup(backup: Backup, dirPath: string, entriesBefore: Set<string>): Promise<void> {
     await this.restore(backup);
     const after = await readdir(dirPath).catch(() => [] as string[]);
@@ -785,8 +727,7 @@ export class ApprovalOrchestrator {
         jobId,
       };
     }
-    // §7.5/G27/G32：Runner 成功 → 先做全部提交前校验，通过后由 Host 原子提交新版本目录；
-    // 只有提交成功才返回 FALLBACK_TO_PENDING + newRevision（新版本必须成为共享事实）。
+    // 新版本必须先成为共享事实，才可通知复核者重新审核。
     try {
       const { store } = this.deps;
       const latest = await store.get(candidate.id, null);
@@ -867,7 +808,6 @@ export class ApprovalOrchestrator {
       if (!commit.success) {
         const probeAfter = await this.deps.vcs.getCommitProbe(probePaths).catch(() => null);
         if (probeBeforeFix === null || probeAfter === null) {
-          // 结果不明（探针不可读）：禁止恢复，人工核对。
           return {
             status: 'RECOVERY_REQUIRED',
             reason: 'COMMIT_OUTCOME_UNKNOWN',
@@ -877,7 +817,6 @@ export class ApprovalOrchestrator {
           };
         }
         if (probeAfter !== probeBeforeFix) {
-          // 探针前进：内容核对，匹配才按成功继续（§5.6 分支 1）。
           const atCommit = writtenReview === null ? null : await this.deps.vcs.readFileAt(probeAfter, reviewRelPath).catch(() => null);
           if (atCommit !== null && atCommit === writtenReview) {
             log(`AI 修复新版本提交已落地（${probeAfter.slice(0, 12)}），按成功继续`);

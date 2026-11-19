@@ -19,7 +19,6 @@ const REVIEW_REL = `${CANDIDATE_DIR_REL}/review.md`;
 const PATCH_REL = `${CANDIDATE_DIR_REL}/001.patch`;
 const BUSINESS_REL = 'src/math.js';
 
-/** 满足 parseReviewMarkdown 的最小 review.md；approved 时带非空 approval 快照。 */
 function reviewMarkdown(status) {
   const approved = status === 'approved';
   return [
@@ -62,7 +61,6 @@ async function writeRepoFile(root, relPath, text) {
   await writeFile(absolute, text, 'utf8');
 }
 
-/** 自建本地 SVN 仓库 + 工作副本（TortoiseSVN 1.14 真机）。 */
 async function createSvnFixture() {
   const base = await mkdtemp(path.join(os.tmpdir(), 'dsh-svn-derived-'));
   const repo = path.join(base, 'repo');
@@ -73,7 +71,7 @@ async function createSvnFixture() {
   return { base, repo, url, wc };
 }
 
-/** 审计提交：pending review.md + 补丁 + 业务文件，然后 update 固定工作副本根 revision。 */
+/** 提交夹具后先更新工作副本根版本，让后续子路径提交对比使用固定起点。 */
 async function seedSvnCandidate(root) {
   await writeRepoFile(root, REVIEW_REL, reviewMarkdown('pending'));
   await writeRepoFile(root, PATCH_REL, '--- a/src/math.js\n+++ b/src/math.js\n');
@@ -94,7 +92,7 @@ test('SVN: getCommitProbe 随目标路径提交前进，getCurrentBase 保持根
 
   await writeRepoFile(wc, REVIEW_REL, reviewMarkdown('approved'));
   await writeRepoFile(wc, BUSINESS_REL, 'export const add = (a, b) => a + b;\n');
-  // 生产批准同样把候选目录纳入提交路径，让 svn 把已调度的补丁删除一起提交。
+  // 把候选目录纳入 SVN 提交路径，确保已调度删除的补丁随批准提交。
   const commit = await vcs.atomicCommit({
     message: 'net: derive',
     paths: [REVIEW_REL, BUSINESS_REL, CANDIDATE_DIR_REL],
@@ -104,7 +102,7 @@ test('SVN: getCommitProbe 随目标路径提交前进，getCurrentBase 保持根
 
   const baseAfter = await vcs.getCurrentBase();
   const probeAfter = await vcs.getCommitProbe([REVIEW_REL, PATCH_REL]);
-  // H1 根因：工作副本根 revision 不随子路径提交前进，不能充当提交探针。
+  // SVN 工作副本根版本可能停在原处，提交探针必须根据实际提交路径判断。
   assert.equal(baseAfter, baseBefore, 'SVN 根 revision 不随子路径提交前进');
   assert.notEqual(probeAfter, probeBefore, '路径级探针必须随提交前进');
   assert.equal(probeAfter, commit.commitRevision);
@@ -125,7 +123,7 @@ test('SVN: readFileAt(probe) 读到已提交内容；out-of-date 失败提交后
   assert.equal(probeAfter, commit.commitRevision);
   assert.equal(await vcs.readFileAt(probeAfter, REVIEW_REL), reviewMarkdown('approved'));
 
-  // 第二个工作副本并发提交同一 review.md，使第一个工作副本的提交 out-of-date。
+  // 用第二个工作副本提交同一文件，让待测工作副本落后于仓库并触发 out-of-date 错误。
   const wc2 = path.join(base, 'wc2');
   runCommand('svn', ['--non-interactive', 'checkout', url, wc2], base);
   await writeRepoFile(wc2, REVIEW_REL, reviewMarkdown('approved').replace('approved_by: tester', 'approved_by: concurrent'));
@@ -136,7 +134,6 @@ test('SVN: readFileAt(probe) 读到已提交内容；out-of-date 失败提交后
   const failed = await vcs.atomicCommit({ message: 'net: derive', paths: [REVIEW_REL] });
   assert.equal(failed.success, false, 'out-of-date 提交必须失败');
   assert.equal(failed.outOfDate, true, failed.errorOutput);
-  // §5.6 分支 2 的前提：提交失败后探针未前进，证明提交不存在。
   assert.equal(await vcs.getCommitProbe([REVIEW_REL]), probeBeforeFailure);
 });
 
@@ -147,7 +144,6 @@ test('SVN: approved review.md + 删除补丁的原子提交派生为 found 且 r
 
   await writeRepoFile(wc, REVIEW_REL, reviewMarkdown('approved'));
   await writeRepoFile(wc, BUSINESS_REL, 'export const add = (a, b) => a + b;\n');
-  // 生产批准同样把候选目录纳入提交路径，让 svn 把已调度的补丁删除一起提交。
   const commit = await vcs.atomicCommit({
     message: 'net: derive',
     paths: [REVIEW_REL, BUSINESS_REL, CANDIDATE_DIR_REL],
@@ -174,7 +170,6 @@ test('Git: 分支上删除补丁后 merge，deriveApprovalCommit 仍 found 且�
   runCommand('git', ['add', '-A'], root);
   runCommand('git', ['commit', '-q', '-m', 'audit pending'], root);
 
-  // 批准提交（approved review.md + 删除补丁 + 业务改动）在侧分支上。
   runCommand('git', ['checkout', '-q', '-b', 'feat'], root);
   await writeRepoFile(root, REVIEW_REL, reviewMarkdown('approved'));
   await writeRepoFile(root, BUSINESS_REL, 'export const add = (a, b) => a + b;\n');
@@ -183,7 +178,7 @@ test('Git: 分支上删除补丁后 merge，deriveApprovalCommit 仍 found 且�
   runCommand('git', ['commit', '-q', '-m', 'net: derive'], root);
   const approvalCommit = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
 
-  // 主分支上制造无关提交，再 merge，使 merge 提交本身也“删除补丁”（相对第一个父）。
+  // 合并也会相对于第一父提交表现为删除补丁，构造这个假阳性来检验派生定位。
   runCommand('git', ['checkout', '-q', mainBranch], root);
   await writeRepoFile(root, 'docs.txt', 'docs\n');
   runCommand('git', ['add', '-A'], root);
@@ -197,7 +192,7 @@ test('Git: 分支上删除补丁后 merge，deriveApprovalCommit 仍 found 且�
     patchPaths: [PATCH_REL],
     targetFiles: [BUSINESS_REL],
   });
-  // 去掉 --first-parent 后必须仍在历史中找到批准提交；merge 提交因父提交 approved 被条件 2 排除。
+  // 合并的一个父提交已经是 approved，合并本身未产生新的批准状态迁移。
   assert.equal(derived.lookup, 'found', derived.diagnostic);
   assert.equal(derived.revision, approvalCommit);
   assert.notEqual(derived.revision, mergeCommit);

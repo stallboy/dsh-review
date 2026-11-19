@@ -2,16 +2,13 @@ import type { InterRevisionDiff, PatchFileStat, PatchStats } from './types.js';
 
 export interface ParsedPatch {
   stats: PatchStats;
-  /** Every path the patch touches, including the old side of a rename or deletion. */
+  /** 包含重命名和删除的旧路径，以便校验补丁触及的完整范围。 */
   paths: string[];
   text: string;
   binary: boolean;
 }
 
-/**
- * Decode a git-quoted path (`core.quotepath` defaults to true for non-ASCII
- * names): C escapes plus octal byte escapes that must be decoded as UTF-8.
- */
+/** Git 的八进制转义表示 UTF-8 字节，须合并后再解码。 */
 function unquoteGitPath(value: string): string {
   const trimmed = value.trim();
   if (trimmed.length < 2 || !trimmed.startsWith('"') || !trimmed.endsWith('"')) return trimmed;
@@ -42,7 +39,7 @@ function stripDiffPrefix(value: string): string {
   return value.startsWith('a/') || value.startsWith('b/') ? value.slice(2) : value;
 }
 
-/** Path from a `---`/`+++`/`Index:` line; the prefix must be stripped after unquoting. */
+/** Git 路径前缀须在去除引号和解码之后剥离。 */
 function headerPath(value: string): string {
   const withoutTab = value.split('\t')[0] ?? '';
   return stripDiffPrefix(unquoteGitPath(withoutTab));
@@ -62,7 +59,7 @@ function readQuotedToken(text: string, start: number): { token: string; end: num
   return null;
 }
 
-/** `a/<same path> b/<same path>`; the only unambiguous split for bare paths with spaces. */
+/** 未加引号的路径可能含空格。同路径情形可先按两侧等长定位分隔符。 */
 function splitSamePath(value: string): string | null {
   const pathLength = (value.length - 5) / 2;
   if (!Number.isInteger(pathLength) || pathLength < 0) return null;
@@ -72,7 +69,6 @@ function splitSamePath(value: string): string | null {
   return value.slice(boundary + 3) === oldPath ? oldPath : null;
 }
 
-/** Both sides of a `diff --git` header; git quotes each side that needs quoting. */
 function diffHeaderPaths(value: string): { oldPath: string; newPath: string } | null {
   const rest = value.trim();
   if (rest.startsWith('"')) {
@@ -91,7 +87,6 @@ function diffHeaderPaths(value: string): { oldPath: string; newPath: string } | 
   return { oldPath: headerPath(rest.slice(0, boundary)), newPath: headerPath(rest.slice(boundary + 1)) };
 }
 
-/** Parse a unified diff (git or svn flavor) enough for queue stats and path validation. */
 export function parsePatch(text: string): ParsedPatch {
   const entries = new Map<string, PatchFileStat>();
   const touched = new Set<string>();
@@ -129,8 +124,7 @@ export function parsePatch(text: string): ParsedPatch {
       inHunk = true;
       continue;
     }
-    // Inside a hunk every '---'/'+++' line is content (a removed line may start
-    // with '-- ', an added line with '++ '), never a file header.
+    // 变更内容本身能产生以 --- 或 +++ 开头的行，hunk 内不能把它识别为文件头。
     if (inHunk) {
       if (line.startsWith('+')) {
         if (current) current.additions += 1;
@@ -180,7 +174,6 @@ export function parsePatch(text: string): ParsedPatch {
   return { stats, paths: [...touched], text, binary };
 }
 
-/** §4.6/G15：补丁不得触及的仓库路径前缀与 VCS 管理文件。 */
 const FORBIDDEN_PATH_PREFIXES = ['.ai-review/', '.tmp/', 'node_modules/', '.git/', '.svn/'];
 
 export function isAiReviewPath(path: string): boolean {
@@ -188,15 +181,12 @@ export function isAiReviewPath(path: string): boolean {
   if (FORBIDDEN_PATH_PREFIXES.some((prefix) => normalized === prefix.slice(0, -1) || normalized.startsWith(prefix))) {
     return true;
   }
-  // 名为 .git 的 worktree 管理文件（根或任意目录下）。
+  // Git worktree 的 .git 是指向元数据目录的文件，也须拦截。
   const segments = normalized.split('/');
   return segments.includes('.git') || segments.includes('.svn');
 }
 
-/**
- * §4.3：从当前 revision 的补丁 Hunk 中提取被评论行的原文与前后行，作为 Host 兜底 anchor。
- * 只做内存解析；目标行不在 Hunk 覆盖范围内时返回 undefined（调用方静默省略）。
- */
+/** 只使用补丁实际覆盖的行，无法提取锚点时调用方仍可保存原评论坐标。 */
 export function anchorFromPatch(
   patchText: string,
   file: string,
@@ -242,7 +232,6 @@ export function anchorFromPatch(
     }
     if (raw.startsWith('--- ')) {
       currentFile = raw.startsWith('--- /dev/null') ? '' : raw.slice(4).trim().replace(/^a\//, '');
-      // 删除文件的 Hunk 只有 `--- a/file` + `+++ /dev/null`：从旧路径命中目标。
       if (currentFile === target) inTarget = true;
       if (inTarget && currentFile !== '' && currentFile !== target) inTarget = false;
       continue;
@@ -271,11 +260,7 @@ export function anchorFromPatch(
   return inTarget ? flush() : undefined;
 }
 
-/**
- * Hunk-level fallback for cross-base diffs. It deliberately does not pretend to
- * be a computed diff: it shows both patches' per-file hunks side by side in one
- * text report, which the UI renders with an explicit "unreliable" banner.
- */
+/** 用于两份补丁基线不同的降级展示。返回的是原 hunk 对照，界面须提示它不代表可计算的差异。 */
 export function buildHunkFallbackDiff(
   fromRevision: number,
   toRevision: number,
@@ -327,7 +312,6 @@ function extractFileSection(patchText: string, path: string): string {
       if (active) collected.push(line);
       continue;
     }
-    // `svn diff` uses `Index:` sections instead of git's `diff --git` headers.
     const indexHeader = /^Index: (.+)$/.exec(line);
     if (indexHeader) {
       active = headerPath(indexHeader[1] ?? '') === path;

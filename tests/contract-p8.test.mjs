@@ -8,8 +8,6 @@ import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
-/** P8 验收：§6.4 人工微调 / §6.5 Rebase——新版本追加、门禁重跑、失败不留半版本。 */
-
 const servers = [];
 after(async () => {
   await Promise.all(servers.map((server) => server.close()));
@@ -78,7 +76,7 @@ test('P8: Rebase——基线落后时产生新版本（author ai）；基线最�
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const { base: apiBase } = await startApi(root);
 
-  // 基线前进后 → Rebase 产生版本 2（共享候选的 base 必然落后于其提交后的 HEAD）。
+  // 夹具的候选记录写入前的基线，提交候选本身就会让 HEAD 前进。
   await writeFile(path.join(root, 'src', 'other.js'), 'export const x = 1;\n', 'utf8');
   runCommand('git', ['add', 'src'], root);
   runCommand('git', ['commit', '-q', '-m', 'base moves'], root);
@@ -90,13 +88,11 @@ test('P8: Rebase——基线落后时产生新版本（author ai）；基线最�
   const dir = path.join(root, '.ai-review', '2026-11', '20261105-net-rb');
   assert.ok(existsSync(path.join(dir, '002.patch')));
   const text = await readFile(path.join(dir, 'review.md'), 'utf8');
-  assert.match(text, /base_revision: "?[0-9a-f]{40}"?/m); // 版本 2 基线 = 新基线
+  assert.match(text, /base_revision: "?[0-9a-f]{40}"?/m);
   assert.match(text, /author: ai/);
   assert.match(text, /status: pending/);
-  // 新基线与 HEAD 一致（取最后一个 revision 的基线）。
   const bases = [...text.matchAll(/base_revision: "?([0-9a-f]{40})"?/g)].map((match) => match[1]);
   assert.equal(bases[bases.length - 1], newBase);
-  // 工作区保持干净（业务代码未被留下改动）。
   const status = runCommand('git', ['status', '--porcelain', 'src'], root).stdout.trim();
   assert.equal(status, '');
 });
@@ -110,7 +106,6 @@ test('P8: 人工微调——补丁可应用且门禁通过时产生版本（auth
   const { base: apiBase } = await startApi(root);
   const dir = path.join(root, '.ai-review', '2026-11', '20261105-net-rb');
 
-  // 坏补丁 → ABORTED，不产生 002.patch。
   const bad = await runJob(apiBase, '/manual-revision', {
     id: '2026-11/20261105-net-rb', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-05T09:00:00+08:00',
     patchText: 'not a patch\n',
@@ -118,7 +113,6 @@ test('P8: 人工微调——补丁可应用且门禁通过时产生版本（auth
   assert.equal(bad.job.result.status, 'ABORTED');
   assert.ok(!existsSync(path.join(dir, '002.patch')));
 
-  // 好补丁 → 版本 2，author human，回 pending。
   const ok = await runJob(apiBase, '/manual-revision', {
     id: '2026-11/20261105-net-rb', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-05T09:00:00+08:00',
     patchText: PATCH('+'),

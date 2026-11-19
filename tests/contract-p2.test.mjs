@@ -7,8 +7,6 @@ import { quickReviewInvariants, fullReviewInvariants } from '../packages/dsh-plu
 import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
 import { createGitFixture } from './helpers.mjs';
 
-/** P2 验收：§13.1 不变量逐条正反用例 + 队列 broken 隔离。 */
-
 function makeCandidate(overrides = {}) {
   return {
     id: '2026-11/20261104-net-fix',
@@ -177,7 +175,6 @@ test('P2: 队列 broken 隔离——违反不变量的候选标记 broken 且不
     '+export const add = (a, b) => a + b;',
     '',
   ].join('\n'), 'utf8');
-  // approved 却 approval: null —— 违反 I6。
   await writeFile(path.join(badDir, 'review.md'), fm('approved', 'null'), 'utf8');
   const { items, errors } = await store.list({}, null);
   assert.equal(errors.length, 0, errors.join('|'));

@@ -4,12 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// 2026-11-12 事故（见 docs/2026-11-12-writer-in-dsh-smoke-test-incident.md §7）：
-// 本机启用 core.fsmonitor 时，每个临时 fixture 仓库都会驻留一个 fsmonitor 守护进程，
-// 累计数百个后 `git add` 会在 IPC 上无限阻塞——四轮全量测试分别在
-// contract-audit-finalize / contract-fixes 等收尾用例上"挂死"均由此产生。
-// 在测试进程树内统一禁用 fsmonitor：GIT_CONFIG_* 会随 child_process 继承，
-// 同时覆盖测试直调的 git 与被测插件拉起的 git 子进程；不改动任何断言。
+// 批量测试临时仓库时，fsmonitor 守护进程会累积并让 git add 卡在 IPC。
+// 用可继承的 GIT_CONFIG_* 禁用它，使测试与被测插件启动的 Git 子进程都生效。
 process.env.GIT_CONFIG_COUNT ??= '1';
 process.env.GIT_CONFIG_KEY_0 ??= 'core.fsmonitor';
 process.env.GIT_CONFIG_VALUE_0 ??= 'false';
@@ -38,7 +34,6 @@ export function runCommand(command, args, cwd, input) {
   return result;
 }
 
-/** Create a throwaway Git repository with one committed source file. */
 export async function createGitFixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'dsh-audit-test-'));
   await mkdir(path.join(root, 'src'), { recursive: true });
@@ -57,30 +52,25 @@ export async function createGitFixture() {
   return root;
 }
 
-/** A stand-in for `dsh headless`; consumes the audit prompt and writes one candidate + report. */
+/** 默认审查替身会为成功路径生成一份候选和一份报告。 */
 export function fakeAuditAgentPath() {
   return path.join(fixturesDir, 'fixtures', 'fake-audit-agent.mjs');
 }
 
-/** A stand-in for a failing executor. */
 export function failAuditAgentPath() {
   return path.join(fixturesDir, 'fixtures', 'fail-audit-agent.mjs');
 }
 
-/** A stand-in that produces only a report (B-class only, no candidate). */
+/** 仅生成 B 类报告，用于覆盖收尾无候选的路径。 */
 export function reportOnlyAgentPath() {
   return path.join(fixturesDir, 'fixtures', 'report-only-agent.mjs');
 }
 
-/** A stand-in that produces a structurally invalid candidate. */
 export function invalidCandidateAgentPath() {
   return path.join(fixturesDir, 'fixtures', 'invalid-candidate-agent.mjs');
 }
 
-/**
- * A stand-in `dsh` executable: ignores the `--profile headless --json -` args
- * and runs the fake agent, so the DSH branch can be tested without a model call.
- */
+/** 替身可在 DSH 命令入口后直接运行审查夹具，测试无需调用模型。 */
 export async function createFakeDshCommand() {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'dsh-audit-dsh-'));
   if (process.platform === 'win32') {

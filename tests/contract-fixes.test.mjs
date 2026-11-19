@@ -9,8 +9,6 @@ import { parseReviewMarkdown, serializeReviewMarkdown, ReviewFormatError } from 
 import { quickReviewInvariants } from '../packages/dsh-plugin/dist/host/invariants.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
-/** 验收审查修复项的回归测试：裸 ISO 时间、批准快照往返、I7/I14、duplicateOf 阻止批准、回填幂等、broken 可读。 */
-
 const servers = [];
 after(async () => {
   await Promise.all(servers.map((server) => server.close()));
@@ -64,9 +62,8 @@ test('修复：裸 ISO（YAML Date 对象）被接受并规范化为 UTC Z', () 
     '# 问题与影响',
     '',
   ].join('\n');
-  const parsed = parseReviewMarkdown(bare); // 之前：抛"必须是字符串"→broken
+  const parsed = parseReviewMarkdown(bare); // 未加引号的 YAML 时间也可能被解析为 Date。
   assert.equal(new Date(parsed.meta.createdAt).toISOString(), '2026-11-04T02:00:00.000Z');
-  // 三写法（裸 / 带引号 / Z）解析为同一时间点。
   const quoted = parseReviewMarkdown(bare.replace('created_at: 2026-11-04T10:00:00+08:00', 'created_at: "2026-11-04T10:00:00+08:00"'));
   const zulu = parseReviewMarkdown(bare.replace('created_at: 2026-11-04T10:00:00+08:00', 'created_at: "2026-11-04T02:00:00Z"'));
   assert.equal(new Date(parsed.meta.createdAt).getTime(), new Date(quoted.meta.createdAt).getTime());
@@ -124,7 +121,7 @@ test('修复：嵌套未知键往返保留（I14 深层）', () => {
 });
 
 test('修复：I7——approval 快照与顶层 gate_checks 不一致标 broken；快照留痕读回', async () => {
-  // I7 读侧：构造 approved 候选，approval.gate_checks 快照与顶层不一致。
+  // 故意让顶层门禁与批准快照不同，用来检出读侧误用顶层值。
   const approvedFm = (snapshot) => [
     '---',
     'schema_version: 1',
@@ -170,7 +167,6 @@ test('修复：I7——approval 快照与顶层 gate_checks 不一致标 broken�
   ].join('\n');
   const ok = parseReviewMarkdown(approvedFm(true));
   assert.deepEqual(quickReviewInvariants(ok.meta ? { id: '2026-11/x', month: '2026-11', slug: 'x', meta: ok.meta } : {}), []);
-  // 快照四字段读回不丢（之前 parseApproval 丢弃）。
   assert.equal(ok.meta.approval?.gateResults?.[0].exit_code, 0);
   assert.deepEqual(ok.meta.approval?.confirmedDecisions, []);
   const roundtrip = serializeReviewMarkdown(ok.meta, ok.body);
@@ -179,7 +175,6 @@ test('修复：I7——approval 快照与顶层 gate_checks 不一致标 broken�
   const bad = parseReviewMarkdown(approvedFm(false));
   const errors = quickReviewInvariants({ id: '2026-11/x', month: '2026-11', slug: 'x', meta: bad.meta });
   assert.ok(errors.some((e) => e.startsWith('I7')), errors.join('|'));
-  // approval 关键字段缺失不再伪装成"未批准"。
   assert.throws(() => parseReviewMarkdown(approvedFm(true).replace('  approved_by: tester\n', '')), ReviewFormatError);
 });
 
@@ -224,18 +219,15 @@ test('修复：duplicateOf 候选被阻止批准；broken 候选详情可读', a
   await mkdir(dirOf('20261106-dup'), { recursive: true });
   await writeFile(path.join(dirOf('20261106-dup'), 'review.md'), fm('20261106-dup', 'pending', { titleText: '修复加法' }), 'utf8');
   await writeFile(path.join(dirOf('20261106-dup'), '001.patch'), 'diff --git a/src/math.js b/src/math.js\n', 'utf8');
-  // broken：approved 无 approval（I6）。
   await mkdir(dirOf('20261106-broken'), { recursive: true });
   const brokenText = fm('20261106-broken', 'approved');
   await writeFile(path.join(dirOf('20261106-broken'), 'review.md'), brokenText.replace(/status: approved/, 'status: approved'), 'utf8');
-  // 让它真正违反 I6：把 approval 置 null 但保留 approved。
   await writeFile(path.join(dirOf('20261106-broken'), 'review.md'), brokenText, 'utf8');
   await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nrejection_memory_days: 30\n', 'utf8');
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
 
   const { base } = await startApi(root);
-  // duplicateOf 阻止批准。
   const blocked = await fetch(`${base}/approve`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ id: '2026-11/20261106-dup', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: '2026-11-04T10:00:00+08:00' }),
@@ -243,8 +235,7 @@ test('修复：duplicateOf 候选被阻止批准；broken 候选详情可读', a
   assert.equal(blocked.status, 409);
   assert.match((await blocked.json()).error.message, /完全重复/);
 
-  // broken 候选详情可读（之前 422 死胡同）。构造真 broken：把 dup 的 review 改坏并提交为共享事实
-  // （§7.1：详情只读 HEAD 同一快照，未提交的手改只作 local 诊断、不进入共享事实）。
+  // 将损坏的候选提交至 HEAD 才能覆盖共享详情，留在工作区只会进入本地诊断。
   const dupPath = path.join(dirOf('20261106-dup'), 'review.md');
   const original = await readFile(dupPath, 'utf8');
   await writeFile(dupPath, original.replace('current_revision: 1', 'current_revision: 9'), 'utf8');
@@ -275,14 +266,13 @@ test('修复：approval 不再保存 commit_revision——旧字段只读保留�
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const { base } = await startApi(root);
 
-  // /backfill 端点已随单次原子提交契约移除。
   const gone = await fetch(`${base}/backfill`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ id: '2026-11/20261106-bf', commitRevision: 'deadbeef' }),
   });
   assert.equal(gone.status, 404);
 
-  // 历史中没有"删除补丁 + approved 状态迁移"的提交 → 派生 unknown，仅诊断，不 broken、不阻塞队列。
+  // 历史缺少同时删除补丁并转入 approved 的提交，用来触发无法定位批准版本的场景。
   const detail = await (await fetch(`${base}/candidate?id=${encodeURIComponent('2026-11/20261106-bf')}`)).json();
   assert.equal(detail.approvalCommitLookup, 'unknown');
   assert.equal(detail.approvalCommitRevision, undefined);

@@ -78,8 +78,7 @@ export async function validateSettings(settings: AppSettings): Promise<SettingsV
   const errors: string[] = [];
   if (!settings.owner.trim()) errors.push('审核者（owner）不能为空');
   if (!settings.repoRoot.trim()) {
-    // Project selection is session-scoped: an empty repoRoot is valid and is
-    // resolved from the active conversation's working directory per request.
+    // 没有固定仓库时按请求使用对应会话的工作目录，空配置仍然合法。
     return { ok: errors.length === 0, errors, vcsType: null };
   }
   const repoRoot = path.resolve(settings.repoRoot);

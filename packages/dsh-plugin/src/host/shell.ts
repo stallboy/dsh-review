@@ -9,7 +9,6 @@ export interface ProcessResult {
   code: number | null;
   signal: NodeJS.Signals | null;
   timedOut: boolean;
-  /** §7.7：由 Job 取消信号终止（区别于超时）。 */
   aborted?: boolean;
   stdout: string;
   stderr: string;
@@ -23,29 +22,19 @@ export interface ProcessOptions {
   input?: string;
   onLine?: (line: string, stream: 'stdout' | 'stderr') => void;
   maxBytes?: number;
-  /**
-   * Windows 上主进程正常退出后是否也执行 taskkill /t /f 清理残留子进程。
-   * 仅用于门禁/Runner 这类可能派生后台进程的 shell；VCS 命令保持默认 false，
-   * 避免每条 git/svn 命令额外付出 taskkill 开销与误杀风险。
-   */
+  /** 门禁和执行器可能留下后台进程，按需清理以免 VCS 短命令承担 taskkill 的开销。 */
   killTreeOnExit?: boolean;
-  /** §7.7：Job 取消信号；触发后终止进程组并等待清理。 */
+  /** 取消会触发进程树清理，命令在清理尝试结束后返回。 */
   signal?: AbortSignal;
 }
 
 const DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
 
-/**
- * §7.3：终止整个进程组/进程树并等待清理完成。
- * POSIX：spawn 使用 detached 形成进程组，kill(-pid) 一次清理全部子进程；
- * Windows：taskkill /t /f 并等待其退出（不再 fire-and-forget）。
- * 目标已退出时静默成功（taskkill/kill 报 ESRCH 均视为已清理）。
- */
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** §7.3：等待进程组真正消失（而不只是“发了信号”）。 */
+/** 发送终止信号后子进程可能仍未退出，因此短时探测进程组是否消失。 */
 async function waitProcessGroupGone(pid: number): Promise<void> {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
@@ -70,10 +59,9 @@ function killTree(pid: number | undefined): Promise<void> {
     });
   }
   try {
-    // 进程组整体终止；组已不存在（ESRCH）视为已清理。
     process.kill(-pid, 'SIGKILL');
   } catch {
-    try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+    try { process.kill(pid, 'SIGKILL'); } catch { }
   }
   return waitProcessGroupGone(pid);
 }
@@ -89,7 +77,7 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
       child = spawn(exe, args, {
         cwd: options.cwd,
         windowsHide: true,
-        // POSIX 下建立独立进程组，超时/取消可 kill(-pid) 清理全部子进程。
+        // 独立的 POSIX 进程组可在取消时一次停止所有后代进程。
         detached: process.platform !== 'win32',
         env: { ...process.env, ...options.env },
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -149,7 +137,6 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
     }, options.timeoutMs ?? 120_000);
     timer.unref?.();
 
-    // §7.7：取消信号立即终止完整进程树；close 后由 finish 等待清理完成。
     const onAbort = (): void => {
       aborted = true;
       killPromise = Promise.all([killPromise, killTree(child.pid)]).then(() => undefined);
@@ -159,8 +146,7 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
       else options.signal.addEventListener('abort', onAbort, { once: true });
     }
 
-    // §7.3：主进程无论成功、失败或超时退出后，都必须终止并等待进程组内残留子进程退出。
-    // Windows 的 taskkill /t /f 需要父进程仍存在；对 VCS 命令关闭正常退出清理（见 ProcessOptions）。
+    // 即使主进程正常退出，POSIX 同组子进程也可能仍在运行。
     const finish = (code: number | null, signal: NodeJS.Signals | null, error?: string): void => {
       clearTimeout(timer);
       options.signal?.removeEventListener('abort', onAbort);
@@ -185,11 +171,7 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
   });
 }
 
-/**
- * Run one shell command. Windows executes it from a temporary `.cmd` file so
- * gate commands containing quotes, `&`, or `%` survive cmd.exe's argument
- * parsing unchanged; POSIX uses a temporary `.sh` file for the same reason.
- */
+/** 用临时脚本执行原始命令，避免传参时再次解释引号和 shell 元字符。 */
 export async function runShell(command: string, options: ProcessOptions): Promise<ProcessResult> {
   const isWindows = process.platform === 'win32';
   const dir = await mkdtemp(join(tmpdir(), 'dsh-shell-'));

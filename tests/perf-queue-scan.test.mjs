@@ -7,13 +7,6 @@ import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
-/**
- * 队列扫描性能优化的契约回归（§4.8 缓存模式 / §7.1 本地视图实时性）：
- * - 共享扫描结果按 HEAD 快照缓存：HEAD 前进必须立即可见新内容（不跨快照复用）；
- * - local/localOnly 属本地视图层，不参与缓存：工作区改动必须在下一次 /queue 立即反映；
- * - 批量本地改动检测（一次 git status）与逐候选检测语义等价，含已跟踪目录内新文件（-uall）。
- */
-
 const servers = [];
 after(async () => {
   await Promise.all(servers.map((server) => server.close()));
@@ -63,11 +56,9 @@ test('§4.8：扫描缓存不跨快照复用——HEAD 前进后新共享内容�
   const before = await (await fetch(`${base}/queue`)).json();
   assert.equal(before.items.length, 1, '首扫见 1 个共享候选');
 
-  // 同一 HEAD 的第二次请求（命中缓存）内容必须一致。
   const repeat = await (await fetch(`${base}/queue`)).json();
   assert.deepEqual(repeat.items.map((item) => item.id), before.items.map((item) => item.id));
 
-  // HEAD 前进：修改标题并提交 + 新增候选并提交，下一次队列必须立即反映。
   const reviewPath = path.join(root, '.ai-review', '2026-11', '20261113-cache-a', 'review.md');
   const original = await readFile(reviewPath, 'utf8');
   await writeFile(reviewPath, original.replace('net: 20261113-cache-a', 'net: 缓存后新标题'), 'utf8');
@@ -89,12 +80,10 @@ test('§7.1：本地视图层不缓存——工作区改动在下一请求立即
   commitAll(root, 'fixture');
   const { base } = await startApi(root);
 
-  // 暖缓存（同一 HEAD）。
   const warm = await (await fetch(`${base}/queue`)).json();
   assert.equal(warm.items.every((item) => item.local === undefined), true, '干净工作区无 local 标记');
 
-  // 已跟踪候选目录内新建未跟踪**子目录**并放文件：默认 -unormal 会把该子目录折叠成一条目录记录
-  // （`?? .../sub/`），按文件路径层级解析可能漏判；必须用 -uall 逐文件列出才算覆盖。
+  // Git 默认把未跟踪的嵌套目录折叠成一条记录。这里用子目录验证文件级扫描能识别这项候选改动。
   await mkdir(path.join(root, '.ai-review', '2026-11', '20261113-local-a', 'sub'), { recursive: true });
   await writeFile(path.join(root, '.ai-review', '2026-11', '20261113-local-a', 'sub', 'notes.md'), 'draft', 'utf8');
   const withNewFile = await (await fetch(`${base}/queue`)).json();
@@ -103,7 +92,6 @@ test('§7.1：本地视图层不缓存——工作区改动在下一请求立即
   assert.equal(withNewFile.items.find((item) => item.id.endsWith('local-b'))?.local, undefined,
     '未改动候选不得误标 local');
 
-  // 修改另一候选的已跟踪文件：批量检测与逐候选检测语义等价。
   const reviewPath = path.join(root, '.ai-review', '2026-11', '20261113-local-b', 'review.md');
   const original = await readFile(reviewPath, 'utf8');
   await writeFile(reviewPath, `${original}\n本地改动\n`, 'utf8');
@@ -114,21 +102,20 @@ test('§7.1：本地视图层不缓存——工作区改动在下一请求立即
 
 test('§4.8：错误条目不随快照键固化——broken 候选在缓存命中路径仍稳定出现', async () => {
   const root = await createGitFixture();
-  // 确定性 broken 候选：review.md 声明 001.patch 但补丁文件不存在 → 扫描错误路径。
+  // 留下对缺失补丁的引用，使共享扫描必然产生 broken 条目。
   const dir = path.join(root, '.ai-review', '2026-11', '20261113-broken-a');
   await mkdir(dir, { recursive: true });
   await writeFile(path.join(dir, 'review.md'), candidateFm('20261113-broken-a'), 'utf8');
   commitAll(root, 'fixture broken');
   const { base } = await startApi(root);
 
-  // 显式空 owner 查全部（缺省 owner 过滤会按设计排除 owner 为空的错误摘要）。
+  // 显式空 owner 才会包含没有 owner 的错误摘要，缺省会按当前操作者过滤。
   const first = await (await fetch(`${base}/queue?owner=`)).json();
   const firstItem = first.items.find((item) => item.id.endsWith('broken-a'));
   assert.ok(firstItem?.parseError, '首扫：补丁缺失的候选必须带 parseError');
   assert.ok(first.errors.some((error) => error.includes('broken-a')), '首扫：错误必须汇总');
 
-  // 第二次请求（缓存命中路径）：错误条目不进缓存、逐请求重扫，结果必须与首扫一致，
-  // 且不得因缓存缺失键而静默丢条目。
+  // 再次请求覆盖共享缓存命中路径，检验未写入缓存的错误条目仍可见。
   const second = await (await fetch(`${base}/queue?owner=`)).json();
   const secondItem = second.items.find((item) => item.id.endsWith('broken-a'));
   assert.ok(secondItem?.parseError, '缓存命中：broken 候选必须仍带 parseError 出现');
@@ -141,9 +128,8 @@ test('§7.1：缓存存在时 local-only 候选（未提交目录）仍实时出
   commitAll(root, 'fixture');
   const { base } = await startApi(root);
 
-  await (await fetch(`${base}/queue`)).json(); // 暖缓存
+  await (await fetch(`${base}/queue`)).json();
 
-  // 审查进行中的典型场景：工作区新增未提交候选目录。
   await writeCandidate(root, '20261113-localonly-new');
   const withDraft = await (await fetch(`${base}/queue`)).json();
   const draft = withDraft.items.find((item) => item.id.endsWith('localonly-new'));
@@ -151,7 +137,6 @@ test('§7.1：缓存存在时 local-only 候选（未提交目录）仍实时出
   assert.equal(draft?.localOnly, true, '未提交候选必须带 localOnly');
   assert.equal(withDraft.counts.pending, 1, 'local-only 不计共享 KPI');
 
-  // 删除后实时消失（本地视图层不缓存）。
   await rm(path.join(root, '.ai-review', '2026-11', '20261113-localonly-new'), { recursive: true, force: true });
   const afterRemove = await (await fetch(`${base}/queue`)).json();
   assert.equal(afterRemove.items.some((item) => item.id.endsWith('localonly-new')), false,

@@ -112,8 +112,8 @@ export class AuditSchedules {
             AND NOT (${UNACCEPTED_SCHEDULED})`).get(projectId));
     }
 
+    /** 改写未取消指令的幂等键使本轮可以重新派发，并保留原指令供节点确认。 */
     yieldToManual(projectId: string, now: string): void {
-        // 保留原指令供节点确认，同时让未主动取消的计划在本轮窗口内重新派发。
         this.database.sql.prepare(`UPDATE commands SET state='completed',updated_at=?,
             idempotency_key=CASE WHEN cancel_requested=1 THEN idempotency_key ELSE 'retired-scheduled:' || command_id END,
             result=CASE WHEN cancel_requested=1 THEN ? ELSE ? END

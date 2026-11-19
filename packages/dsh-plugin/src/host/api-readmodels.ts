@@ -18,16 +18,12 @@ import {
   type Runtime,
 } from './api-context.js';
 
-/** 本模块持有的缓存（原 ReviewApi 私有字段），迁移后由同一个实例共享。 */
 interface ReadModelState {
   approvalLookupCache: Map<string, ApprovalCommitLookup>;
   projectionCache: Map<string, { findings: ReturnType<typeof projectFindings>['findings']; errors: string[]; snapshot: string }>;
   patchCheckCache: Map<string, PatchCheckDiagnostic>;
   patchCheckPending: Set<string>;
-  /**
-   * 有效业务基线比较（§7.7）的派生缓存：键 = `from|to` 两个不可变提交，
-   * 结果是纯函数，可安全长期缓存；`unknown`（无法证明）不缓存，避免瞬时失败被固化。
-   */
+  /** 两个不可变提交间可证明的结果可长期缓存。无法确定时跳过缓存，避免固化瞬时失败。 */
   baselineCache: Map<string, { state: 'unchanged' } | { state: 'changed'; paths: string[] }>;
 }
 
@@ -125,14 +121,10 @@ export class ReadModels {
     const ownerParam = url.searchParams.get('owner');
     const owner = ownerParam !== null ? ownerParam.trim() : await this.host.ownerFor(runtime.root);
     const filter = filterFrom(url, owner);
-    // §7.1：一次队列计算的 base 与候选事实必须来自同一共享快照（Git=HEAD）。
     const view = await sharedViewFor(runtime);
     const base = view?.snapshot ?? await runtime.vcs.getCurrentBase().catch(() => null);
-    // §18.1：stale_days 决定队列的过期提示（只读，不产生共享写入）。
     const reviewers = await loadReviewers(runtime.root, view?.source);
-    // One scan for both the filtered page and the owner-wide status counts: the
-    // filtered items are always a subset of the owner's candidates.
-    // §7.1：共享读取绑定同一 HEAD 快照（Git），本地视图只作 local 诊断。
+    // 同一次扫描可同时生成分页结果和 Owner 范围内的状态计数，避免重复枚举仓库。
     const all = await runtime.store.list({ owner }, base, reviewers.staleDays, reviewers.rejectionMemoryDays, view?.source);
     for (const item of all.items) {
       if (item.local || item.parseError || item.status === 'approved' || item.status === 'rejected' || !base || !item.baseRevision) continue;
@@ -148,19 +140,17 @@ export class ReadModels {
       else this.schedulePatchCheck(runtime, item.id, item.currentRevision, base);
     }
     const counts: Record<ReviewStatus, number> = { pending: 0, changes_requested: 0, approved: 0, rejected: 0 };
-    // §10.1：local 候选不计入共享 KPI。
     for (const item of all.items) {
       if (!item.local) counts[item.status] += 1;
     }
-    // §5.5：approved 项附带派生业务提交版本与三态诊断（仅诊断，不阻塞队列）。
+    // 定位结果仅作诊断，无法定位业务提交仍保留队列项。
     for (const item of items) {
       if (item.status === 'approved' && !item.parseError) {
         const derived = await this.deriveApprovalInfo(runtime, item.id).catch(() => undefined);
         if (derived) Object.assign(item, derived);
       }
     }
-    // §7.6/§10.1：阻塞中的审查租约（active=执行中/待收尾，releasable=超时或取消待处理）。
-    // 仅作诊断展示，为面板的收尾/释放入口提供数据；不是共享事实，无阻塞租约时省略。
+    // 租约是宿主运行态，单独提供给面板的收尾和释放入口。
     let auditLease:
       | {
         auditId: string;
@@ -188,7 +178,6 @@ export class ReadModels {
         };
       }
     } catch {
-      // 租约状态机未初始化（理论不可达）：省略诊断字段，不影响队列主体。
     }
     sendJson(res, 200, {
       configured: true,
@@ -208,7 +197,6 @@ export class ReadModels {
     const { store, vcs } = runtime;
     const me = await this.host.ownerFor(store.repoRoot);
     const id = idFrom(url);
-    // §7.1：详情读取绑定同一共享快照（Git=HEAD）；本地视图只作 local 诊断。
     const view = await sharedViewFor(runtime);
     const currentBase = view?.snapshot ?? await vcs.getCurrentBase().catch(() => null);
     const detail = await store.get(id, currentBase, view?.source);
@@ -224,8 +212,7 @@ export class ReadModels {
     }
     const patchText = detail.patchText;
     const patchPaths = parsePatch(patchText).paths.filter((file) => !isAiReviewPath(file));
-    // §8.2/G40：patchCheck 派生预检——clean/conflicted 只表示补丁能否应用到 checkedBase，
-    // 不构成批准证据；批准 Job 仍会重新严格应用。
+    // 补丁预检只对 checkedBase 有效，批准时仍须重新严格应用。
     let patchCheck: PatchCheckDiagnostic | undefined;
     if (!detail.candidate.parseError && detail.candidate.meta.status !== 'approved' && detail.candidate.meta.status !== 'rejected' && currentBase) {
       const revision = detail.candidate.meta.currentRevision;
@@ -241,7 +228,6 @@ export class ReadModels {
       const byRevision = left.revision - right.revision;
       return byRevision !== 0 ? byRevision : left.id.localeCompare(right.id);
     });
-    // §5.5：approved 候选附带派生业务提交版本与三态诊断。
     let approvalCommitRevision: string | undefined;
     let approvalCommitLookup: 'found' | 'ambiguous' | 'unknown' | undefined;
     if (detail.candidate.meta.status === 'approved' && !detail.candidate.parseError) {
@@ -251,8 +237,7 @@ export class ReadModels {
         approvalCommitLookup = derived.approvalCommitLookup;
       }
     }
-    // §8.2（2026-11-10 澄清）：isBaseBehind 指“业务代码基线是否变化”，不是比较顶层 VCS
-    // 版本号——否则每次评论/状态变更推进 HEAD 都会让候选错误显示为“基线落后”。
+    // 评论或状态变更也会推进 HEAD，须排除评审元数据变化以免误报基线落后。
     const currentRevisionEntry = detail.candidate.meta.revisions.find(
       (revision) => revision.id === detail.candidate.meta.currentRevision,
     );
@@ -262,7 +247,7 @@ export class ReadModels {
       && detail.currentBase !== null
       && currentRevisionEntry.baseRevision !== detail.currentBase) {
       const business = await this.businessBaselineState(runtime.vcs, currentRevisionEntry.baseRevision, detail.currentBase);
-      // 只有能证明业务代码确有变化才算落后；无法证明时保守地沿用“落后”（提示人工确认）。
+      // 无法证明业务基线时保留落后提示，供人工确认。
       if (business.state === 'unchanged' || business.state === 'same') isBaseBehind = false;
     }
     sendJson(res, 200, {
@@ -285,15 +270,11 @@ export class ReadModels {
     });
   }
 
-  /**
-   * §5.5：从 VCS 历史派生批准业务提交版本。结果缓存在内存中，
-   * 键为 (repoRoot, candidateId, VCS 快照)，不持久化、不写入 review.md。
-   */
+  /** 派生结果只缓存于内存，供列表和详情共享，避免回写评审档案。 */
   private async deriveApprovalInfo(
     runtime: Runtime,
     id: string,
   ): Promise<{ approvalCommitRevision?: string; approvalCommitLookup: 'found' | 'ambiguous' | 'unknown' }> {
-    // §7.1：派生读取与缓存键必须绑定同一共享快照；SVN 无法证明快照时不缓存（避免子路径提交后的陈旧结果）。
     const view = await sharedViewFor(runtime);
     const cacheKey = view?.snapshot ? `${runtime.root}|${id}|${view.snapshot}` : null;
     const cached = cacheKey ? state.approvalLookupCache.get(cacheKey) : undefined;
@@ -379,7 +360,6 @@ export class ReadModels {
     sendJson(res, 200, { config });
   }
 
-  /** §3：目录式审查档案列表（旧扁平报告不参与；§7.1 只列共享快照中的档案）。 */
   async auditsList(res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const archive = new AuditArchive(runtime.root);
@@ -403,13 +383,12 @@ export class ReadModels {
     });
   }
 
-  /** §4.8：finding 投影（共享候选事实 + 重开链判定），供 /findings、/convert、/dismiss-finding 复用。 */
+  /** 转换与忽略操作也要使用这份投影，免得以被后来观察覆盖的档案作判断。 */
   async findingProjection(runtime: Runtime): Promise<{
     records: Awaited<ReturnType<AuditArchive['list']>>;
     findings: ReturnType<typeof projectFindings>['findings'];
     errors: string[];
   }> {
-    // §7.1：一次投影计算内的档案与候选事实必须绑定同一个共享快照；缓存键也取自同一个源对象。
     const view = await sharedViewFor(runtime);
     const snapshot = view?.snapshot ?? null;
     const archive = new AuditArchive(runtime.root);
@@ -448,7 +427,6 @@ export class ReadModels {
     return { records, findings: projected.findings, errors };
   }
 
-  /** §3.4：finding 投影（覆盖判定 → 最新观察 → 当前状态 → 可见性）。 */
   async findings(res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const { findings, errors } = await this.findingProjection(runtime);
@@ -470,22 +448,13 @@ export class ReadModels {
       log: () => undefined,
     });
     const result = await runner.run();
-    // §7.4：mode=session 时返回「新会话」口径的提示词（与 /fix-session 实际投递的一致）；
-    // 缺省仍为 headless 口径，保持既有调用方语义。
     const mode = url.searchParams.get('mode') === 'session' ? 'session' : 'headless';
     const rawPrompt = result.prompt ?? result.errorMessage ?? '';
     const prompt = mode === 'session' && rawPrompt ? toSessionFixPrompt(rawPrompt, await loadSystemPrompt()) : rawPrompt;
     sendJson(res, 200, { prompt, comments, mode, title: detail.candidate.meta.title, revision: detail.candidate.meta.currentRevision });
   }
 
-  /**
-   * §7.7/§8.2：判定“有效业务基线”是否变化（排除 `.ai-review/` 评审元数据）。
-   *
-   * - `same`：两个版本号相同；
-   * - `unchanged`：版本号不同，但业务代码零变化（只有 .ai-review/ 提交）——**等同于基线未变**；
-   * - `changed`：业务代码确有变化（附带变化路径）；
-   * - `unknown`：无法证明（浅克隆/非法版本/日志不可读），调用方必须按“无法确定”处理。
-   */
+  /** 排除评审元数据后，版本不同仍可能是同一业务基线。若历史不足以证明差异，调用方须保留未知状态。 */
   async businessBaselineState(
     vcs: VcsAdapter,
     fromRevision: string,
@@ -500,7 +469,6 @@ export class ReadModels {
     const to = toRevision.trim();
     if (!from || !to) return { state: 'unknown', detail: '候选基线或当前基线为空' };
     if (from === to) return { state: 'same' };
-    // 两个不可变提交之间的业务差异是纯函数：命中即返回（仅缓存可证明的结果）。
     const cacheKey = `${vcs.root}|${from}|${to}`;
     const cached = state.baselineCache.get(cacheKey);
     if (cached) return cached;

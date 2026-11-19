@@ -3,17 +3,7 @@ import path from 'node:path';
 import { FilesystemCandidateSource, type CandidateSource } from './store.js';
 import { runProcess, type ProcessResult } from './shell.js';
 
-/**
- * §7.1 本地视图枚举（Git/SVN 共用）：候选目录"是否只存在于工作区"本质是文件系统
- * 问题，直接枚举工作区，由调用方（store.list）扣除共享快照集合。
- *
- * 为什么不用 `git status --porcelain` / `svn status`（2026-11-12 事故修复）：
- * - 两者的未跟踪条目都会**折叠到最高的未跟踪祖先目录**——首次审查时整个
- *   `.ai-review/` 未跟踪，git 只输出一行 `?? .ai-review/`，SVN 同样只报目录本身，
- *   按月份/候选层级解析的正则匹配不到任何条目，本地候选诊断静默失效；
- * - git 还会遵守 `.gitignore`：`.ai-review/` 被忽略时 status 输出为空。
- * 文件系统枚举对两种情况都免疫，且少一次 VCS 子进程。
- */
+/** VCS 状态输出可能把首次审查的未跟踪候选折叠成父目录，Git 还会隐藏被忽略的目录，因此从文件系统枚举。 */
 function listWorktreeCandidateDirs(root: string): Promise<string[]> {
   return new FilesystemCandidateSource(root).listCandidateDirs();
 }
@@ -32,35 +22,26 @@ async function svn(root: string, args: string[]): Promise<ProcessResult> {
   return runProcess('svn', ['--non-interactive', ...args], { cwd: root, timeoutMs: VCS_TIMEOUT_MS, maxBytes: 8 * 1024 * 1024 });
 }
 
-/**
- * §7.1 共享快照读取源：除候选事实之外，还提供审查档案（`audits/<id>/audit.md`）的
- * 同快照读取与快照标识。投影缓存键必须来自同一个源对象，禁止“用 A 快照读取、用 B 快照做键”。
- */
+/** 档案与候选须来自同一固定版本，投影用来缓存的版本也必须来自这一读取源。 */
 export interface AuditSnapshotSource {
-  /** 共享快照中存在 audit.md 的档案目录名（`<audit_id>`）。 */
   listAuditDirs(): Promise<string[]>;
-  /** 读取共享快照中的 audit.md 文本；不存在返回 null。 */
   readAuditText(dirName: string): Promise<string | null>;
 }
 
 export interface SharedCandidateSource extends CandidateSource, AuditSnapshotSource {
-  /** 该源实际绑定的 VCS 快照标识；无法证明快照时可返回 null（调用方不得缓存）。 */
+  /** 无法证明版本时返回 null，调用方须跳过跨请求缓存。 */
   snapshotId(): Promise<string | null>;
   readReviewersText(): Promise<string | null>;
 }
 
-/**
- * §7.1 共享事实读取源（Git）：候选的 review.md 与补丁全部读自创建时固定的同一 HEAD 快照，
- * 不从工作区拼凑；`hasLocalChanges` 用于把存在本地改动的候选降级为 local 诊断。
- * 一次计算（list/get）内所有读取绑定同一 snapshot，不混合不同 VCS 快照。
- */
+/** 创建时固定 HEAD，后续共享读取不受工作区改动或 HEAD 前进影响。 */
 export class GitHeadCandidateSource implements SharedCandidateSource {
   private constructor(
     private readonly root: string,
     private readonly snapshot: string,
   ) {}
 
-  /** 无提交历史（空仓库）返回 null，调用方回退文件系统源。 */
+  /** 没有提交历史时无共享视图，调用方可回退到文件系统视图。 */
   static async create(root: string): Promise<GitHeadCandidateSource | null> {
     const head = await git(root, ['rev-parse', 'HEAD']);
     if (head.code !== 0) return null;
@@ -84,7 +65,7 @@ export class GitHeadCandidateSource implements SharedCandidateSource {
   }
 
   async listDirEntries(month: string, slug: string): Promise<string[] | null> {
-    // 尾斜杠让 ls-tree 列出目录内容（子项为 .ai-review/<month>/<slug>/<name> 全路径）。
+    // ls-tree 需要尾斜杠才能输出目录内条目。
     const result = await git(this.root, ['ls-tree', '--name-only', this.snapshot, '--', `.ai-review/${month}/${slug}/`]);
     if (result.code !== 0) return null;
     const prefix = `.ai-review/${month}/${slug}/`;
@@ -109,19 +90,14 @@ export class GitHeadCandidateSource implements SharedCandidateSource {
     return result.stdout.trim().length > 0;
   }
 
-  /**
-   * §7.1 批量本地改动检测：一次 `git status --porcelain=v1 -z -uall -- .ai-review` 覆盖所有候选，
-   * 语义与逐候选 hasLocalChanges 等价（同一 porcelain 数据源，只是合并子进程）。
-   * `-uall` 防止已跟踪候选目录内的新文件被目录折叠吞掉；`-z` 关闭路径转义，按 NUL 切分。
-   * 失败返回 null，由调用方回退逐候选检测。结果属本地视图层，不得按快照缓存。
-   */
+  /** 批量检测减少逐候选子进程，失败时由调用方逐项重试。工作区状态独立于共享版本，不能按快照缓存。 */
   async localChangedCandidateIds(): Promise<Set<string> | null> {
     const result = await git(this.root, ['status', '--porcelain=v1', '-z', '-uall', '--', '.ai-review']);
     if (result.code !== 0) return null;
     const ids = new Set<string>();
     for (const record of result.stdout.split('\0')) {
       if (record.length === 0) continue;
-      // porcelain v1 -z 记录形如 "XY <path>"；rename 记录后紧跟一个不带状态前缀的原路径记录。
+      // porcelain 的重命名记录后还跟着一个无状态前缀的原路径。-z 使这些路径无须反转义。
       const pathText = record.length > 3 && record[2] === ' ' ? record.slice(3) : record;
       const match = /^\.ai-review\/(\d{4}-\d{2})\/([^/]+)(?:\/|$)/.exec(pathText);
       if (match) ids.add(`${match[1]}/${match[2]}`);
@@ -130,10 +106,6 @@ export class GitHeadCandidateSource implements SharedCandidateSource {
   }
 
   async listLocalOnlyDirs(): Promise<string[]> {
-    // 未进入 HEAD 的候选目录（未跟踪/新增）：仅作 local 诊断展示，不进入共享流程。
-    // 实现见文件顶部说明：工作区枚举 + 调用方扣除共享集合（整目录未跟踪时 git status 会折叠失效）。
-    // master 侧曾把 git 失败从 return [] 收紧为 throw；工作区枚举不再发起 git 子进程，
-    // 读取失败由 FilesystemCandidateSource 归一为空列表（store.list 侧本就 catch 兜底）。
     return listWorktreeCandidateDirs(this.root);
   }
 
@@ -166,12 +138,7 @@ export class GitHeadCandidateSource implements SharedCandidateSource {
   }
 }
 
-/**
- * §7.1 共享事实读取源（SVN）：父目录 BASE 不随子路径提交前进，必须从真实版本化
- * 子路径选择固定修订，避免漏掉已提交候选，并用同一修订读取候选及档案。
- * 说明：`snapshotId()` 返回 null——SVN 的工作副本根 revision 不随子路径提交前进，
- * 无法仅凭根 revision 证明快照未变化，因此调用方不得据此做跨请求缓存。
- */
+/** SVN 的父目录修订不会随子路径提交前进，因此须按相关版本化路径选择读取版本，根修订也不能用作缓存键。 */
 export class SvnBaseCandidateSource implements SharedCandidateSource {
     private snapshot: Promise<{ revision: string; url: string; files: Set<string> } | null> | undefined;
 
@@ -210,10 +177,7 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
     return /<entry\b/.test(result.stdout);
   }
 
-  /**
-   * §7.1 SVN 批量本地改动检测：一次 `svn status --xml -- .ai-review` 覆盖所有候选，
-   * 语义与逐候选 hasLocalChanges 等价。失败返回 null，由调用方回退逐候选检测。
-   */
+  /** 批量状态读取失败时由调用方回退逐候选检测。 */
   async localChangedCandidateIds(): Promise<Set<string> | null> {
     const result = await svn(this.root, ['status', '--xml', '--', '.ai-review']);
     if (result.code !== 0) return null;
@@ -227,8 +191,6 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
   }
 
   async listLocalOnlyDirs(): Promise<string[]> {
-    // 未版本化的候选目录：仅作 local 诊断。`svn status` 对未版本化目录同样只报
-    // 目录本身（不递归），整目录未跟踪时按层级解析会失效——改用工作区枚举（见文件顶部说明）。
     return listWorktreeCandidateDirs(this.root);
   }
 
@@ -245,11 +207,7 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
     return this.readSharedFile('.ai-review/reviewers.yml');
   }
 
-  /**
-   * §7.1 SVN 实现准则：先用 `svn info --xml -R` + `svn status --xml` 证明候选目录
-   * 处于同一基准 revision 且无本地改动，然后直接读本地工作副本文件；
-   * 仅当无法证明同快照时才回退固定修订的远端读取（绝不逐文件无条件远端读取）。
-   */
+  /** 只有版本一致且无本地改动的路径可直接读工作副本，从而避免为每个文件访问远端。 */
   private async readSharedFile(relPath: string): Promise<string | null> {
     const snapshot = await this.sharedSnapshot();
     if (!snapshot?.files.has(relPath.replace(/^\.ai-review\//, ''))) return null;
@@ -258,7 +216,6 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
       try {
         return await readFile(path.join(this.root, relPath), 'utf8');
       } catch {
-        // 本地文件缺失：回退固定修订读取。
       }
     }
     const url = `${snapshot.url}/${relPath.replace(/^\.ai-review\//, '').split('/').map(encodeURIComponent).join('/')}`;

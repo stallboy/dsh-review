@@ -5,12 +5,6 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { ReviewStore, nextUpdatedAt } from '../packages/dsh-plugin/dist/host/store.js';
 
-/**
- * AC-LOCK-01（§4.3 / §8.1 / §12.1）：ConcurrencyGuard 必须含 expectedUpdatedAt，
- * updated_at 严格单调（冻结时钟、时钟回拨均 +1ms 推进），
- * 不推进补丁版本的写入（评论）也能被旧 guard 检出为 stale。
- */
-
 async function fixture(updatedAt) {
   const root = await mkdtemp(path.join(tmpdir(), 'dcr-lock-'));
   const dir = path.join(root, '.ai-review', '2026-11', 'lock-case');
@@ -52,20 +46,19 @@ async function fixture(updatedAt) {
 const guardOf = (updatedAt) => ({ expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: updatedAt });
 
 test('AC-LOCK-01: 冻结时钟下连续写入严格单调（+1ms 推进，UTC 规范化）', async () => {
-  const frozen = new Date().toISOString(); // 与写入时刻同刻度或更早 → 必须严格推进
+  const frozen = new Date().toISOString();
   const { store } = await fixture(frozen);
   const first = await store.addComment('2026-11/lock-case', 'tester', { content: '第一条' }, guardOf(frozen));
   const firstAt = new Date(first.meta.updatedAt).getTime();
   assert.ok(firstAt > new Date(frozen).getTime(), `应严格大于上一值：${first.meta.updatedAt}`);
   assert.match(first.meta.updatedAt, /Z$/);
 
-  // 连续第二次写入同样必须严格推进。
   const second = await store.addComment('2026-11/lock-case', 'tester', { content: '第二条' }, guardOf(first.meta.updatedAt));
   assert.ok(new Date(second.meta.updatedAt).getTime() > firstAt, '连续写入单调递增');
 });
 
 test('AC-LOCK-01: 时钟回拨仍严格推进（未来时间戳 +1ms）', async () => {
-  const future = new Date(Date.now() + 10 * 60_000).toISOString(); // 时钟回拨场景
+  const future = new Date(Date.now() + 10 * 60_000).toISOString();
   const { store } = await fixture(future);
   const updated = await store.addComment('2026-11/lock-case', 'tester', { content: '回拨后写入' }, guardOf(future));
   assert.equal(new Date(updated.meta.updatedAt).getTime(), new Date(future).getTime() + 1);
@@ -75,7 +68,7 @@ test('AC-LOCK-01: 评论不推进版本，旧 guard（缺最新 updated_at）必
   const start = new Date(Date.now() - 60_000).toISOString();
   const { store } = await fixture(start);
   await store.addComment('2026-11/lock-case', 'tester', { content: '第一条' }, guardOf(start));
-  // revision 与 owner 均未变化：仅靠 expectedUpdatedAt 检出并发写入。
+  // 评论不推进补丁版本，也不改变所有者，用来单独覆盖 updated_at 的冲突检测（AC-LOCK-01）。
   await assert.rejects(
     store.addComment('2026-11/lock-case', 'tester', { content: '旧页面写入' }, guardOf(start)),
     (error) => error.status === 409 && error.code === 'stale' && error.details?.currentUpdatedAt !== undefined,

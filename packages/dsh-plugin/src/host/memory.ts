@@ -1,31 +1,21 @@
 import type { ReviewFrontmatter } from './types.js';
 
-/**
- * §6 负向记忆（2026-11-10 对齐 SPEC）：事实源是被拒候选的
- * module + target_files + audit_type + title（+ rejection.reason 作为展示信息）。
- * 确定性指纹使用规范 JSON 数组（无分隔符碰撞），target_files 按 UTF-8 字节序排序。
- * 一切实时计算，不持久化。
- */
+/** 从拒绝记录派生重复判定和提示词摘要。负向记忆没有单独的持久化数据源。 */
 
-/** §6.1 规范化：去首尾空白、合并连续空白、ASCII 小写化（不改变非 ASCII 字符）。 */
 export function normalizeTitle(title: string): string {
   return title.trim().replace(/\s+/g, ' ').replace(/[A-Z]/g, (char) => char.toLowerCase());
 }
 
-/** §4.3：module/tags 的 ASCII 小写化，避免 Unicode 大小写折叠导致的指纹碰撞。 */
+/** 限制为 ASCII，避免 Unicode 大小写折叠合并原本独立的标识。 */
 export function asciiLower(value: string): string {
   return value.replace(/[A-Z]/g, (char) => char.toLowerCase());
 }
 
-/** §6.1：target_files 按 UTF-8 字节序排序（Buffer.compare）。 */
 function sortByUtf8Bytes(files: string[]): string[] {
   return [...files].sort((left, right) => Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8')));
 }
 
-/**
- * §6.1 确定性指纹：JSON.stringify([module 小写, 排序 target_files, audit_type, 规范化 title])。
- * JSON 字段转义与数组边界是指纹的一部分——禁止改用逗号或竖线拼接。
- */
+/** JSON 数组的边界和转义可防止字段中含分隔符时产生指纹碰撞。 */
 export function fingerprintOf(
   meta: Pick<ReviewFrontmatter, 'module' | 'targetFiles' | 'auditType' | 'title'>,
 ): string {
@@ -46,11 +36,10 @@ export interface RejectionMemoryEntry {
   rejectedAt: string;
   rejectedAtMs: number;
   reason: string;
-  /** §4.3/G38：拒绝分类（缺省/未知归入 unspecified 分组）。 */
   category?: string;
-  /** §4.3/G38：Host 从补丁 hunk header 提取的相关符号；仅用于提示词/UI，不进指纹。 */
+  /** 用于说明拒绝记录涉及的符号，不参与重复指纹。 */
   relatedSymbols?: string[];
-  /** §6.2：system:stale 超时归档——弱信号，提示词必须标注，不得描述为“方案被拒绝”。 */
+  /** 超时归档只表示长期未更新，提示词须把它标成弱信号。 */
   staleArchived?: boolean;
   fingerprint: string;
 }
@@ -60,7 +49,6 @@ export interface RejectionMemoryInput {
   meta: ReviewFrontmatter;
 }
 
-/** 从完整候选事实提取一条负向记忆；非 rejected 返回 null。 */
 export function entryFromCandidate(input: RejectionMemoryInput): RejectionMemoryEntry | null {
   const { meta } = input;
   if (meta.status !== 'rejected' || !meta.rejection) return null;
@@ -85,17 +73,12 @@ export function entryFromCandidate(input: RejectionMemoryInput): RejectionMemory
   };
 }
 
-/** 窗口过滤：窗口内阻止，窗口外只作 few-shot（不阻止）。 */
+/** 窗口外的拒绝记录仍可供提示词参考，但不能阻止新候选。 */
 export function withinWindow(entry: RejectionMemoryEntry, windowDays: number, now = Date.now()): boolean {
   return now - entry.rejectedAtMs <= windowDays * 86_400_000;
 }
 
-/**
- * §6.2 阻止与豁免：
- * - 豁免集合 = 沿合法重开链向上追溯到的全部被拒祖先（active → reopenedFrom → … ，带环防护）；
- * - duplicateOf = 按 rejected_at 倒序的第一条**未豁免**同指纹窗口内记录；
- * - 链外或其他同指纹未豁免记录仍正常阻止。
- */
+/** 只豁免调用方证明属于重开链的祖先，链外的同指纹拒绝记录仍能阻止候选。 */
 export function findDuplicate(
   active: { candidateId: string; meta: ReviewFrontmatter },
   memory: RejectionMemoryEntry[],
@@ -103,14 +86,12 @@ export function findDuplicate(
   now = Date.now(),
 ): RejectionMemoryEntry | null {
   if (active.meta.status === 'rejected' || active.meta.status === 'approved') return null;
-  // 本候选自身带重开标记（链成员）→ 只豁免链上祖先，链外匹配仍阻止（在 store 层传入豁免集）。
   const fp = fingerprintOf(active.meta);
   return memory
     .filter((entry) => entry.fingerprint === fp && withinWindow(entry, windowDays, now))
     .sort((left, right) => right.rejectedAtMs - left.rejectedAtMs)[0] ?? null;
 }
 
-/** §6.3：按 rejected_at 倒序取每模块最近 max 条，供提示词注入。 */
 export function topPerModule(memory: RejectionMemoryEntry[], max: number): RejectionMemoryEntry[] {
   const byModule = new Map<string, RejectionMemoryEntry[]>();
   for (const entry of memory) {
@@ -126,14 +107,12 @@ export function topPerModule(memory: RejectionMemoryEntry[], max: number): Rejec
   return picked;
 }
 
-/** §6.3 提示词注入摘要：按 category 分组呈现约束；stale 标注为弱信号；不注入大段历史正文。 */
 export function formatMemorySummary(entries: RejectionMemoryEntry[]): string {
   if (entries.length === 0) return '- 无（近期没有被拒绝的方案）。';
   const knownCategories = new Set(['false_positive', 'intentional_design', 'high_risk', 'out_of_scope', 'stale']);
   const groups = new Map<string, RejectionMemoryEntry[]>();
   for (const entry of entries) {
     const hasCategory = typeof entry.category === 'string' && entry.category.trim().length > 0;
-    // §6.3：分类缺省或未知时归入 unspecified 分组。
     const key = entry.staleArchived
       ? 'stale'
       : hasCategory && knownCategories.has(entry.category ?? '')

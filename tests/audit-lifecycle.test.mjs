@@ -2,12 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AuditLifecycle, LeaseTransitionError } from '../packages/dsh-plugin/dist/host/audit-lifecycle.js';
 
-/**
- * §7.6/§7.7 审查租约状态机的单元测试（架构改进 A4/A6）。
- * 状态迁移只允许 active → releasable → released（以及 active → released 的
- * “执行已证明结束”路径）；取消/超时永不直接释放。
- */
-
 function memoryStore() {
   let saved = [];
   return {
@@ -40,11 +34,9 @@ test('§7.6：active → releasable → released 合法；取消/超时只到 re
 
   assert.equal(lifecycle.blockingLeaseFor('/repo')?.state, 'active');
   assert.equal(await lifecycle.markReleasable('20261110-000000-repo'), true);
-  // releasable 仍然阻塞共享写。
   assert.ok(lifecycle.blockingLeaseFor('/repo'), 'releasable 租约必须继续阻塞');
   await lifecycle.transition('20261110-000000-repo', 'released');
   assert.equal(lifecycle.blockingLeaseFor('/repo'), undefined);
-  // 持久化反映终态。
   assert.equal(store.saved()[0]?.state, 'released');
 });
 

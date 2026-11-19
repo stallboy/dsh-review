@@ -8,8 +8,6 @@ import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { AuditArchive } from '../packages/dsh-plugin/dist/host/audit-archive.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
-/** P7 验收：§6.2 转候选——depends_on 满足判定、两侧同一提交、状态/归档目标校验。 */
-
 const servers = [];
 after(async () => {
   await Promise.all(servers.map((server) => server.close()));
@@ -73,7 +71,7 @@ test('P7: confirm 项转换成功——档案与候选目录同一提交', async
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const commitBefore = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  // 候选在夹具提交之后产生（未提交），转换提交应把两侧一起纳入。
+  // 故意让候选留在工作区，用来验证转换会原子提交候选和档案。
   await writeCandidate(root, '20261104-net-a');
 
   const { base } = await startApi(root);
@@ -83,14 +81,12 @@ test('P7: confirm 项转换成功——档案与候选目录同一提交', async
   assert.equal(audit.items[0].status, 'converted');
   assert.equal(audit.items[0].candidate, '2026-11/20261104-net-a');
 
-  // 恰好一个新提交，同时包含档案与候选目录两侧。
   const commits = runCommand('git', ['rev-list', `${commitBefore}..HEAD`], root).stdout.trim().split('\n');
   assert.equal(commits.length, 1);
   const files = runCommand('git', ['show', '--name-only', '--format=', commits[0]], root).stdout.trim().split('\n');
   assert.ok(files.some((f) => f.includes('audits/20261104-020000-src-host/audit.md')), files.join(','));
   assert.ok(files.some((f) => f.includes('20261104-net-a/review.md')), files.join(','));
 
-  // 重复转换被拒（非 pending）。
   const again = await convert(base, { auditId: '20261104-020000-src-host', findingId: 'f-confirm', candidateId: '2026-11/20261104-net-a' });
   assert.equal(again.status, 409);
 });
@@ -113,20 +109,15 @@ test('P7: deferred——前置 resolved/候选 approved 才可转换；pending/r
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const { base } = await startApi(root);
 
-  // 前置 resolved → 满足。
   const ok = await convert(base, { auditId: '20261104-020000-src-host', findingId: 'dep-ok', candidateId: '2026-11/20261104-net-b' });
   assert.equal(ok.status, 200);
-  // 前置 converted 且其候选 approved → 满足。
   const ok2 = await convert(base, { auditId: '20261104-020000-src-host', findingId: 'dep-cand', candidateId: '2026-11/20261104-net-b' });
   assert.equal(ok2.status, 200);
-  // 前置 pending → 阻塞并显示原因。
   const blocked = await convert(base, { auditId: '20261104-020000-src-host', findingId: 'dep-open', candidateId: '2026-11/20261104-net-b' });
   assert.equal(blocked.status, 409);
   assert.match((await blocked.json()).error.message, /depends_on 未满足/);
-  // 前置无观察 → 阻塞。
   const none = await convert(base, { auditId: '20261104-020000-src-host', findingId: 'dep-none', candidateId: '2026-11/20261104-net-b' });
   assert.equal(none.status, 409);
-  // 已归档候选不能作为转换目标。
   const archived = await convert(base, { auditId: '20261104-020000-src-host', findingId: 'dep-ok', candidateId: '2026-11/20261104-approved' });
   assert.equal(archived.status, 409);
 });

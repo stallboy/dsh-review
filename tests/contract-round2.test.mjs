@@ -7,8 +7,6 @@ import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
-/** 第 2 轮：G29 /candidate/finalize、G30 cancel、G39 anchor、G42 收尾门禁、G15 禁止路径、tags/slug。 */
-
 const servers = [];
 after(async () => { await Promise.all(servers.map((server) => server.close())); });
 
@@ -58,7 +56,7 @@ test('G29：/candidate/finalize 校验并单目录提交；tags 规范化去重�
   await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nrules: []\n', 'utf8');
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'reviewers'], root);
-  await writeCandidate(root, '20261109-solo'); // 未提交（本地候选）
+  await writeCandidate(root, '20261109-solo');
   const { base } = await startApi(root);
   const start = await fetch(`${base}/candidate/finalize`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -69,12 +67,9 @@ test('G29：/candidate/finalize 校验并单目录提交；tags 规范化去重�
   assert.equal(job.result.status, 'COMMITTED', JSON.stringify(job.result));
   const tracked = runCommand('git', ['ls-files', '.ai-review/2026-11'], root).stdout.trim();
   assert.match(tracked, /20261109-solo/);
-  // §4.3：tags 解析时 trim + 小写 + 去重（['Net',' net ','net'] → ['net']）。
   const text = await readFile(path.join(root, '.ai-review', '2026-11', '20261109-solo', 'review.md'), 'utf8');
-  // §4.3：tags trim + 小写 + 去重（['Net',' net ','net'] → ['net']）。
   assert.doesNotMatch(text, /tags:[^\n]*Net/, text);
   assert.match(text, /tags:\s*(\[\s*"net"\s*\]\s*\n|\n\s+- net\s*\n)/, text);
-  // 重复 finalize（已共享）→ 409。
   const again = await fetch(`${base}/candidate/finalize`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ id: '2026-11/20261109-solo' }),
@@ -137,7 +132,6 @@ test('G30：/jobs/:id/cancel 已结束 Job 幂等返回原结果', async () => {
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const { base } = await startApi(root);
-  // 结束一个 ai-fix（manual runner → MANUAL_REQUIRED outcome）。
   const fix = await fetch(`${base}/ai-fix`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -146,7 +140,6 @@ test('G30：/jobs/:id/cancel 已结束 Job 幂等返回原结果', async () => {
     }),
   });
   assert.equal(fix.status, 409, '无未解决评论应 409（G23）');
-  // 直接对未知 job 取消 → 404；对已结束 job → 202 原结果。
   assert.equal((await fetch(`${base}/jobs/job-x/cancel`, { method: 'POST' })).status, 404);
 });
 
@@ -157,7 +150,6 @@ test('G42：verify_gate_on_audit_finalize=declared 时收尾复算门禁并留�
     'default_owner: tester\nrules: []\nverify_gate_on_audit_finalize: declared\n', 'utf8');
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'reviewers'], root);
-  // 手动租约 + 候选（门禁失败命令）→ finalize 应把该候选剔除并返回 VALIDATION_FAILED。
   const { base } = await startApi(root);
   const manual = await (await fetch(`${base}/audit/manual`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -172,6 +164,5 @@ test('G42：verify_gate_on_audit_finalize=declared 时收尾复算门禁并留�
   assert.equal(job.result.status, 'VALIDATION_FAILED', JSON.stringify(job.result));
   const auditText = await readFile(path.join(root, '.ai-review', 'audits', manual.auditId, 'audit.md'), 'utf8');
   assert.match(auditText, /门禁已由 Host 复算（declared）/);
-  // 候选目录未提交。
   assert.equal(runCommand('git', ['ls-files', '.ai-review/2026-11'], root).stdout.trim(), '');
 });

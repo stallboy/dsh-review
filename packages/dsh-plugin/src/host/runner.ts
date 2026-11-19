@@ -24,13 +24,11 @@ export interface RunnerRequest {
   mode: RunnerMode;
   comments: ReviewComment[];
   failureDetail?: string;
-  /** Mode C 的批准时/ Rebase 最新基线；不得回退到旧 revision 基线。 */
+  /** Mode C 需以批准或 Rebase 时的最新基线生成修复，旧候选的基线不足以证明能应用。 */
   baseRevision?: string;
-  /** What the caller left in the business working tree before invoking the fixer. */
   workingTree?: 'current_patch_applied' | 'clean_base';
   log: (line: string) => void;
   resolveCredential?: (reference: string) => Promise<string | undefined>;
-  /** §7.7：Job 取消信号，透传给进程型 Runner。 */
   signal?: AbortSignal;
 }
 
@@ -38,14 +36,12 @@ export interface AgentRunOptions {
   kind: 'dsh' | 'external';
   settings: AppSettings;
   cwd: string;
-  /** Already wrapped by `wrapAgentPrompt` (system + user). */
+  /** 执行器要求调用方先用 wrapAgentPrompt 合并系统提示和用户提示。 */
   prompt: string;
   log: (line: string) => void;
   resolveCredential?: (reference: string) => Promise<string | undefined>;
   timeoutMs?: number;
-  /** Human-readable task name used in timeout/exit messages. */
   label?: string;
-  /** §7.7：Job 取消信号。 */
   signal?: AbortSignal;
 }
 
@@ -58,7 +54,6 @@ export interface AgentRunOutcome {
   aborted?: boolean;
 }
 
-/** Compose the system/user prompt envelope shared by every headless executor. */
 export function wrapAgentPrompt(system: string, user: string): string {
   return [
     '<system>',
@@ -77,7 +72,7 @@ function packageRoot(): string {
   return path.resolve(import.meta.dirname, '../..');
 }
 
-/** §7.4：修复器系统提示词（assets/ai-fixer-system.md）；缺失时退回内置两行约束。 */
+/** 提示词资产缺失时仍须提供修复执行的基本约束。 */
 export async function loadSystemPrompt(): Promise<string> {
   const fallback = [
     '你是 AI Fixer。你在一个产品仓库中修复代码，并更新 .ai-review 候选目录中的 review.md 与 NNN.patch。',
@@ -144,13 +139,7 @@ export async function buildFixPrompt(request: RunnerRequest): Promise<string> {
   return lines.join('\n');
 }
 
-/**
- * §7.4 补充（2026-11-12）：在独立新会话里执行修复的提示词。
- *
- * 与 headless 的 `wrapAgentPrompt` 不同，新会话里 Agent 看到的是对话消息而不是一条
- * stdin 管道：因此这里把系统约束展开成 Markdown 小节，并明确写入 `.ai-review/` 的
- * 提交边界（Host 统一提交）——避免会话型 Agent 误以为可以自己 commit。
- */
+/** 交互式会话直接接收 Markdown 对话，需要写明由 Host 提交，以免 Agent 自行提交产物。 */
 export function buildSessionFixPrompt(system: string, user: string): string {
   return [
     '# 修复任务（独立会话）',
@@ -173,12 +162,7 @@ export function buildSessionFixPrompt(system: string, user: string): string {
   ].join('\n');
 }
 
-/**
- * §7.4（2026-11-12）：把 `manual` Runner 产出的完整修复提示词转换为新会话版本。
- *
- * `buildFixPrompt` 已经包含仓库、候选目录、意见与硬性要求；这里只把其中的
- * 「grep 式执行提示」换成「新会话」口径，不改变任何硬性约束文本。
- */
+/** 保留外部提示词的任务约束，让会话包装层单独补充提交边界。 */
 export function toSessionFixPrompt(manualPrompt: string, system = ''): string {
   const tightened = manualPrompt
     .replace(/^请以 ([A-Z_]+) 模式执行修复，/m, '请以 $1 模式在独立会话中执行修复，');
@@ -218,7 +202,7 @@ function logDshEvent(line: string, log: (line: string) => void): void {
     else if (event.type === 'status' && event.phase) log(`状态: ${event.phase}`);
     else if (event.type === 'final' && event.text) log(`最终结果: ${event.text.slice(0, 500)}`);
   } catch {
-    // Non-JSON progress line is kept in the tail, not parsed.
+    // 非结构化的进度文本也要留给用户诊断。
   }
 }
 
@@ -312,7 +296,6 @@ async function runExternalAgent(options: AgentRunOptions, timeoutMs: number): Pr
   return { ok: true, outputTail: tail, code: 0, timedOut: false };
 }
 
-/** Shared headless executor used by the fixer and the repository auditor. */
 export async function runAgent(options: AgentRunOptions): Promise<AgentRunOutcome> {
   const timeoutMs = options.timeoutMs ?? RUN_TIMEOUT_MS;
   return options.kind === 'dsh' ? runDshAgent(options, timeoutMs) : runExternalAgent(options, timeoutMs);

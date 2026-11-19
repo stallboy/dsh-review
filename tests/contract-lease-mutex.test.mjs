@@ -8,13 +8,6 @@ import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
-/**
- * §7.6/§7.7 / AC-SCHEDULE-01 租约互斥：
- * - 会话审查必须创建持久化执行租约与可追踪 Job，租约/运行中 Job 期间拒绝再次创建会话；
- * - /audit、/audit/session 等新审查入口必须检查未释放租约；
- * - /audit/finalize 提交失败（ABORTED）时必须保留租约，只有正常收尾才释放。
- */
-
 process.env.GIT_AUTHOR_NAME ??= 'lease-test';
 process.env.GIT_AUTHOR_EMAIL ??= 'lease-test@example.com';
 process.env.GIT_COMMITTER_NAME ??= 'lease-test';
@@ -26,8 +19,7 @@ after(async () => {
 });
 
 async function startApi(root, extraDeps = {}) {
-  // 租约状态文件必须放在仓库外（生产为 DSH_HOME）：仓库内的未跟踪文件会被
-  // revertBusinessWorkspace 的 git clean 清理，不能用来验证持久化。
+  // 将租约文件置于仓库外，避免工作区回滚时的 git clean 删除租约，干扰持久化验证。
   const statePath = path.join(await mkdtemp(path.join(tmpdir(), 'dcr-lease-state-')), 'runtime-state.json');
   const settings = { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType: 'git', runner: 'manual', syncBeforeApprove: false };
   const api = new ReviewApi({ settings, saveSettings: async (next) => next, statePath, ...extraDeps });
@@ -149,7 +141,7 @@ test('AC-SCHEDULE-01：finalize 提交失败保留租约，正常收尾后才释
   await mkdir(path.dirname(reportAbs), { recursive: true });
   await writeFile(reportAbs, reportBody, 'utf8');
 
-  // 让 git commit 失败（HEAD 不会前进）：证明提交不存在分支。
+  // 用 pre-commit 钩子阻止提交落地，使 HEAD 停在原位置。
   const hook = path.join(root, '.git', 'hooks', 'pre-commit');
   await mkdir(path.dirname(hook), { recursive: true });
   await writeFile(hook, '#!/bin/sh\nexit 1\n', 'utf8');
@@ -160,11 +152,9 @@ test('AC-SCHEDULE-01：finalize 提交失败保留租约，正常收尾后才释
   assert.equal(firstJob.result.status, 'ABORTED', JSON.stringify(firstJob.result));
   const stateAfterFail = JSON.parse(await readFile(statePath, 'utf8'));
   assert.equal(stateAfterFail.leases[0].state, 'active', '收尾失败必须保留租约');
-  // 租约仍占用仓库：/sync 必须被拒绝。
   const syncBlocked = await post(base, '/sync', {});
   assert.equal(syncBlocked.status, 409);
 
-  // 修复提交条件后重试 finalize：正常收尾才释放租约。
   await rm(hook, { force: true });
   const second = await (await post(base, '/audit/finalize', { auditId: manual.auditId })).json();
   const secondJob = await waitForJob(base, second.jobId);
@@ -177,7 +167,6 @@ test('AC-SCHEDULE-01：finalize 提交失败保留租约，正常收尾后才释
 });
 
 test('§8.2/§10.1：/queue 暴露阻塞审查租约全生命周期（active + sessionId → releasable → 无）', async () => {
-  // 2026-11-12 事故回归：租约 releasable 后仓库被隐形 409 阻塞，面板却无任何提示与收尾入口。
   const root = await createGitFixture();
   await ensureReviewers(root);
   const { base, statePath } = await startApi(root, {
@@ -190,7 +179,6 @@ test('§8.2/§10.1：/queue 暴露阻塞审查租约全生命周期（active + s
   const session = await (await post(base, '/audit/session', { targetPath: '', note: '' })).json();
   assert.ok(session.auditId);
 
-  // sessionId 必须持久化进租约，并随 /queue 暴露。
   const stateJson = JSON.parse(await readFile(statePath, 'utf8'));
   assert.equal(stateJson.leases[0].sessionId, 'sess-queue-lease', '会话 id 必须写入租约记录');
 
@@ -200,14 +188,13 @@ test('§8.2/§10.1：/queue 暴露阻塞审查租约全生命周期（active + s
   assert.equal(during.auditLease?.sessionId, 'sess-queue-lease');
   assert.equal(during.auditLease?.trigger, 'manual');
 
-  // /health 诊断必须暴露阻塞租约（对只看 health 的调用者解释共享写 409 的原因）。
+  // 只查询健康端点的调用者也需要知道共享写入为何返回 409。
   const healthDuring = await (await fetch(`${base}/health`)).json();
   assert.ok(
     healthDuring.diagnostics.some((line) => line.includes(session.auditId) && line.includes('active')),
     `health 诊断应包含 active 租约：${JSON.stringify(healthDuring.diagnostics)}`,
   );
 
-  // 取消跟踪 Job → 租约 releasable（超时同路径）→ /queue 显示 releasable。
   const cancelled = await post(base, `/jobs/${encodeURIComponent(session.jobId)}/cancel`, {});
   assert.equal(cancelled.status, 202);
   const afterCancel = await (await fetch(`${base}/queue`)).json();
@@ -218,7 +205,6 @@ test('§8.2/§10.1：/queue 暴露阻塞审查租约全生命周期（active + s
     'health 诊断应包含 releasable 租约',
   );
 
-  // 确认停止后释放 → 阻塞诊断消失。
   const released = await post(base, '/audit/release', { auditId: session.auditId, confirmStopped: true });
   assert.equal(released.status, 200);
   const afterRelease = await (await fetch(`${base}/queue`)).json();

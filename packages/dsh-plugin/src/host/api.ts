@@ -58,16 +58,11 @@ export class ReviewApi implements ApiHost {
   private configErrors: string[] = [];
   private readonly runtimeCache = new Map<string, Runtime>();
   private readonly jobs = new JobManager();
-  /** §12.1 repo 锁（不可重入，重入即抛可诊断错误）。 */
   private readonly repoLock = new RepoLock();
 
-  /** 读模型与投影（queue/candidate/patch/diff/findings/audits/reviewers…）。 */
   private readonly readModels: ReadModels;
-  /** 共享写事务（提交三分支、前置校验、候选/档案/工作区写端点）。 */
   private readonly writers: Writers;
-  /** 审查生命周期装配（租约持久化、开始/收尾/释放、跟踪 Job、1 小时超时、/sync）。 */
   private readonly auditRuntime: AuditRuntime;
-  /** §7.4（2026-11-12）：在独立 DSH 会话中启动修复（`/fix-session`）。 */
   private readonly fixSessions: FixSessions;
 
   constructor(readonly deps: ApiDeps) {
@@ -78,67 +73,54 @@ export class ReviewApi implements ApiHost {
     this.fixSessions = new FixSessions(this);
   }
 
-  /** ApiHost：子模块（写事务/审查生命周期）共用的 Job 管理器。 */
   get jobManager(): JobManager {
     return this.jobs;
   }
 
   async init(): Promise<void> {
     await this.reconfigure(this.deps.settings);
-    // §7.6：加载持久化审查租约——Host 重启后 active/releasable 租约继续阻塞自动写操作。
     await this.auditRuntime.loadAuditLeases();
   }
 
-  /** ApiHost：`settings` 在 reconfigure 中被整体替换，子模块必须经此访问当前值。 */
   currentSettings(): AppSettings {
     return this.settings;
   }
 
-  /** ApiHost：reconfigure 探测到的 VCS 类型。 */
   get detectedVcsType(): VcsType | null {
     return this.vcsType;
   }
 
-  /** ApiHost：最近一次 reconfigure 的校验错误（readmodels 的 /settings 降级分支使用）。 */
   get lastConfigErrors(): readonly string[] {
     return this.configErrors;
   }
 
-  /** ApiHost：按 auditId 查租约（不存在返回 undefined）。 */
   leaseLookup(auditId: string): AuditLeaseRecord | undefined {
     return this.auditLifecycle.find(auditId);
   }
 
-  /** ApiHost：租约迁移的窄入口（供 /audit/release 与 finalize 使用）。 */
   async leaseTransition(auditId: string, state: 'released' | 'releasable'): Promise<void> {
     await this.auditLifecycle.transition(auditId, state);
   }
 
-  /** ApiHost：§7.6 审查租约状态机（唯一迁移入口）。 */
   get auditLifecycle(): AuditLifecycle {
     return this.auditRuntime.auditLifecycle;
   }
 
-  /** ApiHost：§7.7 运行中的审查 Job / 未释放租约一律阻止自动写。 */
   ensureNoAuditRunning(root?: string): void {
     this.auditRuntime.ensureNoAuditRunning(root);
   }
 
-  /** ApiHost：§7.4 同仓修复会话占用记录（/fix-session 自管理的并发控制与诊断）。 */
   get fixSessionGuard(): FixSessions {
     return this.fixSessions;
   }
 
-  /** ApiHost：会话/手动提示词审查跟踪 Job 的完成回调（仅内存；重启后由 finalize 直接新建 Job）。 */
   readonly auditJobFinishes = new Map<string, (result?: unknown) => void>();
-  /** ApiHost：跟踪 Job id → auditId，供 /jobs/:id/cancel 把租约转为 releasable。 */
   readonly auditJobLeases = new Map<string, string>();
 
   withWriteLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
     return this.repoLock.withWriteLock(repoRoot, fn);
   }
 
-  /** 共享写路由统一加锁（§12.1：同一检出的写操作串行化）。 */
   private withRepoLock<T>(url: URL, fn: () => Promise<T>): Promise<T> {
     return this.repoLock.withRepoLock(url, (target) => this.runtimeFor(target), fn);
   }
@@ -232,7 +214,6 @@ export class ReviewApi implements ApiHost {
     if (url.pathname !== API_PREFIX && !url.pathname.startsWith(`${API_PREFIX}/`)) return false;
     const route = url.pathname.slice(API_PREFIX.length) || '/';
     try {
-      // §8.1：带 body 的请求必须声明 application/json（解析/Content-Type 错误 400）。
       if ((req.method === 'POST' || req.method === 'PUT') && (req.headers['content-length'] ?? '0') !== '0') {
         const contentType = String(req.headers['content-type'] ?? '').toLowerCase();
         if (!contentType.startsWith('application/json')) {
@@ -247,12 +228,9 @@ export class ReviewApi implements ApiHost {
   }
 
   /**
-   * §7.7/§12.1：声明式路由表。横切语义（repo 锁、审查互斥、runtime 解析）由
-   * `dispatch` 依据 `RouteKind` 统一套用，不再依赖命令式 if 链手工登记
-   * （历史缺陷 C1：`/comments` 等端点漏了审查互斥）。
+   * 路由类别集中决定锁、审查互斥和运行时解析，避免新增共享写端点遗漏互斥检查。
    */
   private readonly routes = new RouteTable().addAll([
-    // ---------- 全局只读状态 ----------
     { method: 'GET', path: '/', kind: 'global-read', handler: ({ res, url }) => this.health(res, url) },
     { method: 'GET', path: '/health', kind: 'global-read', handler: ({ res, url }) => this.health(res, url) },
     { method: 'GET', path: '/settings', kind: 'global-read', handler: ({ res, url }) => this.getSettingsResponse(res, url) },
@@ -274,7 +252,6 @@ export class ReviewApi implements ApiHost {
         sendJson(res, 200, { entry });
       },
     },
-    // ---------- 共享事实读 ----------
     { method: 'GET', path: '/queue', kind: 'read', handler: ({ res, url }) => this.readModels.queue(res, url) },
     { method: 'GET', path: '/candidate', kind: 'read', handler: ({ res, url }) => this.readModels.candidate(res, url) },
     { method: 'GET', path: '/patch', kind: 'read', handler: ({ res, url }) => this.readModels.patch(res, url) },
@@ -284,14 +261,12 @@ export class ReviewApi implements ApiHost {
     { method: 'GET', path: '/audits', kind: 'read', handler: ({ res, url }) => this.readModels.auditsList(res, url) },
     { method: 'GET', path: '/findings', kind: 'read', handler: ({ res, url }) => this.readModels.findings(res, url) },
     { method: 'GET', path: '/audit/prompt', kind: 'read', handler: ({ res, url }) => this.auditRuntime.auditPrompt(res, url) },
-    // ---------- 审查控制（handler 自管理互斥，不套 ensureNoAuditRunning；finalize/release 另有豁免） ----------
     { method: 'POST', path: '/audit/session', kind: 'audit-control', handler: ({ req, res, url }) => this.auditRuntime.auditSession(req, res, url) },
     { method: 'POST', path: '/audit', kind: 'audit-control', handler: ({ req, res, url }) => this.auditRuntime.audit(req, res, url) },
     { method: 'POST', path: '/audit/manual', kind: 'audit-control', handler: ({ req, res, url }) => this.auditRuntime.auditManual(req, res, url) },
     { method: 'POST', path: '/audit/finalize', kind: 'audit-control', handler: ({ req, res, url }) => this.auditRuntime.auditFinalize(req, res, url) },
     { method: 'POST', path: '/audit/release', kind: 'audit-control', handler: ({ req, res, url }) => this.auditRuntime.auditRelease(req, res, url) },
     { method: 'POST', path: '/sync', kind: 'audit-control', handler: ({ res, url }) => this.auditRuntime.sync(res, url) },
-    // ---------- 候选/档案共享写（repo 锁 + 审查互斥） ----------
     { method: 'POST', path: '/comments', kind: 'candidate-write', handler: ({ req, res, url }) => this.writers.addComment(req, res, url) },
     { method: 'POST', path: '/comments/batch', kind: 'candidate-write', handler: ({ req, res, url }) => this.writers.addCommentsBatch(req, res, url) },
     { method: 'POST', path: '/comment-status', kind: 'candidate-write', handler: ({ req, res, url }) => this.writers.commentStatus(req, res, url) },
@@ -303,15 +278,10 @@ export class ReviewApi implements ApiHost {
     { method: 'POST', path: '/convert', kind: 'candidate-write', handler: ({ req, res, url }) => this.writers.convert(req, res, url) },
     { method: 'POST', path: '/dismiss-finding', kind: 'candidate-write', handler: ({ req, res, url }) => this.writers.dismissFinding(req, res, url) },
     { method: 'POST', path: '/candidate/finalize', kind: 'candidate-write', handler: ({ req, res, url }) => this.writers.candidateFinalize(req, res, url) },
-    // ---------- 工作区事务（handler 内部在 Job 中取锁） ----------
     { method: 'POST', path: '/rebase', kind: 'workspace-txn', handler: ({ req, res, url }) => this.writers.rebase(req, res, url) },
     { method: 'POST', path: '/manual-revision', kind: 'workspace-txn', handler: ({ req, res, url }) => this.writers.manualRevision(req, res, url) },
-    // §7.4（2026-11-12）：在独立 DSH 会话中启动修复——只创建会话、不改工作区。
-    // 类别取 workspace-txn：复用受理期的审查租约互斥（会话会真实改动业务工作区，
-    // 不能与审查并行）。注意该类别**不**整体持 repo 锁，因此并发由 FixSessions 自己的
-    // 同仓占用记录串行（创建会话最长等 60 秒，放进 repo 锁会阻塞 approve/sync）。
+    // 创建会话可能长时间等待。路由仍检查审查互斥，由 FixSessions 单独占用该仓库，避免阻塞其他写事务。
     { method: 'POST', path: '/fix-session', kind: 'workspace-txn', handler: ({ req, res, url }) => this.fixSessions.create(req, res, url) },
-    // ---------- 长任务启动（受理前做审查互斥，Job 内取锁） ----------
     { method: 'POST', path: '/approve', kind: 'job-start', handler: ({ req, res, url }) => this.approve(req, res, url) },
     { method: 'POST', path: '/ai-fix', kind: 'job-start', handler: ({ req, res, url }) => this.aiFix(req, res, url) },
   ]);
@@ -323,9 +293,7 @@ export class ReviewApi implements ApiHost {
     const { spec, params } = matched;
     const run = (): void | Promise<void> => spec.handler({ req, res, url, params, route });
     const locked = (): Promise<void> => this.withRepoLock(url, async () => { await run(); });
-    // §7.7：审查运行中禁止共享写/新审查/sync——必须在受理阶段拒绝，而不是排队到审查结束后放行。
-    // 判定必须先于加锁，否则请求会先进入锁队列而不是得到 409。
-    // 例外：/audit/finalize 与 /audit/release 必须能在租约存在时执行（由 handler 按租约状态判定）。
+    // 先检查互斥再排队加锁，否则审查期间提交的写请求会等到审查结束后执行。
     if (blockedByRunningAudit(spec.kind) && !isAuditSelfManaged(route)) {
       const runtime = await this.runtimeFor(url);
       this.ensureNoAuditRunning(runtime.root);
@@ -357,7 +325,7 @@ export class ReviewApi implements ApiHost {
       } catch (error) {
         diagnostics.push(`无法统计队列：${error instanceof Error ? error.message : String(error)}`);
       }
-      // §7.6/§10.1：阻塞租约进入诊断——避免只看 /health 的调用者漏掉"共享写被 409 阻塞"的原因。
+      // 健康检查调用者需要知道共享写入返回冲突是否由持久化租约引起。
       try {
         const lease = this.auditLifecycle.blockingLeaseFor(runtime.root);
         if (lease) {
@@ -366,7 +334,6 @@ export class ReviewApi implements ApiHost {
           );
         }
       } catch {
-        // 租约状态机未初始化：跳过该诊断。
       }
     } catch (error) {
       diagnostics.push(error instanceof Error ? error.message : String(error));
@@ -431,7 +398,6 @@ export class ReviewApi implements ApiHost {
       ...(typeof body['syncBeforeApprove'] === 'boolean' ? { syncBeforeApprove: body['syncBeforeApprove'] } : {}),
       ...(typeof body['gateTimeoutMs'] === 'number' ? { gateTimeoutMs: body['gateTimeoutMs'] } : {}),
     };
-    // §9：owner 保存时校验非空；vcsType 必须与实际仓库一致。
     if (body['owner'] !== undefined && (typeof body['owner'] !== 'string' || !body['owner'].trim())) {
       throw new ApiError(422, 'bad_request', 'owner 不能为空');
     }
@@ -450,11 +416,9 @@ export class ReviewApi implements ApiHost {
   private async approve(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.runtimeFor(url);
     const { store, vcs } = runtime;
-    // §7.7 审查互斥由 routes.ts（kind: job-start）在受理阶段统一检查。
     const body = await readJson(req);
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
-    // §4.7：人工判断项的确认/知悉记录随批准提交。
     const confirmed = Array.isArray(body['confirmedDecisions'])
       ? body['confirmedDecisions'].map((item) => String(item).trim()).filter(Boolean)
       : [];
@@ -466,34 +430,23 @@ export class ReviewApi implements ApiHost {
     for (const item of waived) {
       if (!item.reason.trim()) throw new ApiError(422, 'bad_request', `知悉项 ${item.id} 必须填写理由`);
     }
-    // §8.3/§7.5：可选 commitMessage——提供时先替换候选 commit_message 再校验首行；
-    // 校验通过的值在批准原子提交中一并写入 review.md，并作为业务提交说明。
     const commitMessage = body['commitMessage'] === undefined
       ? undefined
       : (typeof body['commitMessage'] === 'string' ? body['commitMessage'] : '');
     if (commitMessage !== undefined && !commitMessage.trim()) {
       throw new ApiError(422, 'bad_request', 'commitMessage 提供时必须非空');
     }
-    // §5.6/§10.2（2026-11-12）：可选 commitDetail——'simple' 只写规范单行，'detailed' 在规范
-    // 单行后空一行追加 Host 生成的事实正文（作者统计/改动摘要/修复方案/来源候选/门禁…）。
-    // 非法取值直接 422，不得静默降级成其中一种（提交信息会进入仓库历史，不能猜）。
     let commitDetail: CommitMessageDetail | undefined;
     if (body['commitDetail'] !== undefined) {
       const normalized = normalizeCommitDetail(body['commitDetail']);
       if (!normalized) throw new ApiError(422, 'bad_request', "commitDetail 只能是 'simple' 或 'detailed'");
       commitDetail = normalized;
     }
-    // §12.2：非 Owner 403（takeover 除外）。
     await this.writers.requireOwnerOf(store, id);
-    await this.writers.requireSharedCandidate(runtime, id); // §7.1
-    // §5.6（2026-11-12）：提交信息详略只决定 Job 内业务提交说明的组成。事实正文必须由
-    // 批准编排在**锁内、同步重绑后**用同一份 `fresh` 快照生成（否则同步换基线后正文会
-    // 描述旧补丁却提交新补丁），因此这里只透传模式，不在受理阶段生成正文。
-    // 注意：不要构造 `{ commitMessage: undefined }`——它会让编排误以为调用方显式传了覆盖值。
+    await this.writers.requireSharedCandidate(runtime, id);
     const approvalCommitInput = commitDetail === undefined && commitMessage === undefined
       ? undefined
       : { ...(commitMessage !== undefined ? { commitMessage } : {}), ...(commitDetail ? { commitDetail } : {}) };
-    // §7.5/G19：受理前完整 guard 预检（409 stale）与 pending-only 状态预检（409 conflict）。
     {
       const detail = await store.get(id, null, await sharedSourceFor(runtime));
       if (detail.candidate.meta.currentRevision !== guard.expectedRevision
@@ -509,7 +462,6 @@ export class ReviewApi implements ApiHost {
         throw new ApiError(409, 'conflict', `只有 pending 可批准（当前 ${detail.candidate.meta.status}）；changes_requested 需先产生新版本或由 Owner 显式转回`);
       }
     }
-    // §7.4：窗口内与被拒候选完全重复的候选被阻止批准；人工重开（/reopen）可豁免。
     {
       const reviewersCfg = await loadReviewers(store.repoRoot, await sharedSourceFor(runtime));
       if (reviewersCfg.rejectionMemoryDays > 0) {
@@ -521,7 +473,6 @@ export class ReviewApi implements ApiHost {
       }
     }
     const job = this.jobs.start('approve', async (log, jobId, signal) => {
-      // §6/§7.5 重复候选复检闭包：供受理后、同步后、门禁后三处复检（G35）。
       const checkDuplicate = async (): Promise<string | null> => {
         const reviewersCfg = await loadReviewers(store.repoRoot, await sharedSourceFor(runtime));
         if (reviewersCfg.rejectionMemoryDays <= 0) return null;
@@ -535,14 +486,11 @@ export class ReviewApi implements ApiHost {
         makeRunner: (request) => new Runner(request),
         checkDuplicate,
         validateNewRevision: (previous, latest) => this.writers.validateNewRevision(runtime, previous, latest, 'ai'),
-        // §7.1：批准流程内部重读候选必须绑定共享快照（每次重建，同步后重绑）。
         sharedSource: () => sharedSourceFor(runtime),
-        // §7.7/G30：批准流程在安全检查点读取取消标志；Runner 由取消信号终止。
         shouldCancel: () => Boolean((job as { cancelRequested?: boolean }).cancelRequested),
         ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
         signal,
       });
-      // §12.1：批准人使用实际操作者，不用 expectedOwner 冒充身份。
       const me = await this.ownerFor(store.repoRoot);
       const outcome = await this.withWriteLock(store.repoRoot, () => orchestrator.approve(id, guard, jobId, log, { confirmed, waived }, me, commitMessage, approvalCommitInput));
       log(`结果：${outcome.status}${outcome.reason ? ` (${outcome.reason})` : ''} — ${outcome.message}`);
@@ -560,11 +508,7 @@ export class ReviewApi implements ApiHost {
     sendJson(res, 202, { jobId: job.id, job });
   }
 
-  /**
-   * Start one AI-fix job from the candidate's unresolved feedback. Shared by
-   * the explicit `/ai-fix` action and the auto-fix chain that follows an
-   * overall opinion, so both paths validate and run identically.
-   */
+  /** 显式修复与总体意见触发的自动修复共用此入口，确保采用相同的校验和执行规则。 */
   async startAiFixJob(runtime: Runtime, id: string, guard: ConcurrencyGuard): Promise<JobRecord> {
     const { store, vcs } = runtime;
     const acceptedSource = await sharedSourceFor(runtime);
@@ -690,11 +634,7 @@ export class ReviewApi implements ApiHost {
     }));
   }
 
-  /**
-   * §7.7/G30 /jobs/:id/cancel：幂等取消——请求停止后续执行，不强行改写业务结果。
-   * 已结束 Job 直接返回原结果；运行中的设置 cancelRequested 标志（批准流程在安全检查点
-   * 读取并中止——此时已证明共享提交不存在，可安全 ABORTED）；租约不随取消自动释放。
-   */
+  /** 取消审查跟踪后仍保留租约，因为外部执行可能继续操作工作区。 */
   private async jobCancel(req: ApiRequest, res: ApiResponse, jobId: string): Promise<void> {
     await readJson(req).catch(() => ({}));
     const job = this.jobs.get(jobId);
@@ -704,13 +644,9 @@ export class ReviewApi implements ApiHost {
       return;
     }
     (job as { cancelRequested?: boolean }).cancelRequested = true;
-    // §7.7：终止进程型 Runner（若该 Job 正在运行 dsh/external 命令）。
     this.jobs.abort(job.id);
-    // §7.6/§7.7：取消审查 Job 只把租约置 releasable 并结束跟踪 Job；
-    // 租约仍阻塞自动写，必须人工确认外部执行停止后 /audit/release。
     const auditId = this.auditJobLeases.get(job.id);
     if (auditId) {
-      // §7.6：取消只迁到 releasable（仍阻塞），绝不自动释放；状态迁移走唯一入口。
       await this.auditLifecycle.markReleasable(auditId).catch(() => false);
       this.auditJobFinishes.get(auditId)?.({
         status: 'ABORTED',
@@ -730,8 +666,6 @@ export class ReviewApi implements ApiHost {
   private jobGet(res: ApiResponse, jobId: string, url: URL): void {
     const job = this.jobs.get(jobId);
     if (!job) throw new ApiError(404, 'not_found', '任务不存在');
-    // §8.2/G36：since/logOffset/totalLogLines/earliestLogOffset 都是单调递增绝对行序号；
-    // since 早于最早保留行时返回完整保留日志并置 logResetRequired=true。
     const earliest = job.logStartOffset ?? 0;
     const total = earliest + job.log.length;
     const sinceParam = url.searchParams.get('since');

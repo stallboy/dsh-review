@@ -1,6 +1,5 @@
-// Stand-in for a broken executor: consumes the prompt and exits non-zero.
 for await (const _chunk of process.stdin) {
-  // Drain stdin so the parent can finish writing the prompt.
+  // 先读完 stdin，让父进程有机会完整写入提示词，再模拟执行失败。
 }
 process.stderr.write('fake audit agent failed intentionally\n');
 process.exit(1);

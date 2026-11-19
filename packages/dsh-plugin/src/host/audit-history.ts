@@ -86,7 +86,7 @@ function decodeRecheck(output: string): Record<string, unknown> | undefined {
             const event = record(JSON.parse(line));
             if ((event.type === 'text' || event.type === 'final') && typeof event.text === 'string') payload = event.text;
         } catch {
-            // 外部 Runner 也可直接输出约定的一行。
+            // 外部执行器也可直接输出复查标记，解析事件失败时应继续检查原始行。
         }
         for (const row of payload.split(/\r?\n/)) {
             const trimmed = row.trim();
@@ -96,7 +96,7 @@ function decodeRecheck(output: string): Record<string, unknown> | undefined {
                 const data = record(JSON.parse(json));
                 if (Array.isArray(data.findings) && Array.isArray(data.candidates)) values.set(JSON.stringify(data), data);
             } catch {
-                // 部分输出或格式错误不构成观察。
+                // 不完整的结果不足以支持复查结论。
             }
         }
     }

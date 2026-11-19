@@ -7,12 +7,6 @@ import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
-/**
- * 批准编排强化（§7.5）：
- * G19——只有 pending 可批准（受理前 409 conflict；受理后 STATE_CONFLICT）；
- * G26——门禁期间业务内容/额外文件变化返回 BUSINESS_CONTENT_CHANGED 并回滚。
- */
-
 const servers = [];
 after(async () => {
   await Promise.all(servers.map((server) => server.close()));
@@ -96,7 +90,7 @@ test('G19：changes_requested 不能批准——受理前 409 conflict', async (
 test('G26：门禁期间修改目标业务文件 → BUSINESS_CONTENT_CHANGED 并回滚', async () => {
   const root = await createGitFixture();
   await writeCandidate(root, '20261108-mutate', {
-    // 门禁命令篡改目标业务文件内容（避免 \n 转义歧义）。
+    // 附加内容避开换行转义，防止不同 shell 改变传给 Node 的脚本。
     gateChecks: ["node -e \"require('fs').appendFileSync('src/math.js','-- injected')\""],
   });
   commitFixture(root);
@@ -104,7 +98,6 @@ test('G26：门禁期间修改目标业务文件 → BUSINESS_CONTENT_CHANGED �
   const outcome = await approveAndWait(base, guardOf('20261108-mutate'));
   assert.equal(outcome.job.result.status, 'ABORTED');
   assert.equal(outcome.job.result.reason, 'BUSINESS_CONTENT_CHANGED');
-  // 业务工作区已还原：math.js 无注入痕迹，候选仍 pending。
   const text = await readFile(path.join(root, 'src', 'math.js'), 'utf8');
   assert.ok(!text.includes('injected'), text);  const status = runCommand('git', ['status', '--porcelain', 'src'], root).stdout.trim();
   assert.equal(status, '');
@@ -122,7 +115,6 @@ test('G26：门禁期间生成额外业务文件 → BUSINESS_CONTENT_CHANGED', 
   const outcome = await approveAndWait(base, guardOf('20261108-extra'));
   assert.equal(outcome.job.result.status, 'ABORTED');
   assert.equal(outcome.job.result.reason, 'BUSINESS_CONTENT_CHANGED');
-  // 额外文件已清理（工作区还原）。
   const status = runCommand('git', ['status', '--porcelain', 'src'], root).stdout.trim();
   assert.equal(status, '');
 });
@@ -149,7 +141,6 @@ test('§7.5/§8.3：/approve 提供 commitMessage 时替换并写入 review.md �
   assert.equal(outcome.job.result.status, 'COMMITTED', JSON.stringify(outcome.job.result));
   const review = await readFile(path.join(root, '.ai-review', '2026-11', '20261108-msg', 'review.md'), 'utf8');
   assert.match(review, /详细说明：替换后的提交信息/);
-  // 业务提交说明使用替换后的 commit_message 全文。
   const subject = runCommand('git', ['log', '-1', '--format=%B'], root).stdout;
   assert.match(subject, /^net: 20261108-msg/);
   assert.match(subject, /详细说明：替换后的提交信息/);

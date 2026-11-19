@@ -195,7 +195,7 @@ export class LocalCentralRuntime {
             const contents = await contentsSha256(unpacked);
             await rm(archive, { force: true }).catch(() => {});
             this.abort.signal.throwIfAborted();
-            // 以安装记录原子发布，避免 Windows 扫描解包文件时占用整个目录。
+            // 原子替换安装记录，避免移动可能被 Windows 扫描程序暂时锁定的解包目录。
             await saveJson(this.installedFile, { version: source.version, folder: path.basename(staging), contentsSha256: contents, protocolVersion: PROTOCOL_VERSION });
             published = true;
             this.replaced = previous?.folder;

@@ -21,13 +21,6 @@ function canRun(command) {
 
 const hasSvn = canRun('svn') && canRun('svnadmin');
 
-/**
- * 2026-11-12 三项需求的契约测试：
- * 1) §7.4：接受（提交并让 AI 修复）可在新 DSH 会话中执行，并保留导出提示词路径；
- * 2) §5.6/§10.2：提交信息可选「简略 / 详细」（单行综述 + 空行 + 事实正文）；
- * 3) §10.2：面板移除「上传人工补丁 / 超时归档 / 从重开来源恢复」，但端点语义不变。
- */
-
 const servers = [];
 after(async () => {
   await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
@@ -78,9 +71,8 @@ async function approveAndWait(base, payload) {
 }
 
 /**
- * 已归档（approved）候选的完整 approval 快照：I7/I8 要求门禁与判断项快照齐全，
- * 缺任何一项都会被解析成 422，测出的就不是「已归档」这条规则了。
- * reviewFixture 把 `approval: ${overrides.approval}` 渲染成一行，因此这里用行内映射。
+ * 批准快照必须完整，否则请求会先因候选数据无效返回 422。
+ * 夹具把 approval 的覆盖值放在字段同一行，因此使用 YAML 行内映射。
  */
 const APPROVED_SNAPSHOT =
   '{approved_by: tester, approved_at: "2026-11-01T11:00:00+08:00", '
@@ -88,10 +80,7 @@ const APPROVED_SNAPSHOT =
   + 'gate_results: [{command: "node --version", exit_code: 0, duration_ms: 10}], '
   + 'confirmed_decisions: [], waived_decisions: []}';
 
-/**
- * 候选夹具：默认带 `# 需人工判断项 / - 无`（否则会被判为「需人工判断项未填写」而无法批准），
- * 可选附带一条评论。`review` 里的同名字段覆盖默认值。
- */
+/** 夹具默认显式声明无人工判断项，避免因文档缺项而无法进入批准流程。 */
 async function candidateFixture(root, slug, { review = {}, comments = [] } = {}) {
   return commitCandidate(root, slug, {
     review: {
@@ -101,8 +90,6 @@ async function candidateFixture(root, slug, { review = {}, comments = [] } = {})
     },
   });
 }
-
-// ---------------------------------------------------------------- 1) 修复执行方式
 
 test('§7.4：POST /fix-session 在独立 DSH 会话中投递修复提示词（不创建审查租约）', async () => {
   const root = await createGitFixture();
@@ -126,14 +113,12 @@ test('§7.4：POST /fix-session 在独立 DSH 会话中投递修复提示词（�
   assert.equal(calls[0].cwd, root);
   assert.equal(calls[0].ownerSessionId, 'owner-sess');
   assert.match(calls[0].title, /AI 修复 · net: 20261112-fix-session/);
-  // 提示词必须包含新会话口径与候选上下文，且不出现内部章节引用（§11 展开要求）。
   assert.match(body.prompt, /修复任务（独立会话）/);
   assert.match(body.prompt, /20261112-fix-session/);
   assert.match(body.prompt, /请修正运算方向/);
   assert.match(body.prompt, /不要执行 `git commit`/);
   assert.doesNotMatch(body.prompt, /§\s*\d/);
   assert.ok(calls[0].prompt === body.prompt, '投递的提示词必须与响应中一致');
-  // 修复会话不占用审查执行租约：共享写不被阻塞。
   assert.equal(api.auditLifecycle.blockingLeaseFor(root), undefined);
 });
 
@@ -197,7 +182,7 @@ test('§7.4：/fix-prompt?mode=session 与 /fix-session 投递同一份提示词
 
   const headless = await (await fetch(`${base}/fix-prompt?id=${encodeURIComponent(candidate.id)}`)).json();
   assert.equal(headless.mode, 'headless');
-  // headless 口径就是 buildFixPrompt 的原文（Runner 再包 stdin 信封），不含会话小节。
+  // Runner 会另行封装 stdin 信封，这里验证封装前供用户导出的原文。
   assert.match(headless.prompt, /^# 任务\n请以 ADDRESS_FEEDBACK 模式执行修复/);
   assert.doesNotMatch(headless.prompt, /修复任务（独立会话）/);
   assert.match(headless.prompt, /补充边界测试/);
@@ -211,7 +196,6 @@ test('§7.4：/fix-session 与运行中的审查租约互斥（workspace-txn）'
   const { api, base } = await startApi(root, {}, {
     createFixSession: async () => { calls.push(1); return { sessionId: 'sess-m' }; },
   });
-  // 真实占用一条 active 审查租约：blockingLeaseFor(root) 必须命中。
   await api.auditLifecycle.create({
     auditId: '20261112-000000-repo', root, targetPath: '', trigger: 'manual', baseRevision: 'x',
     owner: 'tester', createdAt: new Date().toISOString(), candidateIdsBefore: [], state: 'active',
@@ -285,8 +269,6 @@ test('§7.4：toSessionFixPrompt 只在 manual 提示词上换口径，不丢硬
   ].join('\n'));
 });
 
-// ---------------------------------------------------------------- 2) 提交信息详略
-
 test('§5.6：提交信息规范单行由 Host 生成；人类修订版本追加 @ rev 标记', () => {
   const base = {
     id: '2026-11/demo',
@@ -315,7 +297,7 @@ test('§5.6：提交信息规范单行由 Host 生成；人类修订版本追加
     ]),
   };
   assert.equal(buildCommitSubject(mixed), 'review(2026-11/demo): net: 修复连接关闭竞态 @ rev 2');
-  // 标题里的换行/连续空白必须压成单行，否则首行校验会被标题自身破坏。
+  // 标题的换行会截断生成的提交首行，夹具用它覆盖首行校验前的归一化。
   const dirtyTitle = { ...base, meta: { ...aiOnly.meta, title: 'net:   修复\n连接关闭竞态' } };
   assert.equal(composeCommitMessage(dirtyTitle, 'simple', ''), 'review(2026-11/demo): net: 修复 连接关闭竞态');
 });
@@ -340,7 +322,6 @@ test('§5.6：简略信息只提交单行；详细信息在单行后空行分隔
   assert.equal(lines[0], 'review(2026-11/mode): net: 模式');
   assert.equal(lines[1], '', '单行综述与正文之间必须空一行');
   assert.equal(lines[2], '作者统计：A <a@x>：3 次提交');
-  // 正文为空或超长时不得破坏单行 + 空行结构。
   assert.equal(composeCommitMessage(candidate, 'detailed', '   '), 'review(2026-11/mode): net: 模式');
   const clamped = composeCommitMessage(candidate, 'detailed', 'x'.repeat(9000));
   assert.ok(clamped.length < 6200, '详细正文必须限长');
@@ -385,7 +366,7 @@ test('§5.6：详细正文区分历史作者统计与本次待提交，并如实
   assert.match(unavailable, /作者统计：不可用（浅克隆）/);
   const none = await buildCommitDetails(detail.candidate, { repoRoot: root, patchText: patch.text, vcsType: 'git' });
   assert.match(none, /作者统计：不可用（当前 VCS 适配器不提供作者统计）/);
-  // review.md 不记录 audit_id，正文不得凭日期/范围猜测审查档案路径。
+  // 候选缺少可绑定的 audit_id，附近日期或相同范围都无法证明档案归属。
   assert.doesNotMatch(body, /audits\//);
 });
 
@@ -399,7 +380,6 @@ test('§5.6：authorStats 只统计触及路径的历史提交，脏文件计入
   assert.equal(scoped.pendingFiles, 1);
   assert.equal(scoped.historyCommits, 1);
   assert.equal(scoped.buckets[0].name, 'audit-test');
-  // 空路径 = 全仓库统计。
   const repo = await runtime.vcs.authorStats([]);
   assert.equal(repo.scope, 'repo');
   assert.ok(repo.historyCommits >= 1);
@@ -415,7 +395,6 @@ test('§5.6/§8.3：/approve commitDetail=simple 只提交规范单行（即使�
   assert.equal(outcome.job.result.status, 'COMMITTED', JSON.stringify(outcome.job.result));
   const message = runCommand('git', ['log', '-1', '--format=%B'], root).stdout.trim();
   assert.equal(message, 'review(2026-11/20261112-simple): net: 20261112-simple');
-  // review.md 仍保存候选的 commit_message（§4.9），业务提交说明由 detail 决定。
   const review = await readFile(path.join(root, '.ai-review', '2026-11', '20261112-simple', 'review.md'), 'utf8');
   assert.match(review, /status: approved/);
 });
@@ -450,7 +429,6 @@ test('§8.3：/approve commitDetail 非法取值必须 422，不得静默降级'
     assert.equal(response.status, 422, `commitDetail=${JSON.stringify(value)} 必须 422`);
     assert.match((await response.json()).error.message, /commitDetail/);
   }
-  // 候选仍为 pending，未被任何一次请求改动。
   const review = await readFile(path.join(root, '.ai-review', '2026-11', '20261112-bad-detail', 'review.md'), 'utf8');
   assert.match(review, /status: pending/);
 });
@@ -467,12 +445,8 @@ test('§5.6：未提供 commitDetail 时保持旧语义（业务提交使用候�
   assert.match(message, /候选自带的正文/);
 });
 
-// ---------------------------------------------------------------- 3) 审查整改回归
-
 test('§7.5/§5.6（回归）：commitDetail 不放宽首行校验——commit_message 首行 ≠ title 时仍必须中止', async () => {
-  // 独立审查提出「detail 模式可能绕过 §7.5 步骤 3」。实测：步骤 3 读的是 review.md 自身的
-  // commit_message（与请求是否带 commitDetail 无关），因此不存在旁路；本用例把这一结论钉死，
-  // 防止日后有人把 detail 实现成「用生成的首行替换校验对象」而悄悄放宽契约。
+  // 用非法的候选原始首行覆盖详细模式，防止生成的首行掩盖候选校验失败。
   const root = await createGitFixture();
   await commitCandidate(root, '20261112-bypass', {
     review: { commitMessage: '完全不同的标题\n\n正文', bodyLines: ['# 需人工判断项', '', '- 无'] },
@@ -482,10 +456,8 @@ test('§7.5/§5.6（回归）：commitDetail 不放宽首行校验——commit_m
     const outcome = await approveAndWait(base, { ...guardFixture('2026-11/20261112-bypass'), commitDetail });
     assert.equal(outcome.job.result.status, 'ABORTED', JSON.stringify(outcome.job.result));
     assert.equal(outcome.job.result.reason, 'COMMIT_MESSAGE_MISMATCH');
-    // 报错必须指向 review.md 的首行（而不是 Host 生成的单行），否则说明校验对象被换掉了。
     assert.match(outcome.job.result.message, /完全不同的标题/);
   }
-  // 没有产生业务提交：HEAD 仍是候选夹具那次提交，候选仍是 pending。
   const log = runCommand('git', ['log', '-1', '--format=%s'], root).stdout.trim();
   assert.equal(log, 'fixture: 20261112-bypass');
   const review = await readFile(path.join(root, '.ai-review', '2026-11', '20261112-bypass', 'review.md'), 'utf8');
@@ -493,15 +465,13 @@ test('§7.5/§5.6（回归）：commitDetail 不放宽首行校验——commit_m
 });
 
 test('§7.5/§5.6（回归）：详细正文由锁内同步后的同一快照生成，描述的就是被提交的补丁', async () => {
-  // 独立审查 P1-2：受理阶段生成的正文在同步换基线后会描述旧补丁。这里用一个只有同步时
-  // 才会改变的候选补丁验证——提交说明的「改动摘要」必须来自实际提交的补丁。
+  // 让补丁在同步时发生变化，使测试能区分受理阶段的旧摘要与业务提交使用的内容。
   const root = await createGitFixture();
   await commitCandidate(root, '20261112-sync-body', {
     review: { bodyLines: ['# 需人工判断项', '', '- 无'] },
   });
   const { api, base } = await startApi(root, { syncBeforeApprove: false });
   const runtime = await api.runtimeFor(new URL('http://local/'));
-  // 共享源（git HEAD）中的当前补丁改成触及两个文件；正文必须反映这份补丁。
   const candidateDir = path.join(root, '.ai-review', '2026-11', '20261112-sync-body');
   await writeFile(path.join(candidateDir, '001.patch'), [
     'diff --git a/src/math.js b/src/math.js',
@@ -520,7 +490,7 @@ test('§7.5/§5.6（回归）：详细正文由锁内同步后的同一快照生
   ].join('\n'), 'utf8');
   runCommand('git', ['add', '-A', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture: patch with two files'], root);
-  // target_files 需要与补丁一致，否则批准前的完整性校验会拒绝；只改 review.md 并再次提交。
+  // 补齐 target_files 以通过完整性校验，让用例继续验证新补丁的提交说明。
   const reviewPath = path.join(candidateDir, 'review.md');
   const reviewText = await readFile(reviewPath, 'utf8');
   await writeFile(reviewPath, reviewText.replace('target_files: [src/math.js]', 'target_files: [src/math.js, src/extra.txt]'), 'utf8');
@@ -548,7 +518,7 @@ test('§7.4（回归）：同一仓库并发 /fix-session 只允许一个修复�
   const { api, base } = await startApi(root, {}, {
     createFixSession: async () => {
       created += 1;
-      // 模拟创建会话耗时：期间第二个请求必须被拒绝。
+      // 延迟返回会话 ID，让第二个请求进入首次创建仍占用槽位的窗口。
       await new Promise((resolve) => setTimeout(resolve, 150));
       return { sessionId: `sess-${String(created)}` };
     },
@@ -562,14 +532,12 @@ test('§7.4（回归）：同一仓库并发 /fix-session 只允许一个修复�
   assert.deepEqual(statuses, [202, 409], JSON.stringify([await first.clone().json(), await second.clone().json()]));
   assert.equal(created, 1, '只允许创建一个修复会话');
   assert.equal(api.fixSessionGuard.activeFor(root)?.candidateId, candidate.id);
-  // turn 结束释放占用后可以再次启动。
   turnEnded();
   assert.equal(api.fixSessionGuard.activeFor(root), undefined);
   const third = await post(base, '/fix-session', { id: candidate.id });
   assert.equal(third.status, 202, JSON.stringify(await third.clone().json()));
 });
 
-// ---------------------------------------------------------------- 4) SVN 作者统计
 test('§5.6：SVN authorStats 用 svn log --xml 聚合作者，且正文不渲染空邮箱', { skip: !hasSvn }, async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'dcr-svn-stats-'));
   const repo = path.join(base, 'repo');

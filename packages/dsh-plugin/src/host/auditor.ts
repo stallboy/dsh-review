@@ -53,7 +53,6 @@ function pad(value: number): string {
   return String(value).padStart(2, '0');
 }
 
-/** Resolve and validate an audit target; rejects absolute paths and traversal. */
 export function normalizeAuditTarget(
   repoRoot: string,
   raw: string,
@@ -78,7 +77,6 @@ export function normalizeAuditTarget(
   return { targetPath, absolutePath: absolute };
 }
 
-/** Normalize the target and require that it exists in the working tree. */
 export async function resolveAuditTarget(
   repoRoot: string,
   raw: string,
@@ -109,12 +107,7 @@ function isEmptyMarker(item: AuditDeferredItem): boolean {
   return /^(无|none|n\/?a)$/i.test(label);
 }
 
-/**
- * Parse the auditor's Markdown report. The report is the only source of B-class
- * and deferred items, so the contract is deliberately forgiving: any B-class /
- * "needs human confirmation" section yields `confirm` items, and any Deferred /
- * "wait for prerequisite" section yields `deferred` items.
- */
+/** B 类和延后项只来自报告正文，因此允许用中英文的等价标题标明这两类审查项。 */
 export function parseAuditReport(text: string): { deferred: AuditDeferredItem[] } {
   const deferred: AuditDeferredItem[] = [];
   let category: AuditDeferredItem['category'] | null = null;
@@ -204,7 +197,6 @@ async function collectOutline(repoRoot: string, targetAbsolute: string, limit = 
       .map((entry) => `${entry.name}${entry.isDirectory() ? '/' : ''}`);
     if (top.length > 0) lines.push(`根目录条目：${top.join('  ')}`);
   } catch {
-    // A readable repository was already validated by the VCS adapter.
   }
   const targetInfo = await stat(targetAbsolute).catch(() => null);
   if (targetInfo === null) return lines.join('\n');
@@ -249,9 +241,7 @@ async function existingCandidateLines(
   source?: CandidateSource,
 ): Promise<string> {
   try {
-    // §7.1/G10：共享读取绑定同一 VCS 快照；未提供 source 时退回工作区视图（写路径）。
     const { items } = await store.list({}, baseRevision, undefined, undefined, source);
-    // §7.1：提示词注入同样只能使用共享事实——本地草稿（local）不得当作已存在候选。
     const active = items.filter((item) => !item.local && (item.status === 'pending' || item.status === 'changes_requested'));
     if (active.length === 0) return '- 无待处理候选。';
     return active
@@ -263,7 +253,6 @@ async function existingCandidateLines(
   }
 }
 
-/** §7.5/§7.6：负向记忆注入——窗口内 rejected 摘要（每模块上限 max_anti_patterns，按 rejected_at 倒序）。 */
 async function negativeMemoryLines(
   repoRoot: string,
   source?: import('./shared-facts.js').SharedCandidateSource,
@@ -273,18 +262,15 @@ async function negativeMemoryLines(
     const { loadReviewers } = await import('./reviewers.js');
     const { entryFromCandidate, topPerModule, formatMemorySummary, withinWindow } = await import('./memory.js');
     const config = await loadReviewers(repoRoot, source);
-    // §7.1/G10：负向记忆同样只能来自同一共享快照，避免本地未提交内容被当作共享事实。
     const { items } = await store.list({}, null, undefined, undefined, source);
     const full = [];
     for (const item of items) {
-      // §7.1：本地草稿不是共享事实，不得进入负向记忆。
       if (item.local || item.status !== 'rejected') continue;
       try {
         const record = await store.get(item.id, null, source);
         const entry = entryFromCandidate({ candidateId: item.id, meta: record.candidate.meta });
         if (entry && withinWindow(entry, config.rejectionMemoryDays, Date.now())) full.push(entry);
       } catch {
-        // 跳过无法读取的 rejected 候选
       }
     }
     if (full.length === 0) return '- 无（近期没有被拒绝的方案）。';
@@ -303,12 +289,11 @@ export interface BuildAuditPromptInput {
   baseRevision: string;
   reportPath: string;
   mode?: 'headless' | 'session';
-  /** §7.1/G10：提示词中的已存在候选与负向记忆必须读取同一 VCS 共享快照。 */
+  /** 同一提示词里的活跃候选与负向记忆须共用此共享快照，避免引入本地草稿。 */
   source?: import('./shared-facts.js').SharedCandidateSource;
   now?: Date;
 }
 
-/** Build the user prompt for one repository audit. Pure apart from reading repo context. */
 export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<string> {
   const target = await resolveAuditTarget(input.repoRoot, input.targetPath);
   const now = input.now ?? new Date();
@@ -319,7 +304,6 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
   const month = `${String(now.getFullYear())}-${pad(now.getMonth() + 1)}`;
   const scope = target.targetPath ? `\`${target.targetPath}\`` : '全仓库';
   const sessionMode = input.mode === 'session';
-  // §11.4（2026-11-10 修订）：任何模式都严禁 Agent 自行 commit——审查产物由 Host 在收尾统一提交。
   const commitRule = '5. 严禁执行 `git commit` / `svn commit` / `git push` / `svn add`。审查产物由插件在收尾统一提交；结束前 `git status` / `svn status` 除 `.ai-review/` 外必须干净，不得在业务工作区留下未导出的改动或临时文件。';
   const completionRule = sessionMode
     ? '10. 完成时用简体中文输出最终摘要：新增候选、B/Deferred、报告路径，然后停止；Host 负责收尾与提交，不要自行提交。'
@@ -540,7 +524,7 @@ export interface AuditFinalizeInput {
   trigger: 'manual' | 'scheduled';
   runError: string | null;
   startedAt: number;
-  /** 本次运行首次创建了 reviewers.yml（须随收尾提交）。 */
+  /** 仅在本轮新建配置文件时随收尾纳入提交。 */
   reviewersCreated?: boolean;
   extraWarnings?: string[];
   now: Date;
@@ -555,7 +539,6 @@ export interface AuditFinalizeResult {
   body: string;
   commitRevision: string | null;
   status: 'COMMITTED' | 'VALIDATION_FAILED' | 'ABORTED' | 'RECOVERY_REQUIRED';
-  /** RECOVERY_REQUIRED 必含 reason 与 detail。 */
   reason?: AuditOutcome['reason'];
   detail?: string;
   warnings: string[];
@@ -587,7 +570,7 @@ function sameReviewWorktree(before: ReviewWorktreeState, after: ReviewWorktreeSt
         && [...before.paths].every(([entry, fingerprint]) => after.paths.get(entry) === fingerprint);
 }
 
-/** 从 audit_id 的 UTC 时间戳还原 created_at（I13：两者必须精确到秒一致）。 */
+/** I13：使用编号中的 UTC 时刻，避免用收尾时间或机器时区生成不一致的 created_at。 */
 export function auditIdToCreatedAt(auditId: string): string {
   const match = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/.exec(auditId);
   if (!match) return new Date().toISOString();
@@ -595,29 +578,24 @@ export function auditIdToCreatedAt(auditId: string): string {
   return `${y}-${mo}-${d}T${h}:${mi}:${s}Z`;
 }
 
-/** 由 kind+标题派生稳定 finding_id（跨轮一致：同标题同 id）。 */
+/** 跨轮相同类别和标题必须得到同一个编号，投影才能合并它们的观察。 */
 function findingIdOf(kind: 'confirm' | 'deferred', title: string): string {
   const normalized = title.trim().toLowerCase().replace(/\s+/g, ' ');
   const hash = createHash('sha1').update(`${kind}:${normalized}`).digest('hex').slice(0, 10);
   return `f-${hash}`;
 }
 
-/**
- * §4.7/§4.8：从 B/Deferred 文本尽力提取业务文件路径，作为 finding 覆盖判定的
- * target_files。只承认形如 `dir/file.ext` 的仓库相对路径；行号后缀（`:12`、`:12-20`）
- * 不会进入匹配（扩展名之后只认路径字符），URL、绝对路径、盘符、含 `..` 的遍历路径
- * 与 `.ai-review/` 数据目录一律排除。去重后最多保留 20 条，按首次出现顺序。
- */
 const MAX_TARGET_FILES = 20;
 const RAW_TARGET_FILE_PATTERN =
   /(?<![\w/.-])(?:\.\/)?(?:[A-Za-z0-9._@+~-]+\/)+[A-Za-z0-9._@+~-]+\.[A-Za-z][A-Za-z0-9]{0,9}/g;
 
+/** 提取的业务路径用于审查覆盖判定，不能把行号、链接或评审元数据当作路径。 */
 function extractTargetFiles(texts: string[]): string[] {
   const files: string[] = [];
   const seen = new Set<string>();
   for (const text of texts) {
     if (!text) continue;
-    // 统一为正斜杠，兼容 Windows 风格报告；URL/盘符/绝对路径仍会在校验中排除。
+    // 审查报告也可能包含 Windows 路径分隔符。
     const normalized = text.replaceAll('\\', '/');
     for (const match of normalized.matchAll(RAW_TARGET_FILE_PATTERN)) {
       const token = match[0].replace(/^\.\/+/, '');
@@ -633,7 +611,7 @@ function extractTargetFiles(texts: string[]): string[] {
   return files;
 }
 
-/** 空 target_files 在非全仓 scope 下会被覆盖判定排除，必须显式告警（否则 items 全部失效）。 */
+/** 局部审查没有目标路径时，投影无法确认覆盖，须向操作者说明漏报原因。 */
 function warnEmptyTargetFiles(
   warnings: string[],
   item: AuditDeferredItem,
@@ -646,11 +624,7 @@ function warnEmptyTargetFiles(
   );
 }
 
-/**
- * §4.7 items[]：B 类 → confirm（depends_on null）；Deferred → deferred（depends_on
- * 尽力从文本匹配本轮 confirm 标题，未命中时使用占位依赖并告警——该 finding 在依赖出现前不可转换）。
- * §4.8：target_files 从 item.text / item.label 中提取；非全仓 scope 下提取失败必须告警。
- */
+/** 依赖名称没有匹配时保留占位并告警，避免该延后项被提前转为候选。 */
 export function buildAuditItems(deferred: AuditDeferredItem[], warnings: string[], scope: string): AuditItem[] {
   const items: AuditItem[] = [];
   const confirmIds = new Map<string, string>();
@@ -700,10 +674,7 @@ export function buildAuditItems(deferred: AuditDeferredItem[], warnings: string[
   return items;
 }
 
-/**
- * §7.6：A 类正文列表同步过滤——移除引用未通过校验候选的列表行，
- * 并追加一行说明（校验失败候选不进入共享提交，也不得保留在共享正文引用中）。
- */
+/** 收尾不会提交无效候选，报告也不能留下指向这些未共享候选的引用。 */
 function filterAClassSection(body: string, validIds: string[], createdIds: string[]): string {
   const invalid = createdIds.filter((id) => !validIds.includes(id));
   if (invalid.length === 0) return body;
@@ -731,19 +702,13 @@ export interface AuditDeps {
   note: string;
   log: (line: string) => void;
   resolveCredential?: (reference: string) => Promise<string | undefined>;
-  /** §7.1/G10：审查提示词中的共享事实读取源（绑定同一 VCS 快照）；缺省为工作区视图。 */
   candidateSource?: import('./shared-facts.js').SharedCandidateSource;
-  /** §7.7：Job 取消信号，用于终止 headless Runner。 */
   signal?: AbortSignal;
   lease?: AuditLeaseRecord;
   scheduledBaseMatches?: () => Promise<boolean>;
 }
 
-/**
- * Repository audit: an executor scans the current repository, writes orthogonal
- * `.ai-review` candidates plus a report, and the plugin verifies and commits the
- * resulting data. This is the candidate producer that closes the review loop.
- */
+/** 连接审查执行器和 Host 收尾事务。执行器只产出本地审查结果，由 Host 验证后写入共享历史。 */
 export class Auditor {
   constructor(private readonly deps: AuditDeps) {}
 
@@ -774,7 +739,6 @@ export class Auditor {
     }
     const target = await resolveAuditTarget(root, this.deps.targetPath);
     const now = lease ? new Date(lease.createdAt) : new Date();
-    // §4.7：audit_id 由 Host 生成（UTC 时间戳），报告正文路径即档案 audit.md。
     const archive = new AuditArchive(root);
     const auditId = lease?.auditId ?? await archive.nextAuditId(target.targetPath, now);
     const reportPath = `.ai-review/audits/${auditId}/audit.md`;
@@ -915,7 +879,6 @@ export class Auditor {
       warnings.push(`执行期间基线从 ${base.slice(0, 12)} 变为 ${afterBase.slice(0, 12)}，审查结果可能已过期`);
     }
 
-    // §7.7：取消只停止执行，不执行收尾提交；返回 ABORTED 供 Job 记录。
     if (this.deps.signal?.aborted || run.aborted) {
       const message = '仓库审查已取消（未执行收尾提交）';
       warnings.push(message);
@@ -980,11 +943,7 @@ export class Auditor {
     };
   }
 
-  /**
-   * §7.6 Host 收尾：校验新候选（含 owner 路由复核）→ 生成/覆写目录式审查档案
-   * （frontmatter + items + 插件复核块）→ 只提交本轮档案目录与合法新候选目录。
-   * 校验失败的候选不进入提交，错误写入复核块。供 headless run 与手动 finalize 共用。
-   */
+  /** 自动运行与人工收尾共用此事务。无效候选不进入共享提交，复核块须保留剔除原因。 */
   async finalize(input: AuditFinalizeInput): Promise<AuditFinalizeResult> {
     const { store, vcs } = this.deps;
     const warnings = [...(input.extraWarnings ?? [])];
@@ -1026,10 +985,7 @@ export class Auditor {
     body = body.replace(/^\uFEFF/, '').replace(/^---\n[\s\S]*?\n---\n?/, '');
     const deferredItems = parseAuditReport(body).deferred;
 
-    // §4.2/G42：verify_gate_on_audit_finalize 为 smoke/declared 时，对合法候选
-    // 在补丁应用后的工作区复算门禁（smoke=audit_smoke_commands，declared=候选 gate_checks）；
-    // 失败则该候选不提交；无论成败都还原业务工作区。
-    // 注意：复核块必须在门禁复算之后渲染，否则失败错误不会出现在块内。
+    // G42：配置启用时，先在临时应用补丁的工作区复算门禁。
     const { loadReviewers } = await import('./reviewers.js');
     const { runGateChecks } = await import('./validator.js');
     const reviewersConfig = await loadReviewers(store.repoRoot, this.deps.candidateSource);
@@ -1114,7 +1070,7 @@ export class Auditor {
         body = `${sections.join('').trimEnd()}\n\n${auditRecheckSection(input.recheck)}\n`;
     }
     const validAfterGates = created.filter((item) => item.errors.length === 0).map((item) => item.id);
-    // §7.6：复核块在门禁复算之后渲染，失败候选及其错误会进入块内；正文 A 类列表同步过滤。
+    // 须等复算结束再生成复核块，以记录被门禁淘汰的候选。
     const block = renderVerificationBlock({
       created,
       warnings,
@@ -1137,7 +1093,6 @@ export class Auditor {
         items = [...new Map(items.filter(item => !historicalIds.has(item.findingId)).map(item => [item.findingId, item])).values(),
             ...input.recheck.observations];
     }
-    // I13：created_at 必须与 audit_id 的 UTC 时间戳一致（audit_id 生成时刻）。
     const createdAt = auditIdToCreatedAt(input.auditId);
     const previous = input.recheck ? input.recheck.previousAudit : (await archive.list())
       .filter((record) => !record.parseError && record.meta.auditId !== input.auditId)
@@ -1158,7 +1113,6 @@ export class Auditor {
     }, bodyWithGateNote);
     this.log(`审查档案：${reportPath}（B/Deferred ${String(items.length)} 项；${gateNote}）`);
 
-    // §7.6：收尾提交只包含本轮 audit 目录、合法新候选目录与（首次创建的）reviewers.yml。
     const commitPaths = [
       `.ai-review/audits/${input.auditId}`,
       ...validAfterGates.map((id) => `.ai-review/${id}`),
@@ -1171,11 +1125,10 @@ export class Auditor {
     if (validAfterGates.length > 0 || input.runError === null) {
       if (this.deps.signal?.aborted) return cancelled();
       const scopeLabel = input.targetPath || 'repo';
-      // §5.6 三分支：按路径级提交探针判定；探针前进后必须核对完整路径集合与逐文件内容。
-      // SVN 下目录 revision 不随子文件修改前进：探针至少覆盖 audit.md 本身。
+      // SVN 档案目录的修订号不随子文件更新，探针须包含 audit.md。
       const probePaths = [reportPath, ...validAfterGates.map((id) => `.ai-review/${id}`)];
       const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
-      // §7.5 步骤 9（B1）：先展开完整提交集合（目录 → 文件），再核对，防止另存文件夹带。
+      // 提交目录前校验展开后的完整文件集合，防止夹带未验证内容。
       const { entries: commitEntries } = await collectCommitEntries(store.repoRoot, commitPaths);
       if (!await this.scheduledBaseSafe(input.baseRevision)) return recovery();
       if (this.deps.signal?.aborted) return cancelled();
@@ -1223,7 +1176,6 @@ export class Auditor {
           this.log(warning);
         } else {
           status = 'ABORTED';
-          // §5.6(2)：已证明提交不存在 → 恢复操作前状态（删除本轮新写的 audit 目录与新候选目录）。
           await this.removeFinalizeArtifacts(input.auditId, created.map((item) => item.id),
             Boolean(input.scheduledScan && reviewersCreated), Boolean(input.scheduledScan)).catch(() => undefined);
           const warning = `提交 .ai-review 失败，已清理本轮本地写入：${commit.errorOutput}`;
@@ -1252,7 +1204,7 @@ export class Auditor {
     };
   }
 
-  /** §5.6(2)：已证明收尾提交不存在时，删除本轮新生成本地写入。 */
+  /** 仅当已证明没有发生收尾提交时才能删除本轮产物。 */
   private async removeFinalizeArtifacts(auditId: string, candidateIds: string[], removeReviewers = false, scheduled = false): Promise<void> {
     const { rm } = await import('node:fs/promises');
     await rm(path.join(this.deps.store.repoRoot, '.ai-review', 'audits', auditId), { recursive: true, force: true }).catch(() => undefined);
@@ -1260,7 +1212,7 @@ export class Auditor {
       await rm(path.join(this.deps.store.repoRoot, '.ai-review', id), { recursive: true, force: true }).catch(() => undefined);
     }
     if (removeReviewers) await rm(reviewersPath(this.deps.store.repoRoot), { force: true });
-    // 清空首次失败提交留在索引中的暂存（Git）并还原工作区，避免下一次收尾被“额外暂存条目”拒绝。
+    // 失败提交可能留下暂存项，重试收尾前须先清理。
     if (!scheduled) await this.deps.vcs.revertBusinessWorkspace().catch(() => undefined);
   }
 
@@ -1272,7 +1224,6 @@ export class Auditor {
   ): Promise<AuditCandidateResult[]> {
     const { store, vcs } = this.deps;
     const scheduled = this.deps.lease?.trigger === 'scheduled';
-    // §4.2/G3：owner 路由是 Host 强制规则——Agent 填错 owner 的候选不得进入共享提交。
     const { loadReviewers, resolveOwner } = await import('./reviewers.js');
     let reviewers = await loadReviewers(store.repoRoot, this.deps.candidateSource);
     if (allowNewReviewers && this.deps.candidateSource && await this.deps.candidateSource.readReviewersText() === null) {
@@ -1313,7 +1264,6 @@ export class Auditor {
         if (meta.status !== 'pending') result.errors.push(`新候选状态必须是 pending，当前为 ${meta.status}`);
         if (meta.currentRevision !== 1) result.errors.push(`新候选 current_revision 必须为 1，当前为 ${String(meta.currentRevision)}`);
         if (meta.approval !== null) result.errors.push('新候选的 approval 必须为 null');
-        // §4.2/G3：owner 必须等于 Host 按 reviewers.yml 计算的路由结果。
         const routing = resolveOwner(reviewers, { paths: meta.targetFiles, tags: meta.tags });
         const expectedOwner = routing.owner || (scheduled ? this.deps.owner : '');
         if (!expectedOwner) {

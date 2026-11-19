@@ -90,7 +90,7 @@ test('svn revertBusinessWorkspace removes files scheduled by a patch', { skip: !
   runCommand('svn', ['--non-interactive', 'add', 'a.txt'], wc);
   runCommand('svn', ['--non-interactive', 'commit', '-m', 'base'], wc);
 
-  // `svn patch` of an added file schedules it exactly like `svn add` does.
+  // svn patch 会像 svn add 一样调度新文件。直接调度可复现回滚需要清理的状态。
   await writeFile(path.join(wc, 'new.txt'), 'new\n', 'utf8');
   runCommand('svn', ['--non-interactive', 'add', 'new.txt'], wc);
   const vcs = createVcs('svn', wc);

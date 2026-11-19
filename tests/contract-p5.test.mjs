@@ -8,8 +8,6 @@ import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { checkDecisionCoverage, checkCommitMessage } from '../packages/dsh-plugin/dist/host/approval.js';
 import { createGitFixture, fakeAuditAgentPath, runCommand } from './helpers.mjs';
 
-/** P5 验收：批准强化——I8 判断项全覆盖、§4.9 标题一致、§4.7 快照/结果/决定留痕、业务提交用 commit_message。 */
-
 const servers = [];
 after(async () => {
   await Promise.all(servers.map((server) => server.close()));
@@ -106,7 +104,6 @@ async function approveAndWait(base, payload) {
 }
 
 test('P5: 判断项未全覆盖 / 知悉缺理由 / 标题不一致 —— 批准被拒', async () => {
-  // 纯函数级
   const errs = checkDecisionCoverage(
     [{ id: 'h1', question: 'Q1' }, { id: 'h2', question: 'Q2' }],
     ['h1'],
@@ -125,7 +122,6 @@ test('P5: 判断项未全覆盖 / 知悉缺理由 / 标题不一致 —— 批�
   assert.match(checkCommitMessage('t: x', 'other: y\nbody'), /一致/);
   assert.equal(checkCommitMessage('t: x', 't: x\nbody'), null);
 
-  // API 级：知悉缺理由直接 400。
   const root = await createGitFixture();
   await writeCandidate(root, '20261105-net-a', { decisions: [{ id: 'h1', q: '是否接受行为变化？' }] });
   runCommand('git', ['add', '.ai-review'], root);
@@ -141,7 +137,6 @@ test('P5: 判断项未全覆盖 / 知悉缺理由 / 标题不一致 —— 批�
   });
   assert.equal(bad.httpStatus, 422);
 
-  // 判断项漏确认 → job 结果 DECISIONS_UNCONFIRMED。
   const miss = await approveAndWait(base, {
     id: '2026-11/20261105-net-a',
     expectedRevision: 1,
@@ -152,7 +147,6 @@ test('P5: 判断项未全覆盖 / 知悉缺理由 / 标题不一致 —— 批�
   });
   assert.equal(miss.job.result.reason, 'DECISIONS_UNCONFIRMED');
 
-  // commit_message 首行不一致 → COMMIT_MESSAGE_MISMATCH。
   const mismatchRoot = await createGitFixture();
   await writeCandidate(mismatchRoot, '20261105-net-b', { commitMessage: '别的标题\n正文' });
   runCommand('git', ['add', '.ai-review'], mismatchRoot);
@@ -189,7 +183,6 @@ test('P5: 合法批准——快照/结果/决定留痕 + 业务提交使用 comm
   assert.equal(outcome.job.status, 'succeeded');
   assert.equal(outcome.job.result.status, 'COMMITTED', JSON.stringify(outcome.job.result));
 
-  // review.md 留痕：快照、逐条结果、确认/知悉。
   const reviewText = await readFile(path.join(root, '.ai-review', '2026-11', '20261105-net-ok', 'review.md'), 'utf8');
   assert.match(reviewText, /gate_checks:\n\s+- node --version/);
   assert.match(reviewText, /exit_code: 0/);
@@ -197,14 +190,12 @@ test('P5: 合法批准——快照/结果/决定留痕 + 业务提交使用 comm
   assert.match(reviewText, /waived_decisions:/);
   assert.match(reviewText, /发布说明由产品另行补充/);
 
-  // §5.5（2026-11-09 修订）：单次原子提交——最新提交即业务提交（首行 == title），无第二次回填提交。
+  // 只允许一次原子业务提交，因此 HEAD 必须直接指向业务提交（AC-APPROVE-01）。
   const log = runCommand('git', ['log', '-2', '--format=%s'], root).stdout.trim().split('\n');
   assert.equal(log[0], 'net: 修复加法');
   assert.equal(log[1], 'fixture');
-  // review.md 不保存 commit_revision。
   assert.doesNotMatch(reviewText, /commit_revision/);
 
-  // §5.5 派生读模型：/candidate 返回 found 与业务提交版本（AC-APPROVE-01）。
   const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   const detail = await (await fetch(`${base}/candidate?id=${encodeURIComponent('2026-11/20261105-net-ok')}`)).json();
   assert.equal(detail.approvalCommitLookup, 'found', JSON.stringify(detail.approvalCommitLookup));

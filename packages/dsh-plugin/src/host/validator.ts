@@ -18,10 +18,6 @@ function escapeCell(value: string): string {
   return value.replaceAll('|', '\\|').replaceAll('\n', ' ');
 }
 
-/**
- * Run the candidate's `gate_checks` verbatim in the repository working tree.
- * Gate checks are the merge contract: all must pass before an approval may commit.
- */
 export async function runGateChecks(commands: string[], options: GateOptions): Promise<ValidationReport> {
   const results: GateCheckResult[] = [];
   for (const command of commands) {

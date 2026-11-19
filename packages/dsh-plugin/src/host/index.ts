@@ -9,7 +9,6 @@ import { ConnectionController, CONNECTION_PREFIX } from '../connection/controlle
 import { discoverCandidates } from '../connection/config.js';
 import { CENTRAL_PREFIX } from '../connection/gateway.js';
 
-/** Minimal shape of the host-side Cordis context this plugin uses. */
 export interface HostLogger {
   info(message: string, ...args: unknown[]): void;
   warn(message: string, ...args: unknown[]): void;
@@ -42,7 +41,7 @@ export interface HostContext {
   logger?: HostLogger;
 }
 
-/** The live `ctx.sessionController` contract this plugin uses (generated `ctx.remote.session` host side). */
+/** 对应宿主 sessionController 接口，客户端从 ctx.remote.session 访问同一能力。 */
 interface DshSessionController {
   create(request: { workspaceId?: string; cwd?: string }): Promise<{ sessionId?: unknown }>;
   rename?(request: { sessionId: string; title: string }): Promise<unknown>;
@@ -100,7 +99,6 @@ export interface AuditSessionHost {
   logger?: HostLogger;
 }
 
-/** Hard dependency: without the web server this plugin cannot serve its panel API. */
 export const inject = ['webServer'];
 
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
@@ -128,14 +126,7 @@ function describeSessionError(error: unknown): string {
   return String(error);
 }
 
-/**
- * Give the audit conversation the same permission preset / approval policy as
- * the session that opened the review tab. Without this the new session starts
- * at the deployment default (`workspace-write` + `ask`), so an audit that runs
- * `gate_checks` through a piped subprocess stalls on an approval prompt nobody
- * is watching. Inheritance keeps the audit inside the trust level the user
- * already chose for this repository.
- */
+/** 新会话继承打开面板时选定的权限与审批策略，避免无人值守的门禁退回部署默认值后卡在审批。 */
 function inheritOwnerPolicy(
   host: AuditSessionHost,
   ownerSessionId: string,
@@ -179,15 +170,6 @@ function inheritOwnerPolicy(
   return inherited;
 }
 
-/**
- * Create a real DSH conversation for the repository audit and submit the audit prompt.
- *
- * DSH exposes session creation only through the host `sessionController`
- * (`ctx.remote.session` on the client). The former `apiProxy.sessions` transport
- * does not exist in current DSH builds, so this helper drives the supported
- * create → rename → prompt sequence directly and attaches the session to the
- * workspace that owns `cwd`, which makes it show up in the sidebar.
- */
 export async function createDshAuditSession(
   host: AuditSessionHost,
   input: { cwd: string; title: string; prompt: string; ownerSessionId?: string },
@@ -195,12 +177,7 @@ export async function createDshAuditSession(
   return createDshSession(host, input, '审查');
 }
 
-/**
- * §7.4（2026-11-12）：按「在新会话中执行修复」的目标创建会话。
- *
- * 与审查会话共用同一套创建序列与权限继承，只是标签不同；拆分标签是为了让
- * 失败信息直接指向用户刚才点的那个入口（审查 / AI 修复），而不是笼统的“会话”。
- */
+/** 与审查共用创建流程，单列动作标签以便失败提示指向用户刚选的入口。 */
 export async function createDshFixSession(
   host: AuditSessionHost,
   input: { cwd: string; title: string; prompt: string; ownerSessionId?: string },
@@ -208,6 +185,7 @@ export async function createDshFixSession(
   return createDshSession(host, input, '修复');
 }
 
+/** 将会话挂到 cwd 对应的工作区，才能让侧栏在正确的工作区展示它。 */
 async function createDshSession(
   host: AuditSessionHost,
   input: { cwd: string; title: string; prompt: string; ownerSessionId?: string },

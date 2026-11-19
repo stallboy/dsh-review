@@ -60,7 +60,7 @@ function asStringArray(value: unknown, field: string): string[] {
   return asArray(value, field).map((item, index) => asString(item, `${field}[${String(index)}]`));
 }
 
-/** 嵌套对象中未建模的键原样收集（I14：未知嵌套键保留，避免任何一次写入丢字段）。 */
+/** I14：回写元数据时须保留尚未建模的嵌套键，避免丢失其他生产者的字段。 */
 function collectExtra(value: Record<string, unknown>, known: Set<string>): Record<string, unknown> {
   const extra: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value)) {
@@ -476,10 +476,7 @@ export function parseSections(body: string): ReviewSections {
 
 const PLACEHOLDER_JUDGMENT = /^(?:无|暂无|没有|不适用|无需|none|n\/a|na)(?:[。.；;，,：:]|$|[（(])/i;
 
-/**
- * Placeholder text such as “无”, “无。” or “无：...详情...” carries no decision
- * for a human. Treat it as empty so the UI does not render a fake review item.
- */
+/** 「无」及带标点或补充说明的写法只是占位，不能作为待人工判断项展示。 */
 export function isEmptyHumanJudgmentText(value: string): boolean {
   const normalized = value.replace(/[*_`]/g, '').trim();
   if (normalized.length === 0) return true;

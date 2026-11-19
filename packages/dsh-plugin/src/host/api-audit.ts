@@ -33,18 +33,8 @@ import {
   type TrustedActor,
 } from './api-context.js';
 
-/**
- * 审查生命周期装配：租约持久化与状态机、开始/收尾/释放、跟踪 Job、1 小时超时、
- * 审查提示词与 /sync。
- *
- * 分层：本模块只依赖 api-context（窄接口），不反向 import api.ts。
- * 横切语义仍由 api.ts 的 dispatch 按 RouteKind 统一套用：
- * - `/audit/prompt` 属 read（不加锁、不判互斥）；
- * - audit-control 类别由 dispatch 做受理期互斥判定；本模块 handler 只在 beginAuditLease
- *   与 Job 体内按既有语义取锁，与拆分前完全一致。
- */
+/** 将审查执行和租约状态机接入 Host。路由负责请求受理，租约在执行期间持续约束共享写入。 */
 export class AuditRuntime {
-  /** A4：租约状态机集中到 AuditLifecycle（唯一迁移入口）；此处只保留持久化适配器。 */
   private lifecycle: AuditLifecycle | null = null;
 
   constructor(private readonly host: ApiHost) {}
@@ -53,13 +43,12 @@ export class AuditRuntime {
     return this.host.deps.statePath ?? path.join(dshHome(), 'dsh-code-review', 'runtime-state.json');
   }
 
-  /** §7.6 审查租约状态机；未初始化时抛 500。 */
   get auditLifecycle(): AuditLifecycle {
     if (!this.lifecycle) throw new ApiError(500, 'internal', '审查租约状态机未初始化');
     return this.lifecycle;
   }
 
-  /** Host 启动时加载持久化租约：active/releasable 租约继续参与互斥，直到 finalize 或 release。 */
+  /** 进程重启后恢复未释放租约，外部 Agent 可能仍在操作工作区。 */
   async loadAuditLeases(): Promise<void> {
     this.lifecycle = new AuditLifecycle({
       load: async () => {
@@ -99,18 +88,14 @@ export class AuditRuntime {
     await this.auditLifecycle.create(lease);
   }
 
-  /**
-   * §7.6/§7.7：把指定租约迁到 `released`（默认）并持久化。
-   * 只用于“Host 自身已证明执行结束”的场景：审查 Job 正常结束、会话创建失败、finalize 已完成。
-   * 取消/超时只迁到 `releasable`，必须人工确认后 release。
-   */
+  /** 只有 Host 能确认执行已结束才可转为 released。结果不明时应保留互斥。 */
   async releaseLeaseById(auditId: string, state: 'released' | 'releasable' = 'released'): Promise<void> {
     const lease = this.auditLifecycle.find(auditId);
     if (!lease || lease.state === state) return;
     try {
       await this.auditLifecycle.transition(auditId, state);
     } catch (error) {
-      if (error instanceof LeaseTransitionError) return; // 已是终态或非法迁移：保持现状
+      if (error instanceof LeaseTransitionError) return;
       throw error;
     }
     if (state === 'released') {
@@ -119,17 +104,15 @@ export class AuditRuntime {
     }
   }
 
-  /** §7.6：审查执行超时上限 1 小时；超时只把租约置 releasable，不自动解除互斥。 */
+  /** 超时只能表明 Host 停止跟踪，租约继续阻塞自动写入。 */
   armAuditLeaseTimeout(auditId: string): void {
     const timer = setTimeout(() => {
-      // §7.6：超时只把 active 迁到 releasable（仍阻塞），绝不自动释放。
       void this.auditLifecycle.markReleasable(auditId).then((changed) => {
         if (!changed) return;
         this.host.auditJobFinishes.get(auditId)?.({
           status: 'RECOVERY_REQUIRED',
           reason: 'SYNC_STATE_UNKNOWN',
-          // 2026-11-12 事故修订：超时最常发生在"审查会话其实已完成、只是没人收尾"的场景，
-          // 提示必须同时给出两条出路，而不是只引导释放（释放不提交本地候选）。
+          // 超时也可能表示会话已完成但尚未收尾。直接释放会留下未提交的本地候选。
           detail:
             '审查执行超过 1 小时上限，租约已置为 releasable。若审查会话已完成，请执行收尾（/audit/finalize）校验并提交候选；'
             + '确认外部执行已停止且不需要提交时，再人工确认释放（/audit/release）',
@@ -140,7 +123,6 @@ export class AuditRuntime {
     timer.unref?.();
   }
 
-  /** §7.7：创建 audit 跟踪 Job；取消/超时只把租约置 releasable，不自动释放。 */
   startAuditTrackingJob(auditId: string): JobRecord {
     const job = this.host.jobManager.start('audit', () => new Promise<unknown>((resolve) => {
       this.host.auditJobFinishes.set(auditId, (result) => { resolve(result); });
@@ -167,6 +149,7 @@ export class AuditRuntime {
     }
   }
 
+  /** 调用方须持有仓库锁，避免并发请求在各自通过互斥检查后同时取得租约。 */
   async beginAuditLeaseUnderLock(
     runtime: Runtime,
     input: { targetPath: string; baseRevision: string; owner: string; now: Date; trigger: 'manual' | 'scheduled' },
@@ -197,7 +180,6 @@ export class AuditRuntime {
     return this.host.withWriteLock(runtime.root, () => this.beginAuditLeaseUnderLock(runtime, input, clean));
   }
 
-  /** §18.2：把 reviewers.yml 解析结果作为提示词参数传入审查会话。 */
   async ownerRoutingBlock(
     repoRoot: string,
     source?: import('./shared-facts.js').SharedCandidateSource,
@@ -277,7 +259,6 @@ export class AuditRuntime {
     }
     const owner = await this.host.ownerFor(runtime.root);
     const now = new Date();
-    // §7.6：会话审查同样持有执行租约 + 跟踪 audit Job；turn 结束后由 /audit/finalize 收尾。
     const { auditId, reportPath } = await this.beginAuditLease(
       runtime,
       { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'manual' },
@@ -302,16 +283,13 @@ export class AuditRuntime {
     try {
       created = await this.host.deps.createAuditSession({ cwd: runtime.root, title, prompt, ownerSessionId });
     } catch (error) {
-      // 会话创建失败：租约不得残留，否则仓库会被阻塞到人工 release。
       await this.releaseLeaseById(auditId).catch(() => undefined);
       throw error;
     }
-    // §7.6/§10.1：把审查会话 id 记入租约（诊断展示与后续自动化定位用；旧租约无此字段）。
     const leaseForSession = this.auditLifecycle.find(auditId);
     if (leaseForSession && leaseForSession.sessionId !== created.sessionId) {
       await this.upsertLease({ ...leaseForSession, sessionId: created.sessionId });
     }
-    // 跟踪 Job 保持 running 直到 finalize/release/取消；宿主提供 turn-end 钩子时自动收尾。
     const job = this.trackAuditSession(runtime, auditId, created.sessionId);
     sendJson(res, 202, {
       sessionId: created.sessionId,
@@ -343,15 +321,12 @@ export class AuditRuntime {
     }
     const clean = await runtime.vcs.ensureCleanWorkspace();
     const owner = await this.host.ownerFor(runtime.root);
-    // §7.6/§7.7：headless 审查持有一条与手动/会话模式同语义的执行租约，
-    // 保证审查期间其他共享写在受理阶段被 409 拒绝。互斥判定与租约写入在同一 repo 锁内。
     const now = new Date();
     const { auditId } = await this.beginAuditLease(
       runtime,
       { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'manual' },
       clean,
     );
-    // §7.7：headless Runner 的工作区事务必须与其他共享写经同一 repo 锁串行。
     const job = this.host.jobManager.start('audit', (log, _jobId, signal) => this.host.withWriteLock(runtime.root, async () => {
       try {
         const sharedSource = await sharedSourceFor(runtime);
@@ -372,7 +347,6 @@ export class AuditRuntime {
         log(`结果：${outcome.status} — ${outcome.message}`);
         return outcome;
       } finally {
-        // Job 的 task 返回前执行：此刻审查已结束，可安全释放本次执行租约（review 期间保持 active）。
         await this.releaseLeaseById(auditId).catch(() => undefined);
       }
     }));
@@ -467,11 +441,7 @@ export class AuditRuntime {
         return admitted;
     }
 
-  /**
-   * §7.6 手动提示词模式：创建持久化执行租约并返回完整提示词。
-   * 外部 Agent 执行期间租约参与全部互斥；只有 /audit/finalize 正常完成才释放，
-   * 取消或超时只能由人确认停止后经 /audit/release 释放。
-   */
+  /** 提示词交给外部 Agent 后，Host 仍用持久化租约保护执行期间的工作区。 */
   async auditManual(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const body = await readJson(req);
@@ -483,7 +453,6 @@ export class AuditRuntime {
     const clean = await runtime.vcs.ensureCleanWorkspace();
     const owner = await this.host.ownerFor(runtime.root);
     const now = new Date();
-    // §7.7：互斥判定、auditId 分配与 active 租约写入在同一 repo 锁内（消除 TOCTOU）。
     const { auditId, reportPath } = await this.beginAuditLease(
       runtime,
       { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'manual' },
@@ -503,7 +472,6 @@ export class AuditRuntime {
       ...(sharedSource ? { source: sharedSource } : {}),
     });
     const prompt = wrapAgentPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root, sharedSource)}`);
-    // §7.6/§8.3：手动模式同样创建可追踪的 audit Job，并受 1 小时执行上限约束。
     const job = this.startAuditTrackingJob(auditId);
     this.armAuditLeaseTimeout(auditId);
     sendJson(res, 202, {
@@ -518,10 +486,7 @@ export class AuditRuntime {
     });
   }
 
-  /**
-   * §7.6 手动/会话审查收尾：以 lease 中保存的开始快照执行 Host 收尾与共享提交，
-   * 正常完成后释放租约。外部写入的候选按全部校验（含 owner 路由复核）验收。
-   */
+  /** 用租约记录的起始快照验收外部执行结果，避免按变化后的基线接受候选。 */
   private startAuditFinalizeJob(runtime: Runtime, lease: AuditLeaseRecord): JobRecord {
     const job = this.host.jobManager.start('audit', async (log, _jobId, signal) => {
       try {
@@ -584,6 +549,7 @@ export class AuditRuntime {
     return job;
   }
 
+  /** 宿主未提供 turn-end 钩子时，跟踪任务须等待显式收尾。 */
   private followAuditTurn(runtime: Runtime, auditId: string, sessionId: string): void {
     const subscribe = this.host.deps.onAuditTurnEnd;
     if (!subscribe) return;
@@ -613,7 +579,7 @@ export class AuditRuntime {
     sendJson(res, 202, { jobId: job.id, job });
   }
 
-  /** §7.6 释放租约：仅在租约已取消/超时（releasable）或人工确认外部执行已停止后使用。 */
+  /** 取消和超时都无法证明外部执行已停止，因此释放还需要人工确认。 */
   async auditRelease(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const body = await readJson(req);
@@ -625,11 +591,10 @@ export class AuditRuntime {
     if (!lease) throw new ApiError(404, 'not_found', `审查租约不存在：${auditId}`);
     if (lease.root !== runtime.root) throw new ApiError(409, 'conflict', '租约属于另一个仓库检出');
     if (lease.state === 'released') throw new ApiError(409, 'conflict', `租约 ${auditId} 已释放`);
-    // §8.3：仅在租约已取消/超时（releasable）后可用；仍活跃的租约必须 409。
     if (lease.state === 'active') {
       throw new ApiError(409, 'conflict', `租约 ${auditId} 仍处于活跃状态；请先取消审查 Job 或等待超时（releasable）后再释放`);
     }
-    // 复核工作区：外部执行可能残留未还原改动。
+    // 外部 Agent 停止后也可能留下业务改动，释放前须检查工作区。
     const clean = await runtime.vcs.ensureCleanWorkspace();
     if (!clean.clean) {
       throw new ApiError(409, 'conflict', `工作区仍有未还原改动，不能释放租约。\n${clean.message}`);
@@ -648,7 +613,7 @@ export class AuditRuntime {
     const runtime = await this.host.runtimeFor(url);
     const { vcs } = runtime;
     this.host.ensureNoAuditRunning(runtime.root);
-    // §7.7：/sync 与其他工作区事务在同一 repo 锁内串行，不得改变其基线。
+    // 同步会改变基线，必须与使用该工作区的其他事务串行。
     const result = await this.host.withWriteLock(runtime.root, () => vcs.syncAndGetLatestBase());
     if (result.uncertain) {
       throw new ApiError(409, 'conflict', `同步状态无法确定，禁止自动重试：${result.message}`, {

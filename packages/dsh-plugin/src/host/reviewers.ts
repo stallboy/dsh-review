@@ -11,17 +11,14 @@ export interface ReviewerRule {
 export interface ReviewersConfig {
   defaultOwner: string;
   rules: ReviewerRule[];
-  /** §5：门禁白名单（trim 后精确匹配；未命中不是禁止，而是 UI 必须二次确认）。 */
+  /** 白名单未命中时仍可执行门禁，界面需请求二次确认。 */
   allowedGateCommands: string[];
-  /** §5：updated_at 超过该天数进入超时废弃流程；未配置时仅提示。 */
+  /** 未配置时只显示过期提示，不触发归档。 */
   staleDays: number | null;
-  /** §5：rejected 参与重复阻止的时间窗（天），默认 30。 */
   rejectionMemoryDays: number;
-  /** §5：每模块最多注入的负向摘要数量，默认 20。 */
   maxAntiPatterns: number;
-  /** §4.2/G42：收尾门禁复算模式 none/smoke/declared，默认 none。 */
   verifyGateOnAuditFinalize: 'none' | 'smoke' | 'declared';
-  /** §4.2/G42：smoke 模式按顺序在仓库根目录执行的命令。 */
+  /** 收尾复算使用 smoke 模式时，这些命令在仓库根目录依次执行。 */
   auditSmokeCommands: string[];
 }
 
@@ -47,18 +44,14 @@ function asStringArray(value: unknown): string[] {
 
 export interface ReviewersSnapshotSource {
   readReviewersText(): Promise<string | null>;
-  /** 源绑定的 VCS 快照标识；不可证明快照（SVN）时返回 null，对应读取不缓存。 */
   snapshotId?(): Promise<string | null>;
 }
 
-/**
- * 快照键的 reviewers.yml 解析缓存（§4.8 模式）：快照内文件内容不可变，
- * 缓存只保存解析后的配置；不持久化、不跨快照复用。工作区读取（无 source）永不缓存。
- */
+/** 只有不可变快照中的配置才能按版本缓存，工作区配置须每次读取。 */
 const reviewersCache = new Map<string, ReviewersConfig>();
 const REVIEWERS_CACHE_MAX = 32;
 
-/** 防御性深拷贝：缓存对象的所有数组字段与返回值完全脱离引用，调用方改不到缓存。 */
+/** 返回值的数组与缓存脱离，防止调用方改写后污染其他请求。 */
 function cloneReviewersConfig(config: ReviewersConfig): ReviewersConfig {
   return {
     ...config,
@@ -87,7 +80,6 @@ export async function loadReviewers(repoRoot: string, source?: ReviewersSnapshot
     }
   }
   if (text === null) {
-    // 快照中不存在 reviewers.yml 同样按快照键缓存（内容对该快照不可变）。
     const empty = { ...EMPTY_REVIEWERS };
     if (cacheKey) {
       reviewersCache.set(cacheKey, empty);
@@ -133,7 +125,6 @@ export async function loadReviewers(repoRoot: string, source?: ReviewersSnapshot
     auditSmokeCommands: asStringArray(record['audit_smoke_commands']),
   };
   if (cacheKey) {
-    // 缓存的是共享快照内容：返回值给调用方前深拷贝，防止调用方意外改到缓存对象。
     reviewersCache.set(cacheKey, config);
     if (reviewersCache.size > REVIEWERS_CACHE_MAX) {
       const first = reviewersCache.keys().next().value;
@@ -183,14 +174,13 @@ export function resolveOwner(config: ReviewersConfig, input: RouteInput): RouteD
   for (const rule of config.rules) {
     const hasPaths = rule.paths.length > 0;
     const hasTags = rule.tags.length > 0;
-    // §4.2：两类都缺省的规则无效，不得作为通配规则。
+    // 空规则没有匹配依据，跳过以免遮蔽后续明确的路由。
     if (!hasPaths && !hasTags) continue;
     const pathHits = hasPaths
       ? normalizedPaths.reduce((count, candidate) => {
           return count + (rule.paths.some((glob) => globToRegExp(glob).test(candidate)) ? 1 : 0);
         }, 0)
       : 0;
-    // tagHits：至少命中一个规则标签的不同规范化候选 tag 数（同一 tag 只计一次）。
     const matchedTags = new Set<string>();
     if (hasTags) {
       for (const tag of tags) {
@@ -198,7 +188,6 @@ export function resolveOwner(config: ReviewersConfig, input: RouteInput): RouteD
       }
     }
     const tagHits = matchedTags.size;
-    // §4.2：两类同时存在时必须 AND（都至少命中一次）才参与。
     if (hasPaths && hasTags && (pathHits === 0 || tagHits === 0)) continue;
     if (hasPaths && !hasTags && pathHits === 0) continue;
     if (!hasPaths && hasTags && tagHits === 0) continue;

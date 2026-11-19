@@ -1,11 +1,7 @@
 /**
- * Browser half of dsh-code-review. Compiled as a classic script (module: none);
- * React is the only runtime dependency and comes from the module-loader factory.
+ * DSH 评审面板的浏览器入口，由宿主模块加载器提供 React。
+ * 宿主以 classic script 加载并在热更新时重新执行此文件，闭包可避免全局标识冲突。
  */
-
-// A page executes a bundle as one classic script and re-executes it on every HMR
-// swap, so the whole body lives in this closure: no page globals, no re-declaration.
-// __DSH_CODE_REVIEW_IIFE__
 (() => {
   const PACKAGE_ID = 'dsh-code-review';
   const NS = 'dsh-code-review';
@@ -109,22 +105,22 @@
   interface Comment {
     id: string; revision: number; file: string; line: number; author: string;
     content: string; status: 'unresolved' | 'partial' | 'resolved'; createdAt?: string;
-    /** §4.3/G34：行内评论的基线侧（LEFT）/补丁侧（RIGHT）。 */
+    /** 总体意见省略侧别；缺失侧别的旧行内评论按补丁侧匹配。 */
     side?: 'LEFT' | 'RIGHT';
-    /** §4.3/G39：锚点（被评行原文 + 前后各一行），跨版本重定位用。 */
+    /** 版本变化后可用原文锚点找回行号失配的评论。 */
     anchor?: { snippet: string; before?: string; after?: string };
   }
   interface QueueItem {
     id: string; title: string; owner: string; status: string; tags: string[]; ticket: string | null;
     currentRevision: number; createdAt: string; patchStats: Stats; unresolvedComments: number;
     humanJudgmentCount: number; humanJudgmentDeclared: boolean; isBaseBehind: boolean; baseRevision: string; lastFeedback: string; parseError?: string;
-    /** §7.1/§10.1：本地视图（未提交/有本地改动），不计入共享 KPI。 */
+    /** 本地视图不计入共享统计。 */
     local?: boolean;
-    /** §7.1/§10.1：候选目录整体未进入共享快照——详情只读共享事实，卡片不进入详情。 */
+    /** 尚未进入共享快照的候选没有可打开的详情。 */
     localOnly?: boolean;
     isStale?: boolean; duplicateOf?: string;
   }
-  /** §7.6/§10.1：阻塞中的审查执行租约（/queue 诊断字段；无阻塞时省略）。 */
+  /** releasable 租约仍阻塞共享写入，直到显式释放或收尾。 */
   interface AuditLeaseInfo {
     auditId: string; state: 'active' | 'releasable'; trigger: string; createdAt: string;
     owner: string; baseRevision: string; targetPath: string; sessionId?: string;
@@ -137,7 +133,7 @@
   interface CandidateMeta {
     schemaVersion: number; title: string; createdAt: string; updatedAt: string; owner: string; tags: string[]; status: string;
     ticket: string | null; currentRevision: number;
-    /** §4.3/§10.2：人工判断项的唯一机器数据源（正文只作人类可读呈现）。 */
+    /** AC-UI-01：用 Frontmatter 的判断项 ID 收集确认与知悉，避免正文改写影响批准校验。 */
     humanDecisions?: { id: string; question: string; note?: string }[];
     revisions: { id: number; baseRevision: string; patch: string; author?: 'ai' | 'human' }[];
     gateChecks: string[]; comments: Comment[];
@@ -153,10 +149,10 @@
     currentBase: string | null; isBaseBehind: boolean; patchText: string; patchStats: Stats; patchPaths: string[];
     comments: Comment[]; validation: string[];
     revisionStats: Record<string, { patch: string; baseRevision: string; stats: Stats | null }>;
-    /** §5.5：approved 候选的派生业务提交版本与三态诊断（仅诊断展示）。 */
     approvalCommitRevision?: string;
+    /** 业务提交从历史中定位；定位不明时已批准状态仍然有效。 */
     approvalCommitLookup?: 'found' | 'ambiguous' | 'unknown';
-    /** §8.2/G40：补丁预检派生诊断（不构成批准证据）。 */
+    /** G40：预检只用于提示冲突，批准时仍须重新验证补丁。 */
     patchCheck?: { state: 'clean' | 'conflicted' | 'unknown'; checkedBase: string; checkedAt: string };
     canAct: boolean; me: string;
   }
@@ -170,19 +166,12 @@
   }
   interface DiffLine { kind: 'context' | 'add' | 'del' | 'meta'; oldNo: number | null; newNo: number | null; text: string }
   interface DiffFile { path: string; lines: DiffLine[]; binary: boolean }
-  /** 并排视图的行对：meta 行整宽；pair 行左右各一格（null 表示该侧留空占位）。 */
   interface SplitRow { kind: 'meta' | 'pair'; meta: DiffLine | null; left: DiffLine | null; right: DiffLine | null }
 
-  /** 并排视图的自动阈值：容器宽度低于该值时回退单列（按差异滚动容器实测宽度判定）。 */
   const SPLIT_MIN_WIDTH = 900;
 
   const EMPTY_STATS: Stats = { files: 0, additions: 0, deletions: 0, entries: [] };
 
-  /**
-   * One request scope per mounted panel: every in-flight request is aborted when
-   * the component unmounts or its Session changes, so a closed view cannot keep
-   * talking to the Host or resolve into state after teardown.
-   */
   interface ApiClient {
     get<T>(path: string): Promise<T>;
     post<T>(path: string, body?: unknown): Promise<T>;
@@ -194,6 +183,7 @@
     constructor(message: string, readonly issue?: ConnectionIssue) { super(message); }
   }
 
+  /** 请求归属单个会话面板；释放时取消在途请求，避免卸载后再更新视图。 */
   function createApi(sessionId: string, apiRoot = API_ROOT, controlToken?: () => string): ApiClient {
     const inflight = new Set<AbortController>();
     let disposed = false;
@@ -264,11 +254,7 @@
     return status === 'resolved' ? '已处理' : status === 'partial' ? '部分处理' : '未处理';
   }
 
-  /**
-   * §10.2（A9）：判定页面持有的 guard 是否已过期——revision / owner / updated_at
-   * 任一变化都必须提示 stale（updated_at 检出“不推进版本”的评论类写入）。
-   * 抽成纯函数，避免内联条件在多点重复（历史缺陷：刷新解锁与过期判定分散）。
-   */
+  /** AC-LOCK-01：评论可在版本和负责人不变时推进 updatedAt，旧页面也须判为过期。 */
   function isGuardStale(
     snapshot: { revision: number; owner: string; updatedAt: string } | null,
     meta: { currentRevision: number; owner: string; updatedAt: string },
@@ -279,20 +265,8 @@
       || snapshot.updatedAt !== meta.updatedAt;
   }
 
-  /** §10.2：详情页持有的 guard（候选快照版本三字段）。 */
   type GuardSnapshot = { revision: number; owner: string; updatedAt: string };
 
-  /**
-   * §10.2（A9）详情页状态机。
-   *
-   * 收敛前：`detail` / `selectedId` / `stale` 三个 useState 加一个 guardRef，过期判定、
-   * 刷新解锁、切换候选三种迁移分散在 8 处手工赋值里（历史缺陷就是漏清 guard）。
-   * 现在只有四个语义动作，任何迁移都只能通过 reducer，guard 与 stale 不可能失同步：
-   *   - open(id)      进入某候选详情，清空旧快照与 stale
-   *   - leave()       离开详情页
-   *   - loaded(detail) 收到服务端详情：无快照则绑定；有快照且失配则标记 stale
-   *   - rebind()      人工刷新：丢弃旧快照并解除锁定（下一次 loaded 会重新绑定）
-   */
   interface DetailState {
     id: string;
     detail: Detail | null;
@@ -308,10 +282,10 @@
 
   const EMPTY_DETAIL_STATE: DetailState = { id: '', detail: null, stale: false, guard: null };
 
+  /** 集中管理详情与 guard，避免切换候选或刷新时沿用旧快照。 */
   function detailReducer(state: DetailState, action: DetailAction): DetailState {
     switch (action.type) {
       case 'open':
-        // 切换候选：旧快照必须丢弃，否则会拿 A 的 guard 去判定 B。
         return { id: action.id, detail: null, stale: false, guard: null };
       case 'leave':
         return EMPTY_DETAIL_STATE;
@@ -323,6 +297,7 @@
         return { ...state, detail: action.detail, stale };
       }
       case 'rebind':
+        // 本端写入也会推进 updatedAt，重新绑定快照以避免误报并发修改。
         return { ...state, stale: false, guard: null };
       default:
         return state;
@@ -359,7 +334,7 @@
         continue;
       }
       if (!current) continue;
-      // 统一差异以 \n 结尾，split 出的最后一个 '' 不是行内容；合法空上下文行原文是单个空格。
+      // split 生成的空片段没有行号；合法的空上下文行含一个空格。
       if (raw === '') continue;
       if (raw.startsWith('Binary files ') || raw.startsWith('GIT binary patch') || raw.startsWith('Cannot display: file marked as a binary type')) { current.binary = true; current.lines.push({ kind: 'meta', oldNo: null, newNo: null, text: raw }); continue; }
       if (/^(index |new file |deleted file |similarity |rename )/.test(raw)) continue;
@@ -374,15 +349,11 @@
     return files;
   }
 
-  /**
-   * 并排展示用行对：hunk 内连续删除块与随后新增块按行序对齐，多出的一侧留空占位；
-   * 上下文行左右同显；hunk 头与二进制提示等 meta 行整宽。
-   * 纯展示辅助：评论定位仍只认 parseDiff 产出的 side + 行号，不读这里的配对结果。
-   */
+  /** 并排行仅用于展示，评论仍按原始差异的行号和侧别定位。 */
   function buildSplitRows(lines: DiffLine[]): SplitRow[] {
     const rows: SplitRow[] = [];
     const pendingDeletions: DiffLine[] = [];
-    // 游标消费而不是 shift()：超大删除/新增替换块下保持线性。
+    // 用游标保留替换块的线性遍历，避免逐条移除队首时搬移其余元素。
     let deletionCursor = 0;
     const flushDeletions = (): void => {
       for (let index = deletionCursor; index < pendingDeletions.length; index += 1) {
@@ -412,7 +383,7 @@
     const React = requireModule('react') as ReactLike;
     const h = React.createElement;
     const { useState, useEffect, useMemo, useRef, useCallback, useReducer } = React;
-    // 布局测量要在绘制前完成，避免先画单列再跳成并排；React 缺失时退回 useEffect。
+    // 绘制前完成测量，避免差异先渲染为单列再跳到并排布局。
     const useLayoutEffect: typeof useEffect =
       (React as unknown as { useLayoutEffect?: typeof useEffect }).useLayoutEffect ?? useEffect;
 
@@ -591,10 +562,8 @@
 @media(max-width:760px){.dcr-grid{grid-template-columns:1fr}.dcr-line{grid-template-columns:32px 32px 14px 1fr 18px}.dcr-shalf{grid-template-columns:30px 12px minmax(0,1fr) 16px}.dcr-thread{margin-left:80px}.dcr-thread.split{margin-left:10px}}
 `;
 
-    /** 评审页根节点上的 DOM 标记：CSS 据此让宿主底部区带（任务条 + 输入框）不占位。 */
     const VIEW_ATTR = 'data-dcr-view';
 
-    /** Inline markdown-lite: bold, code spans and links; everything stays a React node. */
     function inlineNodes(text: string, keyPrefix: string): any[] {
       const nodes: any[] = [];
       const pattern = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)\s]+\))/g;
@@ -623,10 +592,7 @@
       return nodes;
     }
 
-    /**
-     * Review bodies are Markdown-ish. Rendering headings, lists, bold and code as
-     * real blocks keeps long audit text scannable instead of one wall of `<pre>`.
-     */
+    /** 审查正文可来自仓库；构造 React 节点能避免把正文里的原始 HTML 注入页面。 */
     function RichText(props: { text: string; className?: string }) {
       const text = (props.text || '').replace(/\r\n/g, '\n').trim();
       if (!text) return h('div', { className: 'dcr-muted dcr-small' }, '未填写');
@@ -1094,47 +1060,31 @@
       const [diffMode, setDiffMode] = useState<'full' | 'incremental'>('full');
       const [diffFrom, setDiffFrom] = useState(1);
       const [diffLoading, setDiffLoading] = useState(false);
-      /** §10.2：差异布局偏好——auto 按容器宽度自动切换，split/unified 为用户手动覆盖（仅本会话内存态）。 */
       const [diffLayout, setDiffLayout] = useState<'auto' | 'split' | 'unified'>('auto');
-      /** 差异卡片的实测宽度；用容器而不是 window，面板宽度随宿主布局变化。 */
       const [diffWidth, setDiffWidth] = useState<number | null>(null);
       const diffCardRef = useRef<any>(null);
       const [loading, setLoading] = useState(false);
       const [error, setError] = useState('');
       const [busy, setBusy] = useState(false);
-      /** §10.2（A9）：详情页状态（id/detail/stale/guard）由单一 reducer 持有。 */
       const [detailState, dispatchDetail] = useReducer(detailReducer, EMPTY_DETAIL_STATE);
       const { detail, stale } = detailState;
       const selectedId = detailState.id;
-      /** §12.2/G4：reviewers.yml 的门禁白名单（非白名单命令批准前需二次确认）。 */
       const [allowedGates, setAllowedGates] = useState<string[] | null>(null);
       const [job, setJob] = useState<Job | null>(null);
       const [panel, setPanel] = useState<'' | 'approve' | 'reject'>('');
       const [ack, setAck] = useState<Record<string, boolean>>({});
       const [waiveReason, setWaiveReason] = useState<Record<string, string>>({});
-      /** §8.2/G36：Job 增量日志游标（绝对偏移）与已合并日志行。 */
       const jobLogOffsetRef = useRef<number | null>(null);
       const jobLogRef = useRef<string[]>([]);
       const [general, setGeneral] = useState('');
-      /**
-       * §7.4（2026-11-12）：「提交并让 AI 修复」后由谁启动解决方案。
-       * - session：新建独立 DSH 会话（可见、可交互），由 /fix-session 投递提示词；
-       * - export：不启动任何执行器，只导出提示词，手动粘贴到外部 Agent（codex 等）。
-       */
       const [fixTarget, setFixTarget] = useState<'session' | 'export'>('session');
       const [fixLaunching, setFixLaunching] = useState(false);
       const [fixSession, setFixSession] = useState<{ sessionId: string; title: string; revision: number } | null>(null);
       const [fixPrompt, setFixPrompt] = useState<{ text: string; revision: number } | null>(null);
       const [fixPromptLoading, setFixPromptLoading] = useState(false);
       const [fixCopied, setFixCopied] = useState(false);
-      /**
-       * §5.6（2026-11-12）：批准提交信息详略。detailed = 规范单行 + 空行 + Host 生成的事实正文；
-       * simple = 只写规范单行。缺省 detailed（信息量更完整，但仍以单行综述打头）。
-       */
       const [commitDetail, setCommitDetail] = useState<'simple' | 'detailed'>('detailed');
-      /** §8.3/G37：多条总体评论草稿，一次批量提交（全有或全无，一次共享写入）。 */
       const [batchDrafts, setBatchDrafts] = useState<string[]>([]);
-      /** §10.2/G34/G39：行类型 → side；行号（LEFT=oldNo，RIGHT=newNo）。 */
       const rowSideOf = (l: { kind: string }): 'LEFT' | 'RIGHT' => (l.kind === 'del' ? 'LEFT' : 'RIGHT');
       const rowNoOf = (l: { kind: string; oldNo: number | null; newNo: number | null }): number | null =>
         l.kind === 'del' ? l.oldNo : l.newNo;
@@ -1148,16 +1098,13 @@
       const [auditLaunching, setAuditLaunching] = useState(false);
       const [auditCopied, setAuditCopied] = useState(false);
       const [auditSessionId, setAuditSessionId] = useState('');
-      /** master 侧：本面板实例发起的租约 id（内存态；跨会话/刷新后由 /queue 的 auditLease 横幅兜底）。 */
       const [auditLeaseId, setAuditLeaseId] = useState('');
-      /** §7.6/§10.1：释放/收尾的两段式确认（第一击只亮起，第二击才执行）。 */
       const [releaseArmed, setReleaseArmed] = useState(false);
       const [finalizeArmed, setFinalizeArmed] = useState(false);
       const [filter, setFilter] = useState({ owner: '', statuses: '', text: '', tag: '', dir: '', createdAfter: '', createdBefore: '' });
       const diffFiles = useMemo(() => parseDiff(diff?.unifiedDiff ?? ''), [diff]);
 
-      // 并排/单列自动切换只看差异卡片的真实宽度；窗口宽度与面板宽度并不等价。
-      // 卡片本身不滚动（滚动条在 .dcr-diff-body 内），避免滚动条出现/消失让测量值来回跳。
+      // 宿主布局会改变面板宽度；测量不带滚动条的差异卡片可避免布局反复切换。
       useLayoutEffect(() => {
         const element = diffCardRef.current as { clientWidth?: number } | null;
         if (!element) { setDiffWidth(null); return; }
@@ -1208,18 +1155,15 @@
         setLoading(true);
         try {
           const value = await api.get<Detail>(`/candidate?id=${encodeURIComponent(id)}`);
-          // 顺带刷新门禁白名单（缺席时视为全部非白名单，均需确认）。
           void api.get<{ config?: { allowedGateCommands?: string[] } }>('/reviewers')
             .then((reviewers) => setAllowedGates(reviewers.config?.allowedGateCommands ?? []))
             .catch(() => setAllowedGates([]));
-          // §10.2（A9）：绑定与过期判定全部交给 reducer（'loaded'），不再手工同步 guard。
           dispatchDetail({ type: 'loaded', detail: value });
           setError('');
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
         finally { setLoading(false); }
       }, [api]);
 
-      /** §10.2：guard 变化后“刷新”必须重新绑定新快照并解除锁定。 */
       const reloadCurrent = (): void => {
         if (!selectedId) return;
         dispatchDetail({ type: 'rebind' });
@@ -1239,7 +1183,7 @@
       useEffect(() => {
         void (async () => {
           const current = await refreshHealth();
-          try { await loadSettings(); } catch { /* keep defaults */ }
+          try { await loadSettings(); } catch { /* 健康检查已足以决定打开哪个页面。 */ }
           setScreen(current?.configured ? 'queue' : 'setup');
         })();
       }, [refreshHealth, loadSettings]);
@@ -1275,7 +1219,7 @@
         setGeneral('');
         setDraft(null);
         setPanel('');
-        // 修复会话/导出的提示词绑定具体版本：候选换版本后必须重新生成，不能沿用旧提示词。
+        // 修复会话和提示词绑定候选版本，换版后继续使用可能修到旧补丁。
         setFixSession(null);
         setFixPrompt(null);
         setFixCopied(false);
@@ -1295,7 +1239,7 @@
         const timer = setInterval(() => {
           void (async () => {
             try {
-              // §10.2/G36：使用绝对偏移增量轮询；logResetRequired 时丢弃旧日志按快照重建。
+              // G36：服务端截断日志后绝对偏移仍递增，按行数轮询会漏掉后续输出。
               const since = jobLogOffsetRef.current;
               const value = await api.get<Job & { logOffset?: number; logResetRequired?: boolean }>(
                 `/jobs/${encodeURIComponent(job.id)}${since === null ? '' : `?since=${String(since)}`}`,
@@ -1317,7 +1261,7 @@
                 await loadQueue();
                 await refreshHealth();
               }
-            } catch { /* transient */ }
+            } catch { /* 保留轮询，容忍短暂读取失败。 */ }
           })();
         }, 1200);
         return () => clearInterval(timer);
@@ -1326,7 +1270,6 @@
       const startJob = async (path: string, body: unknown): Promise<void> => {
         setBusy(true); setError('');
         try {
-          // 新 Job：重置增量日志游标。
           jobLogRef.current = [];
           jobLogOffsetRef.current = null;
           const response = await api.post<{ jobId: string; job: Job }>(path, body);
@@ -1343,7 +1286,6 @@
         };
       };
 
-      /** §10.1/§10.2：conflicted 时提供 Rebase 入口；预检不作为批准证据。 */
       const rebaseCandidate = async (): Promise<void> => {
         if (!detail) return;
         await startJob('/rebase', { id: detail.candidate.id, ...guard() });
@@ -1360,12 +1302,9 @@
         try {
           const response = await api.post<{ job?: Job; autoFixError?: string }>('/comments', {
             id: detail.candidate.id, ...guard(), file, line, content: text, autoFix,
-            // §10.2/G34：side 由行类型决定——删除行（oldNo）LEFT，新增/上下文新侧 RIGHT。
             ...(file !== '' && line !== 0 ? { side } : {}),
-            // §4.3/G39：附带锚点（被评行原文 + 前后一行），供跨版本重定位。
             ...(file !== '' && line !== 0 && anchor ? { anchor } : {}),
           });
-          // 本端写入推进 updated_at：重置快照避免把自己判定为 stale。
           dispatchDetail({ type: 'rebind' });
           await afterWrite();
           if (response.autoFixError) {
@@ -1386,8 +1325,6 @@
         }
       };
 
-      // §8.3/G37：批量草稿一次提交（全有或全无；状态只在批次内转换一次）。
-      // 「提交并 AI 修复」不再走这里的 autoFix 分支——修复改由 /fix-session 或导出提示词启动（见 submitFeedbackAndFix）。
       const submitBatch = async (drafts: string[]): Promise<void> => {
         if (!detail || drafts.length === 0) return;
         setBusy(true); setError('');
@@ -1462,9 +1399,9 @@
         finally { setBusy(false); }
       };
 
+      /** G4：白名单仅影响确认交互；白名单不可用时仍须确认所有门禁命令。 */
       const approve = (): void => {
         if (!detail) return;
-        // §12.2/G4：非白名单门禁命令必须二次确认（白名单只降低确认成本，不是安全边界）。
         const gates = detail.candidate.meta.gateChecks.map((command) => command.trim()).filter(Boolean);
         const nonWhitelisted = allowedGates === null ? gates : gates.filter((command) => !allowedGates.includes(command));
         if (nonWhitelisted.length > 0
@@ -1472,7 +1409,6 @@
           return;
         }
         setPanel('');
-        // §5.4/G2：上行 confirmedDecisions / waivedDecisions（来自 Frontmatter human_decisions 的精确覆盖）。
         const decisions = detail.candidate.meta.humanDecisions ?? [];
         const confirmedDecisions = decisions.filter((item) => ack[item.id]).map((item) => item.id);
         const waivedDecisions = decisions
@@ -1480,18 +1416,11 @@
           .map((item) => ({ id: item.id, reason: (waiveReason[item.id] ?? '').trim() }));
         void startJob('/approve', {
           id: detail.candidate.id, ...guard(), confirmedDecisions, waivedDecisions,
-          // §5.6（2026-11-12）：提交信息详略——detailed 由 Host 生成「单行 + 空行 + 正文」。
           commitDetail,
         });
       };
 
-      /**
-       * §7.4（2026-11-12）：「提交并让 AI 修复」的总入口。
-       *
-       * 选择「新会话」时先保存意见（不触发 headless 修复），再调 `/fix-session` 创建独立
-       * 会话投递修复提示词；选择「导出提示词」时只保存意见并生成可复制的提示词，
-       * 由用户粘贴到外部 Agent（codex 等）手动执行。两条路径都不自行提交候选版本。
-       */
+      /** 先保存并刷新意见，让修复会话或导出的提示词包含刚提交的反馈。 */
       const submitFeedbackAndFix = async (drafts: string[]): Promise<void> => {
         if (!detail || drafts.length === 0) return;
         setBusy(true); setError('');
@@ -1515,7 +1444,6 @@
         else await exportFixPrompt();
       };
 
-      /** 在当前候选/版本上新建 DSH 修复会话（可见于侧边栏），不自行提交候选。 */
       const launchFixSession = async (): Promise<void> => {
         if (!detail) return;
         setFixLaunching(true); setError('');
@@ -1532,7 +1460,6 @@
         }
       };
 
-      /** 导出当前候选的修复提示词（新会话口径），供手动粘贴到外部 Agent。 */
       const exportFixPrompt = async (): Promise<void> => {
         if (!detail) return;
         setFixPromptLoading(true); setError('');
@@ -1558,7 +1485,7 @@
         }
       };
 
-      // §5.1/G12：Owner 显式把 changes_requested 转回 pending（不产生新版本）。
+      /** G12：恢复当前补丁的审核资格，沿用现有候选版本。 */
       const resumeCandidate = async (): Promise<void> => {
         if (!detail) return;
         setBusy(true); setError('');
@@ -1659,11 +1586,9 @@
         }
       };
 
-      /**
-       * §7.6：确认外部执行已停止后释放租约（不提交本地候选）；两段式确认防误触。
-       * 目标租约优先取 /queue 的服务端诊断（跨会话/刷新后仍可见），回退本面板内存 id。
-       */
+      /** 释放将解除共享写入占用，需再次确认外部执行已停止。 */
       const releaseAuditLease = async (): Promise<void> => {
+        // 队列刷新前可用面板刚取得的租约标识。
         const leaseId = queue?.auditLease?.auditId ?? auditLeaseId;
         if (!leaseId) return;
         if (!releaseArmed) { setReleaseArmed(true); return; }
@@ -1704,7 +1629,6 @@
       };
 
       const openCandidate = (id: string): void => {
-        // §10.2：切换候选由 reducer 的 'open' 一次性清空 detail/stale/guard（旧的 A 快照不会污染 B）。
         dispatchDetail({ type: 'open', id });
         setDiff(null);
         setDiffMode('full'); setDiffFrom(1); setScreen('detail');
@@ -1712,14 +1636,10 @@
 
       const auditReady = Boolean(queue?.currentBase ?? health?.currentBase);
 
-      /** §7.6/§10.1：租约变化或消失时复位两段式确认，避免旧确认态误伤下一轮租约。 */
+      // 旧租约的确认状态不得延续到下一轮租约。
       useEffect(() => { setReleaseArmed(false); setFinalizeArmed(false); }, [queue?.auditLease?.auditId, queue?.auditLease?.state]);
 
-      /**
-       * §7.6：收尾把执行租约交回 Host——校验本轮候选并原子提交 .ai-review，
-       * 走标准 audit Job（进度与日志复用 renderJob 卡片）。
-       * active（审查可能仍在执行）时两段式确认防误触；releasable 已停止，单击即收。
-       */
+      /** 活跃租约要求二次确认，降低审查仍在写候选时误触收尾的风险。 */
       const finalizeAuditLease = (): void => {
         const info = queue?.auditLease;
         if (!info) return;
@@ -1729,7 +1649,6 @@
         void startJob('/audit/finalize', { auditId: info.auditId });
       };
 
-      /** §10.1：阻塞审查租约横幅——active 给收尾入口，releasable 额外给释放入口。 */
       const renderLeaseBanner = (): any => {
         const info = queue?.auditLease;
         if (!info) return null;
@@ -1759,7 +1678,7 @@
         );
       };
 
-      // master 架构：owner/状态/tag/目录/时间过滤全部由服务端 /queue 完成，客户端直接使用返回集合。
+      /** 复用 /queue 的筛选结果，避免面板重复维护共享与本地候选的筛选规则。 */
       const filteredItems = useMemo(() => queue?.items ?? [], [queue]);
 
       const renderSettings = (): any => {
@@ -1818,7 +1737,6 @@
 
       const renderQueue = (): any => {
         const localTotal = queue?.items.filter((item) => item.local).length ?? 0;
-        // §10.1（P2-4）：区分"仓库真的没有候选"与"被筛选滤空"（本地候选同样受筛选影响）。
         const hasActiveFilter = Boolean(filter.owner || filter.statuses || filter.text || filter.tag || filter.dir || filter.createdAfter || filter.createdBefore);
         return h('div', { className: 'dcr-body' },
         h('div', { className: 'dcr-wrap' },
@@ -1892,7 +1810,6 @@
               {
                 key: item.id,
                 className: 'dcr-item',
-                // §7.1/§10.1：local-only 候选不在共享快照中，详情只读共享事实——卡片不进入详情。
                 ...(item.localOnly ? { style: { opacity: 0.85 } } : { onClick: () => openCandidate(item.id) }),
               },
               h('div', { className: 'dcr-row', style: { alignItems: 'flex-start' } },
@@ -1900,7 +1817,6 @@
                   h('h2', null, item.title),
                   h('div', { className: 'dcr-meta' },
                     h('span', { className: `dcr-chip ${item.status}` }, statusText(item.status)),
-                    // §10.1：stale/duplicate/local 使用不同徽标；local 不计入共享 KPI。
                     item.localOnly
                       ? h('span', { className: 'dcr-chip rejected' }, '本地草稿（未提交）')
                       : item.local ? h('span', { className: 'dcr-chip rejected' }, '本地视图（未提交）') : null,
@@ -1934,7 +1850,6 @@
         if (!detail) return h('div', { className: 'dcr-body' }, error ? h('div', { className: 'dcr-banner err' }, error) : h('div', { className: 'dcr-empty' }, '加载候选…'));
         const candidate = detail.candidate;
         const canAct = detail.canAct && !stale && candidate.meta.status !== 'approved' && candidate.meta.status !== 'rejected';
-        // §10.2/G2：人工判断项只使用 Frontmatter human_decisions 作为数据源；正文不一致只告警。
         const items = (candidate.meta.humanDecisions ?? []).map((decision) => ({ id: decision.id, label: decision.question }));
         const ackCount = items.filter((item) => ack[item.id]).length;
         const waivedCount = items.filter((item) => !ack[item.id] && (waiveReason[item.id] ?? '').trim().length > 0).length;
@@ -1947,14 +1862,8 @@
           { title: '执行门禁', desc: `${String(candidate.meta.gateChecks.length)} 条命令逐条执行，任一失败即回滚。` },
           { title: '原子提交', desc: '业务代码、review.md 状态与补丁清理进入同一个提交。' },
         ];
-        /**
-         * §5.6（2026-11-12）：提交信息详略选择。
-         * 首行综述由 Host 生成（与 title 一致，保证 §4.9/§5.6 校验必然成立），
-         * 这里只展示将要提交的结构，避免用户写出会被批准流程拒绝的信息。
-         */
+        /** 预览首行须与 Host 的 buildCommitSubject 同步；实际提交信息由 Host 生成。 */
         const commitPreview = (): string => {
-          // 与 Host `buildCommitSubject` 同规则：标题折叠为单行（空白压缩 + 去首尾），
-          // 有 author=human 的历史版本时追加 @ rev <最新人工版本号>。
           const revHuman = candidate.meta.revisions.filter((revision) => revision.author === 'human');
           const latestHuman = revHuman.reduce((max, revision) => Math.max(max, revision.id), 0);
           const title = candidate.meta.title.replace(/\s+/g, ' ').trim();
@@ -2060,12 +1969,11 @@
             h('button', { className: 'dcr-btn', onClick: () => setPanel('') }, '取消'),
           ),
         );
-        // §10.2（并排展示）：跨基线 Hunk 级降级仍是原始文本，不参与并排；手动/自动布局只影响结构化差异。
+        // 跨基线兜底只有 Hunk 级近似，逐行渲染会误导行号和评论定位。
         const crossBaseFallback = diff?.resolutionMode === 'cross_base_hunk_fallback' || /^# 跨基线 Hunk 对比/m.test(diff?.unifiedDiff ?? '');
         const splitView = !crossBaseFallback
           && (diffLayout === 'split' || (diffLayout === 'auto' && diffWidth !== null && diffWidth >= SPLIT_MIN_WIDTH));
 
-        // 评论线程：并排/统一共用同一份节点，避免两套渲染漂移。
         const threadNode = (comment: Comment): any => h('div', { key: comment.id, className: `dcr-thread${splitView ? ' split' : ''}` },
           h('div', { className: 'dcr-thread-head' },
             h('span', null, comment.author),
@@ -2078,7 +1986,6 @@
           h(RichText, { text: comment.content }),
         );
 
-        // §10.2/G39：先按 file + line + side 精确匹配，再用 anchor.snippet 在当前差异里重定位（不改写评论）。
         const commentsForRow = (
           file: DiffFile,
           relocated: Map<string, { side: 'LEFT' | 'RIGHT'; line: number }>,
@@ -2092,7 +1999,6 @@
           return exact || relocatedHere;
         });
 
-        // 行内意见入口只出现在该行真正所属的那一侧：删除行=LEFT，新增/上下文=RIGHT。
         const plusNode = (file: DiffFile, side: 'LEFT' | 'RIGHT', rowNo: number | null): any =>
           canAct && rowNo !== null
             ? h('span', {
@@ -2122,7 +2028,7 @@
             h('div', { className: 'dcr-srows' }, ...buildSplitRows(file.lines).map((row, index) => {
               const key = `${file.path}-${String(index)}`;
               if (row.kind === 'meta') return h('div', { key, className: 'dcr-smeta' }, row.meta?.text ?? '');
-              // 上下文行左右是同一个 DiffLine：只按 RIGHT 匹配，保持与单列视图一致的 side 语义。
+              // 上下文行左右引用同一对象，按补丁侧匹配可避免重复呈现评论。
               const context = row.left !== null && row.right !== null && row.left === row.right;
               const rowComments = context
                 ? commentsForRow(file, relocated, 'RIGHT', row.right?.newNo ?? null)
@@ -2171,7 +2077,6 @@
                   h('div', { className: 'dcr-small dcr-muted dcr-mono', style: { marginTop: 6 } }, candidate.id),
                   candidate.meta.approval ? h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 4 } },
                     `批准：${candidate.meta.approval.approvedBy} · ${dateText(candidate.meta.approval.approvedAt)}`,
-                    // §5.5：显示派生业务提交版本；ambiguous/unknown 只显示诊断提示，不显示为失败。
                     detail.approvalCommitRevision ? ` · commit ${short(detail.approvalCommitRevision)}` : '',
                     detail.approvalCommitLookup === 'ambiguous' ? ' · 派生提交不唯一，请人工确认' : '',
                     detail.approvalCommitLookup === 'unknown' ? ' · 业务提交版本未派生（仅诊断）' : '',
@@ -2181,9 +2086,6 @@
                   !detail.canAct ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void takeover(); } }, '接管审核') : null,
                   canAct && candidate.meta.status === 'changes_requested'
                     ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void resumeCandidate(); } }, '转回待审核') : null,
-                  // 2026-11-12：移除三个低频人工入口（人工补丁上传 / 过期归档 / 重开来源恢复）。
-                  // 后端端点（/manual-revision、/archive-stale、/reopen）与 SPEC 语义保持不变，
-                  // 只是不在面板上提供按钮（这些操作需要手输候选 id 与理由，误触后果重）。
                   canAct ? h('button', { className: 'dcr-btn d', disabled: busy, onClick: () => setPanel(panel === 'reject' ? '' : 'reject') }, panel === 'reject' ? '收起放弃' : '放弃') : null,
                   canAct ? h('button', {
                     className: 'dcr-btn p',
@@ -2252,7 +2154,6 @@
               h('div', { className: 'dcr-small dcr-muted', style: { marginBottom: 6 } },
                 '提交后按下方「修复执行方式」保存意见并启动下一版：新建 DSH 会话可直接观察/追问，导出提示词可交给 codex 等外部 Agent；只想记录意见时点「仅提交意见」。'),
               h('textarea', { className: 'dcr-textarea', value: general, disabled: !canAct, placeholder: canAct ? '写给 AI/作者的整体意见（可加入草稿批量提交）…' : '仅 owner 可提交意见', onChange: (e: any) => setGeneral(e.target.value) }),
-              // §7.4（2026-11-12）：修复执行方式——新建会话 / 导出提示词到外部 Agent。
               h('div', { className: 'dcr-row', style: { marginTop: 8, alignItems: 'center' } },
                 h('span', { className: 'dcr-small dcr-muted' }, '修复执行方式'),
                 h('div', { className: 'dcr-seg', role: 'group', 'aria-label': '修复执行方式' },
@@ -2278,7 +2179,6 @@
                 )),
               ) : null,
               h('div', { className: 'dcr-row', style: { marginTop: 8 } },
-                // §10.2：存在本地草稿时一次 /comments/batch 完成提交；随后按所选执行方式启动修复。
                 h('button', {
                   className: 'dcr-btn p',
                   disabled: !canAct || busy || fixLaunching || fixPromptLoading || (batchDrafts.length === 0 && !general.trim()),
@@ -2298,7 +2198,6 @@
                     else if (drafts[0]) void addComment('', 0, drafts[0], false);
                   },
                 }, '仅提交意见'),
-                // §8.3/G37：多条评论进入草稿列表，一次批量提交（单次共享写入 + 单次提交）。
                 h('button', {
                   className: 'dcr-btn',
                   disabled: !canAct || general.trim().length === 0,
@@ -2313,7 +2212,7 @@
                   className: 'dcr-btn',
                   disabled: !canAct || busy || fixLaunching || fixPromptLoading,
                   onClick: () => {
-                    // 批量路径也必须带上已输入的总体意见，否则用户刚写的文字会被静默丢弃。
+                    // 批量修复也要带上尚未加入草稿的输入，避免静默丢掉反馈。
                     const drafts = [...batchDrafts, ...(general.trim() ? [general.trim()] : [])];
                     setBatchDrafts([]); setGeneral('');
                     void submitFeedbackAndFix(drafts);
@@ -2361,8 +2260,7 @@
                   h('pre', { className: 'dcr-raw' }, diff?.unifiedDiff || '（无差异）'),
                 ) :
                 h('div', { className: 'dcr-diff-body' }, ...files.map((file) => {
-                  // §10.2/G39：跨版本重定位——行内评论先按 file+line+side 匹配；
-                  // 未匹配且带锚点的评论按 anchor.snippet 在当前差异中重定位（原文位置展示，不改写评论）。
+                  // G39：重定位只影响当前差异的显示坐标，原评论仍保留创建时的位置。
                   const lineKeys = new Set(file.lines.map((l) => `${rowSideOf(l)}:${String(rowNoOf(l))}`));
                   const relocated = new Map<string, { side: 'LEFT' | 'RIGHT'; line: number }>();
                   for (const comment of detail.comments) {
@@ -2380,7 +2278,6 @@
                   return h('div', { key: file.path },
                     h('div', { className: 'dcr-file' }, file.path),
                     ...file.lines.map((line, index) => {
-                      // §10.2/G34：行类型决定 side 与行号——删除行用 oldNo/LEFT，其余用 newNo/RIGHT。
                       const rowSide: 'LEFT' | 'RIGHT' = line.kind === 'del' ? 'LEFT' : 'RIGHT';
                       const rowNo = rowSide === 'LEFT' ? line.oldNo : line.newNo;
                       const comments = commentsForRow(file, relocated, rowSide, rowNo);
@@ -2408,7 +2305,6 @@
                       const side = draft.side;
                       const { file: draftFile, line: draftLine } = draft;
                       setDraft(null);
-                      // §4.3/G39：从差异行构造锚点（被评行原文 + 前后各一行）。
                       const entry = diffFiles.find((item) => item.path === draftFile);
                       const idx = entry ? entry.lines.findIndex((l) => (side === 'LEFT' ? l.oldNo : l.newNo) === draftLine) : -1;
                       const target = entry && idx >= 0 ? entry.lines[idx] : undefined;
@@ -2471,7 +2367,7 @@
         const running = job.status === 'running';
         const failed = job.status === 'failed';
         const lastLine = job.log.length > 0 ? job.log[job.log.length - 1] : '等待输出…';
-        // §10.2/G21：按 result.status 区分业务结果，不得只看外层 succeeded。
+        // G21：Job 执行成功也可能产生已中止或待人工处理的业务结果。
         const outcome = typeof result?.status === 'string' ? result.status : null;
         const outcomeText: Record<string, string> = {
           COMMITTED: '业务提交成功', FALLBACK_TO_PENDING: '退回待审核', ABORTED: '已中止',
@@ -2502,7 +2398,7 @@
             h('summary', null, `${running ? '实时日志' : '运行日志'}（${String(job.log.length)} 行）`),
             h('div', { className: 'dcr-log' }, job.log.length ? job.log.join('\n') : '等待输出…'),
           ),
-          // §10.2/§7.7：manual 结果统一走判别形状 manualPrompt（recognize 旧 prompt 仅作向后兼容展示）。
+          // 旧 Job 使用 prompt 字段，继续显示已生成的提示词。
           result?.manualPrompt || result?.prompt ? h('details', { className: 'dcr-joblog' },
             h('summary', null, '修复提示词'),
             h('textarea', { className: 'dcr-textarea', style: { minHeight: 180, marginTop: 6 }, readOnly: true, value: String(result.manualPrompt ?? result.prompt) }),

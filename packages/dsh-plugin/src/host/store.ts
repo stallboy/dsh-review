@@ -43,11 +43,6 @@ function candidateId(month: string, slug: string): string {
   return `${month}/${slug}`;
 }
 
-/**
- * 单候选扫描结果：只含**共享快照内容**的解析产物（解析后的候选、补丁统计、不变量结果），
- * 不含 local/localOnly 等本地视图判定，也不含补丁全文（§4.8 缓存约束）。
- * error 非空表示读取/解析失败（走 broken 摘要路径）。
- */
 interface ScannedCandidate {
   candidate: ReviewCandidate | null;
   stats: PatchStats;
@@ -55,10 +50,9 @@ interface ScannedCandidate {
   error: string | null;
 }
 
-/** 共享扫描的候选间并发上限：只为降低 N 个串行 VCS 子进程的墙钟时间，不改变快照绑定语义。 */
+/** 限制并发 VCS 子进程数量，减少大量候选扫描时的资源占用。 */
 const SCAN_CONCURRENCY = 6;
 
-/** 有限并发 map：结果按输入下标落位，保证与串行执行完全相同的顺序与确定性。 */
 async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length);
   let cursor = 0;
@@ -73,35 +67,18 @@ async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) 
   return results;
 }
 
-/**
- * §7.1 候选数据读取源：默认读文件系统（写路径/审计收尾使用）；
- * 共享读取（队列/详情/负向记忆/派生）传入绑定同一 VCS 快照的源（如 GitHeadCandidateSource），
- * 只读已提交内容并标记 local 差异。
- */
+/** 写路径可读工作区。共享读必须由同一 VCS 快照提供评审数据和补丁。 */
 export interface CandidateSource {
-  /** 列出共享快照中存在 review.md 的候选目录（'YYYY-MM/slug'）。 */
+  /** 目录必须包含 review.md，返回值使用 YYYY-MM/slug。 */
   listCandidateDirs(): Promise<string[]>;
-  /** 候选目录内文件名列表；目录不存在返回 null。 */
   listDirEntries(month: string, slug: string): Promise<string[] | null>;
-  /** 读取 review.md 文本；不存在返回 null。 */
   readReviewText(month: string, slug: string): Promise<string | null>;
-  /** 读取补丁文本；不存在返回 null。 */
   readPatchText(month: string, slug: string, patchName: string): Promise<string | null>;
-  /** 工作区相对共享快照是否存在本地改动（review/补丁任一）。 */
+  /** 评审文件或补丁相对读取快照有本地改动时返回 true。 */
   hasLocalChanges(month: string, slug: string): Promise<boolean>;
-  /**
-   * 可选的批量本地改动检测：一次调用返回所有存在本地/暂存改动的候选 id（'YYYY-MM/slug'），
-   * 语义与逐候选 hasLocalChanges 完全等价（§7.1），只把 N 次 VCS 子进程合并为 1 次。
-   * 返回 null 表示无法证明（命令失败等），调用方必须回退逐候选 hasLocalChanges。
-   * 注意：该结果属于**本地视图层**，随工作区实时变化，不得按 VCS 快照缓存。
-   */
+  /** 一次读取可代替逐候选查询。返回 null 时须逐项回退，本地视图也不能随共享快照缓存。 */
   localChangedCandidateIds?(): Promise<Set<string> | null>;
-  /**
-   * 工作区中存在 review.md 的候选目录（'YYYY-MM/slug'），含未进入共享快照者；
-   * 调用方自行与共享集合做差得到 local-only（§7.1 本地诊断）。
-   * 基于文件系统而非 `git/svn status`：status 会把未跟踪目录折叠到最高祖先
-   * 且遵守 ignore 规则，整目录未跟踪（首次审查）时解析会静默失效。
-   */
+  /** VCS status 可能折叠未跟踪目录或应用忽略规则，须通过文件系统发现本地候选。 */
   listLocalOnlyDirs(): Promise<string[]>;
 }
 
@@ -175,7 +152,7 @@ function ensureInside(parent: string, child: string): void {
   }
 }
 
-/** Queue filter shared by `list()` and the API, which reuses one scan for items and counts. */
+/** 列表和计数共用过滤条件，保证两者使用同一份扫描结果时口径一致。 */
 export function matchesReviewFilter(summary: CandidateSummary, filter: ReviewFilter): boolean {
   if (filter.owner && summary.owner !== filter.owner) return false;
   if (filter.statuses && filter.statuses.length > 0 && !filter.statuses.includes(summary.status)) return false;
@@ -196,16 +173,12 @@ export function matchesReviewFilter(summary: CandidateSummary, filter: ReviewFil
   return true;
 }
 
-/** §2.2：时间比较一律按解析后的时间点；无效时间排最后。 */
 function timePoint(value: string): number {
   const parsed = new Date(value).getTime();
   return Number.isNaN(parsed) ? Number.POSITIVE_INFINITY : parsed;
 }
 
-/**
- * §4.3 updated_at 严格单调：每次共享写入必须严格大于上一值，精度至少毫秒。
- * 同一刻度或时钟回拨时使用“上一值 + 1ms”，再规范化为 UTC ISO 字符串。
- */
+/** 冻结时钟和回拨也必须推进值，否则并发守卫无法检出未推进补丁版本的写入。 */
 export function nextUpdatedAt(previous: string): string {
   const now = Date.now();
   const prevMs = previous ? new Date(previous).getTime() : Number.NaN;
@@ -215,11 +188,7 @@ export function nextUpdatedAt(previous: string): string {
 
 export class ReviewStore {
   private readonly fsSource: FilesystemCandidateSource;
-  /**
-   * 共享扫描内存缓存（§4.8 模式）：键 = 该次读取已证明的 VCS 快照标识（Git HEAD commit）。
-   * 不持久化、不跨快照复用、不缓存补丁全文；本地视图层（local/localOnly）不参与缓存，
-   * 每次请求现算。SVN 快照不可证明（snapshotId=null）时不缓存。
-   */
+  /** 只缓存可证明的共享快照及其解析结果。本地视图实时计算，带扫描错误的条目在后续请求重新读取。 */
   private readonly scanCache = new Map<string, Map<string, ScannedCandidate | null>>();
   private static readonly SCAN_CACHE_MAX = 8;
 
@@ -261,7 +230,6 @@ export class ReviewStore {
         humanJudgment: extractHumanJudgment(sections.humanJudgment),
         humanJudgmentDeclared: sections.humanJudgment.trim().length > 0,
       };
-      // §13.2：读取候选时执行只读不变量校验，违反者标记 broken，不参与批准/投影。
       const invariantErrors = quickReviewInvariants(candidate);
       if (invariantErrors.length > 0) {
         return this.brokenCandidate(month, slug, dir, reviewPath, invariantErrors.join('；'), candidate.meta.reopenedFrom);
@@ -335,11 +303,6 @@ export class ReviewStore {
     };
   }
 
-  /**
-   * 扫描单个候选：读取 review.md、目录条目与当前补丁统计，并执行完整不变量校验。
-   * 返回 null 表示 review.md 在该读取源中不存在（调用方按“跳过”处理，保持原语义）。
-   * 结果只含读取源内容本身：不含 local/localOnly 判定，因此共享源的结果可按快照缓存。
-   */
   private async scanCandidate(readSource: CandidateSource, month: string, slug: string): Promise<ScannedCandidate | null> {
     try {
       const text = await readSource.readReviewText(month, slug);
@@ -357,11 +320,10 @@ export class ReviewStore {
           throw new Error(`当前版本补丁不存在：${currentPatchName}`);
         }
         const patchText = entriesHas(currentPatchName) ? await readSource.readPatchText(month, slug, currentPatchName) : null;
-        // 补丁文本用完即弃：缓存只保留解析后的统计（§4.8：不缓存补丁全文）。
+        // 补丁全文只用于本次解析，避免共享快照缓存随补丁体积增长。
         if (patchText !== null) stats = parsePatch(patchText).stats;
       }
       let invariantErrors: string[] | null = null;
-      // I5/I4 的补丁上下文校验（声明非空时强制路径一致）。
       if (candidate.parseError === undefined) {
         const violations = fullReviewInvariants({
           candidate,
@@ -377,7 +339,6 @@ export class ReviewStore {
     }
   }
 
-  /** 候选间有限并发扫描；结果按键索引，与串行扫描同序同内容。 */
   private async scanCandidates(src: CandidateSource, ids: string[]): Promise<Map<string, ScannedCandidate | null>> {
     const entries = await mapLimit(ids, SCAN_CONCURRENCY, async (id) => {
       const [month = '', slug = ''] = id.split('/');
@@ -397,7 +358,6 @@ export class ReviewStore {
     const items: CandidateSummary[] = [];
     const errors: string[] = [];
     const memoryEntries: import('./memory.js').RejectionMemoryEntry[] = [];
-    // §6.2 链豁免计算输入：id → 重开指向与状态（仅共享事实候选）。
     const chainInfo = new Map<string, { reopenedFrom: string | null; status: ReviewStatus }>();
     let sharedDirs: string[] = [];
     try {
@@ -405,19 +365,15 @@ export class ReviewStore {
     } catch (error) {
       return { items, errors: [error instanceof Error ? error.message : String(error)] };
     }
-    // §7.1：仅存在于工作区的候选目录只作 local 诊断，不进入共享流程。
     const shared = new Set(sharedDirs);
     const localOnly = new Set((await src.listLocalOnlyDirs().catch(() => [] as string[])).filter((id) => !shared.has(id)));
     const allDirs = [...new Set([...sharedDirs, ...localOnly])].sort((left, right) => right.localeCompare(left));
 
-    // 共享部分扫描：按 VCS 快照缓存（§4.8 模式）。快照标识来自本请求刚建立的源，
-    // 命中即已证明快照未变化；SVN（snapshotId=null）与工作区源（无 snapshotId）不缓存。
     const snapshotReader = (src as { snapshotId?: () => Promise<string | null> }).snapshotId;
     const snapshot = typeof snapshotReader === 'function' ? await snapshotReader.call(src).catch(() => null) : null;
     const cachedScan = snapshot !== null ? this.scanCache.get(snapshot) ?? null : null;
     let scannedShared: Map<string, ScannedCandidate | null>;
     if (cachedScan) {
-      // 缓存只含无错误条目：缺失键（上次扫描失败的候选）每请求重扫，瞬时 VCS 失败自愈。
       const missing = sharedDirs.filter((id) => !cachedScan.has(id));
       scannedShared = missing.length > 0
         ? new Map([...cachedScan, ...await this.scanCandidates(src, missing)])
@@ -425,8 +381,6 @@ export class ReviewStore {
     } else {
       scannedShared = await this.scanCandidates(src, sharedDirs);
       if (snapshot !== null) {
-        // 含错误的条目不写入缓存：瞬时失败不得随快照键固化（与 baselineCache
-        // 「unknown 不缓存」同理）；确定性 broken 候选的重扫成本可忽略。
         const cacheable = new Map<string, ScannedCandidate | null>();
         for (const [id, entry] of scannedShared) {
           if (entry?.error) continue;
@@ -439,10 +393,8 @@ export class ReviewStore {
         }
       }
     }
-    // 本地视图层（§7.1）：local-only 目录读工作区，永远现算，不进缓存。
     const scannedLocal = await this.scanCandidates(this.fsSource, [...localOnly]);
 
-    // 本地改动检测：优先一次批量调用（语义与逐候选等价），失败回退逐候选（保守视为 local）。
     const changedIds = typeof src.localChangedCandidateIds === 'function'
       ? await src.localChangedCandidateIds().catch(() => null)
       : null;
@@ -455,7 +407,7 @@ export class ReviewStore {
       const [month = '', slug = ''] = id.split('/');
       const isLocalOnly = localOnly.has(id);
       const scanned = (isLocalOnly ? scannedLocal : scannedShared).get(id);
-      if (!scanned) continue; // review.md 在对应读取源中不可读：保持原“跳过”语义
+      if (!scanned) continue;
       if (scanned.error !== null) {
         errors.push(scanned.error);
         const summary: CandidateSummary = {
@@ -477,7 +429,7 @@ export class ReviewStore {
           lastFeedback: '',
           parseError: scanned.error,
         };
-        // §7.1：错误路径同样必须标记本地视图，否则 local 草稿会被误当作共享事实。
+        // 解析失败的本地草稿也须标为本地，否则会被误作共享事实。
         summary.local = isLocalOnly || (await localOf(month, slug)) || undefined;
         summary.localOnly = isLocalOnly || undefined;
         if (matchesReviewFilter(summary, filter)) items.push(summary);
@@ -501,7 +453,6 @@ export class ReviewStore {
       summary.localOnly = isLocalOnly || undefined;
       if (!summary.local) {
         chainInfo.set(candidate.id, { reopenedFrom: candidate.meta.reopenedFrom ?? null, status: candidate.meta.status });
-        // §7.1：local 候选不进入共享流程——不作负向记忆来源。
         if (candidate.meta.status === 'rejected') {
           const entry = entryFromCandidate({ candidateId: candidate.id, meta: candidate.meta });
           if (entry) memoryEntries.push(entry);
@@ -510,7 +461,7 @@ export class ReviewStore {
       if (!matchesReviewFilter(summary, filter)) continue;
       items.push(summary);
     }
-    // §4.8/I16：每个 rejected 候选最多一个直接替代候选——重复替代属链异常，报告为队列错误。
+    // I16 将指向同一被拒候选的多个直接替代者视为重开链异常。
     const replacementCount = new Map<string, number>();
     for (const info of chainInfo.values()) {
       if (info.reopenedFrom) replacementCount.set(info.reopenedFrom, (replacementCount.get(info.reopenedFrom) ?? 0) + 1);
@@ -519,14 +470,11 @@ export class ReviewStore {
       if (count > 1) errors.push(`I16: rejected 候选 ${rejectedId} 有 ${String(count)} 个直接替代候选（应最多 1 个），相关 finding 不参与正常投影`);
     }
     items.sort((left, right) => {
-      // §2.2：按时间点而非字符串；同一时间点以候选 id 为次序键。
       const byDate = timePoint(right.createdAt) - timePoint(left.createdAt);
       return byDate !== 0 ? byDate : right.id.localeCompare(left.id);
     });
-    // §7：负向记忆实时计算——窗口内完全相同指纹的活跃候选被标记阻止（合法重开链豁免祖先）。
     if (rejectionMemoryWindow !== undefined && rejectionMemoryWindow !== null && rejectionMemoryWindow > 0) {
-      // §6.2：豁免按候选各自的重开链计算——链上候选只豁免自己的全部被拒祖先，
-      // 链外候选的同指纹匹配仍正常阻止。
+      // 只豁免该候选在自身重开链上继承的拒绝记录，链外同指纹的拒绝仍生效。
       const chainExempted = new Map<string, Set<string>>();
       for (const [startId, info] of chainInfo) {
         if (!info.reopenedFrom) continue;
@@ -536,7 +484,7 @@ export class ReviewStore {
         while (current !== null && !visited.has(current)) {
           visited.add(current);
           const ancestor = chainInfo.get(current);
-          if (!ancestor || ancestor.status !== 'rejected') break; // 链异常：其后祖先不豁免
+          if (!ancestor || ancestor.status !== 'rejected') break;
           exempt.add(current);
           current = ancestor.reopenedFrom;
         }
@@ -548,7 +496,6 @@ export class ReviewStore {
       for (const item of items) {
         if (item.local || item.parseError || item.status === 'rejected' || item.status === 'approved') continue;
         const exempt = chainExempted.get(item.id);
-        // duplicateOf = 按 rejected_at 倒序的第一条未豁免匹配记录（链外同指纹仍阻止）。
         const match = memory.find((entry) => entry.fingerprint === item.fingerprint && !(exempt?.has(entry.candidateId) ?? false));
         if (match) item.duplicateOf = match.candidateId;
       }
@@ -561,7 +508,6 @@ export class ReviewStore {
     const baseRevision = current?.baseRevision ?? '';
     const unresolved = candidate.meta.comments.filter((comment) => comment.status !== 'resolved').length;
     const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
-    // §18.1：队列加载只提示过期（本地派生状态），不做读时写。
     const anchor = new Date(candidate.meta.updatedAt || candidate.meta.createdAt).getTime();
     const isStale = staleDays !== undefined && staleDays !== null && staleDays > 0 && !archived
       && !Number.isNaN(anchor) && (Date.now() - anchor) / 86_400_000 >= staleDays;
@@ -570,8 +516,7 @@ export class ReviewStore {
       title: candidate.meta.title,
       owner: candidate.meta.owner,
       status: candidate.meta.status,
-      // 候选/统计可能来自扫描缓存（跨请求共享）：数组与对象字段防御性拷贝，
-      // 防止任何调用方改写 summary 时污染缓存（恢复缓存前每请求独立解析的隔离语义）。
+      // 返回值可能被调用方修改，防止修改传播到跨请求共享的扫描缓存。
       tags: [...candidate.meta.tags],
       ticket: candidate.meta.ticket,
       currentRevision: candidate.meta.currentRevision,
@@ -607,8 +552,7 @@ export class ReviewStore {
       throw new ApiError(404, 'not_found', `候选不存在：${id}`);
     }
     const candidate = this.parseCandidateText(month, slug, text);
-    // §18.8：broken 候选只读展示（详情页可见 parseError），不在此抛错造成死胡同；
-    // 写路径各自经 readCategory/校验拦截。
+    // 保留损坏候选的诊断入口，使用户能看到错误并处理该候选。
     if (candidate.parseError) {
       return {
         candidate,
@@ -648,10 +592,7 @@ export class ReviewStore {
     return text;
   }
 
-  /**
-   * §12.2：写入前用真实路径确认仍在 `.ai-review` 内，并拒绝覆盖符号链接目标；
-   * 写入后再复核一次，防止校验后被替换为 symlink。
-   */
+  /** 评审目录必须解析到实际仓库内，且目标文件不能是符号链接。 */
   private async ensureSafeWriteTarget(filePath: string): Promise<void> {
     const dir = path.dirname(filePath);
     const realDir = await realpath(dir).catch(() => null);
@@ -669,14 +610,13 @@ export class ReviewStore {
   async write(candidate: ReviewCandidate, options?: { touchUpdatedAt?: boolean }): Promise<void> {
     await this.ensureSafeWriteTarget(candidate.reviewPath);
     if (options?.touchUpdatedAt !== false) {
-      // §4.3：每次共享写入严格推进 updated_at（冻结时钟/回拨时上一值 +1ms，规范为 UTC）。
       candidate.meta.updatedAt = nextUpdatedAt(candidate.meta.updatedAt);
     }
     const text = serializeReviewMarkdown(candidate.meta, candidate.sections.rawBody);
     const temp = `${candidate.reviewPath}.tmp-${String(process.pid)}`;
     await writeFile(temp, text, 'utf8');
     await rename(temp, candidate.reviewPath);
-    // 操作后复核包含关系，防止校验后父目录被替换为 symlink。
+    // 检测首次校验之后父目录被换成符号链接的情况。
     const realAfter = await realpath(path.dirname(candidate.reviewPath)).catch(() => null);
     const realRoot = await realpath(this.aiReviewRoot).catch(() => path.resolve(this.aiReviewRoot));
     if (realAfter) ensureInside(realRoot, realAfter);
@@ -694,8 +634,6 @@ export class ReviewStore {
     if (guard.expectedRevision !== candidate.meta.currentRevision || guard.expectedOwner !== candidate.meta.owner) {
       throw new ApiError(409, 'stale', '候选已被其他人更新，请重新加载', staleDetails());
     }
-    // §8.1：expectedUpdatedAt 必须等于当前规范化后的 updated_at（按时间点比较），
-    // 用于发现评论等不推进补丁版本的写入。
     const expectedAt = new Date(guard.expectedUpdatedAt).getTime();
     const currentAt = new Date(candidate.meta.updatedAt).getTime();
     if (Number.isNaN(expectedAt) || expectedAt !== currentAt) {
@@ -706,7 +644,6 @@ export class ReviewStore {
     }
   }
 
-  /** §4.3/I11：统一校验评论形状，并在行内评论未提供 anchor 时由 Host 从 Hunk 兜底提取。 */
   private async normalizeCommentInput(
     candidate: ReviewCandidate,
     input: { content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> } },
@@ -740,7 +677,6 @@ export class ReviewStore {
         ...(anchor.extra ? { extra: anchor.extra } : {}),
       };
     } else {
-      // §4.3：Client 未上传时 Host 从该 revision 的补丁 Hunk 提取；失败静默省略。
       anchor = await this.extractHostAnchor(candidate, revision, file, line, input.side);
     }
     return { content, revision, file, line, side: input.side, ...(anchor ? { anchor } : {}) };
@@ -787,10 +723,7 @@ export class ReviewStore {
     return candidate;
   }
 
-  /**
-   * §5.1 /resume：仅 Owner 显式把 changes_requested 转回 pending；
-   * 不产生新补丁版本，只改状态并推进 updated_at。
-   */
+  /** 恢复审核只改变候选状态，不要求作者重新生产补丁。 */
   async resume(id: string, guard: ConcurrencyGuard): Promise<ReviewCandidate> {
     const { month, slug } = this.resolveCandidateDir(id);
     const candidate = await this.readCandidate(month, slug);
@@ -804,10 +737,7 @@ export class ReviewStore {
     return candidate;
   }
 
-  /**
-   * §8.3 /comments/batch：全有或全无——先逐条校验，任一条非法整批 422 不写入；
-   * 一次共享写入与一次提交，pending→changes_requested 只在批次内发生一次。
-   */
+  /** 任一评论无效时整批不落盘，避免修正输入后重试时重复写入先前的评论。 */
   async addComments(
     id: string,
     author: string,
@@ -819,7 +749,6 @@ export class ReviewStore {
     const candidate = await this.readCandidate(month, slug);
     if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
     await this.ensureWriteAllowed(candidate, guard);
-    // §8.3：先整体校验（含 Host anchor 兜底），任一条非法即抛错，不部分写入。
     const normalized: Array<{ content: string; revision: number; file: string; line: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string } }> = [];
     for (const input of inputs) {
       normalized.push(await this.normalizeCommentInput(candidate, input));
@@ -882,7 +811,6 @@ export class ReviewStore {
       throw new ApiError(422, 'bad_request', '拒绝分类必须是非空字符串');
     }
     if (options?.requireStaleDays !== undefined) {
-      // §18.1：显式归档过期候选——只有确实超过 stale_days 的候选可归档（乐观锁保证只写一次）。
       const anchor = new Date(candidate.meta.updatedAt || candidate.meta.createdAt).getTime();
       const ageDays = (Date.now() - anchor) / 86_400_000;
       if (Number.isNaN(anchor)) throw new ApiError(422, 'bad_request', 'updated_at 无法解析，不能判定超时');
@@ -892,8 +820,7 @@ export class ReviewStore {
     }
     candidate.meta.status = 'rejected';
     candidate.meta.approval = null;
-    // §4.8：拒绝必须在同一写入中留痕 rejection；G38：可选 category/related_symbols
-    //（related_symbols 由 Host 在删除补丁前从 hunk header 提取；未知 category 原样保留）。
+    // 补丁会在拒绝后删除，须先保存可供后续复查的关联符号。
     candidate.meta.rejection = {
       rejectedBy: options?.rejectedBy ?? guard.expectedOwner,
       rejectedAt: new Date().toISOString(),
@@ -917,10 +844,7 @@ export class ReviewStore {
     return candidate;
   }
 
-  /**
-   * §4.8/§18.6：人工重开被拒方案——在活跃候选上标记 reopened_from/reopen_reason。
-   * 仅 Owner 人工操作（API 层保证不由 AI 路径触发）；目标必须是真实存在的 rejected 候选。
-   */
+  /** 调用方负责核验 Owner 的人工操作，防止自动流程自行豁免拒绝记忆。 */
   async reopen(
     id: string,
     fromId: string,
@@ -982,10 +906,7 @@ export class ReviewStore {
     return false;
   }
 
-  /**
-   * §6.4/§6.5：追加新版本（人工微调 author=human / Rebase author=ai）。
-   * 调用方负责隔离工作区与门禁；本方法只落盘新补丁、推进版本、回到 pending 并清空批准。
-   */
+  /** 调用方负责隔离工作区并运行门禁。此处写入评审数据和补丁。 */
   async appendRevision(
     id: string,
     input: { author: 'ai' | 'human'; baseRevision: string; patchText: string },
@@ -1019,8 +940,7 @@ export class ReviewStore {
     candidate.meta.approval = {
       approvedBy,
       approvedAt: new Date().toISOString(),
-      // §5.5（2026-11-09 修订）：approval 不保存提交哈希；业务提交版本由 Host 从 VCS 历史派生。
-      // §4.7：批准留痕——门禁快照、逐条执行结果、判断项确认/知悉记录。
+      // 业务提交版本从 VCS 历史派生，避免为回填哈希额外产生一次提交。
       gateChecks: [...candidate.meta.gateChecks],
       gateResults: report.results.map((result) => ({
         command: result.command,
@@ -1067,7 +987,6 @@ export class ReviewStore {
     const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
     if (!current) throw new ApiError(500, 'internal', '当前版本缺失');
     const patchPath = this.patchPathFor(candidate, current.patch);
-    // §7.1：传入共享源时补丁必须与 review.md 来自同一快照，不得读取工作区本地文件。
     const text = source
       ? await source.readPatchText(candidate.month, candidate.slug, current.patch)
       : await readFile(patchPath, 'utf8');
@@ -1079,11 +998,7 @@ export class ReviewStore {
     };
   }
 
-  /**
-   * §7.1/§7.7：从**共享快照**读取当前版本补丁。返回值**不含工作区路径**——调用方
-   * 没有机会再回头读本地文件（历史缺陷 B2：Rebase 绕过共享源读了工作区补丁）。
-   * 这是批准、Rebase、收尾、转换等所有共享流程唯一合法的补丁读取入口。
-   */
+  /** 只交付共享补丁内容，避免共享流程通过返回的路径读到工作区草稿。 */
   async readSharedPatch(
     candidate: ReviewCandidate,
     source: CandidateSource,
@@ -1100,7 +1015,6 @@ export class ReviewStore {
     return { revision: revision.id, patchName: revision.patch, text, baseRevision: revision.baseRevision };
   }
 
-  /** §7.5 步骤 4 / §7.6：批准与收尾必须通过的完整不变量（含 I4/I5/I16 引用目标）。 */
   async validateFullCandidate(
     candidate: ReviewCandidate,
     source?: CandidateSource,
@@ -1165,11 +1079,7 @@ export class ReviewStore {
     return counts;
   }
 
-  /**
-   * List candidate directories without requiring a readable review.md. Used by the
-   * auditor to detect what an external agent actually produced, including broken
-   * or incomplete packages that `list()` would only surface as errors.
-   */
+  /** 包含损坏或未写完的候选目录，便于审查收尾核对 Agent 的实际产物。 */
   async listCandidateIds(): Promise<string[]> {
     const ids: string[] = [];
     let months: string[] = [];

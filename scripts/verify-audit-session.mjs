@@ -1,10 +1,6 @@
 #!/usr/bin/env node
 /**
- * 等价于点一次「审查仓库」的端到端冒烟脚本。
- *
- * 流程：可选自动提交 → 调 Host API 创建审查会话 → 校验 DSH 会话已落盘并挂到
- * 当前工作区（侧边栏可见）→ 校验审查提示词已被接受并开跑 →（可选）等待审查
- * 报告/AI 候选出现。
+ * 验证 Host 创建的审查会话能挂到当前 DSH 工作区并开始运行。
  *
  * 用法：
  *   node scripts/verify-audit-session.mjs --session <DSH sessionId> [options]
@@ -199,7 +195,7 @@ function decodeSessionEvents(file) {
       const chunk = zstdDecompressSync(buffer.subarray(offset));
       if (chunk.length > 0) chunks.push(chunk);
     } catch {
-      // A magic-like sequence inside a compressed block; the real frame follows.
+      // 压缩块内也可能出现同样的魔数，解压失败后继续寻找真正的帧。
     }
     offset += ZSTD_MAGIC.length;
   }
@@ -209,7 +205,7 @@ function decodeSessionEvents(file) {
     try {
       events.push(JSON.parse(line));
     } catch {
-      // Ignore a torn tail line while the session is still writing.
+      // 会话日志仍在写入，末行 JSON 可能尚未写完。
     }
   }
   return events;

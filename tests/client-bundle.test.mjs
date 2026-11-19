@@ -9,12 +9,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const bundleSource = readFileSync(path.join(here, '..', 'packages', 'dsh-plugin', 'dist', 'client.js'), 'utf8');
 const PACKAGE_ID = 'dsh-code-review';
 
-/**
- * A minimal page for the browser half: the real module system loads each bundle
- * as a classic <script> in the page's global scope (see
- * @deepseek-ai/dsh-client-modules `defaultLoadBundle`), so re-execution must be
- * safe and may not leak identifiers.
- */
+/** 用同一个全局作用域模拟宿主的普通 script 加载，以便检出重复执行时的全局标识符冲突。 */
 function createPage() {
   const styles = [];
   const requests = [];
@@ -47,8 +42,7 @@ function createPage() {
   };
   const window = {
     __ModuleLoader__: {
-      // The module system invalidates the old factory before an HMR swap; a
-      // reload therefore replaces the row instead of colliding with it.
+      // 宿主热替换前会使旧工厂失效，因此夹具允许重新注册同名模块。
       load(registration) {
         registrations.set(registration.id, registration);
       },
@@ -209,12 +203,11 @@ test('评审标签的底部区带（任务条 + 输入框）靠评审页根标�
   const client = createClientContext();
   plugin.apply(client.ctx);
 
-  // 只认宿主公开的 data 锚点与插槽名：不依赖宿主 CSS Modules 的哈希 class。
+  // 宿主的 CSS Modules 类名随构建变化，评审页只依赖公开的 DOM 锚点和插槽。
   const style = page.styles[0]?.textContent ?? '';
   assert.match(style, /\[data-conversation-scroll\]:has\(\[data-dcr-view\]\)\s*>\s*\[data-composer-seat\]\s*\{\s*display:none\s*\}/, '任务条和输入框必须在当前评审会话中整体收起');
   assert.doesNotMatch(style, /composerStack|composerSeat/, '不得依赖宿主 CSS Modules 的哈希 class');
 
-  // 评审页根节点必须带标记；槽位接口仍是单一的评审视图。
   assert.equal(client.slots.length, 1);
   assert.equal(client.slots[0].options.id, 'code-review');
   assert.match(bundleSource, /\[VIEW_ATTR\]: 'code-review'/, '评审页根节点必须带 data-dcr-view');
@@ -235,9 +228,7 @@ test('plugin unload disposes the view, its styles and its dictionaries', () => {
 });
 
 test('§10.2（A9）：详情页 id/detail/stale/guard 由单一 reducer 驱动，且不再用裸 ref 手工同步 guard', () => {
-  // 结构断言：reducer 化后，详情页状态只能通过 dispatchDetail 迁移。
-  // 若有人重新引入 guardRef 手工赋值或独立 setStale，这里会立即失败——
-  // 历史缺陷正是“刷新解锁”与“过期判定”分散在多处赋值里而漏改。
+  // 此前刷新解锁与过期判定分散在多处赋值，容易漏掉一处并使用陈旧的 guard。
   assert.match(bundleSource, /function detailReducer\(state, action\)/, '详情页状态机必须存在');
   assert.match(bundleSource, /dispatchDetail\(\{\s*type: 'loaded',\s*detail: value\s*\}\)/);
   assert.match(bundleSource, /dispatchDetail\(\{\s*type: 'rebind'\s*\}\)/);

@@ -29,7 +29,7 @@ async function startApi(root, extraDeps = {}, settingsPatch = {}) {
       settings = next;
       return next;
     },
-    // §7.6：租约状态注入临时路径，避免污染真实 DSH_HOME 并跨测试阻塞。
+    // 把租约文件放在临时路径，避免测试读写真实 DSH_HOME，或被其他用例的租约阻塞。
     statePath: path.join(root, '.tmp', 'runtime-state.json'),
     ...extraDeps,
   });
@@ -130,7 +130,6 @@ test('API creates a DSH audit session with the session prompt', async () => {
   });
 
   assert.equal(response.sessionId, 'session-test');
-  // §7.6/G20：会话审查返回跟踪 Job 与执行租约 auditId，收尾经 /audit/finalize。
   assert.ok(response.jobId, '应返回跟踪 jobId');
   assert.match(response.auditId, /^\d{8}-\d{6}-[a-z0-9][a-z0-9._-]*$/);
   assert.match(response.reportPath, new RegExp(`.ai-review/audits/${response.auditId}/audit.md$`));
@@ -140,7 +139,6 @@ test('API creates a DSH audit session with the session prompt', async () => {
   assert.match(calls[0].title, /仓库审查/);
   assert.match(calls[0].title, /src/);
   assert.match(calls[0].prompt, /独立 DSH 会话/);
-  // §11.4（2026-11-10）：会话模式同样严禁 Agent 自行提交，收尾由 Host 统一执行。
   assert.match(calls[0].prompt, /严禁执行 `git commit`/);
   assert.match(calls[0].prompt, /重点看边界条件/);
   await assert.rejects(stat(path.join(root, '.ai-review')), /ENOENT/);
@@ -227,7 +225,7 @@ test('API queue filters items but keeps owner-wide status counts', async () => {
   const baseRevision = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   await writeQueueCandidate(root, 'pending-one', 'pending', baseRevision);
   await writeQueueCandidate(root, 'approved-one', 'approved', baseRevision);
-  // §7.1：队列只读共享事实（HEAD 同一快照）——夹具必须先提交。
+  // 先提交夹具，队列的共享视图才会从 HEAD 读取这些候选。
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const server = await startApi(root);
@@ -269,8 +267,6 @@ test('API chains an overall comment into an AI fix job', async () => {
 
   const job = await waitForJob(server.base, response.job.id);
   assert.equal(job.status, 'succeeded', job.error ?? '');
-  // §7.7：ai_fix Job 的 manual 结果使用判别形状 status=MANUAL_REQUIRED + manualPrompt
-  // （旧的非判别形状 {manual:true,prompt} 已统一为 AiFixOutcome）。
   assert.equal(job.result.status, 'MANUAL_REQUIRED', JSON.stringify(job.result));
   assert.match(job.result.manualPrompt, /请补充边界测试/);
 
@@ -285,7 +281,7 @@ test('API chains an overall comment into an AI fix job', async () => {
       id: '2026-10/pending-one',
       expectedRevision: 1,
       expectedOwner: 'tester',
-      // 第一条评论已推进 updated_at：使用重新读取后的最新共享事实（AC-LOCK-01）。
+      // 评论在补丁版本不变时也会推进 updated_at，因此第二次写入需要重新获取 guard（AC-LOCK-01）。
       expectedUpdatedAt: detail.candidate.meta.updatedAt,
       content: '只记一条意见',
       autoFix: false,

@@ -8,8 +8,6 @@ import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
-/** P9/P10 验收：路由注入提示词、定时审查调度、检出级写互斥、回填恢复提示。 */
-
 const servers = [];
 after(async () => {
   await Promise.all(servers.map((server) => server.close()));
@@ -23,7 +21,7 @@ async function startApi(root, extraDeps = {}, settingsPatch = {}) {
   const api = new ReviewApi({
     settings,
     saveSettings: async (next) => next,
-    // 租约状态文件放仓库外（生产为 DSH_HOME），避免测试污染真实 DSH_HOME 或被 git clean 删除。
+    // 租约文件留在仓库外，避免测试污染真实 DSH_HOME 或在恢复工作区时被 git clean 清理。
     statePath: path.join(await mkdtemp(path.join(tmpdir(), 'dcr-p9-state-')), 'runtime-state.json'),
     ...extraDeps,
   });
@@ -104,7 +102,6 @@ test('P10: 检出级写互斥——并发超时归档串行化，恰好一个成
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const { base } = await startApi(root);
 
-  // 四个并发归档请求：互斥串行化后，第一个成功写 rejected，其余命中终态校验被拒——只写一次。
   const results = await Promise.all([1, 2, 3, 4].map(() =>
     fetch(`${base}/archive-stale`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -114,7 +111,6 @@ test('P10: 检出级写互斥——并发超时归档串行化，恰好一个成
   assert.equal(statuses.filter((code) => code === 200).length, 1, statuses.join(','));
   assert.equal(statuses.filter((code) => code === 409).length, 3, statuses.join(','));
 
-  // 终态正确且只产生一次 rejected 提交路径变更；锁已释放，后续读正常。
   const queue = await (await fetch(`${base}/queue`)).json();
   const item = queue.items.find((entry) => entry.id.endsWith('net-stale'));
   assert.equal(item?.status, 'rejected');
@@ -139,7 +135,6 @@ test('P10: approved 无可派生提交 → lookup unknown 仅诊断；遗留 com
   const { base } = await startApi(root);
   const queue = await (await fetch(`${base}/queue`)).json();
   const item = queue.items.find((entry) => entry.id.endsWith('net-bf'));
-  // §5.5：unknown 只是诊断，不显示为失败，也不产生 needsBackfill。
   assert.equal(item?.approvalCommitLookup, 'unknown');
   assert.equal(item?.approvalCommitRevision, undefined);
   assert.equal(item?.needsBackfill, undefined);

@@ -9,11 +9,6 @@ import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 import { commitCandidate, guardFixture } from './fixtures/contract.mjs';
 
-/**
- * §7.7：ai_fix Job 的 Outcome 必须是判别形状（status 必填；ABORTED /
- * RECOVERY_REQUIRED 必带 reason），不得退回旧的非判别形状（如 {manual,prompt}）。
- */
-
 const servers = [];
 after(async () => {
   await Promise.all(servers.map((server) => server.close()));
@@ -48,7 +43,6 @@ async function waitJob(base, jobId, attempts = 120) {
   return job;
 }
 
-/** ai_fix Outcome 的判别形状校验。 */
 function assertAiFixOutcomeShape(result, label) {
   assert.ok(result && typeof result === 'object', `${label}: result 必须存在`);
   assert.equal(typeof result.status, 'string', `${label}: 必须含判别字段 status`);
@@ -83,7 +77,7 @@ test('§7.7：/manual-revision 的结果是 AiFixOutcome 判别形状（坏补�
 
 test('§7.7：/candidate/finalize 的结果是 AiFixOutcome 判别形状（校验失败 → VALIDATION_FAILED + errors）', async () => {
   const root = await createGitFixture();
-  // 本地候选（未提交）+ 空 gate_checks → 收尾校验失败。
+  // 用空 gate_checks 构造无效候选，使请求进入收尾校验失败分支。
   const candidate = await commitCandidate(root, '20261111-finalize-shape', {
     review: { gateChecks: '[]' },
     commit: false,
@@ -102,7 +96,7 @@ test('§7.7：/ai-fix 在 manual Runner 下返回 MANUAL_REQUIRED + manualPrompt
   const root = await createGitFixture();
   const candidate = await commitCandidate(root, '20261111-ai-fix-manual-shape', {
     review: {
-      // YAML 列表必须在 `comments:` 后换行并缩进两格。
+      // 覆盖值紧跟 `comments:`，首个空行和后续缩进用于形成 YAML 块列表。
       comments: [
         '',
         '  - id: c1',
@@ -127,22 +121,18 @@ test('§7.7：/ai-fix 在 manual Runner 下返回 MANUAL_REQUIRED + manualPrompt
 });
 
 test('§7.7/§7.5：实现源码中 ai_fix 端点不得再返回裸的非判别对象', async () => {
-  // 拆分后 api.ts 只保留路由/装配，结果工厂与写事务在 api-writers.ts，
-  // 因此按职责"全域扫描"：断言条件原样保留，只扩大读取范围。
+  // 路由装配、写事务与读模型分处不同文件，源码断言需要覆盖这三处。
   const hostFiles = ['api.ts', 'api-writers.ts', 'api-readmodels.ts'];
   const sources = await Promise.all(
     hostFiles.map(async (name) => [name, await readFile(new URL(`../packages/dsh-plugin/src/host/${name}`, import.meta.url), 'utf8')]),
   );
   const source = sources.map(([, text]) => text).join('\n');
-  // 三个 ai_fix 端点必须通过工厂构造结果（aborted / recoveryRequired / committed / validationFailed）。
   for (const factory of ['this.aborted(', 'this.recoveryRequired(', 'this.committed(', 'this.validationFailed(']) {
     assert.ok(source.includes(factory), `必须存在工厂 ${factory}`);
   }
-  // 工厂必须真实存在（不能只是调用点残留）：四个工厂都在 api-writers.ts 定义。
   const writers = sources.find(([name]) => name === 'api-writers.ts')?.[1] ?? '';
   for (const definition of ['aborted', 'recoveryRequired', 'committed', 'validationFailed']) {
     assert.match(writers, new RegExp(`^ {2}${definition}\\(`, 'm'), `api-writers.ts 必须定义 ${definition} 工厂`);
   }
-  // 旧的 {manual:true,prompt} 形状必须消失。
   assert.doesNotMatch(source, /manual: true, prompt:/, 'ai_fix 不得再返回 {manual:true,prompt} 形状');
 });

@@ -10,8 +10,6 @@ import { resolveOwner } from '../packages/dsh-plugin/dist/host/reviewers.js';
 import { formatMemorySummary } from '../packages/dsh-plugin/dist/host/memory.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
-/** 第 3 轮：评论字段校验、Host anchor 兜底、manual Job/租约、Owner AND、负向记忆摘要、提交树核对。 */
-
 const servers = [];
 after(async () => {
   await Promise.all(servers.map((server) => server.close()));
@@ -142,9 +140,7 @@ test('AC-ROUTING-01：reviewers 规则 paths+tags 必须 AND 命中才参与', (
       { owner: 'B', paths: [], tags: ['net'] },
     ],
   };
-  // A 只命中 paths，未命中 tags → 不参与；B 命中 tag → 胜出。
   assert.equal(resolveOwner(config, { paths: ['src/math.js'], tags: ['net'] }).owner, 'B');
-  // 两者都命中 → A 按路径命中数胜出。
   assert.equal(resolveOwner(config, { paths: ['src/math.js'], tags: ['net', 'perf'] }).owner, 'A');
   assert.equal(resolveOwner({ ...base, rules: [] }, { paths: ['x'], tags: [] }).owner, 'default');
 });
@@ -170,7 +166,7 @@ test('§7.7：取消运行中的 headless audit 会终止 Runner 进程并返回
   const started = await post(base, '/audit', { targetPath: '', note: '' });
   assert.equal(started.status, 202);
   const startBody = await started.json();
-  // 等 Job 真正进入 running，再取消。
+  // 给执行器留出启动时间，覆盖运行中取消。
   await new Promise((resolve) => setTimeout(resolve, 300));
   const begin = Date.now();
   const cancelled = await post(base, `/jobs/${encodeURIComponent(startBody.jobId)}/cancel`, {});
