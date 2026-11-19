@@ -78,7 +78,7 @@
         issue?: ConnectionIssue;
         generation: number;
         candidates: { id: string; label: string; root: string; vcsType?: string; target?: string; error?: string; current: boolean }[];
-        projects: { workspaceId: string; root: string; label: string; enabled: boolean; projectId?: string; vcsType: string; target: string }[];
+        projects: { workspaceId: string; root: string; label: string; enabled: boolean; projectId?: string; vcsType: string; target: string; workspaceIssue?: string }[];
         logs: string[];
         hasCredentials: boolean;
         localAvailable: boolean;
@@ -949,9 +949,10 @@
             !status?.candidates.length ? h('div', { className: 'dcr-empty' }, '未发现可接入的工作副本。请打开项目会话后刷新。') : null,
             h('h2', null, '已保存的项目'),
             ...(status?.projects ?? []).map(project => h('section', { className: 'dcr-card', key: project.workspaceId },
-                h('div', { className: 'dcr-row' }, h('strong', { className: 'dcr-grow' }, project.label), h('span', { className: 'dcr-chip' }, project.enabled ? '已启用' : '已停用')),
+                h('div', { className: 'dcr-row' }, h('strong', { className: 'dcr-grow' }, project.label), h('span', { className: 'dcr-chip' }, project.workspaceIssue ? '不可执行' : project.enabled ? '已启用' : '已停用')),
                 h('p', { className: 'dcr-mono dcr-central-path' }, project.root),
                 h('p', { className: 'dcr-muted' }, `${project.vcsType.toUpperCase()} · ${project.target}`),
+                project.workspaceIssue ? h('p', { className: 'dcr-banner warn', role: 'status' }, project.workspaceIssue) : null,
                 h('div', { className: 'dcr-row' },
                     h('button', { className: 'dcr-btn', disabled, onClick: () => { void write('/projects', { workspaceId: project.workspaceId, enabled: !project.enabled }); } }, project.enabled ? '停用项目' : '启用项目'),
                     project.projectId ? projectLink(project.projectId, '打开项目') : h('span', { className: 'dcr-muted' }, '等待中央绑定'),

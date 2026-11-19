@@ -93,7 +93,7 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
 
     app.get('/health', async () => ({ status: 'ok', service: 'dsh-review-central', protocolVersion: 1 }));
     app.get('/api/v1/info', async () => ({ centralId: database.centralId, protocolVersion: PROTOCOL_VERSION,
-        registrationCapabilities: { executionConfigHash: true } }));
+        registrationCapabilities: { executionConfigHash: true, workspaceIssues: true } }));
     app.post('/api/v1/auth/login', async (req, reply) => {
         const input = body(req);
         const username = textValue(input.username, 'username', 80);
@@ -173,7 +173,19 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
         });
     }
 
-    app.post('/node-api/v1/register', async req => ({ node: database.registerNode((req as RequestContext).nodeId!, validateRegistration(req.body), req.headers['x-dsh-review-admission'] === 'paused') }));
+    const readWorkspaceIssues = (value: unknown): Record<string, string> | undefined => {
+        if (value === undefined) return undefined;
+        if (!Array.isArray(value) || value.length > 1000) throw new ProtocolError('workspaceIssues');
+        return Object.fromEntries(value.map(item => {
+            const issue = record(item, 'workspaceIssue');
+            return [entityId(issue.workspaceId, 'workspaceId'), textValue(issue.message, 'workspaceIssue.message', 512)];
+        }));
+    };
+    app.post('/node-api/v1/register', async req => {
+        const { workspaceIssues, ...registration } = record(req.body, 'registration');
+        return { node: database.registerNode((req as RequestContext).nodeId!, validateRegistration(registration),
+            req.headers['x-dsh-review-admission'] === 'paused', readWorkspaceIssues(workspaceIssues)) };
+    });
     app.post('/node-api/v1/status', async req => {
         const id = (req as RequestContext).nodeId!;
         return { centralId: database.centralId, nodeId: id, instanceId: database.getNode(id).instanceId, online: database.getNode(id).online,
@@ -218,9 +230,12 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
     });
     app.post('/node-api/v1/commands/poll', async req => {
         const id = identify(req);
-        const capabilities = body(req).scheduledAuditWorkspaces ?? [];
+        const input = body(req);
+        const capabilities = input.scheduledAuditWorkspaces ?? [];
         if (!Array.isArray(capabilities)) throw new CentralError(422, 'bad_request', '节点审查能力声明无效');
         const workspaces = new Set(capabilities.map(id => entityId(id, 'scheduledAuditWorkspaces')));
+        const issues = readWorkspaceIssues(input.workspaceIssues);
+        if (issues) database.setWorkspaceIssues(id, issues);
         return { ...commands.poll(id, workspaces), projects: database.listProjects(id), queries: snapshots.pending(id) };
     });
     app.post('/node-api/v1/commands/:commandId/ack', async req => ({ command: commands.acknowledge(identify(req), params(req).commandId!) }));

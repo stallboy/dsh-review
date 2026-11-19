@@ -35,7 +35,10 @@ test('SVN 子路径提交后固定远端版本读取，批准直接交付原远�
     await operations.init();
     const nested = new ManagedOperations({ dataDir: path.join(base, 'nested-state'), journal,
         workspaces: [{ workspaceId: 'nested-wc', label: '无效子目录', root: path.join(root, 'src') }] });
-    await assert.rejects(nested.init(), /工作副本根目录/);
+    await nested.init();
+    assert.deepEqual(nested.registrations(), []);
+    assert.match(nested.workspaceIssue('nested-wc'), /工作副本根目录/);
+    nested.stop();
     t.after(async () => { operations.stop(); journal.close(); await rm(base, { recursive: true, force: true }); });
     const project = { projectId: 'svn-project', nodeId: 'svn-node', name: 'SVN', workspaceId: 'svn-wc', bindingGeneration: 1, projectConfigRevision: 1, vcsType: 'svn', target: '^/', enabled: true };
     const snapshot = await operations.snapshot(project);

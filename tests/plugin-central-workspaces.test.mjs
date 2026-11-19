@@ -195,3 +195,76 @@ test('懒初始化仍拒绝持久 workspaceId 改绑另一真实工作副本', a
     await second.init();
     await assert.rejects(second.snapshot(project(changed)), /同一 workspaceId 不能指向不同工作副本或目标/);
 });
+
+test('一个项目分支不匹配时节点保持在线，其他项目继续同步，恢复分支后自动复检', async t => {
+    const state = await fixture(t);
+    const bad = await state.workspace('workspace-bad');
+    const good = await state.workspace('workspace-good');
+    const remote = path.join(state.directory, 'healthy.git');
+    runCommand('git', ['init', '--bare', '-q', remote], good.root);
+    runCommand('git', ['remote', 'add', 'origin', remote], good.root);
+    runCommand('git', ['push', '-qu', 'origin', good.target], good.root);
+    const { app, headers } = await setupCentral(t);
+    const centerUrl = await app.listen({ host: '127.0.0.1', port: 0 });
+    const credential = app.database.createNode('multi-workspace');
+    app.database.registerNode(credential.nodeId, {
+        protocolVersion: 1, instanceId: 'previous-instance', pluginVersion: '0.3.0', dshVersion: 'test',
+        platform: process.platform, workspaces: [bad, good].map(({ workspaceId, label, vcsType, target }) => ({ workspaceId, label, vcsType, target })),
+    });
+    const broken = await bindProject(app, headers, { ...credential, workspaceId: bad.workspaceId });
+    const healthy = await bindProject(app, headers, { ...credential, workspaceId: good.workspaceId });
+    app.database.disconnectNode(credential.nodeId, 'previous-instance');
+    runCommand('git', ['switch', '-c', 'other-target'], bad.root);
+    let worker;
+    t.mock.method(ManagedNode.prototype, 'start', async function () { worker = this; });
+    const node = await startManagedNode({ centerUrl, ...credential, workspaces: [bad, good] },
+        path.join(state.directory, 'managed'), async () => undefined, () => {});
+    try {
+        await worker.drain();
+        assert.equal(app.database.getNode(credential.nodeId).online, true);
+        const request = (project, idempotencyKey) => app.inject({ method: 'POST', url: '/api/v1/projects/' + project.projectId + '/commands',
+            headers, payload: { operation: 'sync', idempotencyKey, payload: {} } });
+        const view = project => app.inject({ url: '/api/v1/projects/' + project.projectId, headers }).then(reply => reply.json());
+        assert.match((await view(broken)).workspaceIssue, /other-target/);
+        assert.ok((await view(healthy)).vcsSnapshot);
+        assert.equal((await request(broken, 'broken-sync')).statusCode, 503);
+        const accepted = await request(healthy, 'healthy-sync');
+        assert.equal(accepted.statusCode, 202, accepted.body);
+        await worker.tick();
+        await worker.drain();
+        await worker.tick();
+        const commandId = accepted.json().command.commandId;
+        const finished = (await app.inject({ url: '/api/v1/commands/' + commandId, headers })).json().command;
+        assert.equal(finished.state, 'completed');
+        assert.equal(finished.result.outcome.status, 'SUCCEEDED');
+        assert.equal(app.database.getNode(credential.nodeId).online, true);
+        runCommand('git', ['switch', bad.target], bad.root);
+        await worker.tick();
+        await worker.drain();
+        await worker.tick();
+        await worker.drain();
+        assert.equal((await view(broken)).workspaceIssue, undefined);
+        assert.ok((await view(broken)).vcsSnapshot);
+    } finally { await node.stop(); }
+});
+
+test('本机配置与已绑定目标冲突时，节点只声明健康工作副本', async t => {
+    const state = await fixture(t);
+    const bad = await state.workspace('workspace-bad');
+    const good = await state.workspace('workspace-good');
+    for (const enabled of [true, false]) {
+        const bound = { ...project(bad), target: 'central-bound-target', enabled };
+        const operations = state.operations([{ ...bad, enabled }, good]);
+        await operations.init([bound, project(good)]);
+        assert.deepEqual(operations.registrations().map(workspace => workspace.workspaceId), [good.workspaceId]);
+        assert.match(operations.workspaceIssue(bad.workspaceId), /central-bound-target/);
+        await operations.refreshWorkspaceIssues([bound, project(good)]);
+        assert.equal(operations.workspaceIssue(good.workspaceId), undefined);
+        assert.match(operations.workspaceIssue(bad.workspaceId), /central-bound-target/);
+    }
+    const bound = { ...project(bad), target: 'central-bound-target', enabled: false };
+    const legacy = state.operations([{ ...bad, enabled: false, target: undefined, vcsType: undefined }]);
+    await legacy.init([bound]);
+    await assert.rejects(legacy.snapshot(bound), /central-bound-target/);
+    assert.equal(legacy.registrations()[0].target, bound.target);
+});

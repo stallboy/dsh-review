@@ -51,6 +51,16 @@ function executionConfigHash(config: ManagedWorkspace): string {
     })).digest('hex');
 }
 
+class WorkspaceConfigurationError extends Error {}
+
+class WorkspaceTargetError extends WorkspaceConfigurationError {
+    constructor(expected?: string, actual?: string) {
+        const display = (value: string) => value.replace(/[\r\n\t]/g, ' ').replace(/[^\s/]+:\/\/[^\s]+/g, '[已隐藏]').slice(0, 180);
+        super('工作副本的目标分支不匹配。期望 ' + (expected ? display(expected) : '明确目标')
+            + '，实际 ' + (actual === undefined ? '读取失败' : actual ? display(actual) : '无明确目标'));
+    }
+}
+
 export class ManagedOperations {
     private readonly runtimes = new Map<string, WorkspaceRuntime>();
     private readonly configs = new Map<string, ManagedWorkspace>();
@@ -58,19 +68,61 @@ export class ManagedOperations {
     private readonly initializing = new Map<string, Promise<WorkspaceRuntime>>();
     private readonly roots = new Map<string, string>();
     private stopped = false;
+    private readonly issues = new Map<string, string>();
 
     constructor(private readonly options: { dataDir: string; journal: ManagedJournal; workspaces: ManagedWorkspace[]; resolveCredential?: (reference: string) => Promise<string | undefined> }) {}
 
-    async init(): Promise<void> {
+    async init(projects: ProjectRecord[] = []): Promise<void> {
         await mkdir(this.options.dataDir, { recursive: true, mode: 0o700 });
         for (const config of this.options.workspaces) {
             if (!/^[\w-]+$/.test(config.workspaceId) || this.configs.has(config.workspaceId)) throw new Error('workspaceId 无效或重复');
             this.configs.set(config.workspaceId, config);
-            if (config.enabled === false) {
-                if ((config.vcsType !== 'git' && config.vcsType !== 'svn') || !config.target) throw new Error('停用 workspace 缺少已验证的 VCS 类型或目标');
-                this.declarations.set(config.workspaceId, { workspaceId: config.workspaceId, label: config.label, vcsType: config.vcsType, target: config.target, executionConfigHash: executionConfigHash(config) });
-            } else await this.initializeWorkspace(config);
+            await this.inspectWorkspace(config, config.enabled !== false, projects.find(project => project.workspaceId === config.workspaceId));
         }
+    }
+
+    private async inspectWorkspace(config: ManagedWorkspace, enabled: boolean, project?: ProjectRecord): Promise<void> {
+        try {
+            if (project && config.target && config.target !== project.target) throw new WorkspaceTargetError(project.target, config.target);
+            if (project && config.vcsType && config.vcsType !== project.vcsType) throw new WorkspaceConfigurationError('工作副本的 VCS 类型与中央绑定不匹配');
+            if (!enabled) {
+                if (!this.declarations.has(config.workspaceId)) {
+                    const vcsType = project?.vcsType ?? config.vcsType, target = project?.target ?? config.target;
+                    if ((vcsType !== 'git' && vcsType !== 'svn') || !target) throw new WorkspaceConfigurationError('停用工作副本缺少已验证的 VCS 类型或目标');
+                    this.declarations.set(config.workspaceId, { workspaceId: config.workspaceId, label: config.label,
+                        vcsType, target, executionConfigHash: executionConfigHash(config) });
+                }
+                this.issues.delete(config.workspaceId);
+                return;
+            }
+            const runtime = this.runtimes.get(config.workspaceId);
+            const current = runtime ?? await this.runtimeForConfig(project ? { ...config, vcsType: project.vcsType, target: project.target } : config);
+            if (project && current.registration.target !== project.target) {
+                throw new WorkspaceTargetError(project.target, current.registration.target);
+            }
+            if (runtime) await this.checkTarget(runtime);
+            this.issues.delete(config.workspaceId);
+        } catch (error) {
+            const message = error instanceof WorkspaceConfigurationError ? error.message
+                : '无法初始化或读取工作副本，请在节点上核对目录和 VCS 配置';
+            this.issues.set(config.workspaceId, message);
+        }
+    }
+
+    workspaceIssue(workspaceId: string): string | undefined {
+        return this.issues.get(workspaceId);
+    }
+
+    workspaceIssues(): { workspaceId: string; message: string }[] {
+        return [...this.issues].map(([workspaceId, message]) => ({ workspaceId, message }));
+    }
+
+    async refreshWorkspaceIssues(projects: ProjectRecord[]): Promise<void> {
+        const bound = new Map(projects.map(project => [project.workspaceId, project]));
+        await Promise.all([...this.configs.values()].map(config => {
+            const project = bound.get(config.workspaceId);
+            return this.inspectWorkspace(config, project?.enabled ?? config.enabled !== false, project);
+        }));
     }
 
     private async initializeWorkspace(config: ManagedWorkspace): Promise<WorkspaceRuntime> {
@@ -84,14 +136,14 @@ export class ManagedOperations {
             const probe = await runProcess('git', ['rev-parse', '--show-toplevel'], { cwd: root, timeoutMs: 10000 });
             const type = probe.code === 0 ? 'git' : 'svn';
             if (config.vcsType && config.vcsType !== type) throw new Error(`workspace ${config.workspaceId} 的 VCS 类型不匹配`);
-            if (type === 'git' && await realpath(probe.stdout.trim()) !== root) throw new Error('workspace 必须是仓库根目录');
+            if (type === 'git' && await realpath(probe.stdout.trim()) !== root) throw new WorkspaceConfigurationError('workspace 必须是仓库根目录');
             if (type === 'svn') {
                 const wcRoot = await runProcess('svn', ['info', '--show-item', 'wc-root', '.'], { cwd: root, timeoutMs: 30000 });
-                if (wcRoot.code !== 0 || await realpath(wcRoot.stdout.trim()) !== root) throw new Error('SVN workspace 必须是工作副本根目录');
+                if (wcRoot.code !== 0 || await realpath(wcRoot.stdout.trim()) !== root) throw new WorkspaceConfigurationError('SVN workspace 必须是工作副本根目录');
             }
             const targetResult = await runProcess(type, type === 'git' ? ['branch', '--show-current'] : ['info', '--show-item', 'relative-url', '.'], { cwd: root, timeoutMs: 30000 });
             const target = targetResult.stdout.trim();
-            if (targetResult.code !== 0 || !target || (config.target && config.target !== target)) throw new Error(`workspace ${config.workspaceId} 的目标分支不匹配`);
+            if (targetResult.code !== 0 || !target || (config.target && config.target !== target)) throw new WorkspaceTargetError(config.target, targetResult.code === 0 ? target : undefined);
             this.options.journal.bindWorkspace(config.workspaceId, JSON.stringify({ root: identity, type, target }));
             const settings: AppSettings = { ...DEFAULT_SETTINGS, ...config.settings, repoRoot: root, vcsType: type, baseBranch: target,
                 owner: 'managed-node' };
@@ -124,23 +176,32 @@ export class ManagedOperations {
         if (this.stopped) throw new Error('托管执行器已停止');
         const runtime = this.runtimes.get(project.workspaceId);
         if (runtime) return runtime;
-        let pending = this.initializing.get(project.workspaceId);
+        const config = this.configs.get(project.workspaceId)!;
+        return this.runtimeForConfig({ ...config, vcsType: project.vcsType, target: project.target });
+    }
+
+    private runtimeForConfig(config: ManagedWorkspace): Promise<WorkspaceRuntime> {
+        let pending = this.initializing.get(config.workspaceId);
         if (!pending) {
-            pending = this.initializeWorkspace(this.configs.get(project.workspaceId)!).finally(() => this.initializing.delete(project.workspaceId));
-            this.initializing.set(project.workspaceId, pending);
+            pending = this.initializeWorkspace(config).finally(() => this.initializing.delete(config.workspaceId));
+            this.initializing.set(config.workspaceId, pending);
         }
         return pending;
     }
 
     private async checkTarget(runtime: WorkspaceRuntime): Promise<void> {
         const result = await runProcess(runtime.registration.vcsType, runtime.registration.vcsType === 'git' ? ['branch', '--show-current'] : ['info', '--show-item', 'relative-url', '.'], { cwd: runtime.root, timeoutMs: 30000 });
-        if (result.code !== 0 || result.stdout.trim() !== runtime.registration.target) throw new Error('工作副本目标已变化，拒绝执行');
+        if (result.code !== 0 || result.stdout.trim() !== runtime.registration.target) throw new WorkspaceTargetError(runtime.registration.target, result.code === 0 ? result.stdout.trim() : undefined);
     }
 
     async execute(command: ManagedCommand, signal: AbortSignal, emit: (line: string) => void, project: ProjectRecord): Promise<ManagedResult> {
         if (command.operation === RETIRED_MANUAL_REVISION) return retiredManualRevisionResult();
         const runtime = await this.runtime(project);
-        if (!command.scheduledAudit) await this.checkTarget(runtime);
+        try { await this.checkTarget(runtime); }
+        catch (error) {
+            if (!(error instanceof WorkspaceTargetError)) throw error;
+            return { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: error.message }, delivery: { state: 'not_required' } };
+        }
         if (command.projectId !== project.projectId || command.bindingGeneration !== project.bindingGeneration || command.projectConfigRevision !== project.projectConfigRevision) throw new Error('执行配置已过期');
         if (command.payload.autoFix === true) return { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '托管模式请先提交评论，再单独启动 AI 修复' }, delivery: { state: 'not_required' } };
         if (command.scheduledAudit && !runtime.registration.supportsScheduledAudit) {

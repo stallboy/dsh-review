@@ -215,7 +215,7 @@ test('旧中央拒绝新版工作副本字段时报告注册阶段且只记一�
     assert.equal(error.stage, 'registration');
     assert.equal(error.code, 'workspace_rejected');
     assert.equal(error.message, '中央服务器拒绝了工作副本信息');
-    assert.match(registration.workspaces[0].executionConfigHash, /^[a-f0-9]{64}$/);
+    assert.equal(Object.hasOwn(registration.workspaces[0], 'executionConfigHash'), false);
     const status = await runtime.status();
     assert.equal(status.phase, 'error');
     assert.equal(status.issue.code, 'workspace_rejected');
@@ -404,7 +404,7 @@ test('已停用工作副本目录消失不影响其他项目恢复并保留历�
     assert.equal(central.projects.find(project => project.projectId === previous[0].projectId).enabled, false);
 });
 
-test('节点初始化失败后可在无未决任务时停用故障项目并恢复其他项目', async t => {
+test('缺失工作副本时连接和其他项目继续运行，故障项目仍可停用', async t => {
     const roots = [await createGitFixture(), await createGitFixture()];
     const { discoverCandidates } = await import('../packages/dsh-plugin/dist/connection/config.js');
     const candidates = () => discoverCandidates(roots.map(root => ({ root })));
@@ -419,7 +419,8 @@ test('节点初始化失败后可在无未决任务时停用故障项目并恢�
     await rm(roots[0], { recursive: true, force: true });
     restored = new ConnectionController({ directory, candidates, localEntry: new URL('../apps/server/dist/owned.js', import.meta.url) });
     await restored.init();
-    assert.equal((await restored.status()).phase, 'error');
+    assert.equal((await restored.status()).phase, 'ready');
+    assert.equal((await restored.status()).nodeOnline, true);
     await restored.project({ workspaceId: project.workspaceId, enabled: false });
     const status = await restored.status();
     assert.equal(status.phase, 'ready', status.error);
@@ -494,6 +495,11 @@ test('故障项目停用遇到断开响应丢失时进入错误态并允许安�
     await rm(root, { recursive: true, force: true });
     restored = new ConnectionController({ directory, candidates, localEntry: new URL('../apps/server/dist/owned.js', import.meta.url) });
     await restored.init();
+    const node = restored.node;
+    assert.ok(node);
+    await node.stop();
+    restored.node = null;
+    restored.phase = 'error';
     const request = restored.request.bind(restored);
     let lose = true;
     restored.request = async (...args) => {

@@ -70,6 +70,9 @@ export class CentralDatabase {
         if (!this.sql.prepare('PRAGMA table_info(nodes)').all().some(column => column.name === 'admission_paused')) {
             this.sql.exec('ALTER TABLE nodes ADD COLUMN admission_paused INTEGER NOT NULL DEFAULT 0');
         }
+        if (!this.sql.prepare('PRAGMA table_info(nodes)').all().some(column => column.name === 'workspace_issues')) {
+            this.sql.exec("ALTER TABLE nodes ADD COLUMN workspace_issues TEXT NOT NULL DEFAULT '{}'");
+        }
         if (!this.sql.prepare('PRAGMA table_info(projects)').all().some(column => column.name === 'execution_config_hash')) {
             this.sql.exec('ALTER TABLE projects ADD COLUMN execution_config_hash TEXT');
         }
@@ -164,6 +167,15 @@ export class CentralDatabase {
             online: Boolean(row.enabled && !row.admission_paused && row.last_seen_at && this.clock().getTime() - Date.parse(row.last_seen_at) <= 30000) };
     }
 
+    workspaceIssues(nodeId: string): Record<string, string> {
+        const row = this.sql.prepare('SELECT workspace_issues FROM nodes WHERE node_id=?').get(nodeId) as Row | undefined;
+        return JSON.parse(row?.workspace_issues ?? '{}');
+    }
+
+    setWorkspaceIssues(nodeId: string, issues: Record<string, string>): void {
+        this.sql.prepare('UPDATE nodes SET workspace_issues=? WHERE node_id=?').run(JSON.stringify(issues), nodeId);
+    }
+
     listNodes(): NodeRecord[] {
         return (this.sql.prepare('SELECT node_id FROM nodes ORDER BY name,node_id').all() as Row[]).map(row => this.getNode(row.node_id));
     }
@@ -173,7 +185,7 @@ export class CentralDatabase {
         return Boolean(node.enabled && node.lastSeenAt && this.clock().getTime() - Date.parse(node.lastSeenAt) <= 30000);
     }
 
-    registerNode(nodeId: string, registration: NodeRegistration, admissionPaused = false): NodeRecord {
+    registerNode(nodeId: string, registration: NodeRegistration, admissionPaused = false, workspaceIssues?: Record<string, string>): NodeRecord {
         return this.transaction(() => {
             const node = this.getNode(nodeId);
             if (this.hasActiveNodeInstance(nodeId) && node.instanceId !== registration.instanceId) throw new CentralError(409, 'instance_conflict', '相同节点已有活动实例');
@@ -193,6 +205,7 @@ export class CentralDatabase {
                 this.sql.prepare('UPDATE projects SET execution_config_hash=?,config_revision=config_revision+1 WHERE project_id=?')
                     .run(workspace.executionConfigHash ?? null, project.projectId);
             }
+            if (workspaceIssues || node.instanceId !== registration.instanceId) this.setWorkspaceIssues(nodeId, workspaceIssues ?? {});
             if (node.instanceId && node.instanceId !== registration.instanceId) {
                 this.sql.prepare("UPDATE commands SET state='recovery_required',updated_at=? WHERE node_id=? AND state IN ('accepted','executing')").run(this.now(), nodeId);
             }

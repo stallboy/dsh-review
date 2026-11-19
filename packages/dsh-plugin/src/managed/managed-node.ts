@@ -19,6 +19,9 @@ export interface ManagedNodeOptions {
     read(query: ManagedQuery, project: ProjectRecord): Promise<ManagedQueryResult>;
     snapshot?: (project: ProjectRecord) => Promise<Pick<ProjectSnapshot, 'vcsSnapshot' | 'queue' | 'findings' | 'audits' | 'errors'>>;
     recover?: (command: ManagedCommand, previous: ManagedResult | undefined, project: ProjectRecord) => Promise<ManagedResult>;
+    initializeWorkspaces?: () => Promise<void>;
+    workspaceIssues?: () => { workspaceId: string; message: string }[];
+    refreshWorkspaceIssues?: (projects: ProjectRecord[]) => Promise<void>;
     fetch?: typeof globalThis.fetch;
     clock?: () => Date;
     onError?: (error: Error) => void;
@@ -52,7 +55,15 @@ export class NodeRegistrationError extends Error {
     }
 }
 
+export function managedCenterUrl(value: string): URL {
+    const url = new URL(value.replace(/\/?$/, '/'));
+    if (url.username || url.password || url.search || url.hash) throw new Error('中央地址不能包含凭据、查询参数或片段');
+    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))) throw new Error('跨机器节点通信必须使用 HTTPS');
+    return url;
+}
+
 export class ManagedNode {
+    private readonly centerUrl: URL;
     readonly instanceId: string;
     private readonly transport: typeof globalThis.fetch;
     private readonly clock: () => Date;
@@ -61,21 +72,23 @@ export class ManagedNode {
     private readonly lastSync = new Map<string, number>();
     private timer: ReturnType<typeof setInterval> | null = null;
     private registered = false;
+    private registrationKey = '';
+    private capabilities?: { executionConfigHash: boolean; workspaceIssues: boolean };
+    private nextCapabilityCheck = 0;
+    private workspaceCheck: Promise<void> | undefined;
     private initialized = false;
     private ticking: Promise<void> | null = null;
     private stopping = false;
 
     constructor(private readonly options: ManagedNodeOptions) {
-        const url = new URL(options.config.centerUrl);
-        if (url.username || url.password || url.search || url.hash) throw new Error('中央地址不能包含凭据、查询参数或片段');
-        if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))) throw new Error('跨机器节点通信必须使用 HTTPS');
+        this.centerUrl = managedCenterUrl(options.config.centerUrl);
         this.instanceId = options.config.instanceId ?? randomUUID();
         this.transport = options.fetch ?? globalThis.fetch;
         this.clock = options.clock ?? (() => new Date());
     }
 
     private async request<T>(pathname: string, payload: unknown): Promise<T> {
-        const url = new URL(pathname.replace(/^\//, ''), this.options.config.centerUrl.replace(/\/?$/, '/'));
+        const url = new URL(pathname.replace(/^\//, ''), this.centerUrl);
         const response = await this.transport(url, {
             method: 'POST', headers: { authorization: `Bearer ${this.options.config.token}`, 'content-type': 'application/json',
                 ...(pathname === '/node-api/v1/register' && this.options.config.pauseAdmission ? { 'x-dsh-review-admission': 'paused' } : {}) },
@@ -117,9 +130,34 @@ export class ManagedNode {
         finally { this.ticking = null; }
     }
 
+    private async refreshCapabilities(): Promise<void> {
+        if (!this.options.workspaceIssues || (this.registered && this.clock().getTime() < this.nextCapabilityCheck)) return;
+        const url = new URL('api/v1/info', this.centerUrl);
+        const info = await this.transport(url, { signal: AbortSignal.timeout(3000) }).then(async response => {
+            if (!response.ok) throw new Error('无法读取中央服务器协议能力');
+            const data = await response.json() as { protocolVersion?: number; registrationCapabilities?: {
+                executionConfigHash?: boolean; workspaceIssues?: boolean;
+            } };
+            if (typeof data?.protocolVersion !== 'number') throw new Error('中央服务器协议能力响应无效');
+            return data;
+        }).catch(error => {
+            if (!this.capabilities) throw error;
+        });
+        this.nextCapabilityCheck = this.clock().getTime() + 10000;
+        if (!info) return;
+        if (info.protocolVersion !== PROTOCOL_VERSION) {
+            this.registered = false;
+            this.capabilities = undefined;
+            throw new Error('中央协议版本不兼容');
+        }
+        this.capabilities = { executionConfigHash: info.registrationCapabilities?.executionConfigHash === true,
+            workspaceIssues: info.registrationCapabilities?.workspaceIssues === true };
+    }
+
     private async cycle(): Promise<void> {
         const { config, journal } = this.options;
         if (!this.initialized) {
+            await this.options.initializeWorkspaces?.();
             for (const saved of journal.interrupted()) {
                 journal.emit(saved.command.commandId, 'recovery_required', undefined, {
                     outcome: { status: 'RECOVERY_REQUIRED', reason: 'NODE_RESTARTED', detail: '节点中断过执行，必须核验 VCS 与工作副本，不能直接重跑' },
@@ -128,19 +166,31 @@ export class ManagedNode {
             }
             this.initialized = true;
         }
+        await this.refreshCapabilities();
         const { workspaces } = config;
-        if (!this.registered) {
+        const workspaceIssues = this.options.workspaceIssues?.() ?? [];
+        const unavailable = new Map(workspaceIssues.map(issue => [issue.workspaceId, issue.message]));
+        const declaredWorkspaces = workspaces.filter(workspace => !unavailable.has(workspace.workspaceId))
+            .map(({ supportsScheduledAudit: _scheduled, executionConfigHash, ...workspace }) =>
+            this.capabilities?.executionConfigHash === false ? workspace : { ...workspace, executionConfigHash });
+        const registrationKey = JSON.stringify(declaredWorkspaces);
+        if (!this.registered || this.registrationKey !== registrationKey) {
             await this.request('/node-api/v1/register', { protocolVersion: PROTOCOL_VERSION, instanceId: this.instanceId,
                 pluginVersion: config.pluginVersion ?? '0.3.0', dshVersion: config.dshVersion ?? 'unknown',
-                platform: process.platform, workspaces: workspaces.map(({ supportsScheduledAudit: _capability, ...workspace }) => workspace) }).catch(error => {
+                platform: process.platform, workspaces: declaredWorkspaces, ...(this.capabilities?.workspaceIssues ? { workspaceIssues } : {}) }).catch(error => {
                 throw error instanceof NodeRegistrationError ? error : new NodeRegistrationError();
             });
             this.registered = true;
+            this.registrationKey = registrationKey;
         }
         const scheduledAuditWorkspaces = this.active.size || this.background.size || config.pauseAdmission ? [] :
-            workspaces.filter(workspace => workspace.supportsScheduledAudit).map(workspace => workspace.workspaceId);
-        const poll = await this.request<PollResult>('/node-api/v1/commands/poll', { instanceId: this.instanceId, scheduledAuditWorkspaces });
+            workspaces.filter(workspace => workspace.supportsScheduledAudit && !unavailable.has(workspace.workspaceId)).map(workspace => workspace.workspaceId);
+        const poll = await this.request<PollResult>('/node-api/v1/commands/poll', { instanceId: this.instanceId, scheduledAuditWorkspaces,
+            ...(this.capabilities?.workspaceIssues ? { workspaceIssues } : {}) });
         if (this.stopping) return;
+        if (this.options.refreshWorkspaceIssues && !this.workspaceCheck) {
+            this.workspaceCheck = this.options.refreshWorkspaceIssues(poll.projects).finally(() => { this.workspaceCheck = undefined; });
+        }
         for (const commandId of poll.cancellations) this.active.get(commandId)?.controller.abort();
         const unconfirmed = journal.awaitingAcknowledgement().filter(command => !poll.commands.some(value => value.commandId === command.commandId));
         for (const value of [...poll.commands, ...unconfirmed]) {
@@ -162,8 +212,13 @@ export class ManagedNode {
                 journal.settleBeforeExecution(command.commandId, acknowledged.result);
                 continue;
             }
-            if (command.scheduledAudit && acknowledged?.state !== 'accepted') continue;
+            if (acknowledged ? acknowledged.state !== 'accepted' : command.scheduledAudit) continue;
             if (this.stopping) return;
+            const issue = project && unavailable.get(project.workspaceId);
+            if (issue) {
+                journal.emit(command.commandId, 'result', undefined, { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: issue }, delivery: { state: 'not_required' } });
+                continue;
+            }
             if (!valid) {
                 journal.emit(command.commandId, 'result', undefined, { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '节点项目绑定或执行配置不一致' }, delivery: { state: 'not_required' } });
                 continue;
@@ -200,7 +255,10 @@ export class ManagedNode {
             if (!project) continue;
             this.track(query.projectId, `query:${query.queryId}`, async () => {
                 let result: ManagedQueryResult;
-                try { result = await this.options.read(query, project); }
+                try {
+                    if (unavailable.has(project.workspaceId)) throw new Error(unavailable.get(project.workspaceId));
+                    result = await this.options.read(query, project);
+                }
                 catch (error) { result = { queryId: query.queryId, vcsSnapshot: query.vcsSnapshot, status: 'error', error: error instanceof Error ? error.message : '查询失败' }; }
                 if (result.status === 'ready') {
                     const bytes = Buffer.from(JSON.stringify(result.data ?? null), 'utf8');
@@ -219,7 +277,7 @@ export class ManagedNode {
             });
         }
         if (this.options.snapshot) {
-            for (const project of poll.projects.filter(p => p.enabled)) {
+            for (const project of poll.projects.filter(p => p.enabled && !unavailable.has(p.workspaceId))) {
                 if (poll.commands.some(command => command.projectId === project.projectId)) continue;
                 if ([...this.active.values()].some(task => task.projectId === project.projectId)) continue;
                 if (this.clock().getTime() - (this.lastSync.get(project.projectId) ?? 0) < 10000) continue;
@@ -271,7 +329,7 @@ export class ManagedNode {
     }
 
     async drain(): Promise<void> {
-        await Promise.all([...this.active.values(), ...this.background.values()].map(value => value.promise));
+        await Promise.all([this.workspaceCheck, ...[...this.active.values(), ...this.background.values()].map(value => value.promise)]);
     }
 
     async stop(): Promise<void> {

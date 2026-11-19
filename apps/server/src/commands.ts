@@ -43,6 +43,8 @@ export class Commands {
             if (this.schedules.blocksManual(projectId)) throw new CentralError(409, 'project_busy', '项目有未决操作');
             const node = db.getNode(project.nodeId);
             if (!project.enabled || !node.online || !node.compatible) throw new CentralError(503, 'node_unavailable', '执行节点离线、停用或协议不兼容');
+            const issues = db.workspaceIssues(node.nodeId);
+            if (Object.hasOwn(issues, project.workspaceId)) throw new CentralError(503, 'workspace_unavailable', issues[project.workspaceId]!);
             this.schedules.yieldToManual(projectId, now);
             return this.insert(project, key, input, { userId: user.userId, reviewIdentity: user.reviewIdentity }, requestHash);
         });
@@ -66,19 +68,23 @@ export class Commands {
             const node = db.getNode(nodeId);
             if (!node.compatible) return { commands: [], cancellations: [], recoveries: [] };
             this.schedules.expire();
+            const issues = db.workspaceIssues(nodeId);
+            const unavailable = (command: CommandRecord) => Object.hasOwn(issues, db.getProject(command.projectId).workspaceId);
             const all = (db.sql.prepare("SELECT command_id FROM commands WHERE node_id=? AND state!='completed' ORDER BY created_at").all(nodeId) as Row[])
                 .map(row => this.get(row.command_id));
-            if (!all.length && node.online) {
-                const due = this.schedules.due(nodeId, scheduledAuditWorkspaces)[0];
+            const relevant = all.filter(command => command.state === 'accepted' || command.state === 'executing' || !unavailable(command));
+            if (!relevant.length && node.online) {
+                const ready = new Set([...scheduledAuditWorkspaces].filter(workspaceId => !Object.hasOwn(issues, workspaceId)));
+                const due = this.schedules.due(nodeId, ready)[0];
                 if (due) {
                     const { key, ...schedule } = due.slot;
                     const input = { operation: 'audit', payload: { targetPath: '.', note: '' } };
                     const actor = { userId: SCHEDULED_AUDIT_ACTOR, reviewIdentity: due.reviewIdentity };
-                    all.push(this.insert(due.project, key, input, actor, digest(stableJson({ ...input, actor, schedule })), schedule));
+                    relevant.push(this.insert(due.project, key, input, actor, digest(stableJson({ ...input, actor, schedule })), schedule));
                 }
             }
-            const running = all.some(c => c.state === 'accepted' || c.state === 'executing' || c.state === 'recovery_required');
-            const dispatchable = all.filter(c => !c.scheduledAudit || scheduledAuditWorkspaces.has(db.getProject(c.projectId).workspaceId));
+            const running = relevant.some(c => c.state === 'accepted' || c.state === 'executing' || c.state === 'recovery_required');
+            const dispatchable = relevant.filter(c => !c.scheduledAudit || scheduledAuditWorkspaces.has(db.getProject(c.projectId).workspaceId));
             const accepted = dispatchable.filter(c => c.state === 'accepted');
             const waiting = dispatchable.filter(c => c.state === 'queued' || c.state === 'dispatched');
             const next = waiting.find(c => !c.scheduledAudit) ?? waiting[0];
@@ -103,8 +109,12 @@ export class Commands {
             this.authorize(nodeId, command, !(command.state === 'completed' && (command.scheduledAudit || command.operation === RETIRED_MANUAL_REVISION)));
             if (command.state === 'queued' || command.state === 'dispatched') {
                 if (!db.getNode(nodeId).compatible) throw new CentralError(409, 'protocol_incompatible', '节点协议不兼容，不能受理写指令');
-                if (command.scheduledAudit && db.sql.prepare(`SELECT 1 FROM commands WHERE node_id=? AND state!='completed'
-                    AND json_extract(envelope,'$.scheduledAudit') IS NULL`).get(nodeId)) return command;
+                const issues = db.workspaceIssues(nodeId);
+                if (Object.hasOwn(issues, db.getProject(command.projectId).workspaceId)) return command;
+                if (command.scheduledAudit && db.sql.prepare(`SELECT projects.workspace_id,commands.state FROM commands JOIN projects USING(project_id)
+                    WHERE commands.node_id=? AND commands.state!='completed'
+                    AND json_extract(envelope,'$.scheduledAudit') IS NULL`).all(nodeId)
+                    .some(row => row.state === 'accepted' || row.state === 'executing' || !Object.hasOwn(issues, String(row.workspace_id)))) return command;
                 db.sql.prepare("UPDATE commands SET state='accepted',updated_at=? WHERE command_id=?").run(now, commandId);
             }
             const acknowledged = this.get(commandId);

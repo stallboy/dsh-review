@@ -373,13 +373,14 @@ export class ConnectionController {
         }
         const active = profile.workspaces.filter(workspace => workspace.enabled);
         this.node = await startManagedNode({ centerUrl: config.centerUrl, ...credentials, pauseAdmission: true,
-            workspaces: profile.workspaces.map(workspace => ({ ...workspace })) }, path.join(this.options.directory, 'connections', config.centralId),
+            workspaces: profile.workspaces.map(workspace => ({ ...workspace })), boundProjects: state.projects }, path.join(this.options.directory, 'connections', config.centralId),
             this.options.resolveCredential ?? (async () => undefined), error => {
                 if (this.phase === 'starting') return;
                 const failure = this.describe(error, '节点连接异常');
                 this.record(failure.message, failure.issue?.detail);
             }).catch(error => { throw error instanceof NodeRegistrationError ? registrationIssue(error) : error; });
         for (const workspace of active) {
+            if (this.node.workspaceIssue(workspace.workspaceId)) continue;
             let result = await this.request(config.centerUrl, 'node-api/v1/projects/ensure', credentials.token, {
                 instanceId: this.node.instanceId, workspaceId: workspace.workspaceId, name: workspace.label, enabled: workspace.enabled, restore: true,
             });
@@ -557,7 +558,10 @@ export class ConnectionController {
             enabled: config?.enabled ?? false, mode: config?.mode ?? (this.legacy ? 'external' : 'local'), centerUrl: config?.centerUrl ?? this.legacyConnection?.centerUrl ?? '',
             centralId: config?.centralId ?? '', nodeId: profile?.nodeId ?? this.legacyConnection?.nodeId ?? '', reviewIdentity: config?.reviewIdentity ?? '',
             phase: this.phase, serverReachable, nodeOnline, error: this.error, issue: this.issue, generation: this.generation,
-            candidates: await this.options.candidates(sessionId), projects,
+            candidates: await this.options.candidates(sessionId), projects: projects.map(workspace => {
+                const workspaceIssue = this.node?.workspaceIssue(workspace.workspaceId);
+                return workspaceIssue ? { ...workspace, workspaceIssue } : workspace;
+            }),
             logs: [...this.logs], hasCredentials: Boolean(config && this.secrets.nodes[config.centralId]), localAvailable,
             localRuntimeDownload, localRuntimeUpdate: config?.mode === 'local' && this.phase === 'ready' ? this.runtimeUpdate : undefined };
     }

@@ -36,14 +36,17 @@ export class Snapshots {
 
     view(projectId: string) {
         const project = this.database.getProject(projectId), node = this.database.getNode(project.nodeId), snapshot = this.get(projectId);
+        const issues = this.database.workspaceIssues(project.nodeId);
+        const workspaceIssue = Object.hasOwn(issues, project.workspaceId) ? issues[project.workspaceId] : undefined;
         const received = this.database.sql.prepare('SELECT received_at FROM snapshots WHERE project_id=?').get(projectId);
         const fresh = snapshot?.bindingGeneration === project.bindingGeneration && snapshot.projectConfigRevision === project.projectConfigRevision
             && received && Date.parse(this.database.now()) - Date.parse(String(received.received_at)) <= 30000;
         return { project, online: node.online, compatible: node.compatible, vcsSnapshot: snapshot?.vcsSnapshot ?? null,
             collectedAt: snapshot?.collectedAt ?? null, snapshotSequence: snapshot?.snapshotSequence ?? null,
             lastSyncedAt: received?.received_at ?? null,
-            freshness: !snapshot ? 'not_synced' : !node.online ? 'offline' : fresh ? 'synced' : 'stale',
-            writable: Boolean(project.enabled && node.online && node.compatible && fresh && !this.schedules.blocksManual(projectId)) };
+            freshness: !snapshot ? 'not_synced' : !node.online ? 'offline' : fresh && !workspaceIssue ? 'synced' : 'stale',
+            ...(workspaceIssue ? { workspaceIssue } : {}),
+            writable: Boolean(project.enabled && node.online && node.compatible && fresh && !workspaceIssue && !this.schedules.blocksManual(projectId)) };
     }
 
     query(projectId: string, kind: QueryKind, params: JsonRecord): { status: number; body: JsonRecord } {
@@ -58,6 +61,7 @@ export class Snapshots {
         }
         if (row?.state === 'ready') return { status: 200, body: { ...view, data: JSON.parse(row.result) } };
         if (!view.online) throw new CentralError(503, 'node_offline', '节点离线且该版本详情尚未缓存');
+        if (view.workspaceIssue) throw new CentralError(503, 'workspace_unavailable', view.workspaceIssue);
         if (row?.state === 'error' || row?.state === 'snapshot_moved') {
             this.database.sql.prepare("UPDATE queries SET state='retired',cache_key=? WHERE query_id=?").run(`retired:${row.query_id}`, row.query_id);
             row = undefined;
@@ -72,7 +76,9 @@ export class Snapshots {
 
     pending(nodeId: string): ManagedQuery[] {
         return (this.database.sql.prepare(`SELECT queries.envelope FROM queries JOIN projects USING(project_id)
-            WHERE queries.state='pending' AND projects.node_id=? LIMIT 20`).all(nodeId) as Row[]).map(row => JSON.parse(row.envelope));
+            WHERE queries.state='pending' AND projects.node_id=?
+            AND NOT EXISTS (SELECT 1 FROM json_each(?) WHERE key=projects.workspace_id) LIMIT 20`)
+            .all(nodeId, JSON.stringify(this.database.workspaceIssues(nodeId))) as Row[]).map(row => JSON.parse(row.envelope));
     }
 
     complete(nodeId: string, value: unknown): void {
