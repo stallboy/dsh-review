@@ -99,13 +99,13 @@ npm ci
 npm run build:plugin
 ```
 
-然后在 DSH 中用 Plugin Manager 安装 `packages/dsh-plugin` 的绝对路径，或由代理执行：
+然后在 DSH 中用 Plugin Manager 安装 `packages/dsh-plugin` 的**绝对路径**（不能指向仓库根目录，根目录的 `package.json` 是私有的工作区清单，没有 `dsh.bundle`，插件管理器会报「没有声明组合包」），或由代理执行：
 
 ```text
-plugin_manager install_bundle target=D:\work\mygithub\dsh-review\packages\dsh-plugin
+plugin_manager install_bundle target=<仓库绝对路径>/packages/dsh-plugin
 ```
 
-安装后刷新 DSH 页面即可在会话顶部的视图标签中看到「评审」；若 host 代码刚更新，可在插件管理中先禁用再启用该插件以重新挂载。
+profile 里的依赖应为 `dsh-code-review link:<仓库绝对路径>/packages/dsh-plugin`。安装后刷新 DSH 页面即可在会话顶部的视图标签中看到「评审」；若 host 代码刚更新，可在插件管理中先禁用再启用该插件以重新挂载。
 
 根目录只负责工作区管理。`npm run build:central` 单独构建中央服务和 Web；`npm run build` 构建全部组件。执行 `npm run pack:plugin` 或 `npm run pack:central`，分别生成根 `dist/` 下的插件和中央服务安装包；二者都包含各自运行依赖，中央包还包含 Web 静态资源。隔离安装、账号与节点配置见 [中央部署说明](docs/central-deployment.md)。
 
