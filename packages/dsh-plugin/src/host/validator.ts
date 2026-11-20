@@ -8,6 +8,7 @@ export interface GateOptions {
   timeoutMs: number;
   onLine?: (line: string, stream: 'stdout' | 'stderr', command: string) => void;
   signal?: AbortSignal;
+  run?: typeof runShell;
 }
 
 function formatDuration(ms: number): string {
@@ -22,7 +23,7 @@ export async function runGateChecks(commands: string[], options: GateOptions): P
   const results: GateCheckResult[] = [];
   for (const command of commands) {
     const startedAt = Date.now();
-    const result = await runShell(command, {
+    const result = await (options.run ?? runShell)(command, {
       cwd: options.cwd,
       timeoutMs: options.timeoutMs,
       onLine: (line, stream) => options.onLine?.(line, stream, command),

@@ -5,6 +5,8 @@ import process from 'node:process';
 import {
   Auditor,
   buildAuditPrompt,
+  existingCandidateLines,
+  negativeMemoryLines,
   loadAuditSystemPrompt,
   resolveAuditTarget,
 } from './auditor.js';
@@ -18,6 +20,11 @@ import { SCHEDULED_AUDIT_ACTOR } from '@dsh-review/protocol';
 import { assertScheduledCheckout, matchesAuditTarget, scheduledReviewDataClean, syncScheduledAudit } from './scheduled-audit-vcs.js';
 import { wrapAgentPrompt } from './runner.js';
 import { loadReviewers } from './reviewers.js';
+import { ReviewStore } from './store.js';
+import { AuditStages, auditUserFields, renderAuditCoordinator } from './audit-stages.js';
+import { assertStageArtifacts, compatibleAuditBase, publishStageArtifacts, verifyStageGates } from './audit-stage-artifacts.js';
+import { AuditStopUnknown, type AuditExecutor } from './audit-stage-runner.js';
+import type { AuditStage } from './audit-prompts.js';
 import { dshHome } from './settings.js';
 import type { JobRecord } from './types.js';
 import { ApiError } from './types.js';
@@ -36,6 +43,76 @@ import {
 /** 将审查执行和租约状态机接入 Host。路由负责请求受理，租约在执行期间持续约束共享写入。 */
 export class AuditRuntime {
   private lifecycle: AuditLifecycle | null = null;
+  private readonly stages = new Map<string, AuditStages>();
+
+  stopStages(auditId: string): void { this.stages.get(auditId)?.cancel(); }
+
+  private stageForSession(sessionId: string): AuditStages {
+    const stage = [...this.stages.values()].find(item => item.lease.sessionId === sessionId);
+    if (!stage || !sessionId || stage.lease.state !== 'active') throw new Error('阶段工具需要有效租约绑定的审查会话');
+    return stage;
+  }
+
+  async runStage(sessionId: string, stage: AuditStage, runner: AuditExecutor, task: unknown, signal: AbortSignal): Promise<unknown> {
+    const session = this.stageForSession(sessionId);
+    try {
+      return await session.run(stage, runner, task, signal);
+    } finally {
+      if (session.uncertain) await this.auditLifecycle.markReleasable(session.lease.auditId);
+    }
+  }
+
+  async publishStages(sessionId: string, input: unknown): Promise<{ reportPath: string }> {
+    const stage = this.stageForSession(sessionId);
+    const lease = stage.lease;
+    return this.host.withWriteLock(lease.root, async () => {
+      if (!await compatibleAuditBase(stage.vcs, lease.baseRevision) || !(await stage.vcs.ensureCleanWorkspace()).clean) {
+        await this.auditLifecycle.markReleasable(lease.auditId);
+        throw new Error('发布前业务基线或工作区发生变化');
+      }
+      const output = stage.publication(input);
+      stage.busy = true;
+      try {
+        const before = new Set(lease.candidateIdsBefore);
+        if ((await new ReviewStore(lease.root).listCandidateIds()).some(id => !before.has(id))) {
+          throw new Error('发现本轮未登记的新增候选');
+        }
+        await publishStageArtifacts(lease.root, output.path, output.body, output.candidates, async manifest => {
+          if (lease.state !== 'active' || stage.uncertain) throw new Error('审查租约已停止');
+          lease.stageSeal = manifest;
+          lease.stageItems = output.items;
+          try { await this.upsertLease(lease); } catch (error) {
+            delete lease.stageSeal;
+            delete lease.stageItems;
+            throw error;
+          }
+        });
+      } catch (error) {
+        if (error instanceof AuditStopUnknown) await this.auditLifecycle.markReleasable(lease.auditId);
+        throw error;
+      } finally {
+        stage.busy = false;
+      }
+      return { reportPath: output.path };
+    });
+  }
+
+  private usesStages(runtime: Runtime): boolean {
+    return runtime.vcsType === 'git' && this.host.deps.auditStageExecutor !== undefined;
+  }
+
+  private async coordinatorPrompt(runtime: Runtime, lease: AuditLeaseRecord, fields: ReturnType<typeof auditUserFields>, note: string): Promise<string> {
+    const source = await sharedSourceFor(runtime);
+    const [reviewers, activeCandidates, negativeMemory] = await Promise.all([
+      loadReviewers(runtime.root, source),
+      existingCandidateLines(runtime.store, lease.baseRevision, source),
+      negativeMemoryLines(runtime.root, source),
+    ]);
+    return renderAuditCoordinator({ lease, reviewers, repoOutline: [lease.targetPath || '.'],
+      history: { activeCandidates, negativeMemory }, legacyNote: fields.focus.includes(note.trim()) ? '' : note,
+      automaticCandidates: this.host.deps.auditStageGates !== undefined,
+      ...fields });
+  }
 
   constructor(private readonly host: ApiHost) {}
 
@@ -107,6 +184,7 @@ export class AuditRuntime {
   /** 超时只能表明 Host 停止跟踪，租约继续阻塞自动写入。 */
   armAuditLeaseTimeout(auditId: string): void {
     const timer = setTimeout(() => {
+      this.stopStages(auditId);
       void this.auditLifecycle.markReleasable(auditId).then((changed) => {
         if (!changed) return;
         this.host.auditJobFinishes.get(auditId)?.({
@@ -152,7 +230,7 @@ export class AuditRuntime {
   /** 调用方须持有仓库锁，避免并发请求在各自通过互斥检查后同时取得租约。 */
   async beginAuditLeaseUnderLock(
     runtime: Runtime,
-    input: { targetPath: string; baseRevision: string; owner: string; now: Date; trigger: 'manual' | 'scheduled' },
+    input: { targetPath: string; baseRevision: string; owner: string; now: Date; trigger: 'manual' | 'scheduled'; phased?: boolean },
     clean: { clean: boolean; message: string },
   ): Promise<{ auditId: string; reportPath: string }> {
     this.assertAuditStartAllowed(runtime, clean);
@@ -167,6 +245,7 @@ export class AuditRuntime {
       owner: input.owner,
       createdAt: input.now.toISOString(),
       candidateIdsBefore,
+      ...(input.phased ? { phased: true } : {}),
       state: 'active',
     });
     return { auditId, reportPath: `.ai-review/audits/${auditId}/audit.md` };
@@ -174,7 +253,7 @@ export class AuditRuntime {
 
   private async beginAuditLease(
     runtime: Runtime,
-    input: { targetPath: string; baseRevision: string; owner: string; now: Date; trigger: 'manual' | 'scheduled' },
+    input: { targetPath: string; baseRevision: string; owner: string; now: Date; trigger: 'manual' | 'scheduled'; phased?: boolean },
     clean: { clean: boolean; message: string },
   ): Promise<{ auditId: string; reportPath: string }> {
     return this.host.withWriteLock(runtime.root, () => this.beginAuditLeaseUnderLock(runtime, input, clean));
@@ -213,6 +292,23 @@ export class AuditRuntime {
     const now = new Date();
     const auditId = await new AuditArchive(runtime.root).nextAuditId(target.targetPath, now);
     const reportPath = `.ai-review/audits/${auditId}/audit.md`;
+    if (mode === 'session' && this.usesStages(runtime)) {
+      let fields: ReturnType<typeof auditUserFields>;
+      try {
+        fields = auditUserFields({
+          focus: JSON.parse(url.searchParams.get('focus') ?? '[]'),
+          extraRequirements: JSON.parse(url.searchParams.get('extraRequirements') ?? '[]'),
+        });
+      } catch {
+        throw new ApiError(400, 'bad_request', '审查附加字段非法');
+      }
+      const prompt = await this.coordinatorPrompt(runtime, {
+        auditId, root: runtime.root, targetPath: target.targetPath, trigger: 'manual', baseRevision,
+        owner, createdAt: now.toISOString(), candidateIdsBefore: [], state: 'active', phased: true,
+      }, fields, note);
+      sendJson(res, 200, { prompt, auditId, mode, targetPath: target.targetPath, baseRevision, owner, reportPath });
+      return;
+    }
     const sharedSource = await sharedSourceFor(runtime);
     const userPrompt = await buildAuditPrompt({
       repoRoot: runtime.root,
@@ -259,36 +355,51 @@ export class AuditRuntime {
     }
     const owner = await this.host.ownerFor(runtime.root);
     const now = new Date();
+    const phased = this.usesStages(runtime);
+    let fields: ReturnType<typeof auditUserFields> = { focus: [], extraRequirements: [] };
+    if (phased) {
+      try { fields = auditUserFields(body); } catch { throw new ApiError(400, 'bad_request', '审查附加字段非法'); }
+    }
     const { auditId, reportPath } = await this.beginAuditLease(
-      runtime,
-      { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'manual' },
-      clean,
+      runtime, { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'manual', phased }, clean,
     );
-    const sharedSource = await sharedSourceFor(runtime);
-    const userPrompt = await buildAuditPrompt({
-      repoRoot: runtime.root,
-      vcsType: runtime.vcsType,
-      owner,
-      targetPath: target.targetPath,
-      note,
-      baseRevision,
-      reportPath,
-      mode: 'session',
-      now,
-      ...(sharedSource ? { source: sharedSource } : {}),
-    });
-    const prompt = composeSessionPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root, sharedSource)}`);
-    const title = `仓库审查 · ${target.targetPath || '全仓库'}`.slice(0, 60);
+    const lease = this.auditLifecycle.find(auditId)!;
+    const title = ('仓库审查 · ' + (target.targetPath || '全仓库')).slice(0, 60);
     let created: { sessionId: string };
     try {
-      created = await this.host.deps.createAuditSession({ cwd: runtime.root, title, prompt, ownerSessionId });
+      const source = await sharedSourceFor(runtime);
+      let prompt: string;
+      if (phased) {
+        prompt = await this.coordinatorPrompt(runtime, lease, fields, note);
+        const reviewers = await loadReviewers(runtime.root, source);
+        this.stages.set(auditId, new AuditStages(lease, runtime.vcs, reviewers, this.host.deps.auditStageExecutor!,
+          this.host.currentSettings().gateTimeoutMs, fields.extraRequirements, this.host.deps.auditStageGates));
+      } else {
+        const userPrompt = await buildAuditPrompt({
+          repoRoot: runtime.root, vcsType: runtime.vcsType, owner, targetPath: target.targetPath,
+          note, baseRevision, reportPath, mode: 'session', now, ...(source ? { source } : {}),
+        });
+        prompt = composeSessionPrompt(await loadAuditSystemPrompt(), userPrompt + '\n\n' + await this.ownerRoutingBlock(runtime.root, source));
+      }
+      created = await this.host.deps.createAuditSession({
+        cwd: runtime.root, title, prompt, ownerSessionId,
+        ...(phased ? { onCreated: async (sessionId: string) => {
+          lease.sessionId = sessionId;
+          await this.upsertLease(lease);
+        } } : {}),
+      });
+      if (lease.sessionId !== created.sessionId) {
+        lease.sessionId = created.sessionId;
+        await this.upsertLease(lease);
+      }
     } catch (error) {
-      await this.releaseLeaseById(auditId).catch(() => undefined);
+      this.stopStages(auditId);
+      if (phased && lease.sessionId) await this.auditLifecycle.markReleasable(auditId);
+      else {
+        this.stages.delete(auditId);
+        await this.releaseLeaseById(auditId).catch(() => undefined);
+      }
       throw error;
-    }
-    const leaseForSession = this.auditLifecycle.find(auditId);
-    if (leaseForSession && leaseForSession.sessionId !== created.sessionId) {
-      await this.upsertLease({ ...leaseForSession, sessionId: created.sessionId });
     }
     const job = this.trackAuditSession(runtime, auditId, created.sessionId);
     sendJson(res, 202, {
@@ -498,6 +609,23 @@ export class AuditRuntime {
           reportPath: `.ai-review/audits/${lease.auditId}/audit.md`, message: '租约已释放或不存在，未重复收尾',
         };
       }
+      if (current.phased) {
+        const before = new Set(current.candidateIdsBefore);
+        try {
+          if (!current.stageSeal || this.stages.get(current.auditId)?.busy
+            || !await compatibleAuditBase(runtime.vcs, current.baseRevision)
+            || !(await runtime.vcs.ensureCleanWorkspace()).clean) throw new Error('未发布或基线发生变化');
+          const newCandidates = (await runtime.store.listCandidateIds()).filter(id => !before.has(id));
+          await assertStageArtifacts(runtime.root, current.stageSeal, newCandidates);
+        } catch (error) {
+          await this.auditLifecycle.markReleasable(current.auditId);
+          const failed = { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', auditId: current.auditId,
+            detail: error instanceof Error ? error.message : String(error), commitRevision: null, created: [] };
+          this.host.auditJobFinishes.get(current.auditId)?.(failed);
+          this.host.auditJobFinishes.delete(current.auditId);
+          return failed;
+        }
+      }
       const sharedSource = await sharedSourceFor(runtime);
       const auditor = new Auditor({
         store: runtime.store,
@@ -514,6 +642,14 @@ export class AuditRuntime {
       const result = await auditor.finalize({
         auditId: current.auditId,
         beforeIds: new Set(current.candidateIdsBefore),
+        ...(current.phased ? {
+          phasedItems: current.stageItems ?? [],
+          phasedSeal: current.stageSeal!,
+          ...(this.host.deps.auditStageGates ? {
+            phasedGate: (patch: string, commands: string[]) => verifyStageGates(current, patch, commands,
+              this.host.deps.auditStageGates!, this.host.currentSettings().gateTimeoutMs, signal),
+          } : {}),
+        } : {}),
         baseRevision: current.baseRevision,
         targetPath: current.targetPath,
         trigger: current.trigger,
@@ -523,6 +659,7 @@ export class AuditRuntime {
       });
       if (result.status === 'COMMITTED' || result.status === 'VALIDATION_FAILED') {
         await this.auditLifecycle.transition(current.auditId, 'released');
+        this.stages.delete(current.auditId);
       } else {
         log(`收尾未完成（${result.status}），租约 ${current.auditId} 保持占用`);
       }
@@ -557,9 +694,10 @@ export class AuditRuntime {
     let dispose = (): void => undefined;
     dispose = subscribe(sessionId, () => {
       if (finished) return;
+      const lease = this.auditLifecycle.find(auditId);
+      if (lease?.phased && (!lease.stageSeal || this.stages.get(auditId)?.busy)) return;
       finished = true;
       queueMicrotask(dispose);
-      const lease = this.auditLifecycle.find(auditId);
       if (lease?.state === 'active') this.startAuditFinalizeJob(runtime, lease);
     });
   }
@@ -573,6 +711,9 @@ export class AuditRuntime {
     if (!lease) throw new ApiError(404, 'not_found', `审查租约不存在：${auditId}`);
     if (lease.root !== runtime.root) throw new ApiError(409, 'conflict', '租约属于另一个仓库检出');
     if (lease.state === 'released') throw new ApiError(409, 'conflict', `租约 ${auditId} 已释放，不能重复收尾`);
+    if (lease.phased && (!lease.stageSeal || this.stages.get(auditId)?.busy)) {
+      throw new ApiError(409, 'conflict', '分阶段审查尚未发布或阶段仍在执行');
+    }
     const running = this.host.jobManager.list().find((job) => job.status === 'running' && job.type !== 'audit');
     if (running) throw new ApiError(409, 'conflict', `已有任务在运行（${running.type}），请等待完成后再收尾。`);
     const job = this.startAuditFinalizeJob(runtime, lease);
@@ -594,12 +735,14 @@ export class AuditRuntime {
     if (lease.state === 'active') {
       throw new ApiError(409, 'conflict', `租约 ${auditId} 仍处于活跃状态；请先取消审查 Job 或等待超时（releasable）后再释放`);
     }
+    if (this.stages.get(auditId)?.busy) throw new ApiError(409, 'conflict', '阶段进程正在停止，暂不能释放租约');
     // 外部 Agent 停止后也可能留下业务改动，释放前须检查工作区。
     const clean = await runtime.vcs.ensureCleanWorkspace();
     if (!clean.clean) {
       throw new ApiError(409, 'conflict', `工作区仍有未还原改动，不能释放租约。\n${clean.message}`);
     }
     await this.auditLifecycle.transition(auditId, 'released');
+    this.stages.delete(auditId);
     this.host.auditJobFinishes.get(lease.auditId)?.({
       status: 'ABORTED',
       auditId: lease.auditId,

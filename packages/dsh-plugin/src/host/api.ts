@@ -94,6 +94,15 @@ export class ReviewApi implements ApiHost {
     return this.configErrors;
   }
 
+  runAuditStage(sessionId: string, stage: import('./audit-prompts.js').AuditStage, runner: import('./audit-stage-runner.js').AuditExecutor,
+    task: unknown, signal: AbortSignal): Promise<unknown> {
+    return this.auditRuntime.runStage(sessionId, stage, runner, task, signal);
+  }
+
+  publishAuditStages(sessionId: string, input: unknown): Promise<{ reportPath: string }> {
+    return this.auditRuntime.publishStages(sessionId, input);
+  }
+
   leaseLookup(auditId: string): AuditLeaseRecord | undefined {
     return this.auditLifecycle.find(auditId);
   }
@@ -646,6 +655,7 @@ export class ReviewApi implements ApiHost {
     this.jobs.abort(job.id);
     const auditId = this.auditJobLeases.get(job.id);
     if (auditId) {
+      this.auditRuntime.stopStages(auditId);
       await this.auditLifecycle.markReleasable(auditId).catch(() => false);
       this.auditJobFinishes.get(auditId)?.({
         status: 'ABORTED',

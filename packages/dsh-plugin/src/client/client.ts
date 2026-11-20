@@ -1094,6 +1094,7 @@
       const [auditOpen, setAuditOpen] = useState(false);
       const [auditTarget, setAuditTarget] = useState('');
       const [auditNote, setAuditNote] = useState('');
+      const [auditExtra, setAuditExtra] = useState('');
       const [auditPrompt, setAuditPrompt] = useState('');
       const [auditPromptLoading, setAuditPromptLoading] = useState(false);
       const [auditLaunching, setAuditLaunching] = useState(false);
@@ -1515,7 +1516,10 @@
       };
 
       const fetchAuditPrompt = async (): Promise<string> => {
-        const query = new URLSearchParams({ targetPath: auditTarget, note: auditNote, mode: 'session' });
+        const query = new URLSearchParams({ targetPath: auditTarget, note: auditNote, mode: 'session',
+          focus: JSON.stringify(auditNote.trim() ? [auditNote.trim()] : []),
+          extraRequirements: JSON.stringify(auditExtra.split(/\r?\n/).map(text => text.trim()).filter(Boolean)),
+        });
         const value = await api.get<{ prompt: string }>(`/audit/prompt?${query.toString()}`);
         return value.prompt;
       };
@@ -1549,6 +1553,8 @@
         try {
           const value = await api.post<{ sessionId: string; auditId: string; job: Job }>('/audit/session', {
             targetPath: auditTarget, note: auditNote,
+            focus: auditNote.trim() ? [auditNote.trim()] : [],
+            extraRequirements: auditExtra.split(/\r?\n/).map(text => text.trim()).filter(Boolean),
           });
           setAuditSessionId(value.sessionId);
           setAuditLeaseId(value.auditId);
@@ -1774,7 +1780,11 @@
             ),
             h('div', { className: 'dcr-field' },
               h('label', null, '补充关注点（可选）'),
-              h('textarea', { className: 'dcr-textarea', value: auditNote, placeholder: '例如：重点关注并发关闭竞态与资源泄漏；不要修改公开 API。', onChange: (e: any) => setAuditNote(e.target.value) }),
+              h('textarea', { className: 'dcr-textarea', value: auditNote, placeholder: '例如：覆盖写入成功后响应超时的重试链路。', onChange: (e: any) => setAuditNote(e.target.value) }),
+            ),
+            h('div', { className: 'dcr-field' },
+              h('label', null, '额外要求（可选）'),
+              h('textarea', { className: 'dcr-textarea', value: auditExtra, placeholder: '每行一条，例如：保留公开 API。', onChange: (e: any) => setAuditExtra(e.target.value) }),
             ),
             h('div', { className: 'dcr-row' },
               h('button', { className: 'dcr-btn p', disabled: busy || auditLaunching || auditPromptLoading || !auditReady, onClick: () => { void launchAuditSession(); } }, auditLaunching ? '正在创建会话…' : '启动审查会话'),
