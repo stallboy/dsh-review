@@ -132,7 +132,7 @@ function createClientContext() {
     },
     slots: {
       inject(key, callback) {
-        assert.equal(key, 'conversation.view');
+        assert.ok(['main', 'sidebar.panellist'].includes(key));
         return own(callback());
       },
       register(options) {
@@ -186,31 +186,28 @@ test('materialized plugin registers the review view, its styles and its dictiona
   const client = createClientContext();
   plugin.apply(client.ctx);
 
-  assert.equal(client.slots.length, 1);
-  assert.equal(client.slots[0].options.name, 'conversation.view');
-  assert.equal(client.slots[0].options.id, 'code-review');
-  assert.equal(client.slots[0].options.order, 40);
+  assert.equal(client.slots.length, 2);
+  const main = client.slots.find(entry => entry.options.name === 'main');
+  const sidebar = client.slots.find(entry => entry.options.name === 'sidebar.panellist');
+  assert.equal(main.options.key, 'code-review');
+  assert.equal(sidebar.options.id, main.options.key);
+  assert.equal(sidebar.options.label(), `${PACKAGE_ID}:nav`);
   assert.equal(client.locales.length, 1);
   assert.equal(client.locales[0].namespace, PACKAGE_ID);
   assert.equal(page.styles.length, 1);
   assert.equal(page.styles[0].tagName, 'style');
 });
 
-test('评审标签的底部区带（任务条 + 输入框）靠评审页根标记隐藏，切回即恢复', () => {
+test('全局评审为宿主顶栏留位，聊天输入与任务区域由宿主管理', () => {
   const page = createPage();
   page.execute();
   const plugin = materialize(page);
   const client = createClientContext();
   plugin.apply(client.ctx);
 
-  // 宿主的 CSS Modules 类名随构建变化，评审页只依赖公开的 DOM 锚点和插槽。
   const style = page.styles[0]?.textContent ?? '';
-  assert.match(style, /\[data-conversation-scroll\]:has\(\[data-dcr-view\]\)\s*>\s*\[data-composer-seat\]\s*\{\s*display:none\s*\}/, '任务条和输入框必须在当前评审会话中整体收起');
-  assert.doesNotMatch(style, /composerStack|composerSeat/, '不得依赖宿主 CSS Modules 的哈希 class');
-
-  assert.equal(client.slots.length, 1);
-  assert.equal(client.slots[0].options.id, 'code-review');
-  assert.match(bundleSource, /\[VIEW_ATTR\]: 'code-review'/, '评审页根节点必须带 data-dcr-view');
+  assert.match(style, /var\(--dsh-frame-top-clearance,\s*0px\)/);
+  assert.doesNotMatch(style, /data-conversation-scroll|data-composer-seat|composerStack|composerSeat/);
 });
 
 test('plugin unload disposes the view, its styles and its dictionaries', () => {

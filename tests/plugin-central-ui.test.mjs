@@ -30,7 +30,8 @@ function createPanel(status = initialStatus(), confirm = () => { throw new Error
     let disposed = false;
     let activeStatus = status;
     let pendingRequest = false;
-    let sessionId = 'session-a';
+    let sessionId;
+    let repoRoot = '';
     let failedWrite = '';
     let testResult;
     let delayNextRead = false;
@@ -89,7 +90,7 @@ function createPanel(status = initialStatus(), confirm = () => { throw new Error
             plugin.apply({
                 locale: { register: () => () => {}, bind: () => key => key },
                 effect: callback => callback(), get: () => undefined,
-                slots: { inject: (_name, callback) => callback(), register: (_options, component) => { view = component; } },
+                slots: { inject: (_name, callback) => callback(), register: (options, component) => { if (options.name === 'main') view = component; } },
             });
         } } },
         document, URL, URLSearchParams, AbortController, console, setTimeout, clearTimeout,
@@ -112,9 +113,12 @@ function createPanel(status = initialStatus(), confirm = () => { throw new Error
             if (pendingRequest) return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
             if (failedWrite && init.method === 'POST') return { ok: false, status: 409, text: async () => JSON.stringify({ error: typeof failedWrite === 'string' ? { message: failedWrite } : failedWrite }) };
             if (testResult && String(url).includes('/connection/test')) return { ok: true, status: 200, text: async () => JSON.stringify(testResult) };
-            const value = String(url).includes('/connection') ? activeStatus
-                : String(url).includes('/health') ? { configured: false, counts: {}, diagnostics: [] }
-                : { settings: { owner: '' }, validation: { ok: true, errors: [] }, runners: [] };
+            const pathname = new URL(url).pathname;
+            if (pathname.endsWith('/settings') && init.method === 'PUT') repoRoot = JSON.parse(init.body).repoRoot;
+            const value = pathname.includes('/connection') ? activeStatus
+                : pathname.endsWith('/health') ? { configured: Boolean(repoRoot), repoRoot, counts: {}, diagnostics: [] }
+                : pathname.endsWith('/queue') ? { items: [], counts: {}, errors: [], repoRoot }
+                : { settings: { owner: '', repoRoot }, validation: { ok: true, errors: [] }, runners: [] };
             return { ok: true, status: 200, text: async () => JSON.stringify(value) };
         },
     });
@@ -124,8 +128,9 @@ function createPanel(status = initialStatus(), confirm = () => { throw new Error
         if (!node || typeof node !== 'object') return node;
         if (typeof node.type === 'function') {
             let owner = components.get(key);
-            if (!owner || owner.type !== node.type) {
-                owner = { type: node.type, hooks: [], index: 0 };
+            if (!owner || owner.type !== node.type || owner.key !== node.props.key) {
+                for (const hook of owner?.hooks ?? []) hook?.cleanup?.();
+                owner = { type: node.type, key: node.props.key, hooks: [], index: 0 };
                 components.set(key, owner);
             }
             current = owner;
@@ -138,7 +143,7 @@ function createPanel(status = initialStatus(), confirm = () => { throw new Error
         for (let turn = 0; turn < 12; turn++) {
             if (disposed) return;
             dirty = false;
-            tree = materialize(view({ sessionId }));
+            tree = materialize(react.createElement(view, sessionId === undefined ? {} : { sessionId }));
             while (effects.length) effects.shift()();
             await new Promise(resolve => setImmediate(resolve));
             if (!dirty) return;
@@ -201,7 +206,7 @@ test('中央连接默认展示，编辑草稿和状态刷新均不会启动或�
     assert.equal(panel.input('节点 Token').props.value, 'new-token');
     assert.equal(panel.input('节点 Token').props.type, 'password');
     assert.equal(panel.requests.filter(request => request.init.method !== 'GET').length, 0);
-    assert.ok(panel.requests.every(request => request.url.searchParams.get('sessionId') === 'session-a'));
+    assert.ok(panel.requests.every(request => !request.url.searchParams.has('sessionId')));
     panel.unmount();
 });
 
@@ -297,14 +302,14 @@ test('注册失败说明原因和处理动作并保留草稿，原始错误仅�
     panel.unmount();
 });
 
-test('同名不同目录的项目分别接入，当前项目有快捷入口且停用只按 workspaceId', async () => {
+test('同名不同目录的项目分别接入和打开，停用按 workspaceId', async () => {
     const panel = createPanel();
     await panel.flush();
     panel.button('项目接入').props.onClick();
     await panel.flush();
     assert.match(panel.text(), /C:\/work\/a/);
     assert.match(panel.text(), /C:\/work\/b/);
-    assert.match(panel.text(), /当前项目/);
+    assert.doesNotMatch(panel.text(), /当前项目/);
     const join = panel.nodes().filter(node => node.type === 'button' && node.children.join('') === '接入项目');
     assert.equal(join.length, 2);
     join[0].props.onClick();
@@ -318,7 +323,11 @@ test('同名不同目录的项目分别接入，当前项目有快捷入口且�
     panel.button('停用项目').props.onClick();
     await panel.flush();
     assert.deepEqual(panel.requests.filter(request => request.init.method === 'POST').at(-1).body, { workspaceId: 'workspace-a', enabled: false });
-    assert.ok(panel.nodes().some(node => node.type === 'a' && node.props.href === '/dsh-code-review/central/projects/project-a'));
+    const link = panel.nodes().find(node => node.type === 'a' && node.props.href === '/dsh-code-review/central/projects/project-a');
+    assert.ok(link);
+    link.props.onClick({ preventDefault() {} });
+    await panel.flush();
+    assert.equal(panel.nodes().find(node => node.type === 'iframe')?.props.src, link.props.href);
     panel.unmount();
 });
 
@@ -372,7 +381,7 @@ test('失败操作原因在正常轮询后仍保留，避免未决任务阻止�
     panel.unmount();
 });
 
-test('切换会话取消旧请求并解除旧操作忙碌状态，草稿继续保留', async () => {
+test('切换会话不会取消中央连接操作或重置草稿，卸载才取消请求', async () => {
     const panel = createPanel();
     await panel.flush();
     panel.button('修改连接').props.onClick();
@@ -386,14 +395,15 @@ test('切换会话取消旧请求并解除旧操作忙碌状态，草稿继续�
     await panel.flush();
     const previousRequest = panel.requests.at(-1);
     assert.equal(panel.button('正在连接…').props.disabled, true);
-    panel.releaseRequests();
     panel.setSession('session-b');
     await panel.flush();
-    assert.equal(previousRequest.init.signal.aborted, true);
-    assert.equal(panel.button('应用更改').props.disabled, false);
+    assert.equal(previousRequest.init.signal.aborted, false);
+    assert.equal(panel.button('正在连接…').props.disabled, true);
     assert.equal(panel.input('节点 ID').props.value, 'draft-node-id');
-    assert.equal(panel.requests.at(-1).url.searchParams.get('sessionId'), 'session-b');
+    assert.equal(panel.requests.at(-1), previousRequest);
+    assert.equal(previousRequest.url.searchParams.has('sessionId'), false);
     panel.unmount();
+    assert.equal(previousRequest.init.signal.aborted, true);
 });
 
 test('轻量插件禁用本机启动但仍允许选择已有中央', async () => {
@@ -615,17 +625,35 @@ test('写后状态读取失败时继续禁止应用，轮询恢复后才显示�
     panel.unmount();
 });
 
-test('切换会话后状态尚未确认时不沿用旧会话的本地评审权限', async () => {
+test('本地评审可在无会话时保存明确的仓库，切换会话后保持队列和仓库', async () => {
     const panel = createPanel({ ...initialStatus(), configured: false, enabled: false, phase: 'stopped' });
     await panel.flush();
     panel.button('本地评审').props.onClick();
     await panel.flush();
-    const reads = panel.requests.filter(request => request.url.pathname.startsWith('/dsh-code-review/api')).length;
-    panel.holdRequests();
+    const repoInput = panel.nodes().find(node => node.props.id === 'dcr-repo-root');
+    assert.equal(repoInput.props.value, '');
+    repoInput.props.onChange({ target: { value: ' C:/review/repo ' } });
+    await panel.flush();
+    panel.button('保存').props.onClick();
+    await panel.flush();
+    const saved = panel.requests.find(request => request.init.method === 'PUT');
+    assert.equal(saved.body.repoRoot, 'C:/review/repo');
+    assert.match(panel.text(), /C:\/review\/repo/);
+    assert.ok(panel.requests.some(request => request.url.pathname.endsWith('/queue')));
+    const reads = panel.requests.length;
     panel.setSession('session-b');
     await panel.flush();
-    assert.equal(panel.nodes().some(node => node.type === 'button' && node.children.join('') === '本地评审'), false);
-    assert.equal(panel.requests.filter(request => request.url.pathname.startsWith('/dsh-code-review/api')).length, reads);
+    assert.match(panel.text(), /C:\/review\/repo/);
+    assert.equal(panel.requests.length, reads);
+    assert.ok(panel.requests.every(request => !request.url.searchParams.has('sessionId')));
+    panel.button('设置').props.onClick();
+    await panel.flush();
+    panel.nodes().find(node => node.props.id === 'dcr-repo-root').props.onChange({ target: { value: 'C:/review/other' } });
+    await panel.flush();
+    panel.button('保存').props.onClick();
+    await panel.flush();
+    assert.match(panel.text(), /C:\/review\/other/);
+    assert.doesNotMatch(panel.text(), /C:\/review\/repo/);
     panel.unmount();
 });
 

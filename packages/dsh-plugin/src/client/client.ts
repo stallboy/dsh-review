@@ -4,6 +4,7 @@
  */
 (() => {
   const PACKAGE_ID = 'dsh-code-review';
+  const PANEL_ID = 'code-review';
   const NS = 'dsh-code-review';
   const API_ROOT = '/dsh-code-review/api';
 
@@ -77,7 +78,7 @@
         error?: string;
         issue?: ConnectionIssue;
         generation: number;
-        candidates: { id: string; label: string; root: string; vcsType?: string; target?: string; error?: string; current: boolean }[];
+        candidates: { id: string; label: string; root: string; vcsType?: string; target?: string; error?: string }[];
         projects: { workspaceId: string; root: string; label: string; enabled: boolean; projectId?: string; vcsType: string; target: string; workspaceIssue?: string }[];
         logs: string[];
         hasCredentials: boolean;
@@ -184,8 +185,8 @@
     constructor(message: string, readonly issue?: ConnectionIssue) { super(message); }
   }
 
-  /** 请求归属单个会话面板；释放时取消在途请求，避免卸载后再更新视图。 */
-  function createApi(sessionId: string, apiRoot = API_ROOT, controlToken?: () => string): ApiClient {
+  /** 释放时取消在途请求，避免卸载后再更新视图。 */
+  function createApi(apiRoot = API_ROOT, controlToken?: () => string): ApiClient {
     const inflight = new Set<AbortController>();
     let disposed = false;
     const request = async <T>(path: string, method: string, body: unknown): Promise<T> => {
@@ -195,7 +196,6 @@
       try {
         const base = typeof document === 'undefined' ? '/' : document.baseURI;
         const url = new URL(`${apiRoot}${path}`, base);
-        if (sessionId) url.searchParams.set('sessionId', sessionId);
         const response = await fetch(url.toString(), {
           method,
           cache: 'no-store',
@@ -389,7 +389,8 @@
       (React as unknown as { useLayoutEffect?: typeof useEffect }).useLayoutEffect ?? useEffect;
 
     const CSS = `
-.dcr{display:flex;flex-direction:column;height:100%;min-height:0;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-size:13px}
+.dcr{display:flex;flex-direction:column;box-sizing:border-box;height:100%;min-height:0;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-size:13px}
+.dcr-workbench{padding-top:var(--dsh-frame-top-clearance,0px)}
 .dcr-top{display:flex;gap:12px;align-items:center;padding:12px 18px;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}
 .dcr-candidate-head{position:sticky;top:0;z-index:2;background:var(--dsw-alias-bg-layer-2)}
 .dcr-top h1{margin:0;font-size:16px;font-weight:650}
@@ -558,12 +559,8 @@
 .dcr-hist{border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:9px 11px;margin-bottom:7px}
 .dcr-raw{white-space:pre-wrap;word-break:break-word;max-height:280px;overflow:auto;background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l1);border-radius:8px;padding:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.5}
 .dcr-sep{height:1px;background:var(--dsw-alias-border-l1);margin:8px 0}
-/* 宿主底部区带与评审视图互为兄弟，必须在共同滚动容器内限定当前会话。 */
-[data-conversation-scroll]:has([data-dcr-view]) > [data-composer-seat]{display:none}
 @media(max-width:760px){.dcr-grid{grid-template-columns:1fr}.dcr-line{grid-template-columns:32px 32px 14px 1fr 18px}.dcr-shalf{grid-template-columns:30px 12px minmax(0,1fr) 16px}.dcr-thread{margin-left:80px}.dcr-thread.split{margin-left:10px}}
 `;
-
-    const VIEW_ATTR = 'data-dcr-view';
 
     function inlineNodes(text: string, keyPrefix: string): any[] {
       const nodes: any[] = [];
@@ -667,7 +664,7 @@
       return h('div', { className: `dcr-rt ${props.className ?? ''}`.trim() }, ...blocks);
     }
 
-    function ReviewPanel(props: { t: (key: string) => string; sessionId: string }) {
+    function ReviewPanel() {
         const [tab, setTab] = useState<'connection' | 'projects' | 'central' | 'local'>('connection');
         const [status, setStatus] = useState<ConnectionStatus | null>(null);
         const [draft, setDraft] = useState<ConnectionDraft>({ mode: 'local', centerUrl: '', nodeId: '', token: '', reviewIdentity: '' });
@@ -678,14 +675,14 @@
         const [busy, setBusy] = useState(false);
         const [pendingAction, setPendingAction] = useState('');
         const [editing, setEditing] = useState(false);
-        const [controlReady, setControlReady] = useState(false);
+        const [confirmed, setControlReady] = useState(false);
         const [framePath, setFramePath] = useState('/dsh-code-review/central/');
+        const [localRepoRevision, setLocalRepoRevision] = useState(0);
         const initialized = useRef(false);
         const edited = useRef(false);
         const draftRevision = useRef(0);
-        const scopeRef = useRef<{ sessionId: string; api: ApiClient; reads: ApiClient; active: boolean; loading: boolean; writing: boolean; ready: boolean; revision: number; token: string } | null>(null);
+        const scopeRef = useRef<{ api: ApiClient; reads: ApiClient; active: boolean; loading: boolean; writing: boolean; ready: boolean; revision: number; token: string } | null>(null);
         const working = busy || status?.phase === 'starting';
-        const confirmed = controlReady && scopeRef.current?.sessionId === props.sessionId;
         const showLocal = Boolean(confirmed && !working && status && !status.configured && !status.legacy);
 
         useEffect(() => {
@@ -717,9 +714,9 @@
         }, []);
 
         useEffect(() => {
-            const scope = { sessionId: props.sessionId, api: null as unknown as ApiClient, reads: null as unknown as ApiClient, active: true, loading: false, writing: false, ready: false, revision: 0, token: '' };
-            scope.api = createApi(props.sessionId, '/dsh-code-review/connection', () => scope.token);
-            scope.reads = createApi(props.sessionId, '/dsh-code-review/connection', () => scope.token);
+            const scope = { api: null as unknown as ApiClient, reads: null as unknown as ApiClient, active: true, loading: false, writing: false, ready: false, revision: 0, token: '' };
+            scope.api = createApi('/dsh-code-review/connection', () => scope.token);
+            scope.reads = createApi('/dsh-code-review/connection', () => scope.token);
             scopeRef.current = scope;
             setBusy(false);
             setPendingAction('');
@@ -736,7 +733,7 @@
                 scope.reads.dispose();
                 if (scopeRef.current === scope) scopeRef.current = null;
             };
-        }, [props.sessionId, refresh]);
+        }, [refresh]);
 
         const clearDraftFeedback = (): void => {
             draftRevision.current += 1;
@@ -750,13 +747,13 @@
         };
         const write = async (path: string, body: unknown, forDraft = false): Promise<boolean> => {
             const scope = scopeRef.current;
-            if (!scope?.active || scope.sessionId !== props.sessionId || !scope.token || !scope.ready || scope.writing || working || status?.legacy) return false;
+            if (!scope?.active || !scope.token || !scope.ready || scope.writing || working || status?.legacy) return false;
             const revision = draftRevision.current;
             scope.writing = true;
             scope.ready = false;
             scope.revision += 1;
             scope.reads.dispose();
-            scope.reads = createApi(props.sessionId, '/dsh-code-review/connection', () => scope.token);
+            scope.reads = createApi('/dsh-code-review/connection', () => scope.token);
             scope.loading = false;
             setControlReady(false);
             setBusy(true);
@@ -834,8 +831,6 @@
             href: `/dsh-code-review/central/projects/${encodeURIComponent(projectId)}`,
             onClick: (event: { preventDefault(): void }) => openProject(projectId, event),
         }, label);
-        const currentCandidate = status?.candidates.find(candidate => candidate.current);
-        const currentProject = status?.projects.find(project => project.root === currentCandidate?.root);
         const disabled = working || !status || !confirmed || Boolean(status.legacy);
         const showForm = Boolean(status && !status.legacy && (!status.configured || editing));
         const localStartLabel = localDownload ? '正在下载并启动…' : '正在启动…';
@@ -852,7 +847,7 @@
         const issue = formFailure?.issue;
         const fieldError = issue?.stage === 'address' ? 'centerUrl' : issue?.stage === 'credentials'
             ? issue.code === 'node_id_mismatch' || issue.code === 'invalid_node_id' ? 'nodeId' : 'token' : undefined;
-        const feedbackId = `dcr-connection-feedback-${encodeURIComponent(props.sessionId)}`;
+        const feedbackId = 'dcr-connection-feedback';
         const savedCredentials = status?.hasCredentials && status.mode === 'external' && draft.centerUrl.trim().replace(/\/+$/, '') === status.centerUrl.replace(/\/+$/, '')
             && (!draft.nodeId.trim() || draft.nodeId.trim() === status.nodeId);
         const field = (label: string, key: 'centerUrl' | 'nodeId' | 'token' | 'reviewIdentity'): any => h('label', { className: 'dcr-field' },
@@ -921,7 +916,7 @@
                     h('p', null, '请通过中央工作台查看项目并执行评审。已保存中央配置时，本地评审写入保持停用。'),
                     h('button', { className: 'dcr-btn p', onClick: () => setTab('central') }, '进入中央工作台'),
                 ))
-                : h(App, { ...props, key: props.sessionId });
+                : h(App, { key: localRepoRevision, onRepoChange: () => setLocalRepoRevision(value => value + 1) });
         else if (tab === 'central') content = status?.legacy
             ? status.centerUrl
                 ? h('div', { className: 'dcr-body' }, h('section', { className: 'dcr-card' },
@@ -939,7 +934,7 @@
             ...(status?.candidates ?? []).map(candidate => {
                 const project = status?.projects.find(value => value.root === candidate.root);
                 return h('section', { className: 'dcr-card', key: candidate.id },
-                    h('div', { className: 'dcr-row' }, h('strong', { className: 'dcr-grow' }, candidate.label), candidate.current ? h('span', { className: 'dcr-chip' }, '当前项目') : null),
+                    h('strong', null, candidate.label),
                     h('p', { className: 'dcr-mono dcr-central-path' }, candidate.root),
                     h('p', { className: 'dcr-muted' }, `${candidate.vcsType?.toUpperCase() ?? '未识别 VCS'} · ${candidate.target ?? '目标未确定'}`),
                     candidate.error ? h('div', { className: 'dcr-banner err' }, candidate.error) : null,
@@ -947,7 +942,7 @@
                         : h('button', { className: 'dcr-btn p', disabled: disabled || Boolean(candidate.error) || status?.phase !== 'ready', onClick: () => { void write('/projects', { candidateId: candidate.id, enabled: true }); } }, '接入项目'),
                 );
             }),
-            !status?.candidates.length ? h('div', { className: 'dcr-empty' }, '未发现可接入的工作副本。请打开项目会话后刷新。') : null,
+            !status?.candidates.length ? h('div', { className: 'dcr-empty' }, '未发现可接入的工作副本。请将仓库目录添加到 DSH 工作区后刷新。') : null,
             h('h2', null, '已保存的项目'),
             ...(status?.projects ?? []).map(project => h('section', { className: 'dcr-card', key: project.workspaceId },
                 h('div', { className: 'dcr-row' }, h('strong', { className: 'dcr-grow' }, project.label), h('span', { className: 'dcr-chip' }, project.workspaceIssue ? '不可执行' : project.enabled ? '已启用' : '已停用')),
@@ -1036,11 +1031,10 @@
                 diagnosticDetails,
             ));
         }
-        return h('div', { className: 'dcr', [VIEW_ATTR]: 'code-review' },
+        return h('div', { className: 'dcr dcr-workbench' },
             h('nav', { className: 'dcr-central-nav', 'aria-label': '评审入口' },
                 ...([['connection', '中央连接'], ['projects', '项目接入'], ['central', '中央工作台'], ...(showLocal ? [['local', '本地评审']] : [])] as [typeof tab, string][]).map(([key, label]) => h('button', { className: 'dcr-btn', key, 'aria-selected': tab === key, onClick: () => { if (key === 'central') setFramePath('/dsh-code-review/central/'); setTab(key); } }, label)),
                 h('span', { className: 'dcr-grow' }),
-                currentProject?.projectId ? projectLink(currentProject.projectId, '打开当前项目') : currentCandidate ? h('button', { className: 'dcr-btn', onClick: () => setTab('projects') }, '当前项目') : null,
                 h('button', { className: 'dcr-btn g', disabled: busy, onClick: () => { void refresh(); } }, '刷新连接'),
             ),
             tab !== 'connection' && visibleFailure && !projectRegistrationFailure ? h('div', { className: 'dcr-banner err', role: 'alert' }, visibleFailure.message) : null,
@@ -1049,11 +1043,10 @@
         );
     }
 
-    const auditJobsBySession = new Map<string, string>();
+    const auditJobsByRepo = new Map<string, string>();
 
-    function App(props: { t: (key: string) => string; sessionId: string }) {
-      const session = props.sessionId || '';
-      const api = useMemo(() => createApi(session), [session]);
+    function App({ onRepoChange }: { onRepoChange: () => void }) {
+      const api = useMemo(() => createApi(), []);
       useEffect(() => () => api.dispose(), [api]);
       const [health, setHealth] = useState<Health | null>(null);
       const [settingsResponse, setSettingsResponse] = useState<SettingsResponse | null>(null);
@@ -1189,8 +1182,8 @@
         void (async () => {
           const current = await refreshHealth();
           try { await loadSettings(); } catch { /* 健康检查已足以决定打开哪个页面。 */ }
-          const auditJobId = auditJobsBySession.get(session);
-          if (current?.configured && auditJobId) {
+          const auditJobId = current?.configured ? auditJobsByRepo.get(current.repoRoot) : undefined;
+          if (auditJobId) {
             try {
               const restored = await api.get<Job>(`/jobs/${encodeURIComponent(auditJobId)}`);
               setJob(restored);
@@ -1199,7 +1192,7 @@
           }
           setScreen(current?.configured ? 'queue' : 'setup');
         })();
-      }, [api, session, refreshHealth, loadSettings]);
+      }, [api, refreshHealth, loadSettings]);
 
       useEffect(() => {
         if (screen !== 'queue') return;
@@ -1380,11 +1373,15 @@
         if (!settings) return;
         setBusy(true); setError('');
         try {
-          await api.put('/settings', settings);
+          const repoRoot = settings.repoRoot.trim();
+          await api.put('/settings', { ...settings, repoRoot });
+          if (repoRoot !== settingsResponse?.settings.repoRoot) {
+            onRepoChange();
+            return;
+          }
           await loadSettings();
           const current = await refreshHealth();
           setScreen(current?.configured ? 'queue' : 'setup');
-          if (current?.configured) await loadQueue();
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
         finally { setBusy(false); }
       };
@@ -1571,7 +1568,7 @@
           setAuditLeaseId(value.auditId);
           jobLogRef.current = [];
           jobLogOffsetRef.current = null;
-          auditJobsBySession.set(session, value.job.id);
+          if (health?.repoRoot) auditJobsByRepo.set(health.repoRoot, value.job.id);
           setJob(value.job);
           setBusy(value.job.status === 'running');
           setAuditOpen(false);
@@ -1716,8 +1713,8 @@
               h('h3', null, screen === 'setup' ? '首次配置' : '本地设置'),
               h('div', { className: 'dcr-grid' },
                 h('div', { className: 'dcr-field', style: { gridColumn: '1 / -1' } },
-                  h('label', null, '当前会话目录（自动作为评审仓库）'),
-                  h('input', { className: 'dcr-input', readOnly: true, value: health?.repoRoot ?? '', placeholder: '会话没有工作目录' }),
+                  h('label', { htmlFor: 'dcr-repo-root' }, '本地评审仓库'),
+                  h('input', { id: 'dcr-repo-root', className: 'dcr-input', value: settings.repoRoot, placeholder: 'Git/SVN 工作副本目录', onChange: (e: any) => update({ repoRoot: e.target.value }) }),
                 ),
                 h('div', { className: 'dcr-field' },
                   h('label', null, '审核者（owner）'),
@@ -1752,11 +1749,11 @@
               ),
               h('div', { className: 'dcr-row', style: { marginTop: 12 } },
                 h('button', { className: 'dcr-btn p', disabled: busy, onClick: () => { void saveSettings(); } }, busy ? '保存中…' : '保存'),
-                screen === 'settings' && health?.configured ? h('button', { className: 'dcr-btn', onClick: () => setScreen('queue') }, '返回评审') : null,
+                screen === 'settings' && health?.configured ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setScreen('queue') }, '返回评审') : null,
               ),
               settingsResponse && !settingsResponse.validation.ok ? h('div', { className: 'dcr-banner err', style: { marginTop: 10 } }, settingsResponse.validation.errors.join('；') || '配置不完整') : null,
             ),
-            h('div', { className: 'dcr-card dcr-small dcr-muted' }, '评审仓库取当前会话的工作目录（需为 Git/SVN 仓库），无需单独配置项目目录。owner 用于乐观锁与操作隔离；AI 修复默认调用本机 DSH headless profile。'),
+            h('div', { className: 'dcr-card dcr-small dcr-muted' }, '本地评审使用此处保存的 Git/SVN 工作副本。owner 用于乐观锁与操作隔离；AI 修复默认调用本机 DSH headless profile。'),
           ),
         );
       };
@@ -1815,7 +1812,7 @@
               h('button', { className: 'dcr-btn', onClick: () => { void dismissFinding(); } }, '忽略 finding'),
               h('button', { className: 'dcr-btn g', onClick: () => setAuditOpen(false) }, '取消'),
               h('span', { className: 'dcr-grow' }),
-              h('span', { className: 'dcr-small dcr-muted' }, `基线 ${short(queue?.currentBase ?? health?.currentBase)} · 使用当前 DSH 会话模型`),
+              h('span', { className: 'dcr-small dcr-muted' }, `基线 ${short(queue?.currentBase ?? health?.currentBase)} · 使用新建 DSH 会话`),
             ),
             auditLeaseId ? h('div', { className: 'dcr-banner info', style: { marginTop: 10 } }, `执行租约 ${auditLeaseId} 正在参与互斥；外部 Agent 停止后按实际状态选择收尾或确认释放。`) : null,
             auditSessionId ? h('div', { className: 'dcr-banner info', style: { marginTop: 10 } }, `审查会话已创建（${short(auditSessionId)}）。请在侧边栏打开「仓库审查 · ${auditTarget.trim() || '全仓库'}」查看实时过程；当前页面不会被遮挡。`) : null,
@@ -2420,7 +2417,7 @@
                 .catch((e) => setError(e instanceof Error ? e.message : String(e)));
             } }, '取消任务') : null,
             !running ? h('button', { className: 'dcr-btn g', onClick: () => {
-              if (auditJobsBySession.get(session) === job.id) auditJobsBySession.delete(session);
+              if (health?.repoRoot && auditJobsByRepo.get(health.repoRoot) === job.id) auditJobsByRepo.delete(health.repoRoot);
               setJob(null);
             } }, '关闭') : null,
           ),
@@ -2451,7 +2448,7 @@
       };
 
       let content: any;
-      if (health?.managed) return h('div', { className: 'dcr', [VIEW_ATTR]: 'code-review' },
+      if (health?.managed) return h('div', { className: 'dcr' },
         h('h1', null, '此节点已接入中央工作台'),
         h('p', null, '项目、审查结果和任务由中央服务统一管理。'),
         h('a', { className: 'dcr-btn dcr-primary', href: health.managed.centerUrl, target: '_blank', rel: 'noopener noreferrer' }, '打开中央工作台'),
@@ -2461,7 +2458,7 @@
       else if (screen === 'queue') content = renderQueue();
       else content = renderDetail();
 
-      return h('div', { className: 'dcr', [VIEW_ATTR]: 'code-review' },
+      return h('div', { className: 'dcr' },
         h('div', { className: 'dcr-top' },
           h('div', { className: 'dcr-grow' },
             h('div', { className: 'dcr-row' },
@@ -2470,11 +2467,11 @@
               health?.vcsType ? h('span', { className: 'dcr-chip' }, health.vcsType.toUpperCase()) : null,
               health?.currentBase ? h('span', { className: 'dcr-chip dcr-mono' }, short(health.currentBase)) : null,
             ),
-            h('div', { className: 'dcr-sub' }, `${health?.repoRoot || '会话没有工作目录'} · 审核者 ${health?.owner || settings?.owner || '未设置'}`),
+            h('div', { className: 'dcr-sub' }, `${health?.repoRoot || '未配置本地评审仓库'} · 审核者 ${health?.owner || settings?.owner || '未设置'}`),
           ),
           screen === 'detail' ? h('button', { className: 'dcr-btn g', onClick: () => setScreen('queue') }, '← 队列') : null,
           h('button', { className: 'dcr-btn', onClick: () => { void refreshHealth(); if (screen === 'queue') void loadQueue(); if (screen === 'detail') reloadCurrent(); } }, '刷新'),
-          h('button', { className: 'dcr-btn', onClick: () => { void (async () => { try { await loadSettings(); } finally { setScreen('settings'); } })(); } }, '设置'),
+          h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void (async () => { try { await loadSettings(); } finally { setScreen('settings'); } })(); } }, '设置'),
         ),
         content,
       );
@@ -2496,13 +2493,24 @@
           return () => style.remove();
         }, 'dsh-code-review: styles');
         const t = ctx.locale.bind(NS);
-        ctx.slots.inject('conversation.view', () => {
+        ctx.slots.inject('main', () => {
           const off = ctx.slots.register(
-            { name: 'conversation.view', id: 'code-review', order: 40, label: () => t('nav'), locale: NS, inject: () => ({ t }) },
-            (props: any) => h(ReviewPanel, {
-              t,
-              sessionId: typeof props?.sessionId === 'string' ? props.sessionId : '',
-            }),
+            { name: 'main', key: PANEL_ID, locale: NS },
+            ReviewPanel,
+          );
+          return typeof off === 'function' ? off : undefined;
+        });
+        ctx.slots.inject('sidebar.panellist', () => {
+          const off = ctx.slots.register(
+            { name: 'sidebar.panellist', id: PANEL_ID, order: 40, label: () => t('nav'), locale: NS },
+            ({ size = 16 }: { size?: number }) => h('svg', {
+              width: size, height: size, viewBox: '0 0 24 24', fill: 'none',
+              stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round',
+              strokeLinejoin: 'round', 'aria-hidden': true,
+            },
+              h('rect', { x: 2.5, y: 3.5, width: 19, height: 17, rx: 3 }),
+              h('path', { d: 'M7 9.5h10M7 13h4m2 2 2.5 2.5L19 14' }),
+            ),
           );
           return typeof off === 'function' ? off : undefined;
         });

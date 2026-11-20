@@ -30,7 +30,16 @@ const patch=${JSON.stringify(patch)};
 const status={controlToken:'control',configured:false,enabled:false,mode:'local',reviewIdentity:'',centerUrl:'',centralId:'',nodeId:'',phase:'stopped',nodeOnline:false,generation:1,hasCredentials:false,localAvailable:true,candidates:[],projects:[],logs:[]};
 window.test={status,writes:0,cleanups:[],errors:[],root:createRoot(document.getElementById('review-mount'))};
 window.addEventListener('error',event=>test.errors.push(String(event.error||event.message)));
-window.__ModuleLoader__={load({factory}){factory(()=>React).apply({get(){},effect(callback){const clean=callback();if(clean)test.cleanups.push(clean)},locale:{register(){return()=>{}},bind(){return()=> '评审'}},slots:{inject(name,callback){callback()},register(options,component){test.view=component;return()=>{}}}})}};
+window.__ModuleLoader__={load({factory}){factory(()=>React).apply({get(){},effect(callback){const clean=callback();if(clean)test.cleanups.push(clean)},locale:{register(){return()=>{}},bind(){return()=> '评审'}},slots:{inject(name,callback){const clean=callback();if(clean)test.cleanups.push(clean)},register(options,component){
+    if(options.name==='main')test.view=component;
+    if(options.name==='sidebar.panellist'){
+        const entry=document.createElement('button');
+        entry.textContent=options.label();
+        entry.onclick=()=>test.mountReview();
+        document.getElementById('global-nav').append(entry);
+        return()=>entry.remove();
+    }
+}}})}};
 window.fetch=async(url,init={})=>{
     let value;
     if(String(url).includes('/connection')){
@@ -45,7 +54,7 @@ window.fetch=async(url,init={})=>{
         }
         value={...status};
     }else if(test.auditFixture && String(url).includes('/api/health')){
-        value={configured:true,repoRoot:'/test/repo',owner:'tester',counts:{}};
+        value={configured:true,repoRoot:test.auditRepoRoot??'/test/repo',owner:'tester',counts:{}};
     }else if(test.auditFixture && String(url).includes('/api/settings')){
         value={settings:{owner:'tester'},validation:{ok:true,errors:[]}};
     }else if(test.auditFixture && String(url).includes('/api/queue')){
@@ -70,7 +79,7 @@ window.fetch=async(url,init={})=>{
     else value={project:{projectId:'project-a',name:'Demo',target:'main',vcsType:'git'},writable:true,vcsSnapshot:'v1',freshness:'synced',online:true};
     return new Response(JSON.stringify(value),{status:200,headers:{'content-type':'application/json'}});
 };
-test.mountReview=()=>flushSync(()=>test.root.render(h(test.view,{sessionId:'browser-case'})));
+test.mountReview=()=>flushSync(()=>test.root.render(h(test.view)));
 test.hideReview=()=>flushSync(()=>test.root.render(null));
 test.mountCandidate=()=>{
     test.queryClient=new QueryClient({defaultOptions:{queries:{retry:false,refetchOnWindowFocus:false}}});
@@ -86,9 +95,10 @@ const js = bundled.outputFiles.find(file => file.path.endsWith('.js')).text;
 const css = bundled.outputFiles.find(file => file.path.endsWith('.css'))?.text ?? '';
 const client = await readFile(path.join(root, 'packages/dsh-plugin/dist/client.js'), 'utf8');
 const html = `<!doctype html><html><head><meta charset="utf-8"><style>${css}</style></head><body>
-<div data-conversation-scroll id="review-scroll"><div id="review-mount"></div><div data-composer-seat id="seat" style="height:180px">Agent Loop 输入框和任务列表</div></div>
+<nav id="global-nav"></nav><main id="review-mount"></main>
+<div data-conversation-scroll id="review-scroll"><div data-composer-seat id="seat" style="height:180px">Agent Loop 输入框和任务列表</div></div>
 <div data-conversation-scroll id="other-scroll"><div data-composer-seat id="other-seat" style="height:80px">其他会话输入框</div></div>
-<div id="candidate-mount"></div><script src="/bootstrap.js"></script><script src="/client.js"></script><script>test.mountReview()</script></body></html>`;
+<div id="candidate-mount"></div><script src="/bootstrap.js"></script><script src="/client.js"></script></body></html>`;
 const server = createServer((req, res) => {
     const route = req.url === '/bootstrap.js' ? [js, 'text/javascript'] : req.url === '/client.js' ? [client, 'text/javascript'] : [html, 'text/html'];
     res.writeHead(200, { 'content-type': route[1] }); res.end(route[0]);
@@ -118,13 +128,16 @@ try {
     await send('Page.navigate', { url: `http://127.0.0.1:${server.address().port}/` });
     await send('Page.bringToFront');
     await send('Emulation.setFocusEmulationEnabled', { enabled: true });
+    await waitFor(`document.querySelector('#global-nav button')!==null`);
+    await click('评审');
     await waitFor(`document.querySelector('input[aria-label="审核身份"]')!==null`);
+    await check('无会话时可从全局导航打开评审，聊天输入区不被改写', `document.querySelector('main .dcr-workbench') && document.getElementById('seat').offsetHeight===180 && document.getElementById('other-seat').offsetHeight===80`);
     await evaluate('test.auditFixture=true');
     await click('本地评审');
     await waitFor(`[...document.querySelectorAll('button')].some(button=>button.textContent==='收尾并提交候选')`);
     await click('收尾并提交候选');
     await waitFor(`document.querySelector('.dcr-job')?.textContent.includes('评审文件校验')`);
-    await check('主会话收尾后直接展示两类文件及字段错误', `(()=>{const job=document.querySelector('.dcr-job');return job.textContent.includes('1/3 个文件通过') && job.textContent.includes('.ai-review/2026-11/bad/review.md') && job.textContent.includes('owner 是必填字段') && job.textContent.includes('.ai-review/audits/20261119-120000-repo/audit.md') && job.textContent.includes('previous_audit 是必填字段')})()`);
+    await check('收尾后直接展示两类文件及字段错误', `(()=>{const job=document.querySelector('.dcr-job');return job.textContent.includes('1/3 个文件通过') && job.textContent.includes('.ai-review/2026-11/bad/review.md') && job.textContent.includes('owner 是必填字段') && job.textContent.includes('.ai-review/audits/20261119-120000-repo/audit.md') && job.textContent.includes('previous_audit 是必填字段')})()`);
     await click('中央连接');
     await click('本地评审');
     await waitFor(`[...document.querySelectorAll('button')].some(button=>button.textContent==='审查仓库')`);
@@ -135,11 +148,15 @@ try {
     await waitFor(`[...document.querySelectorAll('button')].some(button=>button.textContent==='本地评审')`);
     await click('本地评审');
     await waitFor(`document.querySelector('.dcr-job')?.textContent.includes('评审文件校验')`);
-    await check('切回主会话后恢复自动收尾诊断', `test.manualFinalizes===1 && document.querySelector('.dcr-job').textContent.includes('previous_audit 是必填字段')`);
+    await check('重开同一工作副本后恢复自动收尾诊断', `test.manualFinalizes===1 && document.querySelector('.dcr-job').textContent.includes('previous_audit 是必填字段')`);
+    await click('中央连接');
+    await evaluate("test.auditRepoRoot='/test/other'");
+    await click('本地评审');
+    await waitFor(`document.querySelector('.dcr-sub')?.textContent.includes('/test/other') && [...document.querySelectorAll('button')].some(button=>button.textContent==='审查仓库')`);
+    await check('另一工作副本不恢复上一副本的任务', `document.querySelector('.dcr-job')===null`);
     await click('中央连接');
     await evaluate('test.auditFixture=false');
     await waitFor(`document.querySelector('input[aria-label="审核身份"]')!==null`);
-    await check('仅评审会话底部隐藏且零高度', `getComputedStyle(document.getElementById('seat')).display==='none' && document.getElementById('seat').offsetHeight===0 && document.getElementById('other-seat').offsetHeight===80`);
     await evaluate(`(()=>{const input=document.querySelector('input[aria-label="审核身份"]');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'张三');input.dispatchEvent(new Event('input',{bubbles:true}))})()`);
     await waitFor(`[...document.querySelectorAll('button')].some(b=>b.textContent==='应用并启动'&&!b.disabled)`);
     await click('应用并启动');
@@ -149,11 +166,11 @@ try {
     await check('未变配置禁止再次应用', `[...document.querySelectorAll('button')].find(b=>b.textContent==='应用更改').disabled`);
     await click('取消修改');
     await evaluate('test.hideReview()');
-    await check('切回聊天恢复底部及高度', `getComputedStyle(document.getElementById('seat')).display!=='none'&&document.getElementById('seat').offsetHeight===180`);
-    await evaluate('test.mountReview()');
+    await check('切回聊天时评审卸载，输入区可用', `!document.querySelector('main .dcr-workbench')&&document.getElementById('seat').offsetHeight===180`);
+    await click('评审');
     await waitFor(`document.body.textContent.includes('中央已连接')`);
     await evaluate('test.root.unmount();for(const clean of test.cleanups.reverse())clean();test.mountCandidate()');
-    await check('卸载移除样式并恢复底部', `document.getElementById('seat').offsetHeight===180&&!document.querySelector('style[data-dsh-code-review]')`);
+    await check('卸载移除入口和样式，聊天输入区可用', `document.getElementById('seat').offsetHeight===180&&!document.querySelector('style[data-dsh-code-review], #global-nav button')`);
     await waitFor(`document.body.textContent.includes('方案与证据')`);
     await check('问题描述渲染无序列表', `[...document.querySelectorAll('#candidate-mount article ul > li')].map(item=>item.textContent).join(',')==='第一项,第二项'`);
     await check('根本原因、修复方案渲染加粗和有序列表', `[...document.querySelectorAll('#candidate-mount article strong')].map(item=>item.textContent).join(',')==='状态检查缺少同步,统一状态流转' && document.querySelectorAll('#candidate-mount article ol > li').length===2`);
