@@ -486,36 +486,69 @@ test('可下载版沿用两个启动入口，取消保留草稿，确认只提�
     saved.unmount();
 });
 
-test('选择已保存连接不启动，切换请求绑定中央身份，返回本机时恢复已初始化身份', async () => {
+test('编辑已保存连接不启动，直接切换只提交中央身份，返回本机时恢复已初始化身份', async () => {
     const connection = { centralId: 'central-remote', label: '团队中央', centerUrl: 'https://review.example/', nodeId: 'team-node' };
     const local = { ...initialStatus(), localReviewIdentity: '张三', savedConnections: [connection] };
     const panel = createPanel(local);
     await panel.flush();
-    panel.button('选择连接 团队中央').props.onClick();
+    panel.button('编辑连接 团队中央').props.onClick();
     await panel.flush();
     assert.equal(panel.input('中央地址').props.value, connection.centerUrl);
     assert.equal(panel.input('节点 Token').props.value, '');
     assert.equal(panel.requests.some(request => request.init.method === 'POST'), false);
+    panel.button('取消修改').props.onClick();
+    await panel.flush();
     const external = { ...local, ...connection, mode: 'external', reviewIdentity: '', generation: 2,
         testSession: { user: { reviewIdentity: '团队审核员' } } };
     panel.setStatus(external);
-    panel.button('切换并连接').props.onClick();
+    panel.button('切换到 团队中央').props.onClick();
     await panel.flush();
     const post = () => panel.requests.filter(request => request.init.method === 'POST').at(-1);
-    assert.equal(post().body.expectedCentralId, connection.centralId);
-    assert.equal(post().body.token, undefined);
+    assert.deepEqual(post().body, { savedCentralId: connection.centralId });
+    assert.equal(panel.nodes().some(node => node.type === 'input'), false);
     assert.match(panel.text(), /审核身份团队审核员/);
     panel.button('前往工作台切换账号');
-    panel.button('选择本机托管').props.onClick();
-    await panel.flush();
-    assert.match(panel.text(), /本机审核身份张三/);
-    assert.equal(panel.nodes().some(node => node.type === 'input' && node.props['aria-label'] === '审核身份'), false);
     panel.setStatus(local);
-    panel.button('切换并连接').props.onClick();
+    panel.button('切换到本机托管').props.onClick();
     await panel.flush();
     assert.deepEqual(post().body, { mode: 'local', reviewIdentity: '张三' });
     assert.match(panel.text(), /审核身份张三/);
     assert.doesNotMatch(panel.text(), /团队审核员/);
+    panel.unmount();
+});
+
+test('删除配置必须确认，删除当前连接后仍可管理连接且不开放本地评审', async () => {
+    const remote = { centralId: 'central-remote', label: '团队中央', centerUrl: 'https://review.example/', nodeId: 'team-node' };
+    const other = { centralId: 'central-other', label: '旧中央', centerUrl: 'https://previous.example/', nodeId: 'previous-node' };
+    const status = { ...initialStatus(), ...remote, mode: 'external', reviewIdentity: '', savedConnections: [remote, other] };
+    const panel = createPanel(status);
+    await panel.flush();
+    const posts = () => panel.requests.filter(request => request.init.method === 'POST');
+    panel.button('删除连接 旧中央').props.onClick();
+    await panel.flush();
+    assert.match(panel.text(), /审核历史和项目绑定会保留/);
+    assert.equal(posts().length, 0);
+    panel.button('取消').props.onClick();
+    await panel.flush();
+    assert.equal(posts().length, 0);
+    panel.button('删除连接 旧中央').props.onClick();
+    await panel.flush();
+    panel.setStatus({ ...status, savedConnections: [remote] });
+    panel.button('确认删除').props.onClick();
+    await panel.flush();
+    assert.equal(posts()[0].url.pathname, '/dsh-code-review/connection/forget');
+    assert.deepEqual(posts()[0].body, { centralId: other.centralId, stopCurrent: false });
+    assert.match(panel.text(), /中央已连接/);
+    assert.doesNotMatch(panel.text(), /旧中央/);
+    panel.button('删除当前配置').props.onClick();
+    await panel.flush();
+    panel.setStatus({ ...status, savedConnections: [], centralId: '', centerUrl: '', nodeId: '', phase: 'stopped', enabled: false, nodeOnline: false });
+    panel.button('确认停止并删除').props.onClick();
+    await panel.flush();
+    assert.deepEqual(posts()[1].body, { centralId: remote.centralId, stopCurrent: true });
+    assert.match(panel.text(), /未选择中央连接/);
+    assert.equal(panel.nodes().some(node => node.type === 'button' && node.children.join('') === '本地评审'), false);
+    panel.button('添加连接');
     panel.unmount();
 });
 

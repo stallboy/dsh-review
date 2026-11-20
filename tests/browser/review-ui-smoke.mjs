@@ -48,7 +48,10 @@ window.fetch=async(url,init={})=>{
         if(init.method==='POST'){
             test.writes++;
             const body=JSON.parse(init.body||'{}');
-            if(String(url).includes('/apply')){
+            if(String(url).endsWith('/forget')){
+                status.savedConnections=status.savedConnections.filter(connection=>connection.centralId!==body.centralId);
+                if(status.centralId===body.centralId)Object.assign(status,{enabled:false,phase:'stopped',nodeOnline:false,centerUrl:'',centralId:'',nodeId:''});
+            }else if(String(url).includes('/apply')){
                 status.phase='starting';
                 if(body.confirmRuntimeDownload){
                     status.runtimeProgress={stage:'downloading',received:524288,total:1048576};
@@ -57,7 +60,9 @@ window.fetch=async(url,init={})=>{
                     delete status.localRuntimeDownload;
                     status.localAvailable=true;
                 }else await new Promise(resolve=>setTimeout(resolve,120));
-                Object.assign(status,{configured:true,enabled:true,phase:'ready',nodeOnline:true,reviewIdentity:body.reviewIdentity,centerUrl:'http://127.0.0.1:40000',centralId:'central',nodeId:'node'});
+                const target=status.savedConnections?.find(connection=>connection.centralId===body.savedCentralId);
+                Object.assign(status,{configured:true,enabled:true,phase:'ready',nodeOnline:true,reviewIdentity:body.reviewIdentity,centerUrl:'http://127.0.0.1:40000',centralId:'central',nodeId:'node'},
+                    target?{...target,mode:'external',generation:status.generation+1}:{});
             }
         }
         value={...status};
@@ -187,6 +192,17 @@ try {
     await check('切回聊天时评审卸载，输入区可用', `!document.querySelector('main .dcr-workbench')&&document.getElementById('seat').offsetHeight===180`);
     await click('评审');
     await waitFor(`document.body.textContent.includes('中央已连接')`);
+    await evaluate(`test.status.savedConnections=[{centralId:'external-a',label:'团队中央',centerUrl:'https://team.example.test/',nodeId:'team-node'}]`);
+    await click('刷新连接');
+    await waitFor(`document.querySelector('button[aria-label="切换到 团队中央"]')!==null`);
+    await evaluate(`document.querySelector('button[aria-label="切换到 团队中央"]').click()`);
+    await waitFor(`test.writes===2 && document.body.textContent.includes('https://team.example.test/') && document.querySelector('main h2')?.textContent==='团队中央'`);
+    await check('切换已保存中央不打开编辑表单', `!document.querySelector('input[aria-label="中央地址"]')`);
+    await click('删除当前配置');
+    await check('删除当前连接先聚焦确认区域', `test.writes===2 && document.activeElement.getAttribute('aria-labelledby')==='dcr-delete-connection-title'`);
+    await click('确认停止并删除');
+    await waitFor(`document.body.textContent.includes('未选择中央连接')`);
+    await check('删除后仍可添加连接且本地评审入口保持隐藏', `test.writes===3 && [...document.querySelectorAll('button')].some(button=>button.textContent==='添加连接') && ![...document.querySelectorAll('button')].some(button=>button.textContent==='本地评审')`);
     await evaluate('test.root.unmount();for(const clean of test.cleanups.reverse())clean();test.mountCandidate()');
     await check('卸载移除入口和样式，聊天输入区可用', `document.getElementById('seat').offsetHeight===180&&!document.querySelector('style[data-dsh-code-review], #global-nav button')`);
     await waitFor(`document.body.textContent.includes('方案与证据')`);

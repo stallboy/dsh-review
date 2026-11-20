@@ -703,6 +703,7 @@
         const [runningLocalStart, setRunningLocalStart] = useState(false);
         const [runtimeProgress, setRuntimeProgress] = useState<RuntimeProgress | null>(null);
         const [downloadConfirmation, setDownloadConfirmation] = useState<{ source: NonNullable<ConnectionStatus['localRuntimeDownload']>; submit: () => void } | null>(null);
+        const [deleteConfirmation, setDeleteConfirmation] = useState<{ centralId: string; name: string; stopCurrent: boolean } | null>(null);
         const [downloadNotice, setDownloadNotice] = useState('');
         const [centralSession, setCentralSession] = useState<{ generation: number; identity: string } | null>(null);
         const [editing, setEditing] = useState(false);
@@ -712,12 +713,13 @@
         const reloadLocalRepo = useCallback(() => setLocalRepoRevision(value => value + 1), []);
         const initialized = useRef(false);
         const edited = useRef(false);
-        const downloadPanel = useRef<HTMLElement | null>(null);
+        const confirmationPanel = useRef<HTMLElement | null>(null);
         const draftRevision = useRef(0);
         const scopeRef = useRef<{ api: ApiClient; reads: ApiClient; active: boolean; loading: boolean; writing: boolean; ready: boolean; revision: number; token: string } | null>(null);
         const progress = runningLocalStart ? runtimeProgress : status?.runtimeProgress;
         const working = busy || status?.phase === 'starting' || Boolean(progress && !progress.error);
-        const controlsLocked = working || Boolean(downloadConfirmation);
+        const controlsLocked = working || Boolean(downloadConfirmation || deleteConfirmation);
+        const hasConnection = Boolean(status?.configured && (status.mode === 'local' || (status.centralId && status.centerUrl)));
         const localIdentity = status?.localReviewIdentity || (status?.mode === 'local' && status.configured && status.centralId ? status.reviewIdentity : '');
         const centralHome = '/dsh-code-review/central/';
         const framePath = frameProject && frameProject.centralId === status?.centralId
@@ -729,8 +731,8 @@
         }, [showLocal, tab, status]);
 
         useEffect(() => {
-            if (downloadConfirmation && tab === 'connection') downloadPanel.current?.focus();
-        }, [downloadConfirmation, tab]);
+            if ((downloadConfirmation || deleteConfirmation) && tab === 'connection') confirmationPanel.current?.focus();
+        }, [downloadConfirmation, deleteConfirmation, tab]);
 
         const refresh = useCallback(async (afterWrite = false): Promise<void> => {
             const scope = scopeRef.current;
@@ -868,16 +870,16 @@
             ...(draft.expectedCentralId ? { expectedCentralId: draft.expectedCentralId } : {}),
         };
         const currentSaved = status?.savedConnections?.find(connection => connection.centralId === status.centralId);
-        const unchanged = Boolean(status?.configured && draft.mode === status.mode
+        const unchanged = Boolean(hasConnection && status && draft.mode === status.mode
             && (draft.mode === 'local' || (draft.centerUrl.trim() === status.centerUrl && draft.nodeId.trim() === status.nodeId && !draft.token
                 && (!draft.expectedCentralId || status.centralId === draft.expectedCentralId) && (draft.label?.trim() ?? '') === (currentSaved?.label ?? ''))));
         const savedDraft = (): ConnectionDraft => ({ mode: status!.mode, centerUrl: status!.centerUrl, nodeId: status!.nodeId, token: '',
             reviewIdentity: localIdentity || (status!.mode === 'local' ? status!.reviewIdentity : ''),
             label: currentSaved?.label, expectedCentralId: currentSaved?.centralId });
-        const chooseConnection = (connection?: SavedConnection, local = false): void => {
+        const editSavedConnection = (connection?: SavedConnection): void => {
             clearDraftFeedback();
             setDownloadNotice('');
-            setDraft({ mode: local ? 'local' : 'external', centerUrl: connection?.centerUrl ?? '', nodeId: connection?.nodeId ?? '',
+            setDraft({ mode: 'external', centerUrl: connection?.centerUrl ?? '', nodeId: connection?.nodeId ?? '',
                 token: '', reviewIdentity: localIdentity || '', label: connection?.label, expectedCentralId: connection?.centralId });
             edited.current = true;
             setEditing(true);
@@ -942,7 +944,7 @@
         const switchingConnection = Boolean(status?.configured && (draft.mode !== status.mode
             || draft.expectedCentralId && draft.expectedCentralId !== status.centralId));
         const applyLabel = busy && pendingAction === '/apply' ? (draft.mode === 'local' ? localStartLabel : '正在连接…')
-            : switchingConnection ? '切换并连接' : status?.configured ? '应用更改' : draft.mode === 'local' ? '应用并启动' : '保存并连接';
+            : hasConnection && switchingConnection ? '切换并连接' : hasConnection ? '应用更改' : draft.mode === 'local' ? '应用并启动' : '保存并连接';
         const starting = status?.phase === 'starting' || (busy && pendingAction === '/apply') || Boolean(progress && !progress.error);
         const runtimeStage = {
             preparing: '准备本机运行包', requesting: '请求下载', downloading: '下载运行包', verifying: '校验运行包',
@@ -953,7 +955,7 @@
         const phaseTitle = !status ? '正在读取状态…' : status.legacy ? '旧托管配置'
             : starting ? '正在连接…' : status.phase === 'error' ? '连接失败'
             : status.phase === 'ready' ? (status.nodeOnline ? '中央已连接' : status.serverReachable === false ? '连接状态待确认' : '节点离线')
-            : status.configured ? '连接已停止' : '尚未配置';
+            : hasConnection ? '连接已停止' : status.configured ? '未选择中央连接' : '尚未配置';
         const savedFailure: ConnectionFailure | null = loadError ? { message: loadError } : status?.error ? { message: status.error, issue: status.issue }
             : !busy && progress?.error ? { message: progress.error } : null;
         const visibleFailure = failure ?? savedFailure;
@@ -1086,7 +1088,7 @@
                 h('header', { className: 'dcr-connection-head' }, h('h1', null, '中央连接'),
                     h('span', { 'aria-live': 'polite', className: `dcr-chip ${!starting && status?.nodeOnline ? 'approved' : !starting && status?.phase === 'error' ? 'rejected' : 'pending'}` }, phaseTitle),
                 ),
-                downloadConfirmation ? h('section', { className: 'dcr-card dcr-connection-card', ref: downloadPanel, tabIndex: -1, 'aria-labelledby': 'dcr-download-title' },
+                downloadConfirmation ? h('section', { className: 'dcr-card dcr-connection-card', ref: confirmationPanel, tabIndex: -1, 'aria-labelledby': 'dcr-download-title' },
                     h('h2', { id: 'dcr-download-title' }, '下载本机中央运行包'),
                     h('p', null, `版本 ${downloadConfirmation.source.version} · ${runtimeBytes(downloadConfirmation.source.size, downloadConfirmation.source.size)}`),
                     h('p', { className: 'dcr-muted dcr-mono' }, downloadConfirmation.source.url),
@@ -1094,13 +1096,24 @@
                         h('button', { className: 'dcr-btn p', onClick: downloadConfirmation.submit }, '下载并启动'),
                         h('button', { className: 'dcr-btn', onClick: () => { setDownloadConfirmation(null); setDownloadNotice('已取消，未开始下载。'); } }, '取消')),
                 ) : null,
+                deleteConfirmation ? h('section', { className: 'dcr-card dcr-connection-card', ref: confirmationPanel, tabIndex: -1, 'aria-labelledby': 'dcr-delete-connection-title' },
+                    h('h2', { id: 'dcr-delete-connection-title' }, `删除连接「${deleteConfirmation.name}」`),
+                    h('p', null, `${deleteConfirmation.stopCurrent ? '此操作会先停止插件连接。' : ''}本机保存的地址、名称和节点凭据将被移除。审核历史和项目绑定会保留。`),
+                    h('div', { className: 'dcr-connection-actions' },
+                        h('button', { className: 'dcr-btn d', onClick: () => {
+                            const { centralId, stopCurrent } = deleteConfirmation;
+                            setDeleteConfirmation(null);
+                            void write('/forget', { centralId, stopCurrent });
+                        } }, deleteConfirmation.stopCurrent ? '确认停止并删除' : '确认删除'),
+                        h('button', { className: 'dcr-btn', onClick: () => setDeleteConfirmation(null) }, '取消')),
+                ) : null,
                 downloadNotice ? h('p', { className: 'dcr-banner info', role: 'status' }, downloadNotice) : null,
                 showProgress ? h('section', { className: 'dcr-card dcr-connection-card', 'aria-label': '本机中央启动进度' },
                     h('h2', { role: 'status' }, progress ? `${progress.error ? '' : '正在'}${runtimeStage[progress.stage]}${progress.error ? '失败' : '…'}` : '正在准备启动本机中央…'),
                     progress?.error ? null : h('progress', { 'aria-label': '运行包下载与启动进度', ...(showBytes ? { value: progress!.received, max: progress!.total } : {}) }),
                     showBytes ? h('p', null, `已下载 ${runtimeBytes(progress!.received!, progress!.total!)} / ${runtimeBytes(progress!.total!, progress!.total!)}`) : null,
                 ) : null,
-                status && (status.configured || status.legacy) ? h('section', { className: 'dcr-card dcr-connection-card' },
+                status && (hasConnection || status.legacy) ? h('section', { className: 'dcr-card dcr-connection-card' },
                     h('h2', null, currentSaved?.label || (status.mode === 'local' ? '本机托管' : '已有中央')),
                     h('dl', { className: 'dcr-connection-meta' },
                         h('dt', null, '中央地址'), h('dd', { className: 'dcr-mono' }, status.centerUrl || '等待中央启动'),
@@ -1133,6 +1146,8 @@
                         !status.legacy && !showForm ? h('button', { className: 'dcr-btn', disabled, onClick: editConnection }, '修改连接') : null,
                         status.configured && !status.legacy && !showForm ? h('button', { className: 'dcr-btn d', disabled: disabled || !status.enabled, onClick: () => { void write('/stop', {}); } },
                             busy && pendingAction === '/stop' ? '正在停止…' : '停止连接') : null,
+                        !status.legacy && !showForm && status.mode === 'external' ? h('button', { className: 'dcr-btn d', disabled,
+                            onClick: () => setDeleteConfirmation({ centralId: status.centralId, name: currentSaved?.label || status.centerUrl, stopCurrent: status.enabled }) }, '删除当前配置') : null,
                     ),
                 ) : visibleFailure && !showForm ? feedback(visibleFailure) : null,
                 status?.configured && !status.legacy && !showForm ? h('section', { className: 'dcr-card dcr-connection-card' },
@@ -1140,15 +1155,22 @@
                     ...(status.savedConnections ?? []).filter(connection => connection.centralId !== status.centralId).map(connection =>
                         h('div', { className: 'dcr-saved-connection', key: connection.centralId },
                             h('div', null, h('strong', null, connection.label || '已有中央'), h('small', { className: 'dcr-muted' }, connection.centerUrl)),
-                            h('button', { className: 'dcr-btn', 'aria-label': `选择连接 ${connection.label || connection.centerUrl}`, disabled, onClick: () => chooseConnection(connection) }, '选择'))),
+                            h('div', { className: 'dcr-connection-actions' },
+                                h('button', { className: 'dcr-btn p', 'aria-label': `切换到 ${connection.label || connection.centerUrl}`, disabled,
+                                    onClick: () => { void write('/apply', { savedCentralId: connection.centralId }); } }, '切换'),
+                                h('button', { className: 'dcr-btn', 'aria-label': `编辑连接 ${connection.label || connection.centerUrl}`, disabled,
+                                    onClick: () => editSavedConnection(connection) }, '编辑'),
+                                h('button', { className: 'dcr-btn d', 'aria-label': `删除连接 ${connection.label || connection.centerUrl}`, disabled,
+                                    onClick: () => setDeleteConfirmation({ centralId: connection.centralId, name: connection.label || connection.centerUrl, stopCurrent: false }) }, '删除')))),
                     status.mode !== 'local' && localIdentity ? h('div', { className: 'dcr-saved-connection' },
                         h('div', null, h('strong', null, '本机托管'), h('small', { className: 'dcr-muted' }, localIdentity)),
-                        h('button', { className: 'dcr-btn', 'aria-label': '选择本机托管', disabled, onClick: () => chooseConnection(undefined, true) }, '选择')) : null,
+                        h('button', { className: 'dcr-btn p', 'aria-label': '切换到本机托管', disabled: disabled || localUnavailable,
+                            onClick: () => startConnection({ mode: 'local', reviewIdentity: localIdentity }) }, '切换')) : null,
                     h('div', { className: 'dcr-connection-actions' },
-                        h('button', { className: 'dcr-btn', disabled, onClick: () => chooseConnection() }, '添加连接')),
+                        h('button', { className: 'dcr-btn', disabled, onClick: () => editSavedConnection() }, '添加连接')),
                 ) : null,
                 showForm ? h('section', { className: 'dcr-card dcr-connection-card', 'aria-busy': working },
-                    h('h2', null, status?.configured ? '修改配置' : '选择连接方式'),
+                    h('h2', null, hasConnection ? '修改配置' : '选择连接方式'),
                     h('div', { className: 'dcr-connection-modes', role: 'group', 'aria-label': '连接方式' },
                         modeOption('local', '本机托管', '由插件在这台机器上启动中央服务。'),
                         modeOption('external', '连接已有中央', '使用管理员提供的地址和节点凭据。'),

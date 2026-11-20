@@ -236,9 +236,13 @@ export class ConnectionController {
     }
 
     private savedCredentials(centralId: string, centerUrl: string) {
+        return this.savedAddress(centralId) === centerUrl ? this.secrets.nodes[centralId] : undefined;
+    }
+
+    private savedAddress(centralId: string): string | undefined {
+        if (!/^[\w-]{16,128}$/.test(centralId) || centralId === this.secrets.localCentralId) return undefined;
         const config = this.config;
-        const savedUrl = config?.mode === 'external' && config.centralId === centralId ? config.centerUrl : config?.profiles[centralId]?.centerUrl;
-        return savedUrl === centerUrl ? this.secrets.nodes[centralId] : undefined;
+        return config?.mode === 'external' && config.centralId === centralId ? config.centerUrl : config?.profiles[centralId]?.centerUrl;
     }
 
     private async acquire(): Promise<void> {
@@ -446,7 +450,13 @@ export class ConnectionController {
         return this.run(() => this.withOwnership(async () => {
             this.runtimeProgress = undefined;
             try {
-                await this.applyConnection(input);
+                if (input.savedCentralId === undefined) await this.applyConnection(input);
+                else {
+                    const centralId = typeof input.savedCentralId === 'string' ? input.savedCentralId : '';
+                    const centerUrl = this.savedAddress(centralId);
+                    if (!centerUrl) throw new Error('已保存的连接不存在，请刷新连接列表');
+                    await this.applyConnection({ mode: 'external', centerUrl, expectedCentralId: centralId });
+                }
                 this.runtimeProgress = undefined;
             } catch (error) {
                 const progress = this.runtimeProgress as RuntimeProgress | undefined;
@@ -546,6 +556,51 @@ export class ConnectionController {
             this.error = '';
             this.issue = undefined;
             this.generation++;
+        }));
+    }
+
+    async forget(input: Record<string, unknown>): Promise<void> {
+        return this.run(() => this.withOwnership(async () => {
+            const centralId = typeof input.centralId === 'string' ? input.centralId : '';
+            const config = this.config;
+            if (!config || !this.savedAddress(centralId)) throw new Error('已保存的连接不存在，请刷新连接列表');
+            const current = config.mode === 'external' && config.centralId === centralId;
+            if (current) {
+                if (config.enabled && input.stopCurrent !== true) throw new Error('该连接正在使用，请刷新后确认停止并删除');
+                await this.idle();
+                await this.shutdown(false);
+            }
+
+            const previous = current ? { ...config, enabled: false } : config;
+            const next = structuredClone(previous);
+            const profile = next.profiles[centralId];
+            if (profile) {
+                delete profile.centerUrl;
+                delete profile.label;
+            }
+            if (current) {
+                next.centerUrl = '';
+                next.centralId = '';
+                next.reviewIdentity = '';
+                this.runtimeProgress = undefined;
+                this.error = '';
+                this.issue = undefined;
+                this.generation++;
+            }
+            const nextSecrets = { ...this.secrets, nodes: { ...this.secrets.nodes } };
+            delete nextSecrets.nodes[centralId];
+            const configFile = path.join(this.options.directory, 'connection.json');
+            this.config = previous;
+            await saveJson(configFile, next);
+            this.config = next;
+            try {
+                await saveJson(path.join(this.options.directory, 'connection-secrets.json'), nextSecrets);
+            } catch (error) {
+                await saveJson(configFile, previous);
+                this.config = previous;
+                throw error;
+            }
+            this.secrets = nextSecrets;
         }));
     }
 
@@ -667,6 +722,7 @@ export class ConnectionController {
             if (endpoint === '/test') result = await this.test(input);
             else if (endpoint === '/apply') await this.apply(input);
             else if (endpoint === '/stop') await this.disable();
+            else if (endpoint === '/forget') await this.forget(input);
             else if (endpoint === '/projects') await this.project(input, url.searchParams.get('sessionId') ?? undefined);
             else { res.writeHead(404); res.end(); return; }
             res.setHeader('content-type', 'application/json; charset=utf-8');

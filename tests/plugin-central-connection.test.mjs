@@ -320,12 +320,38 @@ test('旧配置升级后可按中央切换并恢复已保存地址、节点和�
     assert.equal((await restored.status()).centralId, second.database.centralId);
     const saved = { centerUrl: original.centerUrl, expectedCentralId: original.centralId };
     assert.equal((await restored.test(saved)).authenticated, true);
-    await restored.apply({ mode: 'external', ...saved });
+    await restored.apply({ savedCentralId: original.centralId, centerUrl: secondUrl });
     const back = await restored.status();
     assert.equal(back.nodeId, firstNode.nodeId);
     assert.equal(back.projects[0].workspaceId, original.projects[0].workspaceId);
     assert.equal(back.projects[0].projectId, original.projects[0].projectId);
+    await restored.forget({ centralId: second.database.centralId, stopCurrent: false });
+    assert.equal((await restored.status()).nodeOnline, true);
+    assert.deepEqual((await restored.status()).savedConnections.map(connection => connection.centralId), [original.centralId]);
+    await assert.rejects(restored.apply({ savedCentralId: second.database.centralId }), /已保存的连接不存在/);
+    await assert.rejects(restored.forget({ centralId: original.centralId, stopCurrent: false }), /正在使用/);
+    await restored.forget({ centralId: original.centralId, stopCurrent: true });
+    const empty = await restored.status();
+    assert.equal(empty.configured, true);
+    assert.equal(empty.enabled, false);
+    assert.equal(empty.centralId, '');
+    assert.deepEqual(empty.savedConnections, []);
+    const retained = JSON.parse(await readFile(filename, 'utf8'));
+    assert.equal(retained.profiles[original.centralId].centerUrl, undefined);
+    assert.equal(retained.profiles[original.centralId].workspaces[0].projectId, original.projects[0].projectId);
+    const secrets = JSON.parse(await readFile(path.join(directory, 'connection-secrets.json'), 'utf8'));
+    assert.equal(secrets.nodes[original.centralId], undefined);
+    assert.equal(secrets.nodes[other.centralId], undefined);
+    assert.equal((await fetch(new URL('api/v1/info', original.centerUrl))).status, 200);
+    await assert.rejects(restored.apply({ mode: 'external', centerUrl: firstUrl, nodeId: firstNode.nodeId }), { code: 'invalid_token' });
     await restored.stop();
+    const restarted = new ConnectionController({ directory, candidates });
+    t.after(() => restarted.stop());
+    await restarted.init();
+    assert.equal((await restarted.status()).centralId, '');
+    await restarted.apply({ mode: 'external', centerUrl: firstUrl, ...firstNode });
+    assert.equal((await restarted.status()).projects[0].projectId, original.projects[0].projectId);
+    await restarted.stop();
 });
 
 test('未决中央任务阻止停用和更换中央，节点凭据与用户身份分别保存', async t => {
@@ -347,6 +373,7 @@ test('未决中央任务阻止停用和更换中央，节点凭据与用户身�
         payload: { operation: 'audit', idempotencyKey: 'pending-switch', payload: { note: '验证' } } });
     assert.equal(accepted.statusCode, 202, accepted.body);
     await assert.rejects(value.disable(), /未决|未核验|未确认/);
+    await assert.rejects(value.forget({ centralId: app.database.centralId, stopCurrent: true }), /未决|未核验|未确认/);
     await assert.rejects(value.apply({ mode: 'local', reviewIdentity: '其他中央审核者' }), /未决|未核验|未确认/);
     assert.equal((await value.status()).centralId, app.database.centralId);
 });
