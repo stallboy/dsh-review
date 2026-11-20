@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -47,7 +47,7 @@ test('审查档案要求显式填写必填字段并验证数组元素类型', ()
 });
 
 test('只读命令批量输出字段和路径，校验失败返回非零且不改数据', async t => {
-    const root = await mkdtemp(path.join(tmpdir(), 'review-data-cli-'));
+    const root = await mkdtemp(path.join(await realpath(tmpdir()), 'review-data-cli-'));
     t.after(() => rm(root, { recursive: true, force: true }));
     const reviewPath = path.join(root, '2026-11', 'strict', 'review.md');
     const auditPath = path.join(root, 'audits', auditId, 'audit.md');
@@ -58,7 +58,7 @@ test('只读命令批量输出字段和路径，校验失败返回非零且不�
     await writeFile(auditPath, audit);
     await writeFile(invalidPath, invalidReview);
     const cli = fileURLToPath(new URL('../packages/dsh-plugin/dist/host/validate-review-data.js', import.meta.url));
-    const run = (...files) => spawnSync(process.execPath, [cli, ...files], { cwd: root, encoding: 'utf8' });
+    const run = (...files) => spawnSync(process.execPath, [cli, ...files], { cwd: root, encoding: 'utf8', env: { ...process.env, INIT_CWD: '' } });
     const pass = run(path.relative(root, reviewPath), auditPath);
     assert.equal(pass.status, 0, pass.stderr);
     assert.deepEqual(JSON.parse(pass.stdout), { ok: true, files: [{ path: reviewPath, errors: [] }, { path: auditPath, errors: [] }] });
