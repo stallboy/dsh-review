@@ -46,6 +46,20 @@
         nodeId: string;
         token: string;
         reviewIdentity: string;
+        label?: string;
+        expectedCentralId?: string;
+    }
+    interface SavedConnection {
+        centralId: string;
+        centerUrl: string;
+        nodeId: string;
+        label?: string;
+    }
+    interface RuntimeProgress {
+        stage: 'preparing' | 'requesting' | 'downloading' | 'verifying' | 'unpacking' | 'switching' | 'starting';
+        received?: number;
+        total?: number;
+        error?: string;
     }
     type RegistrationCompatibility = 'supported' | 'unknown' | 'incompatible';
     interface ConnectionIssue {
@@ -72,6 +86,8 @@
         centralId: string;
         nodeId: string;
         reviewIdentity: string;
+        localReviewIdentity?: string;
+        savedConnections?: SavedConnection[];
         phase: 'stopped' | 'starting' | 'ready' | 'error';
         serverReachable?: boolean;
         nodeOnline: boolean;
@@ -84,6 +100,7 @@
         hasCredentials: boolean;
         localAvailable: boolean;
         localRuntimeDownload?: { version: string; url: string; size: number; sha256: string };
+        runtimeProgress?: RuntimeProgress;
         localRuntimeUpdate?: { currentVersion: string; latestVersion: string };
         legacy?: boolean;
     }
@@ -238,6 +255,10 @@
   function short(value: string | null | undefined): string {
     if (!value) return '—';
     return value.length > 12 ? value.slice(0, 12) : value;
+  }
+
+  function runtimeBytes(bytes: number, total: number): string {
+    return total < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KiB` : `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
   }
   function dateText(value: string | null | undefined): string {
     if (!value) return '—';
@@ -426,6 +447,9 @@
 .dcr-connection-meta dd{margin:0;overflow-wrap:anywhere}
 .dcr-connection-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .dcr-connection-actions .dcr-btn{min-height:34px;white-space:normal}
+.dcr-connection-card progress{width:100%;accent-color:var(--dsw-alias-brand-primary)}
+.dcr-saved-connection{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.dcr-saved-connection small{display:block;overflow-wrap:anywhere}
 .dcr-connection-checks{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;list-style:none;padding:0;margin:0}
 .dcr-connection-checks li{display:flex;gap:7px;align-items:first baseline;padding:8px 10px;line-height:1.45;background:var(--dsw-alias-bg-base);border:1px solid var(--dsw-alias-border-l1);border-radius:6px}
 .dcr-connection-checks .passed span{color:var(--dsw-alias-state-success-primary)}
@@ -676,21 +700,37 @@
         const [copyNotice, setCopyNotice] = useState('');
         const [busy, setBusy] = useState(false);
         const [pendingAction, setPendingAction] = useState('');
+        const [runningLocalStart, setRunningLocalStart] = useState(false);
+        const [runtimeProgress, setRuntimeProgress] = useState<RuntimeProgress | null>(null);
+        const [downloadConfirmation, setDownloadConfirmation] = useState<{ source: NonNullable<ConnectionStatus['localRuntimeDownload']>; submit: () => void } | null>(null);
+        const [downloadNotice, setDownloadNotice] = useState('');
+        const [centralSession, setCentralSession] = useState<{ generation: number; identity: string } | null>(null);
         const [editing, setEditing] = useState(false);
         const [confirmed, setControlReady] = useState(false);
-        const [framePath, setFramePath] = useState('/dsh-code-review/central/');
+        const [frameProject, setFrameProject] = useState<{ centralId: string; projectId: string } | null>(null);
         const [localRepoRevision, setLocalRepoRevision] = useState(0);
         const reloadLocalRepo = useCallback(() => setLocalRepoRevision(value => value + 1), []);
         const initialized = useRef(false);
         const edited = useRef(false);
+        const downloadPanel = useRef<HTMLElement | null>(null);
         const draftRevision = useRef(0);
         const scopeRef = useRef<{ api: ApiClient; reads: ApiClient; active: boolean; loading: boolean; writing: boolean; ready: boolean; revision: number; token: string } | null>(null);
-        const working = busy || status?.phase === 'starting';
+        const progress = runningLocalStart ? runtimeProgress : status?.runtimeProgress;
+        const working = busy || status?.phase === 'starting' || Boolean(progress && !progress.error);
+        const controlsLocked = working || Boolean(downloadConfirmation);
+        const localIdentity = status?.localReviewIdentity || (status?.mode === 'local' && status.configured && status.centralId ? status.reviewIdentity : '');
+        const centralHome = '/dsh-code-review/central/';
+        const framePath = frameProject && frameProject.centralId === status?.centralId
+            ? `${centralHome}projects/${encodeURIComponent(frameProject.projectId)}` : centralHome;
         const showLocal = Boolean(confirmed && !working && status && !status.configured && !status.legacy);
 
         useEffect(() => {
             if (status && !showLocal && tab === 'local') setTab('connection');
         }, [showLocal, tab, status]);
+
+        useEffect(() => {
+            if (downloadConfirmation && tab === 'connection') downloadPanel.current?.focus();
+        }, [downloadConfirmation, tab]);
 
         const refresh = useCallback(async (afterWrite = false): Promise<void> => {
             const scope = scopeRef.current;
@@ -707,7 +747,8 @@
                 setLoadError('');
                 if (!initialized.current) {
                     initialized.current = true;
-                    if (!edited.current) setDraft({ mode: value.mode, centerUrl: value.centerUrl, nodeId: value.nodeId, token: '', reviewIdentity: value.reviewIdentity });
+                    if (!edited.current) setDraft({ mode: value.mode, centerUrl: value.centerUrl, nodeId: value.nodeId, token: '',
+                        reviewIdentity: value.localReviewIdentity || (value.mode === 'local' ? value.reviewIdentity : '') });
                 }
             } catch (reason) {
                 if (scope.active && revision === scope.revision) setLoadError(reason instanceof Error ? reason.message : String(reason));
@@ -738,6 +779,40 @@
             };
         }, [refresh]);
 
+        useEffect(() => {
+            if (!runningLocalStart) return;
+            const api = createApi('/dsh-code-review/connection');
+            let active = true;
+            let reading = false;
+            const timer = setInterval(async () => {
+                if (reading) return;
+                reading = true;
+                try {
+                    const value = await api.get<RuntimeProgress | null>('/progress');
+                    if (active && value) setRuntimeProgress(value);
+                } catch {
+                    // 完整错误及连接状态由写请求和写后刷新处理。
+                } finally {
+                    reading = false;
+                }
+            }, 750);
+            return () => { active = false; clearInterval(timer); api.dispose(); };
+        }, [runningLocalStart]);
+
+        const externalGeneration = tab === 'connection' && status?.mode === 'external' && status.phase === 'ready' ? status.generation : undefined;
+        useEffect(() => {
+            setCentralSession(null);
+            if (externalGeneration === undefined) return;
+            const api = createApi('/dsh-code-review/central');
+            let active = true;
+            void api.get<{ user: { reviewIdentity: string } }>('/api/v1/auth/session').then(value => {
+                if (active && typeof value?.user?.reviewIdentity === 'string') {
+                    setCentralSession({ generation: externalGeneration, identity: value.user.reviewIdentity });
+                }
+            }).catch(() => {});
+            return () => { active = false; api.dispose(); };
+        }, [externalGeneration]);
+
         const clearDraftFeedback = (): void => {
             draftRevision.current += 1;
             setCheck(null);
@@ -746,6 +821,7 @@
         const edit = (change: Partial<ConnectionDraft>): void => {
             edited.current = true;
             clearDraftFeedback();
+            setDownloadNotice('');
             setDraft(previous => ({ ...previous, ...change }));
         };
         const write = async (path: string, body: unknown, forDraft = false): Promise<boolean> => {
@@ -789,44 +865,70 @@
             centerUrl: draft.centerUrl.trim(),
             ...(draft.nodeId.trim() ? { nodeId: draft.nodeId.trim() } : {}),
             ...(draft.token ? { token: draft.token } : {}),
+            ...(draft.expectedCentralId ? { expectedCentralId: draft.expectedCentralId } : {}),
         };
-        const unchanged = Boolean(status?.configured && draft.mode === status.mode && draft.reviewIdentity.trim() === status.reviewIdentity
-            && (draft.mode === 'local' || (draft.centerUrl.trim() === status.centerUrl && draft.nodeId.trim() === status.nodeId && !draft.token)));
-        const savedDraft = (): ConnectionDraft => ({ mode: status!.mode, centerUrl: status!.centerUrl, nodeId: status!.nodeId, token: '', reviewIdentity: status!.reviewIdentity });
+        const currentSaved = status?.savedConnections?.find(connection => connection.centralId === status.centralId);
+        const unchanged = Boolean(status?.configured && draft.mode === status.mode
+            && (draft.mode === 'local' || (draft.centerUrl.trim() === status.centerUrl && draft.nodeId.trim() === status.nodeId && !draft.token
+                && (!draft.expectedCentralId || status.centralId === draft.expectedCentralId) && (draft.label?.trim() ?? '') === (currentSaved?.label ?? ''))));
+        const savedDraft = (): ConnectionDraft => ({ mode: status!.mode, centerUrl: status!.centerUrl, nodeId: status!.nodeId, token: '',
+            reviewIdentity: localIdentity || (status!.mode === 'local' ? status!.reviewIdentity : ''),
+            label: currentSaved?.label, expectedCentralId: currentSaved?.centralId });
+        const chooseConnection = (connection?: SavedConnection, local = false): void => {
+            clearDraftFeedback();
+            setDownloadNotice('');
+            setDraft({ mode: local ? 'local' : 'external', centerUrl: connection?.centerUrl ?? '', nodeId: connection?.nodeId ?? '',
+                token: '', reviewIdentity: localIdentity || '', label: connection?.label, expectedCentralId: connection?.centralId });
+            edited.current = true;
+            setEditing(true);
+        };
         const editConnection = (): void => {
             clearDraftFeedback();
+            setDownloadNotice('');
             setDraft(savedDraft());
             edited.current = false;
             setEditing(true);
         };
         const cancelEditing = (): void => {
             clearDraftFeedback();
+            setDownloadNotice('');
             setDraft(savedDraft());
             edited.current = false;
             setEditing(false);
         };
         const localDownload = status?.localRuntimeDownload;
         const localUnavailable = status?.localAvailable === false && !localDownload;
-        const startConnection = async (body: { mode: ConnectionDraft['mode']; reviewIdentity: string }, forDraft = false): Promise<boolean> => {
-            if (scopeRef.current?.writing || working) return false;
+        const startConnection = (body: { mode: ConnectionDraft['mode']; reviewIdentity: string }, forDraft = false): void => {
+            if (scopeRef.current?.writing || controlsLocked) return;
             const download = body.mode === 'local' ? localDownload : undefined;
-            if (download) {
-                const size = download.size < 1024 * 1024 ? `${Math.ceil(download.size / 1024)} KiB` : `${(download.size / (1024 * 1024)).toFixed(2)} MiB`;
-                if (!window.confirm(`启动需要下载中央运行包 ${download.version}（${size}）。\n来源：${download.url}\n确认下载并启动？`)) return false;
-            }
-            return write('/apply', { ...body, ...(download ? { confirmRuntimeDownload: download.sha256 } : {}) }, forDraft);
+            setDownloadNotice('');
+            const submit = async (): Promise<void> => {
+                if (scopeRef.current?.writing) return;
+                setDownloadConfirmation(null);
+                setRuntimeProgress(null);
+                setRunningLocalStart(body.mode === 'local');
+                try {
+                    const applied = await write('/apply', { ...body, ...(download ? { confirmRuntimeDownload: download.sha256 } : {}) }, forDraft);
+                    if (applied && forDraft) { setEditing(false); edited.current = false; }
+                } finally {
+                    setRunningLocalStart(false);
+                }
+            };
+            if (download) setDownloadConfirmation({ source: download, submit: () => { void submit(); } });
+            else void submit();
         };
         const apply = (): void => {
             if ((status?.phase === 'ready' && unchanged) || (draft.mode === 'external' && check?.registrationCompatibility === 'incompatible')) return;
-            void startConnection({
+            startConnection({
                 mode: draft.mode,
-                ...(draft.mode === 'external' ? credentials : {}),
-                reviewIdentity: draft.reviewIdentity.trim(),
-            }, true).then(applied => { if (applied) { setEditing(false); edited.current = false; } });
+                ...(draft.mode === 'external' ? { ...credentials, ...(draft.label !== undefined ? { label: draft.label.trim() } : {}) } : {}),
+                reviewIdentity: draft.mode === 'local' && localIdentity ? localIdentity : draft.reviewIdentity.trim(),
+            }, true);
         };
         const openProject = (projectId: string, event: { preventDefault(): void }): void => {
             event.preventDefault();
-            setFramePath(`/dsh-code-review/central/projects/${encodeURIComponent(projectId)}`);
+            if (!status || starting) return;
+            setFrameProject({ centralId: status.centralId, projectId });
             setTab('central');
         };
         const projectLink = (projectId: string, label: string): any => h('a', {
@@ -834,26 +936,37 @@
             href: `/dsh-code-review/central/projects/${encodeURIComponent(projectId)}`,
             onClick: (event: { preventDefault(): void }) => openProject(projectId, event),
         }, label);
-        const disabled = working || !status || !confirmed || Boolean(status.legacy);
+        const disabled = controlsLocked || !status || !confirmed || Boolean(status.legacy);
         const showForm = Boolean(status && !status.legacy && (!status.configured || editing));
         const localStartLabel = localDownload ? '正在下载并启动…' : '正在启动…';
+        const switchingConnection = Boolean(status?.configured && (draft.mode !== status.mode
+            || draft.expectedCentralId && draft.expectedCentralId !== status.centralId));
         const applyLabel = busy && pendingAction === '/apply' ? (draft.mode === 'local' ? localStartLabel : '正在连接…')
-            : status?.configured ? '应用更改' : draft.mode === 'local' ? '应用并启动' : '保存并连接';
-        const starting = status?.phase === 'starting' || (busy && pendingAction === '/apply');
+            : switchingConnection ? '切换并连接' : status?.configured ? '应用更改' : draft.mode === 'local' ? '应用并启动' : '保存并连接';
+        const starting = status?.phase === 'starting' || (busy && pendingAction === '/apply') || Boolean(progress && !progress.error);
+        const runtimeStage = {
+            preparing: '准备本机运行包', requesting: '请求下载', downloading: '下载运行包', verifying: '校验运行包',
+            unpacking: '解包运行包', switching: '检查原连接状态', starting: '启动本机中央并连接节点',
+        };
+        const showProgress = Boolean(progress || runningLocalStart);
+        const showBytes = !progress?.error && progress?.received !== undefined && progress.total !== undefined;
         const phaseTitle = !status ? '正在读取状态…' : status.legacy ? '旧托管配置'
             : starting ? '正在连接…' : status.phase === 'error' ? '连接失败'
             : status.phase === 'ready' ? (status.nodeOnline ? '中央已连接' : status.serverReachable === false ? '连接状态待确认' : '节点离线')
             : status.configured ? '连接已停止' : '尚未配置';
-        const savedFailure: ConnectionFailure | null = loadError ? { message: loadError } : status?.error ? { message: status.error, issue: status.issue } : null;
+        const savedFailure: ConnectionFailure | null = loadError ? { message: loadError } : status?.error ? { message: status.error, issue: status.issue }
+            : !busy && progress?.error ? { message: progress.error } : null;
         const visibleFailure = failure ?? savedFailure;
         const formFailure = visibleFailure?.forDraft ? visibleFailure : null;
         const issue = formFailure?.issue;
         const fieldError = issue?.stage === 'address' ? 'centerUrl' : issue?.stage === 'credentials'
             ? issue.code === 'node_id_mismatch' || issue.code === 'invalid_node_id' ? 'nodeId' : 'token' : undefined;
         const feedbackId = 'dcr-connection-feedback';
-        const savedCredentials = status?.hasCredentials && status.mode === 'external' && draft.centerUrl.trim().replace(/\/+$/, '') === status.centerUrl.replace(/\/+$/, '')
-            && (!draft.nodeId.trim() || draft.nodeId.trim() === status.nodeId);
-        const field = (label: string, key: 'centerUrl' | 'nodeId' | 'token' | 'reviewIdentity'): any => h('label', { className: 'dcr-field' },
+        const selectedSaved = status?.savedConnections?.find(connection => connection.centralId === draft.expectedCentralId);
+        const credentialSource = selectedSaved ?? (status?.mode === 'external' && status.hasCredentials ? status : undefined);
+        const savedCredentials = credentialSource && draft.centerUrl.trim().replace(/\/+$/, '') === credentialSource.centerUrl.replace(/\/+$/, '')
+            && (!draft.nodeId.trim() || draft.nodeId.trim() === credentialSource.nodeId);
+        const field = (label: string, key: 'centerUrl' | 'nodeId' | 'token' | 'reviewIdentity' | 'label'): any => h('label', { className: 'dcr-field' },
             h('span', null, label),
             h('input', {
                 className: 'dcr-input', 'aria-label': label,
@@ -863,8 +976,8 @@
                 placeholder: key === 'centerUrl' ? 'https://review.example.com' : undefined,
                 'aria-invalid': fieldError === key || undefined,
                 'aria-describedby': fieldError === key ? feedbackId : undefined,
-                value: draft[key], disabled: working,
-                readOnly: key === 'reviewIdentity' && draft.mode === 'local' && status?.configured && status.mode === 'local',
+                value: draft[key] ?? '', disabled: controlsLocked,
+                maxLength: key === 'label' ? 80 : undefined,
                 onChange: (event: { target: { value: string } }) => edit({ [key]: event.target.value }),
             }),
         );
@@ -928,7 +1041,7 @@
                     h('a', { className: 'dcr-btn p', href: status.centerUrl, target: '_blank', rel: 'noopener noreferrer' }, '打开已有中央工作台'),
                 ))
                 : h('div', { className: 'dcr-empty' }, '旧托管配置中的中央地址无效，请检查 managed-node.json。')
-            : status?.phase === 'ready'
+            : status?.phase === 'ready' && !starting
                 ? h('iframe', { className: 'dcr-central-frame', title: '中央工作台', src: framePath, key: `${status.generation}:${framePath}` })
                 : h('div', { className: 'dcr-empty' }, '中央尚未就绪，请在中央连接中应用配置或重试。');
         else if (tab === 'projects') content = h('div', { className: 'dcr-body' }, h('div', { className: 'dcr-wrap' },
@@ -965,7 +1078,7 @@
             const modeOption = (mode: ConnectionDraft['mode'], label: string, description: string): any => {
                 const id = `${feedbackId}-${mode}`;
                 return h('button', { className: 'dcr-connection-mode', 'aria-label': label, 'aria-pressed': draft.mode === mode,
-                    'aria-describedby': id, disabled: working, onClick: () => edit({ mode }) },
+                    'aria-describedby': id, disabled: controlsLocked, onClick: () => edit({ mode }) },
                     h('strong', null, label), h('span', { id, className: 'dcr-muted' }, description),
                 );
             };
@@ -973,13 +1086,28 @@
                 h('header', { className: 'dcr-connection-head' }, h('h1', null, '中央连接'),
                     h('span', { 'aria-live': 'polite', className: `dcr-chip ${!starting && status?.nodeOnline ? 'approved' : !starting && status?.phase === 'error' ? 'rejected' : 'pending'}` }, phaseTitle),
                 ),
+                downloadConfirmation ? h('section', { className: 'dcr-card dcr-connection-card', ref: downloadPanel, tabIndex: -1, 'aria-labelledby': 'dcr-download-title' },
+                    h('h2', { id: 'dcr-download-title' }, '下载本机中央运行包'),
+                    h('p', null, `版本 ${downloadConfirmation.source.version} · ${runtimeBytes(downloadConfirmation.source.size, downloadConfirmation.source.size)}`),
+                    h('p', { className: 'dcr-muted dcr-mono' }, downloadConfirmation.source.url),
+                    h('div', { className: 'dcr-connection-actions' },
+                        h('button', { className: 'dcr-btn p', onClick: downloadConfirmation.submit }, '下载并启动'),
+                        h('button', { className: 'dcr-btn', onClick: () => { setDownloadConfirmation(null); setDownloadNotice('已取消，未开始下载。'); } }, '取消')),
+                ) : null,
+                downloadNotice ? h('p', { className: 'dcr-banner info', role: 'status' }, downloadNotice) : null,
+                showProgress ? h('section', { className: 'dcr-card dcr-connection-card', 'aria-label': '本机中央启动进度' },
+                    h('h2', { role: 'status' }, progress ? `${progress.error ? '' : '正在'}${runtimeStage[progress.stage]}${progress.error ? '失败' : '…'}` : '正在准备启动本机中央…'),
+                    progress?.error ? null : h('progress', { 'aria-label': '运行包下载与启动进度', ...(showBytes ? { value: progress!.received, max: progress!.total } : {}) }),
+                    showBytes ? h('p', null, `已下载 ${runtimeBytes(progress!.received!, progress!.total!)} / ${runtimeBytes(progress!.total!, progress!.total!)}`) : null,
+                ) : null,
                 status && (status.configured || status.legacy) ? h('section', { className: 'dcr-card dcr-connection-card' },
-                    h('h2', null, showForm ? '已保存连接' : status.mode === 'local' ? '本机托管' : '已有中央'),
+                    h('h2', null, currentSaved?.label || (status.mode === 'local' ? '本机托管' : '已有中央')),
                     h('dl', { className: 'dcr-connection-meta' },
                         h('dt', null, '中央地址'), h('dd', { className: 'dcr-mono' }, status.centerUrl || '等待中央启动'),
                         h('dt', null, '节点 ID'), h('dd', { className: 'dcr-mono' }, status.nodeId || '未分配'),
-                        status.mode === 'local' ? h('dt', null, '审核身份') : null,
-                        status.mode === 'local' ? h('dd', null, status.reviewIdentity || '未设置') : null,
+                        h('dt', null, '审核身份'),
+                        h('dd', null, status.mode === 'local' ? localIdentity || status.reviewIdentity || '未设置'
+                            : centralSession?.generation === status.generation ? centralSession.identity : '由中央工作台的登录账号决定'),
                     ),
                     visibleFailure && !formFailure ? feedback(visibleFailure) : null,
                     status.localRuntimeUpdate ? h('p', { className: 'dcr-banner info', role: 'status' },
@@ -994,14 +1122,31 @@
                         status.phase === 'ready' && hasProjects && !showForm ? h('button', { className: 'dcr-btn', onClick: () => setTab('projects') }, '管理项目') : null,
                         !status.legacy && (status.phase === 'error' || status.phase === 'stopped') ? h('button', { className: `dcr-btn${showForm ? '' : ' p'}`,
                             disabled: disabled || (status.mode === 'local' && localUnavailable),
-                            onClick: () => { void startConnection({ mode: status.mode, reviewIdentity: status.reviewIdentity, ...(status.mode === 'external' ? { centerUrl: status.centerUrl, nodeId: status.nodeId } : {}) }); } },
+                            onClick: () => startConnection({ mode: status.mode, reviewIdentity: status.reviewIdentity,
+                                ...(status.mode === 'external' ? { centerUrl: status.centerUrl, nodeId: status.nodeId, expectedCentralId: status.centralId || undefined } : {}) }) },
                             busy && pendingAction === '/apply' && status.mode === 'local' && localDownload ? localStartLabel
                                 : status.phase === 'error' ? '重试已保存连接' : '启动已保存连接') : null,
+                        !status.legacy && (!showForm || visibleFailure?.issue?.code === 'connection_busy') && canEnterWorkbench
+                             && (status.mode === 'external' || visibleFailure?.issue?.code === 'connection_busy')
+                             ? h('button', { className: 'dcr-btn', onClick: () => { setFrameProject(null); setTab('central'); } },
+                                 visibleFailure?.issue?.code === 'connection_busy' ? '返回原中央处理任务' : '前往工作台切换账号') : null,
                         !status.legacy && !showForm ? h('button', { className: 'dcr-btn', disabled, onClick: editConnection }, '修改连接') : null,
                         status.configured && !status.legacy && !showForm ? h('button', { className: 'dcr-btn d', disabled: disabled || !status.enabled, onClick: () => { void write('/stop', {}); } },
                             busy && pendingAction === '/stop' ? '正在停止…' : '停止连接') : null,
                     ),
                 ) : visibleFailure && !showForm ? feedback(visibleFailure) : null,
+                status?.configured && !status.legacy && !showForm ? h('section', { className: 'dcr-card dcr-connection-card' },
+                    h('h2', null, '管理连接'),
+                    ...(status.savedConnections ?? []).filter(connection => connection.centralId !== status.centralId).map(connection =>
+                        h('div', { className: 'dcr-saved-connection', key: connection.centralId },
+                            h('div', null, h('strong', null, connection.label || '已有中央'), h('small', { className: 'dcr-muted' }, connection.centerUrl)),
+                            h('button', { className: 'dcr-btn', 'aria-label': `选择连接 ${connection.label || connection.centerUrl}`, disabled, onClick: () => chooseConnection(connection) }, '选择'))),
+                    status.mode !== 'local' && localIdentity ? h('div', { className: 'dcr-saved-connection' },
+                        h('div', null, h('strong', null, '本机托管'), h('small', { className: 'dcr-muted' }, localIdentity)),
+                        h('button', { className: 'dcr-btn', 'aria-label': '选择本机托管', disabled, onClick: () => chooseConnection(undefined, true) }, '选择')) : null,
+                    h('div', { className: 'dcr-connection-actions' },
+                        h('button', { className: 'dcr-btn', disabled, onClick: () => chooseConnection() }, '添加连接')),
+                ) : null,
                 showForm ? h('section', { className: 'dcr-card dcr-connection-card', 'aria-busy': working },
                     h('h2', null, status?.configured ? '修改配置' : '选择连接方式'),
                     h('div', { className: 'dcr-connection-modes', role: 'group', 'aria-label': '连接方式' },
@@ -1009,13 +1154,14 @@
                         modeOption('external', '连接已有中央', '使用管理员提供的地址和节点凭据。'),
                     ),
                     draft.mode === 'external' ? h('div', { className: 'dcr-connection-section' },
-                        h('div', { className: 'dcr-connection-fields' }, field('中央地址', 'centerUrl'), field('节点 ID', 'nodeId'), field('节点 Token', 'token')),
-                        savedCredentials ? h('p', { className: 'dcr-muted' }, 'Token 留空时使用为此节点保存的凭据。') : null,
+                        h('div', { className: 'dcr-connection-fields' }, field('中央地址', 'centerUrl'), field('节点 ID', 'nodeId'), field('节点 Token', 'token'), field('连接名称（可选）', 'label')),
+                        savedCredentials ? h('p', { className: 'dcr-muted' }, 'Token 留空时使用为此节点保存的凭据。')
+                            : selectedSaved ? h('p', { className: 'dcr-muted' }, '修改地址时，请填写节点 Token 以核验原中央。') : null,
                     ) : h('div', { className: 'dcr-connection-section' },
-                        h('div', { className: 'dcr-connection-fields' }, field('审核身份', 'reviewIdentity')),
+                        localIdentity ? h('dl', { className: 'dcr-connection-meta' }, h('dt', null, '本机审核身份'), h('dd', null, localIdentity))
+                            : h('div', { className: 'dcr-connection-fields' }, field('审核身份', 'reviewIdentity')),
                         localDownload ? h('p', { className: 'dcr-muted' }, '首次启动需确认下载本机中央运行包。')
                             : localUnavailable ? h('p', { className: 'dcr-muted' }, '此插件包未包含本机中央服务。请使用本机整合包，或连接已有中央。') : null,
-                        status?.configured && status.mode === 'local' ? h('p', { className: 'dcr-muted' }, '本机审核身份已初始化。') : null,
                     ),
                     visibleFailure && (formFailure || !status?.configured) ? feedback(visibleFailure) : null,
                     check ? h('div', { className: 'dcr-connection-feedback', role: 'status' },
@@ -1025,10 +1171,11 @@
                     ) : null,
                     h('div', { className: 'dcr-connection-actions' },
                         h('button', { className: 'dcr-btn p', disabled: disabled || (status?.phase === 'ready' && unchanged)
-                            || (draft.mode === 'local' ? localUnavailable || !draft.reviewIdentity.trim() : !draft.centerUrl.trim() || check?.registrationCompatibility === 'incompatible'), onClick: apply }, applyLabel),
+                            || (draft.mode === 'local' ? localUnavailable || !localIdentity && !draft.reviewIdentity.trim()
+                                : !draft.centerUrl.trim() || check?.registrationCompatibility === 'incompatible'), onClick: apply }, applyLabel),
                         draft.mode === 'external' ? h('button', { className: 'dcr-btn', disabled: disabled || !draft.centerUrl.trim(), onClick: () => { void write('/test', credentials, true); } },
                             pendingAction === '/test' ? '正在检查…' : '检查连接') : null,
-                        editing && status?.configured ? h('button', { className: 'dcr-btn g', disabled: working, onClick: cancelEditing }, '取消修改') : null,
+                        editing && status?.configured ? h('button', { className: 'dcr-btn g', disabled: controlsLocked, onClick: cancelEditing }, '取消修改') : null,
                     ),
                 ) : null,
                 diagnosticDetails,
@@ -1036,7 +1183,7 @@
         }
         return h('div', { className: 'dcr dcr-workbench' },
             h('nav', { className: 'dcr-central-nav', 'aria-label': '评审入口' },
-                ...([['connection', '中央连接'], ['projects', '项目接入'], ['central', '中央工作台'], ...(showLocal ? [['local', '本地评审']] : [])] as [typeof tab, string][]).map(([key, label]) => h('button', { className: 'dcr-btn', key, 'aria-selected': tab === key, onClick: () => { if (key === 'central') setFramePath('/dsh-code-review/central/'); setTab(key); } }, label)),
+                ...([['connection', '中央连接'], ['projects', '项目接入'], ['central', '中央工作台'], ...(showLocal ? [['local', '本地评审']] : [])] as [typeof tab, string][]).map(([key, label]) => h('button', { className: 'dcr-btn', key, 'aria-selected': tab === key, onClick: () => { if (key === 'central') setFrameProject(null); setTab(key); } }, label)),
                 h('span', { className: 'dcr-grow' }),
                 h('button', { className: 'dcr-btn g', disabled: busy, onClick: () => { void refresh(); } }, '刷新连接'),
             ),

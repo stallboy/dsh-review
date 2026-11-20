@@ -11,7 +11,7 @@ import { NodeRegistrationError } from '../managed/managed-node.js';
 import { normalizeCenterUrl, readJson, saveJson, type Candidate, type ConnectionConfig, type ConnectionSecrets } from './config.js';
 import { CentralGateway, CENTRAL_PREFIX, requestBody } from './gateway.js';
 import { LocalCentralProcess } from './local-process.js';
-import { LocalCentralRuntime } from './local-runtime.js';
+import { LocalCentralRuntime, type RuntimeProgress } from './local-runtime.js';
 
 export const CONNECTION_PREFIX = '/dsh-code-review/connection';
 
@@ -74,6 +74,7 @@ export class ConnectionController {
     private localAccess = false;
     private readonly runtime: LocalCentralRuntime;
     private runtimeUpdate: Awaited<ReturnType<LocalCentralRuntime['newerVersion']>>;
+    private runtimeProgress?: RuntimeProgress;
     private readonly gateway: CentralGateway;
     private readonly controlToken = randomBytes(32).toString('base64url');
     private phase: 'stopped' | 'starting' | 'ready' | 'error' = 'stopped';
@@ -202,7 +203,7 @@ export class ConnectionController {
             registrationCompatibility: support === true ? 'supported' : support === false ? 'incompatible' : 'unknown' };
     }
 
-    private async verifyCredentials(centerUrl: string, info: CentralCheck, token: string, nodeId?: string): Promise<void> {
+    private async verifyCredentials(centerUrl: string, info: CentralCheck, token: string, nodeId?: string): Promise<NodeStatus> {
         const status = await this.request(centerUrl, 'node-api/v1/status', token, {}).catch(error => {
             const httpStatus = error instanceof CentralRequestError ? error.status : undefined;
             const rejected = httpStatus === 401 || httpStatus === 403;
@@ -213,18 +214,31 @@ export class ConnectionController {
         if (typeof status.nodeId !== 'string' || !status.nodeId || (nodeId && status.nodeId !== nodeId)) {
             throw new ConnectionIssueError('credentials', 'node_id_mismatch', '节点 ID 与接入凭据不匹配', undefined, info.registrationCompatibility);
         }
+        return status;
     }
 
     async test(input: Record<string, unknown>): Promise<CentralCheck & { authenticated: boolean }> {
         const centerUrl = this.address(input.centerUrl);
         const info = await this.inspectCentral(centerUrl);
+        this.checkExpectedCentral(input, info);
         const nodeId = typeof input.nodeId === 'string' ? input.nodeId.trim() : '';
-        const saved = this.config?.mode === 'external' && this.config.centerUrl === centerUrl && this.config.centralId === info.centralId
-            ? this.secrets.nodes[info.centralId] : undefined;
+        const saved = this.savedCredentials(info.centralId, centerUrl);
         const supplied = typeof input.token === 'string' ? input.token.trim() : '';
         const token = supplied || (saved && (!nodeId || nodeId === saved.nodeId) ? saved.token : '');
         if (token) await this.verifyCredentials(centerUrl, info, token, nodeId || (supplied ? undefined : saved?.nodeId));
         return { ...info, authenticated: Boolean(token) };
+    }
+
+    private checkExpectedCentral(input: Record<string, unknown>, info: CentralCheck): void {
+        if (input.expectedCentralId !== undefined && input.expectedCentralId !== info.centralId) {
+            throw new ConnectionIssueError('server', 'central_identity_changed', '此地址对应另一中央，请核对地址或添加为新连接');
+        }
+    }
+
+    private savedCredentials(centralId: string, centerUrl: string) {
+        const config = this.config;
+        const savedUrl = config?.mode === 'external' && config.centralId === centralId ? config.centerUrl : config?.profiles[centralId]?.centerUrl;
+        return savedUrl === centerUrl ? this.secrets.nodes[centralId] : undefined;
     }
 
     private async acquire(): Promise<void> {
@@ -401,17 +415,18 @@ export class ConnectionController {
         if (this.legacy) throw new Error('检测到旧 managed-node.json；请先在原中央处理未决任务，停用旧托管配置并重启插件，再应用新连接。旧执行记录不会自动迁移');
         if (!this.config?.centralId) return null;
         const journalFile = path.join(this.options.directory, 'connections', this.config.centralId, 'journal.sqlite');
-        if (this.node?.hasUnsettled()) throw new Error('节点存在未核验执行或未确认事件，请先处理原任务');
+        if (this.node?.hasUnsettled()) throw new ConnectionIssueError('startup', 'connection_busy', '节点存在未核验执行或未确认事件，请先处理原任务');
         if (!this.node && existsSync(journalFile)) {
             const journal = new ManagedJournal(journalFile);
-            try { if (journal.hasUnsettled()) throw new Error('节点存在未核验执行或未确认事件，请先恢复原连接'); }
+            try { if (journal.hasUnsettled()) throw new ConnectionIssueError('startup', 'connection_busy', '节点存在未核验执行或未确认事件，请先恢复原连接'); }
             finally { journal.close(); }
         }
         if (!this.config.enabled) return null;
         const credentials = this.secrets.nodes[this.config.centralId];
         if (!credentials) throw new Error('无法核验原中央节点状态，请恢复原连接');
         const status = await this.request(this.config.centerUrl, 'node-api/v1/status', credentials.token, {}) as NodeStatus;
-        if (status.centralId !== this.config.centralId || status.nodeId !== credentials.nodeId || status.pending) throw new Error('原中央身份变化或仍有未决任务，不能更换或停用连接');
+        if (status.centralId !== this.config.centralId || status.nodeId !== credentials.nodeId) throw new Error('原中央或节点身份已变化，请核对原连接');
+        if (status.pending) throw new ConnectionIssueError('startup', 'connection_busy', '原中央仍有未决任务，请先处理后再切换或停止连接');
         if (!this.node) {
             if (typeof status.activeInstance !== 'boolean' || typeof status.instanceId !== 'string') throw new Error('中央缺少实例恢复状态，请升级后重试');
             if (status.activeInstance) throw new Error('原节点仍有活动实例，请先确认旧节点已停止');
@@ -429,46 +444,94 @@ export class ConnectionController {
 
     async apply(input: Record<string, unknown>): Promise<void> {
         return this.run(() => this.withOwnership(async () => {
-            if (input.mode !== 'local' && input.mode !== 'external') throw new Error('请选择中央连接方式');
-            if (this.legacy) await this.idle();
-            const mode = input.mode;
-            const reviewIdentity = typeof input.reviewIdentity === 'string' ? input.reviewIdentity.trim() : this.config?.reviewIdentity ?? '';
-            if (mode === 'local' && (!reviewIdentity || reviewIdentity.length > 160)) throw new Error('请填写有效的本机审核身份');
-            if (mode === 'local' && this.secrets.localReviewIdentity && reviewIdentity !== this.secrets.localReviewIdentity) {
-                throw new Error('本机审核身份已初始化，不能通过修改连接配置更换操作者');
+            this.runtimeProgress = undefined;
+            try {
+                await this.applyConnection(input);
+                this.runtimeProgress = undefined;
+            } catch (error) {
+                const progress = this.runtimeProgress as RuntimeProgress | undefined;
+                if (progress) {
+                    this.runtimeProgress = { ...progress, error: this.describe(error, '本机中央启动失败', typeof input.token === 'string' ? input.token.trim() : undefined).message };
+                }
+                throw error;
             }
-            const centerUrl = mode === 'external' ? this.address(input.centerUrl ?? this.config?.centerUrl) : '';
-            let centralId = mode === 'local' ? this.secrets.localCentralId ?? (this.config?.mode === 'local' ? this.config.centralId : '') : '';
-            let credentials: { nodeId: string; token: string } | undefined;
-            if (mode === 'external') {
-                const info = await this.inspectCentral(centerUrl);
-                centralId = info.centralId;
-                const previous = this.secrets.nodes[centralId];
-                const nodeId = (typeof input.nodeId === 'string' ? input.nodeId.trim() : '') || previous?.nodeId || '';
-                const token = (typeof input.token === 'string' ? input.token.trim() : '') || (nodeId === previous?.nodeId ? previous.token : '');
-                if (!/^[\w-]{16,128}$/.test(nodeId)) throw new ConnectionIssueError('credentials', 'invalid_node_id', '请填写中央签发的节点 ID', undefined, info.registrationCompatibility);
-                if (!/^[\w-]{20,256}$/.test(token)) throw new ConnectionIssueError('credentials', 'invalid_token', '请填写中央签发的节点 Token', undefined, info.registrationCompatibility);
-                credentials = { nodeId, token };
-                await this.verifyCredentials(centerUrl, info, token, nodeId);
-                this.requireRegistrationSupport(info);
-                const saved = this.config?.profiles[centralId];
-                if (saved && saved.nodeId !== credentials.nodeId) throw new Error('该中央已有另一节点绑定，拒绝替换现有节点身份');
-            }
-            const same = Boolean(this.config && this.config.mode === mode && (mode === 'local' || this.config.centralId === centralId));
-            if (same && this.phase === 'ready' && (mode === 'local' || this.config!.centerUrl === centerUrl)) return;
-            const entry = mode === 'local' ? await this.localEntry(true) ?? await this.runtime.download(input.confirmRuntimeDownload) : undefined;
-            if (this.disposed) throw new Error('插件正在停止');
-            if (!same || this.phase === 'ready') await this.idle();
-            const profiles = this.config?.profiles ?? {};
-            this.options.beforeConfigure?.();
-            this.claimed = true;
-            await this.shutdown(false);
-            await this.runtime.discardReplaced();
-            this.config = { version: 1, enabled: true, mode, centerUrl, centralId, reviewIdentity, profiles };
-            if (credentials) this.secrets.nodes[centralId] = credentials;
-            await this.persist();
-            await this.resume(entry);
         }));
+    }
+
+    private async applyConnection(input: Record<string, unknown>): Promise<void> {
+        if (input.mode !== 'local' && input.mode !== 'external') throw new Error('请选择中央连接方式');
+        if (this.legacy) await this.idle();
+        const mode = input.mode;
+        const reviewIdentity = typeof input.reviewIdentity === 'string' ? input.reviewIdentity.trim()
+            : this.secrets.localReviewIdentity ?? this.config?.reviewIdentity ?? '';
+        if (mode === 'local' && (!reviewIdentity || reviewIdentity.length > 160)) throw new Error('请填写有效的本机审核身份');
+        if (mode === 'local' && this.secrets.localReviewIdentity && reviewIdentity !== this.secrets.localReviewIdentity) {
+            throw new Error('本机审核身份已初始化，不能通过修改连接配置更换操作者');
+        }
+        const centerUrl = mode === 'external' ? this.address(input.centerUrl ?? this.config?.centerUrl) : '';
+        let centralId = mode === 'local' ? this.secrets.localCentralId ?? (this.config?.mode === 'local' ? this.config.centralId : '') : '';
+        let credentials: { nodeId: string; token: string } | undefined;
+        const label = typeof input.label === 'string' ? input.label.trim() : undefined;
+        if (label && label.length > 80) throw new Error('连接名称不能超过 80 个字符');
+        if (mode === 'external') {
+            const info = await this.inspectCentral(centerUrl);
+            this.checkExpectedCentral(input, info);
+            centralId = info.centralId;
+            const previous = this.savedCredentials(centralId, centerUrl);
+            const supplied = typeof input.token === 'string' ? input.token.trim() : '';
+            const nodeId = (typeof input.nodeId === 'string' ? input.nodeId.trim() : '') || previous?.nodeId || '';
+            const token = supplied || (nodeId === previous?.nodeId ? previous.token : '');
+            if (!/^[\w-]{16,128}$/.test(nodeId)) throw new ConnectionIssueError('credentials', 'invalid_node_id', '请填写中央签发的节点 ID', undefined, info.registrationCompatibility);
+            if (!/^[\w-]{20,256}$/.test(token)) throw new ConnectionIssueError('credentials', 'invalid_token', '请填写中央签发的节点 Token', undefined, info.registrationCompatibility);
+            credentials = { nodeId, token };
+            const target = await this.verifyCredentials(centerUrl, info, token, nodeId);
+            this.requireRegistrationSupport(info);
+            const saved = this.config?.profiles[centralId];
+            if (saved && saved.nodeId !== credentials.nodeId) throw new Error('该中央已有另一节点绑定，拒绝替换现有节点身份');
+            if (this.config?.enabled && this.config.centralId !== centralId && target.activeInstance === true) {
+                throw new ConnectionIssueError('registration', 'instance_conflict', '目标中央已连接相同节点的活动实例');
+            }
+        }
+        const same = Boolean(this.config && this.config.mode === mode && (mode === 'local' || this.config.centralId === centralId));
+        if (same && this.phase === 'ready' && (mode === 'local' || this.config!.centerUrl === centerUrl)) {
+            const profile = this.config!.profiles[centralId];
+            if (mode === 'external' && profile && label !== undefined && profile.label !== (label || undefined)) {
+                const previousLabel = profile.label;
+                profile.label = label || undefined;
+                try { await this.persist(); }
+                catch (error) { profile.label = previousLabel; throw error; }
+            }
+            return;
+        }
+        if (mode === 'local') this.runtimeProgress = { stage: 'preparing' };
+        const entry = mode === 'local' ? await this.localEntry(true) ?? await this.runtime.download(input.confirmRuntimeDownload,
+            progress => { this.runtimeProgress = progress; }) : undefined;
+        if (this.disposed) throw new Error('插件正在停止');
+        if (mode === 'local') this.runtimeProgress = { stage: 'switching' };
+        if (!same || this.phase === 'ready') await this.idle();
+        const profiles = this.config?.profiles ?? {};
+        const prior = this.config;
+        if (prior?.mode === 'external') {
+            const priorNode = this.secrets.nodes[prior.centralId];
+            const priorProfile = profiles[prior.centralId] ?? (priorNode
+                ? profiles[prior.centralId] = { nodeId: priorNode.nodeId, workspaces: [] } : undefined);
+            if (priorProfile) priorProfile.centerUrl = prior.centerUrl;
+        }
+        this.options.beforeConfigure?.();
+        this.claimed = true;
+        await this.shutdown(false);
+        await this.runtime.discardReplaced();
+        this.config = { version: 1, enabled: true, mode, centerUrl, centralId, reviewIdentity: mode === 'local' ? reviewIdentity : '', profiles };
+        if (credentials) {
+            this.secrets.nodes[centralId] = credentials;
+            const profile = profiles[centralId] ??= { nodeId: credentials.nodeId, workspaces: [] };
+            profile.centerUrl = centerUrl;
+            if (label !== undefined) profile.label = label || undefined;
+        } else {
+            this.runtimeProgress = { stage: 'starting' };
+        }
+        await this.persist();
+        await this.resume(entry);
     }
 
     async disable(): Promise<void> {
@@ -479,6 +542,7 @@ export class ConnectionController {
             this.config.enabled = false;
             await this.persist();
             this.phase = 'stopped';
+            this.runtimeProgress = undefined;
             this.error = '';
             this.issue = undefined;
             this.generation++;
@@ -554,6 +618,12 @@ export class ConnectionController {
         }
         const localAvailable = Boolean(await this.localEntry(false));
         const localRuntimeDownload = localAvailable ? undefined : await this.runtime.offer();
+        const localCentralId = this.secrets.localCentralId ?? (config?.mode === 'local' ? config.centralId : undefined);
+        const localReviewIdentity = this.secrets.localReviewIdentity ?? (config?.mode === 'local' && config.centralId ? config.reviewIdentity : undefined);
+        const savedConnections = Object.entries(config?.profiles ?? {}).flatMap(([centralId, profile]) => {
+            const centerUrl = config?.mode === 'external' && config.centralId === centralId ? config.centerUrl : profile.centerUrl;
+            return centralId !== localCentralId && centerUrl ? [{ centralId, centerUrl, label: profile.label, nodeId: profile.nodeId }] : [];
+        });
         return { controlToken: this.controlToken, configured: this.configured, legacy: this.legacy,
             enabled: config?.enabled ?? false, mode: config?.mode ?? (this.legacy ? 'external' : 'local'), centerUrl: config?.centerUrl ?? this.legacyConnection?.centerUrl ?? '',
             centralId: config?.centralId ?? '', nodeId: profile?.nodeId ?? this.legacyConnection?.nodeId ?? '', reviewIdentity: config?.reviewIdentity ?? '',
@@ -563,7 +633,8 @@ export class ConnectionController {
                 return workspaceIssue ? { ...workspace, workspaceIssue } : workspace;
             }),
             logs: [...this.logs], hasCredentials: Boolean(config && this.secrets.nodes[config.centralId]), localAvailable,
-            localRuntimeDownload, localRuntimeUpdate: config?.mode === 'local' && this.phase === 'ready' ? this.runtimeUpdate : undefined };
+            localRuntimeDownload, runtimeProgress: this.runtimeProgress, localReviewIdentity, savedConnections,
+            localRuntimeUpdate: config?.mode === 'local' && this.phase === 'ready' ? this.runtimeUpdate : undefined };
     }
 
     async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -576,6 +647,11 @@ export class ConnectionController {
                 return;
             }
             const endpoint = url.pathname.slice(CONNECTION_PREFIX.length).replace(/\/$/, '');
+            if (req.method === 'GET' && endpoint === '/progress') {
+                res.writeHead(200, { 'cache-control': 'no-store', 'content-type': 'application/json; charset=utf-8' });
+                res.end(JSON.stringify(this.runtimeProgress ?? null));
+                return;
+            }
             if (req.method === 'GET' && !endpoint) {
                 res.setHeader('cache-control', 'no-store');
                 res.setHeader('content-type', 'application/json; charset=utf-8');

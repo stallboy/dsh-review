@@ -30,6 +30,7 @@ function createPanel(status = initialStatus(), confirm = () => { throw new Error
     let disposed = false;
     let activeStatus = status;
     let pendingRequest = false;
+    let holdApply = false;
     let sessionId;
     let repoRoot = '';
     let failedWrite = '';
@@ -37,6 +38,7 @@ function createPanel(status = initialStatus(), confirm = () => { throw new Error
     let delayNextRead = false;
     let failNextRead = false;
     const delayedReads = [];
+    const delayedApplies = [];
     const components = new Map();
     const requests = [];
     const timers = new Map();
@@ -114,8 +116,16 @@ function createPanel(status = initialStatus(), confirm = () => { throw new Error
             if (failedWrite && init.method === 'POST') return { ok: false, status: 409, text: async () => JSON.stringify({ error: typeof failedWrite === 'string' ? { message: failedWrite } : failedWrite }) };
             if (testResult && String(url).includes('/connection/test')) return { ok: true, status: 200, text: async () => JSON.stringify(testResult) };
             const pathname = new URL(url).pathname;
+            if (holdApply && pathname.endsWith('/connection/apply')) {
+                return new Promise((resolve, reject) => {
+                    delayedApplies.push(() => resolve({ ok: true, status: 200, text: async () => '{}' }));
+                    init.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+                });
+            }
             if (pathname.endsWith('/settings') && init.method === 'PUT') repoRoot = JSON.parse(init.body).repoRoot;
-            const value = pathname.includes('/connection') ? activeStatus
+            const value = pathname.endsWith('/api/v1/auth/session') ? activeStatus.testSession ?? null
+                : pathname.endsWith('/connection/progress') ? activeStatus.runtimeProgress ?? null
+                : pathname.includes('/connection') ? activeStatus
                 : pathname.endsWith('/health') ? { configured: Boolean(repoRoot), repoRoot, counts: {}, diagnostics: [] }
                 : pathname.endsWith('/queue') ? { items: [], counts: {}, errors: [], repoRoot }
                 : { settings: { owner: '', repoRoot }, validation: { ok: true, errors: [] }, runners: [] };
@@ -182,6 +192,8 @@ function createPanel(status = initialStatus(), confirm = () => { throw new Error
         delayNextRead() { delayNextRead = true; },
         failNextRead() { failNextRead = true; },
         releaseReads() { for (const resolve of delayedReads.splice(0)) resolve(); },
+        holdApply() { holdApply = true; },
+        releaseApply() { holdApply = false; for (const resolve of delayedApplies.splice(0)) resolve(); },
         unmount() {
             disposed = true;
             for (const owner of components.values()) for (const hook of owner.hooks) hook?.cleanup?.();
@@ -364,7 +376,7 @@ test('重试使用已保存配置，待应用草稿及令牌不会随重试提�
     panel.button('重试已保存连接').props.onClick();
     await panel.flush();
     assert.deepEqual(panel.requests.find(request => request.init.method === 'POST').body, {
-        mode: 'external', reviewIdentity: '张三', centerUrl: 'http://127.0.0.1:42100', nodeId: 'node-a',
+        mode: 'external', reviewIdentity: '张三', centerUrl: 'http://127.0.0.1:42100', nodeId: 'node-a', expectedCentralId: 'central-a',
     });
     assert.equal(panel.input('中央地址').props.value, 'https://draft.example');
     assert.equal(panel.input('节点 Token').props.value, 'draft-secret');
@@ -392,7 +404,7 @@ test('切换会话不会取消中央连接操作或重置草稿，卸载才取�
     panel.input('节点 ID').props.onChange({ target: { value: 'draft-node-id' } });
     await panel.flush();
     panel.holdRequests();
-    panel.button('应用更改').props.onClick();
+    panel.button('切换并连接').props.onClick();
     await panel.flush();
     const previousRequest = panel.requests.at(-1);
     assert.equal(panel.button('正在连接…').props.disabled, true);
@@ -421,35 +433,90 @@ test('轻量插件禁用本机启动但仍允许选择已有中央', async () =>
 test('可下载版沿用两个启动入口，取消保留草稿，确认只提交当前运行包摘要', async () => {
     const source = { version: '0.1.0', url: 'https://download.example.test/central.tgz', size: 1048576, sha256: 'a'.repeat(64) };
     const downloadStatus = { ...initialStatus(), localAvailable: false, enabled: false, phase: 'stopped', localRuntimeDownload: source };
-    const dialogs = [];
-    const confirm = message => { dialogs.push(message); return dialogs.length > 1; };
-    const panel = createPanel({ ...downloadStatus, configured: false }, confirm);
+    const panel = createPanel({ ...downloadStatus, configured: false });
     await panel.flush();
     panel.input('审核身份').props.onChange({ target: { value: '自选审核者' } });
     await panel.flush();
     assert.equal(panel.button('应用并启动').props.disabled, false);
     panel.button('应用并启动').props.onClick();
     await panel.flush();
+    for (const piece of ['0.1.0', source.url, '1.00 MiB']) assert.ok(panel.text().includes(piece));
+    panel.button('取消').props.onClick();
+    await panel.flush();
     assert.equal(panel.requests.some(request => request.init.method === 'POST'), false);
     assert.equal(panel.input('审核身份').props.value, '自选审核者');
-    for (const piece of ['0.1.0', source.url, '1.00 MiB']) assert.ok(dialogs[0].includes(piece));
+    assert.match(panel.text(), /已取消，未开始下载/);
     panel.button('应用并启动').props.onClick();
+    await panel.flush();
+    panel.holdApply();
+    panel.button('下载并启动').props.onClick();
     await panel.flush();
     const posts = panel.requests.filter(request => request.init.method === 'POST');
     assert.equal(posts.length, 1);
     assert.deepEqual(posts[0].body, { mode: 'local', reviewIdentity: '自选审核者', confirmRuntimeDownload: source.sha256 });
+    assert.match(panel.text(), /正在准备启动本机中央/);
+    const downloading = { ...downloadStatus, configured: false, runtimeProgress: { stage: 'downloading', received: 524288, total: 1048576 } };
+    panel.setStatus(downloading);
+    await panel.poll();
+    assert.match(panel.text(), /已下载 0.50 MiB \/ 1.00 MiB/);
+    assert.equal(panel.nodes().find(node => node.type === 'progress').props.value, 524288);
+    const reopened = createPanel(downloading);
+    await reopened.flush();
+    assert.match(reopened.text(), /已下载 0.50 MiB \/ 1.00 MiB/);
+    assert.equal(reopened.button('应用并启动').props.disabled, true);
+    reopened.unmount();
+    panel.setStatus({ ...initialStatus(), reviewIdentity: '自选审核者' });
+    panel.releaseApply();
+    await panel.flush();
+    assert.match(panel.text(), /中央已连接/);
+    assert.equal(panel.nodes().some(node => node.type === 'progress'), false);
     panel.unmount();
 
-    const saved = createPanel(downloadStatus, confirm);
+    const saved = createPanel(downloadStatus);
     await saved.flush();
     saved.button('启动已保存连接').props.onClick();
     await saved.flush();
-    assert.equal(dialogs.length, 3);
+    assert.ok(saved.text().includes(source.url));
+    saved.button('下载并启动').props.onClick();
+    await saved.flush();
     assert.equal(saved.requests.find(request => request.init.method === 'POST').body.confirmRuntimeDownload, source.sha256);
     saved.setStatus({ ...initialStatus(), localRuntimeUpdate: { currentVersion: '0.1.0', latestVersion: '0.2.0' } });
     await saved.poll();
     assert.match(saved.text(), /中央运行包.*0\.1\.0.*0\.2\.0|中央运行包.*0\.2\.0.*0\.1\.0/);
     saved.unmount();
+});
+
+test('选择已保存连接不启动，切换请求绑定中央身份，返回本机时恢复已初始化身份', async () => {
+    const connection = { centralId: 'central-remote', label: '团队中央', centerUrl: 'https://review.example/', nodeId: 'team-node' };
+    const local = { ...initialStatus(), localReviewIdentity: '张三', savedConnections: [connection] };
+    const panel = createPanel(local);
+    await panel.flush();
+    panel.button('选择连接 团队中央').props.onClick();
+    await panel.flush();
+    assert.equal(panel.input('中央地址').props.value, connection.centerUrl);
+    assert.equal(panel.input('节点 Token').props.value, '');
+    assert.equal(panel.requests.some(request => request.init.method === 'POST'), false);
+    const external = { ...local, ...connection, mode: 'external', reviewIdentity: '', generation: 2,
+        testSession: { user: { reviewIdentity: '团队审核员' } } };
+    panel.setStatus(external);
+    panel.button('切换并连接').props.onClick();
+    await panel.flush();
+    const post = () => panel.requests.filter(request => request.init.method === 'POST').at(-1);
+    assert.equal(post().body.expectedCentralId, connection.centralId);
+    assert.equal(post().body.token, undefined);
+    assert.match(panel.text(), /审核身份团队审核员/);
+    panel.button('前往工作台切换账号');
+    panel.button('选择本机托管').props.onClick();
+    await panel.flush();
+    assert.match(panel.text(), /本机审核身份张三/);
+    assert.equal(panel.nodes().some(node => node.type === 'input' && node.props['aria-label'] === '审核身份'), false);
+    panel.setStatus(local);
+    panel.button('切换并连接').props.onClick();
+    await panel.flush();
+    assert.deepEqual(post().body, { mode: 'local', reviewIdentity: '张三' });
+    assert.match(panel.text(), /审核身份张三/);
+    assert.doesNotMatch(panel.text(), /团队审核员/);
+    panel.unmount();
 });
 
 test('存在已保存中央配置时隐藏本地评审，不加载旧可写面板', async () => {
@@ -539,7 +606,7 @@ test('已连接的未变配置不能再次应用，取消编辑不改变运行�
     await panel.flush();
     panel.input('中央地址').props.onChange({ target: { value: 'https://draft.example' } });
     await panel.flush();
-    assert.equal(panel.button('应用更改').props.disabled, false);
+    assert.equal(panel.button('切换并连接').props.disabled, false);
     panel.button('取消修改').props.onClick();
     await panel.flush();
     assert.match(panel.text(), /本机托管/);

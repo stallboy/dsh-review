@@ -277,6 +277,57 @@ test('切换已有中央后停止插件不停止已有服务，切回本机保�
     assert.equal((await fetch(new URL('/api/v1/info', centerUrl))).status, 200);
 });
 
+test('旧配置升级后可按中央切换并恢复已保存地址、节点和工作副本', async t => {
+    const first = (await setupCentral(t)).app;
+    const second = (await setupCentral(t)).app;
+    const firstUrl = await first.listen({ host: '127.0.0.1', port: 0 });
+    const secondUrl = await second.listen({ host: '127.0.0.1', port: 0 });
+    const firstNode = first.database.createNode('旧配置节点');
+    const secondNode = second.database.createNode('团队节点');
+    const root = await createGitFixture();
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const { discoverCandidates } = await import('../packages/dsh-plugin/dist/connection/config.js');
+    const candidates = () => discoverCandidates([{ root }]);
+    const { value, directory, ConnectionController } = await controller(t, { candidates });
+    await value.apply({ mode: 'external', centerUrl: firstUrl, ...firstNode });
+    await value.project({ candidateId: (await candidates())[0].id, enabled: true });
+    const original = await value.status();
+    await value.stop();
+    const filename = path.join(directory, 'connection.json');
+    const legacy = JSON.parse(await readFile(filename, 'utf8'));
+    delete legacy.profiles[original.centralId].centerUrl;
+    await writeFile(filename, JSON.stringify(legacy));
+
+    const restored = new ConnectionController({ directory, candidates });
+    t.after(() => restored.stop());
+    await restored.init();
+    const activeTarget = (await controller(t)).value;
+    await activeTarget.apply({ mode: 'external', centerUrl: secondUrl, ...secondNode });
+    await assert.rejects(restored.apply({ mode: 'external', centerUrl: secondUrl, ...secondNode }), { code: 'instance_conflict' });
+    assert.equal((await restored.status()).nodeOnline, true);
+    assert.equal((await restored.status()).centralId, original.centralId);
+    await activeTarget.stop();
+    await restored.apply({ mode: 'external', centerUrl: secondUrl, ...secondNode, label: '团队中央' });
+    const other = await restored.status();
+    assert.equal(other.projects.length, 0);
+    assert.deepEqual(other.savedConnections.map(connection => [connection.centralId, connection.centerUrl, connection.label]), [
+        [original.centralId, original.centerUrl, undefined], [second.database.centralId, other.centerUrl, '团队中央'],
+    ]);
+    assert.equal(JSON.stringify(other.savedConnections).includes(firstNode.token), false);
+    assert.equal(JSON.stringify(other.savedConnections).includes(secondNode.token), false);
+    await assert.rejects(restored.apply({ mode: 'external', centerUrl: secondUrl, expectedCentralId: original.centralId }),
+        { code: 'central_identity_changed' });
+    assert.equal((await restored.status()).centralId, second.database.centralId);
+    const saved = { centerUrl: original.centerUrl, expectedCentralId: original.centralId };
+    assert.equal((await restored.test(saved)).authenticated, true);
+    await restored.apply({ mode: 'external', ...saved });
+    const back = await restored.status();
+    assert.equal(back.nodeId, firstNode.nodeId);
+    assert.equal(back.projects[0].workspaceId, original.projects[0].workspaceId);
+    assert.equal(back.projects[0].projectId, original.projects[0].projectId);
+    await restored.stop();
+});
+
 test('未决中央任务阻止停用和更换中央，节点凭据与用户身份分别保存', async t => {
     let runtime;
     t.after(() => runtime?.stop());

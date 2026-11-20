@@ -206,12 +206,21 @@ test('可下载插件隔离安装后须明确确认，校验失败保留原连�
     let corrupt = true;
     let count = 0;
     let versionResponse;
+    let finishDownload;
+    let pauseDownload = false;
     const server = createServer((request, response) => {
         if (request.url === '/central.tgz') {
             count++;
-            response.end(corrupt ? corrupted : runtimeArchive);
+            if (corrupt) response.end(corrupted);
+            else if (pauseDownload) {
+                const midpoint = Math.floor(runtimeArchive.length / 2);
+                response.write(runtimeArchive.subarray(0, midpoint));
+                finishDownload = () => response.end(runtimeArchive.subarray(midpoint));
+            } else response.end(runtimeArchive);
         } else if (request.url === '/latest.json') {
             versionResponse = response;
+        } else if (request.url === '/dsh-code-review/connection/progress') {
+            void controller.handle(request, response);
         } else response.writeHead(404).end();
     });
     server.listen(0, '127.0.0.1');
@@ -250,14 +259,34 @@ test('可下载插件隔离安装后须明确确认，校验失败保留原连�
     assert.equal(preserved.mode, 'external');
     assert.equal(preserved.phase, 'ready');
     assert.equal(preserved.nodeOnline, true);
+    assert.equal(preserved.runtimeProgress.stage, 'verifying');
+    assert.match(preserved.runtimeProgress.error, /SHA-256 校验失败/);
 
     corrupt = false;
-    await controller.apply(confirmed);
+    pauseDownload = true;
+    const apply = controller.apply(confirmed);
+    void apply.catch(() => {});
+    try {
+        let progress;
+        for (let attempt = 0; attempt < 80; attempt++) {
+            const response = await fetch(`${origin}/dsh-code-review/connection/progress`);
+            progress = await response.json();
+            if (progress?.stage === 'downloading' && progress.received === Math.floor(runtimeArchive.length / 2)) break;
+            await delay(25);
+        }
+        assert.deepEqual(progress, { stage: 'downloading', received: Math.floor(runtimeArchive.length / 2), total: runtimeArchive.length });
+        assert.equal((await controller.status()).mode, 'external');
+    } finally {
+        pauseDownload = false;
+        finishDownload?.();
+    }
+    await apply;
     const ready = await controller.status();
     assert.equal(ready.phase, 'ready');
     assert.equal(ready.nodeOnline, true);
     assert.equal(ready.localAvailable, true);
     assert.equal(ready.localRuntimeDownload, undefined);
+    assert.equal(ready.runtimeProgress, undefined);
     assert.equal(ready.localRuntimeUpdate, undefined);
     assert.equal((await fetch(new URL('/', ready.centerUrl))).status, 200);
     for (let attempt = 0; !versionResponse && attempt < 20; attempt++) await delay(25);

@@ -42,13 +42,21 @@ window.__ModuleLoader__={load({factory}){factory(()=>React).apply({get(){},effec
 }}})}};
 window.fetch=async(url,init={})=>{
     let value;
-    if(String(url).includes('/connection')){
+    if(String(url).endsWith('/connection/progress')){
+        value=status.runtimeProgress??null;
+    }else if(String(url).includes('/connection')){
         if(init.method==='POST'){
             test.writes++;
             const body=JSON.parse(init.body||'{}');
             if(String(url).includes('/apply')){
                 status.phase='starting';
-                await new Promise(resolve=>setTimeout(resolve,120));
+                if(body.confirmRuntimeDownload){
+                    status.runtimeProgress={stage:'downloading',received:524288,total:1048576};
+                    await new Promise(resolve=>{test.completeDownload=resolve});
+                    delete status.runtimeProgress;
+                    delete status.localRuntimeDownload;
+                    status.localAvailable=true;
+                }else await new Promise(resolve=>setTimeout(resolve,120));
                 Object.assign(status,{configured:true,enabled:true,phase:'ready',nodeOnline:true,reviewIdentity:body.reviewIdentity,centerUrl:'http://127.0.0.1:40000',centralId:'central',nodeId:'node'});
             }
         }
@@ -156,14 +164,24 @@ try {
     await check('另一工作副本不恢复上一副本的任务', `document.querySelector('.dcr-job')===null`);
     await click('中央连接');
     await evaluate('test.auditFixture=false');
+    await evaluate(`test.hideReview();Object.assign(test.status,{localAvailable:false,localRuntimeDownload:{version:'0.1.0',size:1048576,url:'https://runtime.example.test/central.tgz',sha256:'a'.repeat(64)}});test.mountReview()`);
     await waitFor(`document.querySelector('input[aria-label="审核身份"]')!==null`);
     await evaluate(`(()=>{const input=document.querySelector('input[aria-label="审核身份"]');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'张三');input.dispatchEvent(new Event('input',{bubbles:true}))})()`);
     await waitFor(`[...document.querySelectorAll('button')].some(b=>b.textContent==='应用并启动'&&!b.disabled)`);
     await click('应用并启动');
+    await check('页面内确认可获焦并显示下载包来源和大小', `document.activeElement.getAttribute('aria-labelledby')==='dcr-download-title' && document.body.textContent.includes('https://runtime.example.test/central.tgz') && document.body.textContent.includes('1.00 MiB') && test.writes===0`);
+    await click('取消');
+    await check('取消下载保留身份草稿且没有启动请求', `test.writes===0 && document.body.textContent.includes('已取消，未开始下载') && document.querySelector('input[aria-label="审核身份"]').value==='张三'`);
+    await click('应用并启动');
+    await click('下载并启动');
+    await waitFor(`document.querySelector('progress')?.value===524288`);
+    await check('启动请求等待期间显示实际下载字节数', `document.querySelector('progress')?.max===1048576 && document.body.textContent.includes('已下载 0.50 MiB / 1.00 MiB')`);
+    await evaluate('test.completeDownload()');
     await waitFor(`document.body.textContent.includes('中央已连接')`);
     await check('成功转为摘要且只应用一次', `test.writes===1&&!document.querySelector('input')&&![...document.querySelectorAll('button')].some(b=>b.textContent==='应用并启动')`);
     await click('修改连接');
     await check('未变配置禁止再次应用', `[...document.querySelectorAll('button')].find(b=>b.textContent==='应用更改').disabled`);
+    await check('已初始化的本机身份展示为摘要', `!document.querySelector('input[aria-label="审核身份"]') && document.body.textContent.includes('本机审核身份')`);
     await click('取消修改');
     await evaluate('test.hideReview()');
     await check('切回聊天时评审卸载，输入区可用', `!document.querySelector('main .dcr-workbench')&&document.getElementById('seat').offsetHeight===180`);

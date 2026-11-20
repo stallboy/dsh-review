@@ -26,6 +26,8 @@ export interface SelectedWorkspace {
 export interface ConnectionProfile {
     nodeId: string;
     workspaces: SelectedWorkspace[];
+    centerUrl?: string;
+    label?: string;
 }
 
 export interface ConnectionConfig {

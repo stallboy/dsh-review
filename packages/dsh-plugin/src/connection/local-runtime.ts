@@ -17,6 +17,14 @@ interface RuntimeSource extends RuntimeDownload {
     versionUrl: string;
 }
 
+export type RuntimeStage = 'requesting' | 'downloading' | 'verifying' | 'unpacking';
+export interface RuntimeProgress {
+    stage: RuntimeStage | 'preparing' | 'switching' | 'starting';
+    received?: number;
+    total?: number;
+    error?: string;
+}
+
 interface CachedRuntime {
     version: string;
     folder: string;
@@ -50,7 +58,7 @@ async function loadSource(file: URL): Promise<RuntimeSource | null> {
     }
 }
 
-async function fetchBytes(url: URL, limit: number, signal: AbortSignal): Promise<Buffer> {
+async function fetchBytes(url: URL, limit: number, signal: AbortSignal, onBytes?: (length: number) => void): Promise<Buffer> {
     for (let redirects = 0; redirects <= 4; redirects++) {
         const response = await fetch(url, { signal, redirect: 'manual' });
         if ([301, 302, 303, 307, 308].includes(response.status)) {
@@ -78,6 +86,7 @@ async function fetchBytes(url: URL, limit: number, signal: AbortSignal): Promise
                 length += value.byteLength;
                 if (length > limit) throw new Error('中央运行包响应超过声明的大小');
                 chunks.push(value);
+                onBytes?.(length);
             }
         } finally {
             await reader.cancel().catch(() => {});
@@ -158,7 +167,8 @@ export class LocalCentralRuntime {
         if (source) return { version: source.version, size: source.size, sha256: source.sha256, url: source.url };
     }
 
-    async download(confirmation: unknown): Promise<URL> {
+    async download(confirmation: unknown, report: (progress: RuntimeProgress) => void): Promise<URL> {
+        report({ stage: 'requesting' });
         const source = await this.source;
         if (!source) throw new Error('当前插件未包含中央运行包，请安装本机整合插件包，或连接已有中央');
         if (confirmation !== source.sha256) throw new Error('请确认下载当前提供的中央运行包后再启动');
@@ -168,10 +178,13 @@ export class LocalCentralRuntime {
         let published = false;
         try {
             const signal = AbortSignal.any([this.abort.signal, AbortSignal.timeout(60000)]);
-            const data = await fetchBytes(new URL(source.url), source.size, signal);
+            const data = await fetchBytes(new URL(source.url), source.size, signal,
+                received => report({ stage: 'downloading', received, total: source.size }));
+            report({ stage: 'verifying' });
             if (data.length !== source.size || createHash('sha256').update(data).digest('hex') !== source.sha256) {
                 throw new Error('中央运行包大小或 SHA-256 校验失败');
             }
+            report({ stage: 'unpacking' });
             const archive = path.join(staging, 'central.tgz');
             const unpacked = path.join(staging, 'package');
             await writeFile(archive, data, { flag: 'wx' });
