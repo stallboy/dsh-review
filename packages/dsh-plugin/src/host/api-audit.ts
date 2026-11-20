@@ -592,7 +592,9 @@ export class AuditRuntime {
         await this.auditLifecycle.transition(current.auditId, 'released');
         this.clearAuditLeaseTimeout(current.auditId);
       } else {
-        if (automatic) await this.auditLifecycle.markReleasable(current.auditId);
+        if (result.status === 'ABORTED' && (automatic || signal.aborted)) {
+          await this.auditLifecycle.markReleasable(current.auditId);
+        }
         log(`收尾未完成（${result.status}），租约 ${current.auditId} 保持占用`);
       }
       const outcome = {
