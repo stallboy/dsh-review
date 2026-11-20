@@ -77,6 +77,33 @@ const guardOf = (slug, over = {}) => ({
   ...over,
 });
 
+test('切换本地评审仓库后，旧页面无法写入含同一候选的工作副本', async () => {
+  const first = await createGitFixture();
+  const second = await createGitFixture();
+  const slug = '20261120-shared';
+  await writeCandidate(first, slug);
+  commitFixture(first);
+  runCommand('git', ['fetch', first, 'HEAD'], second);
+  runCommand('git', ['reset', '--hard', 'FETCH_HEAD'], second);
+  const head = runCommand('git', ['rev-parse', 'HEAD'], first).stdout.trim();
+  const api = new ReviewApi({ settings: { ...DEFAULT_SETTINGS, repoRoot: first, owner: 'tester' }, saveSettings: async next => next });
+  await api.init();
+  const opened = await api.invoke({ method: 'GET', path: '/candidate', query: { id: guardOf(slug).id, expectedRepoRoot: first } });
+  assert.equal(opened.status, 200);
+  assert.equal((await api.invoke({ method: 'PUT', path: '/settings', body: { repoRoot: second } })).status, 200);
+  const staleQueue = await api.invoke({ method: 'GET', path: '/queue', query: { expectedRepoRoot: first } });
+  assert.equal(staleQueue.status, 409);
+  const body = { ...guardOf(slug), reason: '回归测试' };
+  const staleWrite = await api.invoke({ method: 'POST', path: '/reject', query: { expectedRepoRoot: first }, body });
+  assert.equal(staleWrite.status, 409);
+  assert.equal(staleWrite.body.error.code, 'conflict');
+  assert.equal(runCommand('git', ['rev-parse', 'HEAD'], first).stdout.trim(), head);
+  assert.equal(runCommand('git', ['rev-parse', 'HEAD'], second).stdout.trim(), head);
+  assert.equal((await api.invoke({ method: 'POST', path: '/reject', query: { expectedRepoRoot: second }, body })).status, 200);
+  assert.notEqual(runCommand('git', ['rev-parse', 'HEAD'], second).stdout.trim(), head);
+  assert.equal(runCommand('git', ['rev-parse', 'HEAD'], first).stdout.trim(), head);
+});
+
 test('G19：changes_requested 不能批准——受理前 409 conflict', async () => {
   const root = await createGitFixture();
   await writeCandidate(root, '20261108-cr', { status: 'changes_requested' });

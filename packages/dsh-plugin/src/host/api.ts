@@ -165,20 +165,25 @@ export class ReviewApi implements ApiHost {
   }
 
   async runtimeFor(url: URL): Promise<Runtime> {
+    const settings = this.settings;
     const sessionId = url.searchParams.get('sessionId') ?? '';
     const sessionRoot = sessionId ? this.deps.resolveSessionCwd?.(sessionId) : undefined;
-    const selected = (sessionRoot ?? '').trim() || this.settings.repoRoot.trim();
-    if (!selected) {
+    const selected = (sessionRoot ?? '').trim() || settings.repoRoot.trim();
+    const root = selected ? path.resolve(selected) : '';
+    const expectedRepoRoot = url.searchParams.get('expectedRepoRoot');
+    if (expectedRepoRoot !== null && expectedRepoRoot !== root) {
+      throw new ApiError(409, 'conflict', '评审仓库已切换，请刷新工作台后重试');
+    }
+    if (!root) {
       throw new ApiError(412, 'not_configured', '当前会话没有可用目录，且未配置产品仓库');
     }
-    const root = path.resolve(selected);
     const cached = this.runtimeCache.get(root);
     if (cached) return cached;
     const vcsType = await detectVcs(root).catch(() => null);
     if (!vcsType) {
       throw new ApiError(412, 'not_configured', `${root} 不是 Git/SVN 仓库，评审需要产品仓库工作区`);
     }
-    const adapter = createVcs(vcsType, root, this.settings.baseBranch);
+    const adapter = createVcs(vcsType, root, settings.baseBranch);
     const runtime: Runtime = {
       root,
       vcsType,

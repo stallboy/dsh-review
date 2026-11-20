@@ -293,7 +293,10 @@ export class RepoLock {
         }
         return this.lockContext.run(runtime.root, () => this.withWriteLock(runtime.root, fn));
       },
-      () => fn(),
+      (error) => {
+        if (url.searchParams.has('expectedRepoRoot')) throw error;
+        return fn();
+      },
     );
   }
 }

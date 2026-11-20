@@ -173,6 +173,7 @@ function createPanel(status = initialStatus(), confirm = () => { throw new Error
         },
         setStatus(next) { activeStatus = next; },
         setSession(next) { sessionId = next; },
+        setLocalRepoRoot(next) { repoRoot = next; },
         failWrites(message) { failedWrite = message; },
         setTestResult(value) { testResult = value; },
         async poll() { for (const callback of [...timers.values()]) callback(); await flush(); },
@@ -639,7 +640,7 @@ test('本地评审可在无会话时保存明确的仓库，切换会话后保�
     const saved = panel.requests.find(request => request.init.method === 'PUT');
     assert.equal(saved.body.repoRoot, 'C:/review/repo');
     assert.match(panel.text(), /C:\/review\/repo/);
-    assert.ok(panel.requests.some(request => request.url.pathname.endsWith('/queue')));
+    assert.ok(panel.requests.some(request => request.url.pathname.endsWith('/queue') && request.url.searchParams.get('expectedRepoRoot') === 'C:/review/repo'));
     const reads = panel.requests.length;
     panel.setSession('session-b');
     await panel.flush();
@@ -654,6 +655,13 @@ test('本地评审可在无会话时保存明确的仓库，切换会话后保�
     await panel.flush();
     assert.match(panel.text(), /C:\/review\/other/);
     assert.doesNotMatch(panel.text(), /C:\/review\/repo/);
+    panel.setLocalRepoRoot('C:/review/remote-change');
+    await panel.poll();
+    assert.equal(panel.requests.filter(request => request.url.pathname.endsWith('/queue')).at(-1).url.searchParams.get('expectedRepoRoot'), 'C:/review/other');
+    panel.button('刷新').props.onClick();
+    await panel.flush();
+    assert.match(panel.text(), /C:\/review\/remote-change/);
+    assert.equal(panel.requests.filter(request => request.url.pathname.endsWith('/queue')).at(-1).url.searchParams.get('expectedRepoRoot'), 'C:/review/remote-change');
     panel.unmount();
 });
 

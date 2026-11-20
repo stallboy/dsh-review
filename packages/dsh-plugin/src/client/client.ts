@@ -186,7 +186,7 @@
   }
 
   /** 释放时取消在途请求，避免卸载后再更新视图。 */
-  function createApi(apiRoot = API_ROOT, controlToken?: () => string): ApiClient {
+  function createApi(apiRoot = API_ROOT, controlToken?: () => string, expectedRepoRoot?: () => string | null): ApiClient {
     const inflight = new Set<AbortController>();
     let disposed = false;
     const request = async <T>(path: string, method: string, body: unknown): Promise<T> => {
@@ -196,6 +196,8 @@
       try {
         const base = typeof document === 'undefined' ? '/' : document.baseURI;
         const url = new URL(`${apiRoot}${path}`, base);
+        const repoRoot = expectedRepoRoot?.();
+        if (repoRoot && path !== '/health' && path !== '/settings') url.searchParams.set('expectedRepoRoot', repoRoot);
         const response = await fetch(url.toString(), {
           method,
           cache: 'no-store',
@@ -678,6 +680,7 @@
         const [confirmed, setControlReady] = useState(false);
         const [framePath, setFramePath] = useState('/dsh-code-review/central/');
         const [localRepoRevision, setLocalRepoRevision] = useState(0);
+        const reloadLocalRepo = useCallback(() => setLocalRepoRevision(value => value + 1), []);
         const initialized = useRef(false);
         const edited = useRef(false);
         const draftRevision = useRef(0);
@@ -916,7 +919,7 @@
                     h('p', null, '请通过中央工作台查看项目并执行评审。已保存中央配置时，本地评审写入保持停用。'),
                     h('button', { className: 'dcr-btn p', onClick: () => setTab('central') }, '进入中央工作台'),
                 ))
-                : h(App, { key: localRepoRevision, onRepoChange: () => setLocalRepoRevision(value => value + 1) });
+                : h(App, { key: localRepoRevision, onRepoChange: reloadLocalRepo });
         else if (tab === 'central') content = status?.legacy
             ? status.centerUrl
                 ? h('div', { className: 'dcr-body' }, h('section', { className: 'dcr-card' },
@@ -1046,7 +1049,8 @@
     const auditJobsByRepo = new Map<string, string>();
 
     function App({ onRepoChange }: { onRepoChange: () => void }) {
-      const api = useMemo(() => createApi(), []);
+      const boundRepoRoot = useRef<string | null>(null);
+      const api = useMemo(() => createApi(API_ROOT, undefined, () => boundRepoRoot.current), []);
       useEffect(() => () => api.dispose(), [api]);
       const [health, setHealth] = useState<Health | null>(null);
       const [settingsResponse, setSettingsResponse] = useState<SettingsResponse | null>(null);
@@ -1117,13 +1121,18 @@
       const refreshHealth = useCallback(async (): Promise<Health | null> => {
         try {
           const value = await api.get<Health>('/health');
+          if (boundRepoRoot.current !== null && value.repoRoot !== boundRepoRoot.current) {
+            onRepoChange();
+            return null;
+          }
+          boundRepoRoot.current = value.repoRoot;
           setHealth(value);
           return value;
         } catch (e) {
           setError(e instanceof Error ? e.message : String(e));
           return null;
         }
-      }, [api]);
+      }, [api, onRepoChange]);
 
       const loadSettings = useCallback(async (): Promise<SettingsResponse> => {
         const value = await api.get<SettingsResponse>('/settings');

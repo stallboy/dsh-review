@@ -106,6 +106,7 @@ export class ReadModels {
     try {
       runtime = await this.host.runtimeFor(url);
     } catch (error) {
+      if (error instanceof ApiError && error.code === 'conflict') throw error;
       sendJson(res, 200, {
         configured: false,
         items: [],

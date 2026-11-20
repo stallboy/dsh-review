@@ -806,7 +806,7 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 
 收尾前须复核业务基线和工作区；不可确认时保留现场。收尾时 Host 必须验证每个 A 类候选：Frontmatter 合法、status=pending、rev1、approval=null、基线与本轮一致、补丁可在基线干净应用且不越界，并通过全部适用不变量。owner 必须等于 Host 按同一共享快照中的 reviewers.yml、target_files 和 tags 计算的路由结果，否则不得提交。B/Deferred 解析为档案 items，并写入插件复核块。校验失败的候选不得提交，其错误必须写入本轮复核结果；合法候选与本轮 audit 目录仍可继续。
 
-收尾必须对本轮新候选的 `review.md` 和 Host 生成的正式 `audit.md` 执行与只读校验命令相同的文件格式检查。Job 通过 `result.dataValidation` 按文件返回 `path` 和 `errors`，主会话的评审面板展示其中的格式错误。候选文件格式错误沿用候选排除规则；正式档案校验失败时阻止本轮收尾提交，会话和手动收尾保留现有租约。
+收尾必须对本轮新候选的 `review.md` 和 Host 生成的正式 `audit.md` 执行与只读校验命令相同的文件格式检查。Job 通过 `result.dataValidation` 按文件返回 `path` 和 `errors`，全局评审工作台按工作副本展示其中的格式错误。候选文件格式错误沿用候选排除规则。正式档案校验失败时阻止本轮收尾提交，会话和手动收尾保留现有租约。
 
 若 `reviewers.yml` 的 `verify_gate_on_audit_finalize` 为 `smoke` 或 `declared`，Host 还必须对每个通过前述校验的新候选，在其补丁应用后的工作区执行对应命令（`smoke` 执行 `audit_smoke_commands`，`declared` 执行候选 `gate_checks`）；执行后须仅还原本轮应用的补丁，保留 `.ai-review/`；出现并发业务改动或无法确认回退范围时保留现场并进入恢复。门禁失败的候选不提交，错误写入复核块。收尾重跑必须串行逐候选执行，并在 audit / finalize Job 日志中实时输出当前复核的候选 ID 与门禁命令进度；单条命令同样受 §9 的 `gateTimeoutMs` 约束，超时按失败处理。默认 `none`：审计期门禁是 AI 报告，批准时 Host 仍会重新执行全部门禁。复核块必须明确区分“补丁可应用/Frontmatter 与不变量通过”和“门禁是否由 Host 复算”；未复算时不得写成“通过全部适用检查”。
 
@@ -844,7 +844,7 @@ Rebase 由插件自身以 ai_fix Job 执行：读取当前基线，基线未变�
 
 ### 7.8 会话级仓库解析
 
-全局评审工作台的请求不携带会话 ID，本地模式使用设置中显式保存的 `repoRoot`。API 仍支持显式传入 `sessionId` 的调用，优先尝试解析其会话 cwd，再回退到 `repoRoot`。每请求解析并缓存，缓存最多 8 个仓库。仍无法解析时，操作型接口返回 412 `not_configured`；`/health`、`/settings` 与 `/queue` 返回 200 诊断/空队列响应，其中 `configured: false`，以便 Client 展示设置入口。
+全局评审工作台的请求不携带会话 ID，本地模式使用设置中显式保存的 `repoRoot`。工作台将加载时确认的仓库根作为 `expectedRepoRoot` 随仓库操作发送；Host 解析出的目标与之不一致时，操作返回 409 `conflict`。API 仍支持显式传入 `sessionId` 的调用，优先尝试解析其会话 cwd，再回退到 `repoRoot`。每请求解析并缓存，缓存最多 8 个仓库。仍无法解析时，操作型接口返回 412 `not_configured`；`/health`、`/settings` 与 `/queue` 返回 200 诊断/空队列响应，其中 `configured: false`，以便 Client 展示设置入口。
 
 ---
 
