@@ -1158,7 +1158,8 @@ export class Auditor {
     const bodyWithGateNote = `${filteredBody.replace(/\s+$/, '')}\n\n> 收尾说明：${gateNote}\n`;
     let items = input.phasedItems ?? buildAuditItems(deferredItems, warnings, input.targetPath || '.');
     if (input.recheck) {
-        const historicalIds = new Set(input.recheck.knownFindings.flatMap(item => [item.findingId, findingIdOf(item.kind, item.title)]));
+        const historicalIds = new Set(input.recheck.knownFindings.flatMap(item =>
+            item.kind === 'repair' ? [item.findingId] : [item.findingId, findingIdOf(item.kind, item.title)]));
         items = [...new Map(items.filter(item => !historicalIds.has(item.findingId)).map(item => [item.findingId, item])).values(),
             ...input.recheck.observations];
     }

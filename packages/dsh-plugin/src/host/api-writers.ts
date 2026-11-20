@@ -607,6 +607,7 @@ export class Writers {
     const archive = new AuditArchive(runtime.root);
     const record = await archive.read(auditId);
     if (record.parseError) throw new ApiError(422, 'bad_request', `审查档案无效：${record.parseError}`);
+    if (record.meta.schemaVersion === 2) throw new ApiError(409, 'conflict', '新版发现应使用发现处置入口');
     await this.requireSharedAudit(runtime, auditId, record.reviewPath);
     const item = record.meta.items.find((entry) => entry.findingId === findingId);
     if (!item) throw new ApiError(404, 'not_found', `finding 不存在：${findingId}`);
@@ -664,6 +665,7 @@ export class Writers {
     const archive = new AuditArchive(runtime.root);
     const record = await archive.read(auditId);
     if (record.parseError) throw new ApiError(422, 'bad_request', `审查档案无效：${record.parseError}`);
+    if (record.meta.schemaVersion === 2) throw new ApiError(409, 'conflict', '新版发现应使用发现处置入口');
     await this.requireSharedAudit(runtime, auditId, record.reviewPath);
     const item = record.meta.items.find((entry) => entry.findingId === findingId);
     if (!item) throw new ApiError(404, 'not_found', `finding 不存在：${findingId}`);
@@ -702,6 +704,9 @@ export class Writers {
       return store.get(candidateId, null);
     })();
     if (detail.candidate.parseError) throw new ApiError(422, 'bad_request', `候选数据无效：${detail.candidate.parseError}`);
+    if (detail.candidate.meta.schemaVersion === 2) {
+      throw new ApiError(409, 'conflict', '新版候选必须在关联的发现中审核');
+    }
     if (detail.candidate.meta.status === 'approved' || detail.candidate.meta.status === 'rejected') {
       throw new ApiError(409, 'conflict', `候选 ${candidateId} 已归档，不能作为转换目标`);
     }
@@ -922,6 +927,7 @@ export class Writers {
       const meta = detail.candidate.meta;
       const errors: string[] = [];
       if (detail.candidate.parseError) errors.push(detail.candidate.parseError);
+      if (meta.schemaVersion === 2) errors.push('发现候选必须随关联档案收尾');
       if (meta.status !== 'pending') errors.push(`独立候选状态必须是 pending，当前为 ${meta.status}`);
       if (meta.currentRevision !== 1) errors.push(`独立候选 current_revision 必须为 1，当前为 ${String(meta.currentRevision)}`);
       if (meta.approval !== null) errors.push('独立候选的 approval 必须为 null');

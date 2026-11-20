@@ -3,6 +3,7 @@ import type { ReviewCandidate, RevisionEntry } from './types.js';
 /** 候选读取端的不变量检查。补丁能否应用须由有 VCS 上下文的调用方另行验证。 */
 
 const TIME_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+export const FINDING_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 
 export function isRepoRelativePath(value: string): boolean {
   if (!value || value.includes('\\') || value.includes('..') || value.startsWith('/') || value.endsWith('/')) return false;
@@ -40,7 +41,13 @@ export function quickReviewInvariants(candidate: ReviewInvariantInput['candidate
   if (!/^\d{4}-\d{2}$/.test(candidate.month) || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(candidate.slug)) {
     errors.push(`I1: 候选目录命名非法：${candidate.id}`);
   }
-  if (meta.schemaVersion !== 1) errors.push(`I2: schema_version 必须是 1，实际 ${String(meta.schemaVersion)}`);
+  if (meta.schemaVersion !== 1 && meta.schemaVersion !== 2) {
+    errors.push(`I2: schema_version 必须是 1 或 2，实际 ${String(meta.schemaVersion)}`);
+  }
+  if ((meta.schemaVersion === 2 && !FINDING_ID_PATTERN.test(meta.findingId ?? ''))
+    || (meta.schemaVersion === 1 && meta.findingId !== undefined)) {
+    errors.push('I2: 只有 v2 候选必须绑定合法的 finding_id');
+  }
 
   const ids = meta.revisions.map((revision) => revision.id);
   if (ids.length === 0) {

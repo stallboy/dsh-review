@@ -1,0 +1,94 @@
+import { FINDING_ID_PATTERN, parseTime } from './invariants.js';
+import { readYamlDocument } from './yaml.js';
+
+export type FindingDecision =
+    | { action: 'accept_as_is'; reason: string }
+    | { action: 'defer'; reason: string; reviewAfter?: string; reviewWhen?: string }
+    | { action: 'human_takeover'; reason?: string }
+    | { action: 'add_repair_hint'; hint: string }
+    | { action: 'resume_review'; reason: string };
+
+export type FindingEvent = FindingDecision & { revision: number; auditId: string; actor: string; at: string };
+export type FindingDisposition = 'undecided' | 'accept_as_is' | 'defer' | 'human_takeover' | 'applied' | 'resolved';
+
+export function findingRecordPath(findingId: string): string {
+    if (!FINDING_ID_PATTERN.test(findingId)) throw new Error('发现编号无效');
+    return `.ai-review/findings/${findingId}.yml`;
+}
+
+function record(value: unknown): Record<string, unknown> {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || value instanceof Date) {
+        throw new Error('发现处置记录必须是对象');
+    }
+    return value as Record<string, unknown>;
+}
+
+function nonEmpty(value: unknown, field: string): string {
+    if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} 必须是非空字符串`);
+    return value;
+}
+
+function parseDecision(input: Record<string, unknown>): FindingDecision {
+    switch (input['action']) {
+        case 'accept_as_is':
+        case 'resume_review':
+            return { action: input['action'], reason: nonEmpty(input['reason'], 'reason') };
+        case 'defer': {
+            const date = input['review_after'];
+            const reviewAfter = date instanceof Date ? date.toISOString().slice(0, 10)
+                : date === undefined ? undefined : nonEmpty(date, 'review_after');
+            if (reviewAfter !== undefined) {
+                const parsed = new Date(`${reviewAfter}T00:00:00.000Z`);
+                if (!/^\d{4}-\d{2}-\d{2}$/.test(reviewAfter) || !Number.isFinite(parsed.getTime())
+                    || parsed.toISOString().slice(0, 10) !== reviewAfter) {
+                    throw new Error('review_after 必须是有效的 UTC 日期');
+                }
+            }
+            const condition = input['review_when'];
+            return {
+                action: 'defer',
+                reason: nonEmpty(input['reason'], 'reason'),
+                ...(reviewAfter !== undefined ? { reviewAfter } : {}),
+                ...(condition !== undefined ? { reviewWhen: nonEmpty(condition, 'review_when') } : {}),
+            };
+        }
+        case 'human_takeover':
+            return {
+                action: 'human_takeover',
+                ...(input['reason'] !== undefined ? { reason: nonEmpty(input['reason'], 'reason') } : {}),
+            };
+        case 'add_repair_hint':
+            return { action: 'add_repair_hint', hint: nonEmpty(input['hint'], 'hint') };
+        default:
+            throw new Error('发现处置动作无效');
+    }
+}
+
+export function parseFindingEvents(text: string, findingId: string): FindingEvent[] {
+    const doc = record(readYamlDocument(text));
+    if (doc['schema_version'] !== 1 || !FINDING_ID_PATTERN.test(findingId) || doc['finding_id'] !== findingId
+        || !Array.isArray(doc['events'])) {
+        throw new Error('发现处置记录版本、编号或事件列表无效');
+    }
+    let disposition: FindingDisposition = 'undecided';
+    return doc['events'].map((value, index) => {
+        const input = record(value);
+        const revision = index + 1;
+        if (input['revision'] !== revision) throw new Error('发现处置事件版本必须连续');
+        const auditId = nonEmpty(input['audit_id'], 'audit_id');
+        const actor = nonEmpty(input['actor'], 'actor');
+        const rawAt = input['at'];
+        const at = rawAt instanceof Date ? rawAt.toISOString() : nonEmpty(rawAt, 'at');
+        if (!parseTime(at, 'at', [])) throw new Error('发现处置事件时间无效');
+        const decision = parseDecision(input);
+        if (decision.action === 'add_repair_hint') {
+            if (disposition !== 'human_takeover') throw new Error('仅可为人工接手的发现补充线索');
+        } else if (decision.action === 'resume_review') {
+            if (disposition === 'undecided') throw new Error('发现已经处于待审核状态');
+            disposition = 'undecided';
+        } else {
+            disposition = decision.action;
+        }
+        return { revision, auditId, actor, at, ...decision };
+    });
+}

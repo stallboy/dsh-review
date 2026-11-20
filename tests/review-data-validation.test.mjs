@@ -5,8 +5,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { parseAuditMarkdown, serializeAuditMarkdown } from '../packages/dsh-plugin/dist/host/audit-archive.js';
-import { parseReviewMarkdown } from '../packages/dsh-plugin/dist/host/frontmatter.js';
+import { auditInvariantErrors, parseAuditMarkdown, serializeAuditMarkdown } from '../packages/dsh-plugin/dist/host/audit-archive.js';
+import { parseReviewMarkdown, serializeReviewMarkdown } from '../packages/dsh-plugin/dist/host/frontmatter.js';
 import { reviewFixture } from './fixtures/contract.mjs';
 
 const auditId = '20261119-120000-repo';
@@ -44,6 +44,37 @@ test('审查档案要求显式填写必填字段并验证数组元素类型', ()
         assert.notEqual(audit.replace(input, invalid), audit);
         assert.throws(() => parseAuditMarkdown(audit.replace(input, invalid)), message);
     }
+});
+
+test('V2 候选必须绑定合法发现，旧候选仍可往返', () => {
+    const legacy = reviewFixture('legacy');
+    const v2 = legacy.replace('schema_version: 1', 'schema_version: 2\nfinding_id: math-addition');
+    const parsed = parseReviewMarkdown(v2);
+    assert.equal(parsed.meta.findingId, 'math-addition');
+    assert.deepEqual(parseReviewMarkdown(serializeReviewMarkdown(parsed.meta, parsed.body)).meta, parsed.meta);
+    assert.equal(parseReviewMarkdown(legacy).meta.findingId, undefined);
+    assert.throws(() => parseReviewMarkdown(v2.replace('finding_id: math-addition\n', '')), /finding_id/);
+    assert.throws(() => parseReviewMarkdown(v2.replace('math-addition', '../escape')), /finding_id/);
+    assert.throws(() => parseReviewMarkdown(v2.replace('schema_version: 2', 'schema_version: 1')), /finding_id/);
+});
+
+test('V2 档案保持方案顺序并校验选项的归属和格式', () => {
+    const { meta, body } = parseAuditMarkdown(audit);
+    const first = { candidateId: '2026-11/fix-a', tradeoff: '影响面小' };
+    const second = { candidateId: '2026-11/fix-b', tradeoff: '复用公用逻辑' };
+    const item = {
+        findingId: 'math-addition', kind: 'repair', title: '加法异常', summary: '两个正数相加错误',
+        targetFiles: ['src/math.js'], dependsOn: null, status: 'pending', candidate: null,
+        repairPlan: '恢复加法语义并校验正数输入', options: [first, second],
+    };
+    const v2 = { ...meta, schemaVersion: 2, candidates: [first.candidateId, second.candidateId], items: [item] };
+    assert.deepEqual(parseAuditMarkdown(serializeAuditMarkdown(v2, body)).meta, v2);
+    assert.deepEqual(auditInvariantErrors(v2, auditId), []);
+    assert.match(auditInvariantErrors({ ...v2, items: [{ ...item, options: [first, first] }] }, auditId).join(), /选项/);
+    assert.match(auditInvariantErrors({ ...v2, items: [{ ...item, options: [{ ...first, candidateId: '../escape' }] }] }, auditId).join(), /选项/);
+    assert.match(auditInvariantErrors({ ...v2, candidates: [first.candidateId] }, auditId).join(), /选项/);
+    assert.match(auditInvariantErrors({ ...v2, items: [{ ...item, options: [] }] }, auditId).join(), /选项/);
+    assert.match(auditInvariantErrors({ ...v2, items: [{ ...item, options: undefined }] }, auditId).join(), /选项/);
 });
 
 test('只读命令批量输出字段和路径，校验失败返回非零且不改数据', async t => {

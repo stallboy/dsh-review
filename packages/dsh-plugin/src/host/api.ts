@@ -462,6 +462,9 @@ export class ReviewApi implements ApiHost {
       : { ...(commitMessage !== undefined ? { commitMessage } : {}), ...(commitDetail ? { commitDetail } : {}) };
     {
       const detail = await store.get(id, null, await sharedSourceFor(runtime));
+      if (detail.candidate.meta.schemaVersion === 2) {
+        throw new ApiError(409, 'conflict', '发现候选尚不能在此版本批准。');
+      }
       if (detail.candidate.meta.currentRevision !== guard.expectedRevision
         || detail.candidate.meta.owner !== guard.expectedOwner
         || new Date(guard.expectedUpdatedAt).getTime() !== new Date(detail.candidate.meta.updatedAt).getTime()) {

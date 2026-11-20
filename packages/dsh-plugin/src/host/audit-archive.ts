@@ -1,8 +1,10 @@
 import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { auditFiles } from './audit-files.js';
 import path from 'node:path';
 import { readMarkdownFrontmatter, dump } from './yaml.js';
-import { isRepoRelativePath, parseTime } from './invariants.js';
+import { FINDING_ID_PATTERN, isRepoRelativePath, parseTime } from './invariants.js';
+import type { FindingDisposition, FindingEvent } from './finding-decisions.js';
 
 /** 审查档案的读写、校验与审查项投影。档案以 audits/<audit_id>/audit.md 为单位。 */
 
@@ -14,7 +16,7 @@ export class AuditFormatError extends Error {
 }
 
 export type AuditTrigger = 'manual' | 'scheduled';
-export type AuditItemKind = 'confirm' | 'deferred';
+export type AuditItemKind = 'confirm' | 'deferred' | 'repair';
 export type AuditItemStatus = 'pending' | 'converted' | 'dismissed' | 'resolved';
 
 export interface AuditItem {
@@ -26,6 +28,10 @@ export interface AuditItem {
   dependsOn: string | null;
   status: AuditItemStatus;
   candidate: string | null;
+  repairPlan?: string;
+  options?: { candidateId: string; tradeoff: string }[];
+  repairRevisions?: string[];
+  repairAttribution?: string;
 }
 
 export interface AuditFrontmatter {
@@ -49,7 +55,7 @@ export interface AuditRecord {
 }
 
 const AUDIT_DIR_PATTERN = /^\d{8}-\d{6}-[a-z0-9][a-z0-9._-]*$/;
-const FINDING_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const CANDIDATE_ID_PATTERN = /^\d{4}-\d{2}\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -78,13 +84,13 @@ function asStringArray(value: unknown, field: string): string[] {
     return asArray(value, field).map((item, index) => asString(item, `${field}[${String(index)}]`));
 }
 
-function parseItem(value: unknown, index: number): AuditItem {
+function parseItem(value: unknown, index: number, schemaVersion: number): AuditItem {
     const name = `items[${String(index)}].`;
     if (!isRecord(value)) throw new AuditFormatError(`items[${String(index)}] 必须是对象`);
     const field = (key: string) => requiredField(value, key, name);
     const kind = asString(field('kind'), `${name}kind`);
-    if (kind !== 'confirm' && kind !== 'deferred') {
-        throw new AuditFormatError(`${name}kind 只能是 confirm | deferred`);
+    if (kind !== 'confirm' && kind !== 'deferred' && !(schemaVersion === 2 && kind === 'repair')) {
+        throw new AuditFormatError(`${name}kind 不受当前 schema_version 支持`);
     }
     const status = asString(field('status'), `${name}status`);
     if (!['pending', 'converted', 'dismissed', 'resolved'].includes(status)) {
@@ -94,9 +100,9 @@ function parseItem(value: unknown, index: number): AuditItem {
     if (!FINDING_ID_PATTERN.test(findingId)) {
         throw new AuditFormatError(`${name}finding_id 格式非法：${findingId}`);
     }
-    return {
+    const item: AuditItem = {
         findingId,
-        kind,
+        kind: kind as AuditItemKind,
         title: asString(field('title'), `${name}title`),
         summary: asString(field('summary'), `${name}summary`),
         targetFiles: asStringArray(field('target_files'), `${name}target_files`),
@@ -104,6 +110,26 @@ function parseItem(value: unknown, index: number): AuditItem {
         status: status as AuditItemStatus,
         candidate: asNullableString(field('candidate'), `${name}candidate`),
     };
+    if (schemaVersion === 2) {
+        if (Object.hasOwn(value, 'repair_plan')) item.repairPlan = asString(value['repair_plan'], `${name}repair_plan`);
+        if (Object.hasOwn(value, 'options')) {
+            item.options = asArray(value['options'], `${name}options`).map((option, optionIndex) => {
+                const key = `${name}options[${String(optionIndex)}]`;
+                if (!isRecord(option)) throw new AuditFormatError(`${key} 必须是对象`);
+                return {
+                    candidateId: asString(option['candidate_id'], `${key}.candidate_id`),
+                    tradeoff: asString(option['tradeoff'], `${key}.tradeoff`),
+                };
+            });
+        }
+        if (Object.hasOwn(value, 'repair_revisions')) {
+            item.repairRevisions = asStringArray(value['repair_revisions'], `${name}repair_revisions`);
+        }
+        if (Object.hasOwn(value, 'repair_attribution')) {
+            item.repairAttribution = asString(value['repair_attribution'], `${name}repair_attribution`);
+        }
+    }
+    return item;
 }
 
 export function parseAuditMarkdown(text: string): { meta: AuditFrontmatter; body: string } {
@@ -117,7 +143,9 @@ export function parseAuditMarkdown(text: string): { meta: AuditFrontmatter; body
     if (!isRecord(doc)) throw new AuditFormatError('audit.md Frontmatter 必须是 YAML 对象');
     const field = (key: string) => requiredField(doc, key);
     const schemaVersion = field('schema_version');
-    if (schemaVersion !== 1) throw new AuditFormatError('schema_version 必须是数字 1；更高版本需要升级插件');
+    if (schemaVersion !== 1 && schemaVersion !== 2) {
+        throw new AuditFormatError('schema_version 必须是数字 1 或 2；更高版本需要升级插件');
+    }
     const trigger = asString(field('trigger'), 'trigger');
     if (trigger !== 'manual' && trigger !== 'scheduled') throw new AuditFormatError('trigger 只能是 manual | scheduled');
     const scope = asString(field('scope'), 'scope');
@@ -133,7 +161,7 @@ export function parseAuditMarkdown(text: string): { meta: AuditFrontmatter; body
             trigger,
             previousAudit: asNullableString(field('previous_audit'), 'previous_audit'),
             candidates: asStringArray(field('candidates'), 'candidates'),
-            items: asArray(field('items'), 'items').map(parseItem),
+            items: asArray(field('items'), 'items').map((item, index) => parseItem(item, index, schemaVersion)),
         },
         body,
     };
@@ -158,6 +186,12 @@ export function serializeAuditMarkdown(meta: AuditFrontmatter, body: string): st
       depends_on: item.dependsOn,
       status: item.status,
       candidate: item.candidate,
+      ...(item.repairPlan !== undefined ? { repair_plan: item.repairPlan } : {}),
+      ...(item.options !== undefined ? {
+        options: item.options.map(({ candidateId, tradeoff }) => ({ candidate_id: candidateId, tradeoff })),
+      } : {}),
+      ...(item.repairRevisions !== undefined ? { repair_revisions: item.repairRevisions } : {}),
+      ...(item.repairAttribution !== undefined ? { repair_attribution: item.repairAttribution } : {}),
     })),
   };
   const yamlText = dump(doc, { lineWidth: -1, noRefs: true, sortKeys: false }).replace(/\n$/, '');
@@ -168,20 +202,54 @@ export function auditInvariantErrors(meta: AuditFrontmatter, dirName: string): s
   const errors: string[] = [];
   if (!AUDIT_DIR_PATTERN.test(dirName)) errors.push(`I1: audit 目录名非法：${dirName}`);
   if (meta.auditId !== dirName) errors.push(`I1: audit_id=${meta.auditId} 与目录名 ${dirName} 不一致`);
+  if (meta.schemaVersion !== 1 && meta.schemaVersion !== 2) errors.push('I2: 档案 schema_version 无效');
   const findingIds = new Set<string>();
+  const optionIds = new Set<string>();
+  const publishedIds = new Set(meta.candidates);
   for (const item of meta.items) {
     const at = `items[${item.findingId}]`;
     if (!FINDING_ID_PATTERN.test(item.findingId)) errors.push(`I1: ${at} finding_id 非法`);
     if (findingIds.has(item.findingId)) errors.push(`I1: ${at} finding_id 在同一档案内重复`);
     findingIds.add(item.findingId);
     for (const target of item.targetFiles) {
-      if (!isRepoRelativePath(target)) errors.push(`I12: ${at} target_files 含非法路径：${target}`);
+      if (!isRepoRelativePath(target) || (meta.schemaVersion === 2 && path.win32.parse(target).root)) {
+        errors.push(`I12: ${at} target_files 含非法路径：${target}`);
+      }
     }
     if (item.status === 'converted' && !item.candidate) errors.push(`I9: ${at} converted 但 candidate 为空`);
     if (item.status !== 'converted' && item.candidate) errors.push(`I9: ${at} 非 converted 但 candidate 非空`);
     if (item.kind === 'deferred' && !item.dependsOn) errors.push(`I10: ${at} deferred 缺少 depends_on`);
     if (item.kind === 'deferred' && item.dependsOn === item.findingId) errors.push(`I10: ${at} deferred 不得自依赖`);
-    if (item.kind === 'confirm' && item.dependsOn) errors.push(`I10: ${at} confirm 不应有 depends_on`);
+    if (item.kind !== 'deferred' && item.dependsOn) errors.push(`I10: ${at} 非 deferred 不应有 depends_on`);
+    if (meta.schemaVersion === 2) {
+      if (item.kind === 'repair' && item.repairPlan !== undefined && item.status === 'pending' && item.options === undefined) {
+        errors.push(`I2: ${at} 发布修复方案时必须提供选项`);
+      }
+      if (item.options !== undefined) {
+        if (item.kind !== 'repair' || item.status !== 'pending' || !item.repairPlan?.trim()
+          || item.options.length < 1 || item.options.length > 3) {
+          errors.push(`I2: ${at} 修复选项必须属于待审核修复方案，且为一至三项`);
+        }
+        for (const option of item.options) {
+          if (!CANDIDATE_ID_PATTERN.test(option.candidateId) || !publishedIds.has(option.candidateId)
+            || optionIds.has(option.candidateId) || !option.tradeoff.trim()) {
+            errors.push(`I2: ${at} 修复选项无效或重复：${option.candidateId}`);
+          }
+          optionIds.add(option.candidateId);
+        }
+      }
+      if (item.repairRevisions !== undefined || item.repairAttribution !== undefined) {
+        const revisions = item.repairRevisions ?? [];
+        if (item.status !== 'resolved' || !item.repairAttribution?.trim() || revisions.length === 0
+          || new Set(revisions).size !== revisions.length) {
+          errors.push(`I2: ${at} 修复归因须对应已解决观察，并含有效版本和归因说明`);
+        }
+      }
+    }
+  }
+  if (meta.schemaVersion === 2 && (publishedIds.size !== meta.candidates.length
+    || meta.candidates.some((candidateId) => !optionIds.has(candidateId)))) {
+    errors.push('I2: v2 档案的候选清单必须与新发布的修复选项一致');
   }
   const pendingDeps = new Map<string, string>();
   for (const item of meta.items) {
@@ -360,6 +428,7 @@ export interface CandidateChainInfo {
   status: 'pending' | 'changes_requested' | 'approved' | 'rejected';
   reopenedFrom: string | null;
   broken?: boolean;
+  findingId?: string;
 }
 
 export interface FindingProjection {
@@ -375,9 +444,17 @@ export interface FindingProjection {
   lastObservedAt: string;
   candidateStatus?: 'pending' | 'changes_requested' | 'approved' | 'rejected';
   candidate?: string;
+  findingVersion?: string;
+  disposition?: FindingDisposition;
+  decision?: FindingEvent;
+  repairHints?: string[];
+  repairPlan?: string;
+  repairRevisions?: string[];
+  repairAttribution?: string;
+  options?: { candidateId: string; tradeoff: string; status: CandidateChainInfo['status'] }[];
 }
 
-function scopeCovers(scope: string, targetFiles: string[]): boolean {
+export function scopeCovers(scope: string, targetFiles: string[]): boolean {
   if (scope === '.') return true;
   const prefix = scope.endsWith('/') ? scope : `${scope}/`;
   if (targetFiles.length === 0) return false;
@@ -389,14 +466,24 @@ export function projectFindings(
   audits: AuditRecord[],
   candidateInfoById: (candidateId: string) => CandidateChainInfo | null,
   candidateIds: string[] = [],
+  v2?: {
+    candidateInfo: (id: string) => CandidateChainInfo | null;
+    events: ReadonlyMap<string, FindingEvent[] | Error>;
+  },
 ): { findings: FindingProjection[]; errors: string[] } {
   const errors: string[] = [];
   const valid = audits.filter((audit) => !audit.parseError);
   // 观察时间相同时用档案编号打破平局，使最新观察的选择不依赖枚举顺序。
   const latest = new Map<string, { audit: AuditRecord; item: AuditItem }>();
+  const versioned = new Map<string, { audit: AuditRecord; item: AuditItem }[]>();
   for (const audit of valid) {
     for (const item of audit.meta.items) {
       if (!scopeCovers(audit.meta.scope, item.targetFiles)) continue;
+      if (audit.meta.schemaVersion === 2) {
+        const observations = versioned.get(item.findingId) ?? [];
+        observations.push({ audit, item });
+        versioned.set(item.findingId, observations);
+      }
       const current = latest.get(item.findingId);
       if (!current) {
         latest.set(item.findingId, { audit, item });
@@ -410,7 +497,7 @@ export function projectFindings(
     }
   }
   const projections: FindingProjection[] = [];
-  const pushBase = (findingId: string, entry: { audit: AuditRecord; item: AuditItem }, state: ProjectedState, chain?: { id: string; status: CandidateChainInfo['status'] }): void => {
+  const pushBase = (findingId: string, entry: { audit: AuditRecord; item: AuditItem }, state: ProjectedState, chain?: { id: string; status: CandidateChainInfo['status'] }, details?: Partial<FindingProjection>): void => {
     projections.push({
       findingId,
       title: entry.item.title,
@@ -423,9 +510,57 @@ export function projectFindings(
       lastObservedAudit: entry.audit.meta.auditId,
       lastObservedAt: entry.audit.meta.createdAt,
       ...(chain ? { candidate: chain.id, candidateStatus: chain.status } : {}),
+      ...details,
     });
   };
   for (const [findingId, entry] of latest) {
+    const observations = versioned.get(findingId);
+    if (observations?.some(({ item }) => item.repairPlan !== undefined || item.kind === 'repair'
+      || item.repairRevisions !== undefined)) {
+      if (!v2) continue;
+      observations.sort((a, b) => new Date(b.audit.meta.createdAt).getTime() - new Date(a.audit.meta.createdAt).getTime()
+        || b.audit.meta.auditId.localeCompare(a.audit.meta.auditId));
+      const current = observations[0] ?? entry;
+      const plan = observations.find(({ item }) => item.repairPlan !== undefined);
+      const events = v2.events.get(findingId) ?? [];
+      const optionIds = new Set(observations.flatMap(({ item }) => item.options?.map((option) => option.candidateId) ?? []));
+      const optionInfo = new Map([...optionIds].map((id) => [id, v2.candidateInfo(id)]));
+      const unavailable = [...optionInfo].find(([, info]) => !info || info.broken || info.findingId !== findingId);
+      const approved = [...optionInfo].filter(([, info]) => info?.status === 'approved');
+      if (!plan || unavailable || approved.length > 1 || events instanceof Error) {
+        const reason = events instanceof Error ? events.message : unavailable
+          ? `候选 ${unavailable[0]} 缺失、无效或关联不一致` : !plan ? '缺少原始方案' : '同一发现存在多条批准';
+        errors.push(`finding ${findingId}：${reason}`);
+        continue;
+      }
+      const currentAuditIds = new Set(observations.map(({ audit }) => audit.meta.auditId));
+      if (events.some((event) => !currentAuditIds.has(event.auditId))) {
+        errors.push(`finding ${findingId}：处置指向不存在或范围不符的观察`);
+        continue;
+      }
+      const decision = events.filter((event) => event.action !== 'add_repair_hint').at(-1);
+      const winningId = approved[0]?.[0];
+      const disposition: FindingDisposition = current.item.status === 'resolved' ? 'resolved' : winningId ? 'applied'
+        : decision && decision.action !== 'resume_review' ? decision.action : 'undecided';
+      const options = (plan.item.options ?? []).flatMap((option) => {
+        const info = optionInfo.get(option.candidateId);
+        return info ? [{ ...option, status: info.status }] : [];
+      });
+      const findingVersion = createHash('sha256').update(JSON.stringify({
+        observation: current.audit.meta.auditId, item: current.item,
+        plan: plan.audit.meta.auditId, options: plan.item.options, winningId, events,
+      })).digest('hex');
+      pushBase(findingId, current, disposition === 'resolved' || disposition === 'applied' ? 'closed' : 'open',
+        winningId ? { id: winningId, status: 'approved' } : undefined, {
+          findingVersion, disposition, options,
+          ...(decision ? { decision } : {}),
+          ...(plan.item.repairPlan !== undefined ? { repairPlan: plan.item.repairPlan } : {}),
+          ...(current.item.repairRevisions ? { repairRevisions: current.item.repairRevisions } : {}),
+          ...(current.item.repairAttribution ? { repairAttribution: current.item.repairAttribution } : {}),
+          repairHints: events.flatMap((event) => event.action === 'add_repair_hint' ? [event.hint] : []),
+        });
+      continue;
+    }
     const { item } = entry;
     if (item.status === 'dismissed') { pushBase(findingId, entry, 'dismissed'); continue; }
     if (item.status === 'resolved') { pushBase(findingId, entry, 'closed'); continue; }

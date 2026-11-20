@@ -3,7 +3,9 @@ import path from 'node:path';
 import { isAiReviewPath, parsePatch } from './patch.js';
 import { loadReviewers } from './reviewers.js';
 import { Runner, loadSystemPrompt, toSessionFixPrompt } from './runner.js';
-import { AuditArchive, projectFindings } from './audit-archive.js';
+import { AuditArchive, projectFindings, scopeCovers, type CandidateChainInfo } from './audit-archive.js';
+import { parseFindingEvents, type FindingDisposition, type FindingEvent } from './finding-decisions.js';
+import { FINDING_ID_PATTERN, isRepoRelativePath } from './invariants.js';
 import { matchesReviewFilter } from './store.js';
 import type { ReviewStatus, ApprovalCommitLookup, PatchCheckDiagnostic } from './types.js';
 import { ApiError } from './types.js';
@@ -405,15 +407,32 @@ export class ReadModels {
     const records = await archive.list(view?.source);
     const queue = await runtime.store.list({}, null, undefined, undefined, view?.source);
     const sharedItems = queue.items.filter((item) => !item.local);
-    const infoById = new Map(sharedItems.map((item) => [item.id, {
+    const toChainInfo = (items: typeof queue.items): Map<string, CandidateChainInfo> => new Map(items.map((item) => [item.id, {
       status: item.status,
       reopenedFrom: item.reopenedFrom ?? null,
       broken: item.parseError !== undefined,
-    } as import('./audit-archive.js').CandidateChainInfo]));
+      ...(item.findingId !== undefined ? { findingId: item.findingId } : {}),
+    }]));
+    const infoById = toChainInfo(sharedItems);
+    const v2Info = toChainInfo(queue.items.filter((item) => !item.localOnly));
+    const v2Ids = new Set(records.filter((record) => !record.parseError && record.meta.schemaVersion === 2)
+      .flatMap((record) => record.meta.items.map((item) => item.findingId)));
+    const events = new Map<string, FindingEvent[] | Error>();
+    if (view?.source) {
+      for (const findingId of v2Ids) {
+        try {
+          const text = await view.source.readFindingText(findingId);
+          if (text !== null) events.set(findingId, parseFindingEvents(text, findingId));
+        } catch (error) {
+          events.set(findingId, error instanceof Error ? error : new Error(String(error)));
+        }
+      }
+    }
     const projected = projectFindings(
       records,
       (candidateId) => infoById.get(candidateId) ?? null,
       sharedItems.map((item) => item.id),
+      view?.source ? { candidateInfo: (id) => v2Info.get(id) ?? null, events } : undefined,
     );
     const errors = [
       ...records.filter((record) => record.parseError).map((record) => `${record.dirName}: ${record.parseError}`),
@@ -431,9 +450,21 @@ export class ReadModels {
   }
 
   async findings(res: ApiResponse, url: URL): Promise<void> {
+    const scope = url.searchParams.get('scope');
+    const findingId = url.searchParams.get('findingId');
+    const dispositions = url.searchParams.get('dispositions')?.split(',').filter(Boolean) ?? [];
+    const valid: FindingDisposition[] = ['undecided', 'accept_as_is', 'defer', 'human_takeover', 'applied', 'resolved'];
+    if ((scope && scope !== '.' && (!isRepoRelativePath(scope) || path.win32.parse(scope).root))
+      || (findingId && !FINDING_ID_PATTERN.test(findingId))
+      || dispositions.some((disposition) => !valid.includes(disposition as FindingDisposition))) {
+      throw new ApiError(422, 'bad_request', '发现查询筛选参数无效');
+    }
     const runtime = await this.host.runtimeFor(url);
     const { findings, errors } = await this.findingProjection(runtime);
-    sendJson(res, 200, { findings, errors });
+    const filtered = findings.filter((finding) => (!scope || scopeCovers(scope, finding.targetFiles))
+      && (!findingId || finding.findingId === findingId)
+      && (dispositions.length === 0 || (finding.disposition !== undefined && dispositions.includes(finding.disposition))));
+    sendJson(res, 200, { findings: filtered, errors });
   }
 
   async fixPrompt(res: ApiResponse, url: URL): Promise<void> {

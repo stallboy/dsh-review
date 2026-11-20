@@ -39,6 +39,8 @@
 
 每个阶段先增加对应用例并确认旧实现无法满足新行为，再完成实现、跑通过相关用例、独立审查并提交。多补丁和两个客户端的选择界面都属于本次交付。
 
+先接入格式读取与校验时，v2 仍须在审批和旧版档案处置入口被拦截。完成持锁互斥、未决恢复及版本能力校验后，再与产物发布一起开放新版写入。
+
 ### 1. 共享记录与投影
 
 - 扩展 `packages/dsh-plugin/src/host/frontmatter.ts`、`types.ts` 和 `audit-archive.ts`。按 §4.9 双读 v1/v2，新增双向关联、当前选项组和处置事件的共享读取。沿用候选版本及状态枚举。
@@ -47,7 +49,7 @@
 
 ### 2. 审查产物与收尾
 
-- 修改 `packages/dsh-plugin/src/host/audit-stages.ts`、`audit-stage-artifacts.ts`、`auditor.ts`，以及 `packages/dsh-plugin/assets/repo-audit-system.md`、`assets/audit/orchestrator.md` 和 `assets/audit/patch/SKILL.md`。让审查产出文字方案或一至三个独立候选，复用现有门禁、工作区复原、格式校验与收尾提交。
+- 修改 `packages/dsh-plugin/src/host/audit-stages.ts`、`audit-stage-artifacts.ts`、`api-audit.ts`、`audit-lifecycle.ts` 和 `auditor.ts`，以及 `packages/dsh-plugin/assets/repo-audit-system.md`、`assets/audit/orchestrator.md` 和 `assets/audit/patch/SKILL.md`。让审查产出文字方案或一至三个独立候选，复用现有门禁、工作区复原、格式校验与收尾提交。分阶段会话须把经 Host 校验的发现与选项随原产物封存一起持久化，重启后按同一租约收尾。
 - 验证。扩展 `tests/audit-core.test.mjs` 和 `tests/contract-audit-finalize.test.mjs`，覆盖同基线多方案、坏选项排除、零有效选项降为文字方案，以及无关候选继续收尾。
 
 ### 3. 处置写入和单选审批

@@ -530,6 +530,7 @@ export class ReviewStore {
       baseRevision,
       lastFeedback: findLastFeedback(candidate.meta),
       reopenedFrom: candidate.meta.reopenedFrom ?? null,
+      ...(candidate.meta.findingId !== undefined ? { findingId: candidate.meta.findingId } : {}),
       fingerprint: fingerprintOf(candidate.meta),
       ...(isStale ? { isStale: true } : {}),
       ...(candidate.parseError ? { parseError: candidate.parseError } : {}),

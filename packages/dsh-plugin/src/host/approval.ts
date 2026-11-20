@@ -310,6 +310,10 @@ export class ApprovalOrchestrator {
         };
       }
       const fresh = freshReload.candidate;
+      if (fresh.meta.schemaVersion === 2) {
+        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        return { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '发现候选尚不能在此版本批准。', jobId };
+      }
       if (messageOverride !== undefined) {
         fresh.meta.commitMessage = messageOverride;
         const replacedMessageError = checkCommitMessage(fresh.meta.title, fresh.meta.commitMessage);
@@ -571,6 +575,9 @@ export class ApprovalOrchestrator {
       };
     }
     const candidate = reload.candidate;
+    if (candidate.meta.schemaVersion === 2) {
+      return { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '发现候选尚不能在此版本批准。', jobId } };
+    }
     if (commitMessage !== undefined) candidate.meta.commitMessage = commitMessage;
     const decisionErrors = checkDecisionCoverage(candidate.meta.humanDecisions, decisions.confirmed, decisions.waived);
     if (decisionErrors.length > 0) {
