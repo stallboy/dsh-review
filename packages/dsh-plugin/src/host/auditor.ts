@@ -996,6 +996,7 @@ export class Auditor {
         reason, detail, message: '审查收尾需要核验现场',
     });
     const cancelled = () => input.scheduledScan ? recovery('SCHEDULE_SCAN_DIRTY', '全仓扫描收尾已取消，现场保留待核验') : aborted();
+    const gateRecovery = (detail: string) => recovery(input.scheduledScan ? 'SCHEDULE_SCAN_DIRTY' : 'SYNC_STATE_UNKNOWN', detail);
     const baseSafe = async () => await this.scheduledBaseSafe(input.baseRevision)
       && (input.scheduledScan !== undefined || await compatibleAuditBase(vcs, input.baseRevision).catch(() => false));
     const businessClean = async () => (await vcs.ensureCleanWorkspace().catch(() => null))?.clean === true;
@@ -1068,7 +1069,7 @@ export class Auditor {
             }
           }
           if (!await baseSafe() || !await businessClean()) {
-            return recovery('SYNC_STATE_UNKNOWN', '门禁应用补丁前基线或业务工作区发生变化，现场保留待核验');
+            return gateRecovery('门禁应用补丁前基线或业务工作区发生变化，现场保留待核验');
           }
           const cleanBase = await vcs.getCurrentBase();
           if (!cleanBase) return recovery();
@@ -1079,7 +1080,7 @@ export class Auditor {
           applying = true;
           const applied = await scheduledPatch(vcs, patchPath, false);
           if (!applied.ok) {
-            if (!await businessClean()) return recovery('SYNC_STATE_UNKNOWN', '门禁补丁未完整应用，现场保留待核验');
+            if (input.scheduledScan || !await businessClean()) return gateRecovery('无法确认门禁补丁已完整应用，现场保留待核验');
             candidate.errors.push(`收尾门禁：补丁无法应用——${applied.message}`);
             continue;
           }
@@ -1101,7 +1102,7 @@ export class Auditor {
           }
         } catch (error) {
           if (input.phasedItems && (error instanceof AuditStopUnknown || this.deps.signal?.aborted)) return recovery();
-          if (applying && !gatePatch) return recovery('SYNC_STATE_UNKNOWN', '无法核验门禁应用的补丁，现场保留待核验');
+          if (applying && !gatePatch) return gateRecovery('无法核验门禁应用的补丁，现场保留待核验');
           candidate.errors.push(`收尾门禁执行异常：${error instanceof Error ? error.message : String(error)}`);
         }
         if (!await baseSafe()) return recovery();
@@ -1111,7 +1112,7 @@ export class Auditor {
           const patch = await auditFiles(store.repoRoot, { op: 'snapshot', paths: [relativePatch] }).catch(() => null);
           if (worktree !== gatePatch.appliedState || await vcs.getCurrentBase() !== gatePatch.base
             || patch?.entries?.[0]?.blobHash !== gatePatch.hash) {
-            return recovery('SYNC_STATE_UNKNOWN', '门禁期间出现本轮补丁以外的工作区改动，现场保留待核验');
+            return gateRecovery('门禁期间出现本轮补丁以外的工作区改动，现场保留待核验');
           }
           if (input.scheduledScan) {
             const review = await captureReviewWorktree(store.repoRoot, vcs.type, true).catch(() => null);
@@ -1121,7 +1122,7 @@ export class Auditor {
           }
           const undone = await undoScheduledGatePatch(vcs, gatePatch.path, gatePatch.targetFiles).catch(() => false);
           if (!undone || !await businessClean()) {
-            return recovery('SYNC_STATE_UNKNOWN', '无法完整还原门禁的补丁，现场保留待核验');
+            return gateRecovery('无法完整还原门禁的补丁，现场保留待核验');
           }
         }
       }
