@@ -38,6 +38,8 @@ async function install(t, artifact) {
 test('独立插件包离线安装后可加载宿主、界面和资源，不携带中央应用', async t => {
     npm('npm run pack:plugin', root);
     const directory = await install(t, 'dsh-code-review-0.3.0.tgz');
+    const help = npm('npm exec --offline -- dsh-review-validate --help', directory);
+    assert.match(help, /只读检查 Frontmatter/);
     run(process.execPath, ['--input-type=module', '-e', `
         import assert from 'node:assert/strict';
         import { existsSync, readFileSync } from 'node:fs';

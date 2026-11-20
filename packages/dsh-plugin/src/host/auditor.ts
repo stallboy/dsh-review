@@ -1251,6 +1251,7 @@ export class Auditor {
       };
       try {
         const detail = await store.get(id, baseRevision);
+        if (detail.candidate.parseError) throw new Error(detail.candidate.parseError);
         const meta = detail.candidate.meta;
         const current = meta.revisions.find((revision) => revision.id === meta.currentRevision);
         if (!current) throw new Error('current_revision 对应的版本缺失');

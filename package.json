@@ -22,6 +22,7 @@
         "deploy": "node scripts/deploy.mjs",
         "start": "node scripts/start.mjs",
         "start:central": "node apps/server/dist/cli.js serve",
+        "validate:review-data": "node packages/dsh-plugin/dist/host/validate-review-data.js",
         "verify:audit": "node scripts/verify-audit-session.mjs"
     },
     "devDependencies": {

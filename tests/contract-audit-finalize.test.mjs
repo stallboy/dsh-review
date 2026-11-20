@@ -192,3 +192,26 @@ test('G3：owner 填错的候选不进入共享提交（VALIDATION_FAILED + 目�
   assert.match(auditText, /未通过收尾校验/);
   assert.match(auditText, /owner 应为 tester/);
 });
+
+test('收尾拒绝重复键和缺失字段，Job 保留原始格式错误', async () => {
+    const root = await createGitFixture();
+    await ensureReviewers(root);
+    const { base } = await startApi(root);
+    const post = async (route, data) => (await fetch(base + route, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data),
+    })).json();
+    const { auditId } = await post('/audit/manual', { targetPath: '', note: '' });
+    const duplicate = '20261109-duplicate-owner', missing = '20261109-missing-owner';
+    await writeCandidate(root, duplicate, 'other\nowner: tester');
+    await writeCandidate(root, missing);
+    const missingReview = path.join(root, '.ai-review', '2026-11', missing, 'review.md');
+    await writeFile(missingReview, (await readFile(missingReview, 'utf8')).replace('owner: tester\n', ''), 'utf8');
+
+    const { jobId } = await post('/audit/finalize', { auditId });
+    const job = await waitForJob(base, jobId);
+    assert.equal(job.result.status, 'VALIDATION_FAILED');
+    const results = new Map(job.result.created.map(candidate => [candidate.id, candidate.errors]));
+    assert.match(results.get(`2026-11/${duplicate}`)[0], /duplicated mapping key/);
+    assert.match(results.get(`2026-11/${missing}`)[0], /owner.*必填/);
+    assert.equal(runCommand('git', ['ls-files', '.ai-review/2026-11'], root).stdout.trim(), '');
+});
