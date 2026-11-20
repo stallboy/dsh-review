@@ -711,7 +711,7 @@ export class AuditRuntime {
         const result = await auditor.finalize({
           auditId: current.auditId,
           beforeIds: new Set(current.candidateIdsBefore),
-          beforeCommit: () => this.auditLifecycle.transition(current.auditId, 'releasable', true),
+          beforeCommit: () => this.auditLifecycle.transition(current.auditId, current.state, true),
           ...(current.phased ? {
             phasedItems: current.stageItems ?? [],
             phasedSeal: current.stageSeal!,
@@ -799,7 +799,7 @@ export class AuditRuntime {
       if (lease.commitOutcomeUnknown && body['confirmCommitChecked'] !== true) {
         throw new ApiError(409, 'conflict', '必须显式确认已核验提交结果（confirmCommitChecked: true）');
       }
-      if (lease.state === 'active') {
+      if (lease.state === 'active' && !lease.commitOutcomeUnknown) {
         throw new ApiError(409, 'conflict', `租约 ${auditId} 仍处于活跃状态；请先取消审查 Job 或等待超时（releasable）后再释放`);
       }
       if (this.stages.get(auditId)?.busy) throw new ApiError(409, 'conflict', '阶段进程正在停止，暂不能释放租约');

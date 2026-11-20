@@ -219,7 +219,7 @@ test('自动收尾提交结果不明时禁止重试，人工核验后可释放',
     t.mock.method(GitAdapter.prototype, 'atomicCommit', async () => {
         const persisted = JSON.parse(await readFile(path.join(root, '.tmp', 'runtime-state.json'), 'utf8'));
         assert.equal(persisted.leases[0].commitOutcomeUnknown, true);
-        assert.equal(persisted.leases[0].state, 'releasable');
+        assert.equal(persisted.leases[0].state, 'active');
         return { success: false, commitRevision: null, outOfDate: false, verificationFailed: true, errorOutput: '提交结果不明' };
     });
     const { base } = await startApi(root, {

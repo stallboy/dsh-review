@@ -1674,7 +1674,7 @@
       const renderLeaseBanner = (): any => {
         const info = queue?.auditLease;
         if (!info) return null;
-        const active = info.state === 'active';
+        const active = info.state === 'active' && !info.commitOutcomeUnknown;
         return h('div', { className: 'dcr-card' },
           h('div', { className: 'dcr-row' },
             h('div', { className: 'dcr-grow' },
