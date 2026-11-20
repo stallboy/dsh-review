@@ -48,6 +48,8 @@ export interface CommitResult {
   outOfDate: boolean;
   errorOutput: string;
     verificationFailed?: boolean;
+  /** 只有调用方证实提交未落地后，才可撤销本次准备状态。 */
+  restorePreparation?: () => Promise<void>;
 }
 
 export interface CleanResult {
@@ -692,6 +694,14 @@ export class GitAdapter implements VcsAdapter {
         commitRevision: null,
         outOfDate: /index\.lock|cannot lock ref|unable to create.*lock|Another git process/i.test(output),
         errorOutput: output,
+        restorePreparation: async () => {
+          const current = await git(this.root, ['ls-files', '-s', '-z', '--', ...allowed]);
+          if (current.code !== 0 || current.stdout !== indexResult.stdout) {
+            throw new Error('提交失败后本轮暂存项发生变化');
+          }
+          const restored = await git(this.root, ['reset', '-q', '--', ...allowed]);
+          if (restored.code !== 0) throw new Error(`无法撤销本轮暂存项：${describe(restored)}`);
+        },
       };
     }
     const head = await git(this.root, ['rev-parse', 'HEAD']);
@@ -1019,8 +1029,8 @@ export class SvnAdapter implements VcsAdapter {
     let preparing = false;
     let beforeStates: ReturnType<typeof svnCommitStates> | undefined;
     let preparationScopes: string[] = [];
-    const failure = async (errorOutput: string, commitRevision: string | null = null, verificationFailed = false): Promise<CommitResult> => {
-        if (preparing && !commitStarted && beforeStates) {
+    const restorePreparation = async (errorOutput: string): Promise<string> => {
+        if (preparing && beforeStates) {
             const current = await svn(this.root, ['status', '--xml', '--verbose', '--ignore-externals', '--', ...preparationScopes]);
             if (current.code !== 0 || !/<status>[\s\S]*<\/status>\s*$/.test(current.stdout)) {
                 errorOutput += `\n无法核对本次 SVN 调度以执行恢复：${describe(current)}`;
@@ -1041,6 +1051,10 @@ export class SvnAdapter implements VcsAdapter {
                 for (const target of missing) await rm(path.join(this.root, target), { recursive: true, force: true });
             }
         }
+        return errorOutput;
+    };
+    const failure = async (errorOutput: string, commitRevision: string | null = null, verificationFailed = false): Promise<CommitResult> => {
+        if (!commitStarted) errorOutput = await restorePreparation(errorOutput);
         return { success: false, commitRevision, outOfDate: false, errorOutput, ...(verificationFailed ? { verificationFailed: true } : {}) };
     };
     const paths = [...new Set(input.paths.filter((item) => item.trim()).map((item) => normalizeCommitPath(this.root, item)))];
@@ -1164,7 +1178,17 @@ export class SvnAdapter implements VcsAdapter {
     const commit = await svn(this.root, ['commit', '--depth', 'empty', '-m', input.message, '--', ...commitPaths]);
     if (commit.code !== 0) {
         const output = describe(commit);
-        return { success: false, commitRevision: null, outOfDate: /out of date|E160028|E155011|remains in conflict/i.test(output), errorOutput: output };
+        const outOfDate = /out of date|E160028|E155011|remains in conflict/i.test(output);
+        const rejected = !commit.timedOut && !commit.aborted && commit.code !== null
+            && /^svn: E(?:160028|155011):|^svn: E165001:.*pre-commit hook/im.test(commit.stderr);
+        return {
+            success: false, commitRevision: null, outOfDate, errorOutput: output,
+            ...(!rejected ? { verificationFailed: true } : {}),
+            restorePreparation: async () => {
+                const error = await restorePreparation('');
+                if (error) throw new Error(error.trim());
+            },
+        };
     }
     const revision = /Committed revision\s+(\d+)/i.exec(commit.stdout)?.[1] ?? null;
     if (!revision) return failure('SVN 返回成功但无法取得提交版本，必须核验提交结果', null, true);

@@ -85,7 +85,7 @@ async function candidateFixture(root, slug, { review = {}, comments = [] } = {})
   return commitCandidate(root, slug, {
     review: {
       bodyLines: ['# 需人工判断项', '', '- 无'],
-      ...(comments.length > 0 ? { extraLines: ['comments:', commentFixture(comments)] } : {}),
+      ...(comments.length > 0 ? { comments: commentFixture(comments) } : {}),
       ...review,
     },
   });
@@ -129,7 +129,7 @@ test('§7.4/§12.2：/fix-session 拒绝已归档候选、无未解决评论与�
     review: {
       status: 'approved',
       approval: APPROVED_SNAPSHOT,
-      extraLines: ['comments:', commentFixture([{ id: 'c1' }])],
+      comments: commentFixture([{ id: 'c1' }]),
       bodyLines: ['# 需人工判断项', '', '- 无'],
     },
   });
@@ -157,7 +157,7 @@ test('§7.4/§12.2：/fix-session 拒绝已归档候选、无未解决评论与�
 test('§7.4：Host 未挂载 sessionController 时 /fix-session 返回 500 且提示导出提示词', async () => {
   const root = await createGitFixture();
   const candidate = await commitCandidate(root, '20261112-fix-nosession', {
-    review: { extraLines: ['comments:', commentFixture([{ id: 'c1' }])], bodyLines: ['# 需人工判断项', '', '- 无'] },
+    review: { comments: commentFixture([{ id: 'c1' }]), bodyLines: ['# 需人工判断项', '', '- 无'] },
   });
   const { base } = await startApi(root);
   const response = await post(base, '/fix-session', { id: candidate.id });
@@ -335,7 +335,7 @@ test('§5.6：详细正文区分历史作者统计与本次待提交，并如实
   const root = await createGitFixture();
   await writeFile(path.join(root, 'src', 'math.js'), 'export const add = (a, b) => a - b;\n// 用户改动\n', 'utf8');
   const candidate = await commitCandidate(root, '20261112-detail-body', {
-    review: { extraLines: ['comments:', commentFixture([{ id: 'c1', status: 'resolved' }])], bodyLines: ['# 需人工判断项', '', '- 无'] },
+    review: { comments: commentFixture([{ id: 'c1', status: 'resolved' }]), bodyLines: ['# 需人工判断项', '', '- 无'] },
   });
   const { api } = await startApi(root);
   const runtime = await api.runtimeFor(new URL('http://local/'));
@@ -402,7 +402,7 @@ test('§5.6/§8.3：/approve commitDetail=simple 只提交规范单行（即使�
 test('§5.6/§8.3：/approve commitDetail=detailed 提交「单行 + 空行 + 事实正文」', async () => {
   const root = await createGitFixture();
   await commitCandidate(root, '20261112-detailed', {
-    review: { extraLines: ['comments:', commentFixture([{ id: 'c1', content: '请补充说明' }])], bodyLines: ['# 需人工判断项', '', '- 无'] },
+    review: { comments: commentFixture([{ id: 'c1', content: '请补充说明' }]), bodyLines: ['# 需人工判断项', '', '- 无'] },
   });
   const { base } = await startApi(root);
   const outcome = await approveAndWait(base, { ...guardFixture('2026-11/20261112-detailed'), commitDetail: 'detailed' });

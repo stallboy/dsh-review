@@ -144,6 +144,16 @@ profile 里的依赖应为 `dsh-code-review link:<仓库绝对路径>/packages/d
 
 每次写入都会经过前端并发锁校验；`.ai-review` 变更会立即 commit（不 push），保证同一仓库的其他 DSH 实例能同步看到。
 
+### 评审数据只读校验
+
+源码工作副本完成插件构建后，可从主会话按文件校验本轮产物。
+
+```bash
+npm run --silent validate:review-data -- "路径/review.md" "路径/audit.md"
+```
+
+在本地安装插件包后，也可使用 `npm exec --offline -- dsh-review-validate` 调用同一命令。命令输出 JSON，其中 `files` 逐个列出路径和错误。全部通过退出 0，任一文件失败退出 1，缺少文件参数退出 2。收尾前可检查候选 `review.md`，收尾后可检查 Host 生成的 `audit.md`。补丁能否应用、基线和 owner 路由由 Host 在收尾时检查。
+
 ## 本机 API
 
 Host 端在 `/dsh-code-review/api` 下注册：

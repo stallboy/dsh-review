@@ -370,28 +370,57 @@ test('§7.7/§7.3：门禁执行中取消会终止进程并返回带 reason 的 
 });
 
 
-test('§7.6：真实 turn 结束通知驱动 audit Job 自动 Host finalize 并释放租约', async () => {
-  const root = await createGitFixture();
-  let turnEnded;
-  const { base } = await startApi(root, {}, {
-    createAuditSession: async () => ({ sessionId: 'audit-turn-session' }),
-    onAuditTurnEnd: (sessionId, callback) => {
-      assert.equal(sessionId, 'audit-turn-session');
-      turnEnded = callback;
-      return () => undefined;
-    },
-  });
-  const response = await post(base, '/audit/session', { targetPath: '', note: '' });
-  assert.equal(response.status, 202, JSON.stringify(await response.clone().json()));
-  const started = await response.json();
-  assert.equal(typeof turnEnded, 'function');
-  turnEnded();
-  const job = await waitJob(base, started.jobId, 240);
-  assert.equal(job.status, 'succeeded', JSON.stringify(job));
-  assert.equal(job.result?.status, 'COMMITTED', JSON.stringify(job.result));
-  const audits = await (await fetch(`${base}/audits`)).json();
-  assert.equal(audits.audits.length, 1);
-  assert.equal(audits.audits[0].auditId, started.auditId);
+test('§7.6：已确认空闲的会话复用跟踪 Job，在维护窗口内自动收尾', async () => {
+    const root = await createGitFixture();
+    let ready;
+    let request;
+    let observing;
+    const { api, base } = await startApi(root, {}, {
+        createAuditSession: async input => {
+            request = input.requestId;
+            return { sessionId: 'audit-idle-session' };
+        },
+        withAuditSessionIdle: async (sessionId, requestId, signal, finalize) => {
+            assert.equal(sessionId, 'audit-idle-session');
+            assert.equal(requestId, request);
+            assert.ok(requestId);
+            observing = signal;
+            await new Promise(resolve => { ready = resolve; });
+            await finalize(signal);
+            return true;
+        },
+    });
+    const response = await post(base, '/audit/session', { targetPath: '', note: '' });
+    assert.equal(response.status, 202, JSON.stringify(await response.clone().json()));
+    const started = await response.json();
+    assert.equal(typeof ready, 'function');
+    assert.equal(api.auditRuntime.leaseTimeouts.has(started.auditId), true);
+    let unlock;
+    let acquired;
+    const held = new Promise(resolve => { acquired = resolve; });
+    const blocker = api.withWriteLock(root, async () => {
+        acquired();
+        await new Promise(resolve => { unlock = resolve; });
+    });
+    await held;
+    try {
+        ready();
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(api.auditRuntime.leaseTimeouts.has(started.auditId), false);
+        const duplicate = await post(base, '/audit/finalize', { auditId: started.auditId });
+        assert.equal(duplicate.status, 409);
+    } finally {
+        unlock();
+        await blocker;
+    }
+    const job = await waitJob(base, started.jobId, 240);
+    assert.equal(job.status, 'succeeded', JSON.stringify(job));
+    assert.equal(job.result?.status, 'COMMITTED', JSON.stringify(job.result));
+    assert.deepEqual(job.result.dataValidation, [{ path: started.reportPath, errors: [] }]);
+    assert.equal(observing.aborted, true);
+    const audits = await (await fetch(`${base}/audits`)).json();
+    assert.equal(audits.audits.length, 1);
+    assert.equal(audits.audits[0].auditId, started.auditId);
 });
 
 test('AC-SCHEDULE-01：并发会话审查在同一 repo 锁内取得租约，只创建一个会话', async () => {

@@ -123,7 +123,7 @@
   /** releasable 租约仍阻塞共享写入，直到显式释放或收尾。 */
   interface AuditLeaseInfo {
     auditId: string; state: 'active' | 'releasable'; trigger: string; createdAt: string;
-    owner: string; baseRevision: string; targetPath: string; sessionId?: string;
+    owner: string; baseRevision: string; targetPath: string; sessionId?: string; commitOutcomeUnknown?: true;
   }
   interface Queue {
     configured: boolean; items: QueueItem[]; errors: string[]; currentBase: string | null;
@@ -160,6 +160,7 @@
     mode: 'full' | 'incremental'; unifiedDiff: string; fromRevision: number | null; toRevision: number;
     fromBase: string | null; toBase: string; resolutionMode: string | null; notes: string[];
   }
+  interface ReviewDataFileValidation { path: string; errors: string[] }
   interface Job {
     id: string; type: string; status: 'running' | 'succeeded' | 'failed'; startedAt: string;
     finishedAt?: string; log: string[]; result?: any; error?: string;
@@ -920,7 +921,7 @@
                     h('p', null, '请通过中央工作台查看项目并执行评审。已保存中央配置时，本地评审写入保持停用。'),
                     h('button', { className: 'dcr-btn p', onClick: () => setTab('central') }, '进入中央工作台'),
                 ))
-                : h(App, props);
+                : h(App, { ...props, key: props.sessionId });
         else if (tab === 'central') content = status?.legacy
             ? status.centerUrl
                 ? h('div', { className: 'dcr-body' }, h('section', { className: 'dcr-card' },
@@ -1047,6 +1048,8 @@
             content,
         );
     }
+
+    const auditJobsBySession = new Map<string, string>();
 
     function App(props: { t: (key: string) => string; sessionId: string }) {
       const session = props.sessionId || '';
@@ -1186,9 +1189,17 @@
         void (async () => {
           const current = await refreshHealth();
           try { await loadSettings(); } catch { /* 健康检查已足以决定打开哪个页面。 */ }
+          const auditJobId = auditJobsBySession.get(session);
+          if (current?.configured && auditJobId) {
+            try {
+              const restored = await api.get<Job>(`/jobs/${encodeURIComponent(auditJobId)}`);
+              setJob(restored);
+              setBusy(restored.status === 'running');
+            } catch { /* 回到队列后仍可使用租约入口。 */ }
+          }
           setScreen(current?.configured ? 'queue' : 'setup');
         })();
-      }, [refreshHealth, loadSettings]);
+      }, [api, session, refreshHealth, loadSettings]);
 
       useEffect(() => {
         if (screen !== 'queue') return;
@@ -1560,6 +1571,7 @@
           setAuditLeaseId(value.auditId);
           jobLogRef.current = [];
           jobLogOffsetRef.current = null;
+          auditJobsBySession.set(session, value.job.id);
           setJob(value.job);
           setBusy(value.job.status === 'running');
           setAuditOpen(false);
@@ -1601,7 +1613,10 @@
         if (!releaseArmed) { setReleaseArmed(true); return; }
         setBusy(true);
         try {
-          await api.post('/audit/release', { auditId: leaseId, confirmStopped: true });
+          await api.post('/audit/release', {
+            auditId: leaseId, confirmStopped: true,
+            ...(queue?.auditLease?.commitOutcomeUnknown ? { confirmCommitChecked: true } : {}),
+          });
           setAuditLeaseId('');
           setReleaseArmed(false);
           setJob(null);
@@ -1659,15 +1674,16 @@
       const renderLeaseBanner = (): any => {
         const info = queue?.auditLease;
         if (!info) return null;
-        const active = info.state === 'active';
+        const active = info.state === 'active' && !info.commitOutcomeUnknown;
         return h('div', { className: 'dcr-card' },
           h('div', { className: 'dcr-row' },
             h('div', { className: 'dcr-grow' },
-              h('h3', { style: { margin: 0 } }, active ? '仓库审查执行中（待收尾）' : '审查待处理：执行租约已超时或被取消'),
+              h('h3', { style: { margin: 0 } }, info.commitOutcomeUnknown ? '审查提交待核验'
+                : active ? '仓库审查执行中（待收尾）' : '审查待处理：执行租约等待确认'),
               h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 4 } },
                 `${info.auditId} · 始于 ${dateText(info.createdAt)} · 基线 ${short(info.baseRevision)}${info.sessionId ? ` · 审查会话 ${short(info.sessionId)}` : ''}`),
             ),
-            h('button',
+            info.commitOutcomeUnknown ? null : h('button',
               {
                 className: 'dcr-btn p', disabled: busy, onClick: finalizeAuditLease,
                 ...(active ? { title: '审查会话可能仍在执行：再次点击确认收尾' } : {}),
@@ -1676,11 +1692,14 @@
                 ? (finalizeArmed ? '确认收尾（审查仍在执行）' : '收尾并提交候选')
                 : '收尾并提交候选'),
             active ? null : h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void releaseAuditLease(); } },
-              releaseArmed ? '确认释放（不提交）' : '释放租约'),
+              info.commitOutcomeUnknown ? (releaseArmed ? '再次确认已核验并释放' : '确认已核验并释放')
+                : (releaseArmed ? '确认释放（不提交）' : '释放租约')),
           ),
           h('div', { className: `dcr-banner ${active ? 'info' : 'warn'}`, style: { marginTop: 8 } },
-            active
-              ? '审查会话结束后请回到这里执行收尾：Host 将校验本轮候选并原子提交 .ai-review，随后候选进入下方队列；收尾前共享写保持互斥。'
+            info.commitOutcomeUnknown
+              ? '请核对版本历史和本轮评审文件，确认提交结果且外部执行已停止后，再释放租约。'
+              : active
+              ? 'Host 确认审查会话结束后会自动收尾。若未自动启动，请先确认会话已结束，再手动收尾。收尾前共享写保持互斥。'
               : '执行租约仍在阻塞共享写（approve / AI 修复 / rebase / sync 均被拒绝）。若审查会话已完成并产出候选，「收尾并提交候选」会校验并提交它们；确认外部执行已停止且不需要提交时，才释放租约（本地候选保持未提交状态）。'),
         );
       };
@@ -2375,6 +2394,8 @@
       const renderJob = (): any => {
         if (!job) return null;
         const result = job.result;
+        const validation: ReviewDataFileValidation[] = job.type === 'audit' && Array.isArray(result?.dataValidation)
+          ? result.dataValidation : [];
         const running = job.status === 'running';
         const failed = job.status === 'failed';
         const lastLine = job.log.length > 0 ? job.log[job.log.length - 1] : '等待输出…';
@@ -2398,12 +2419,24 @@
                 .then((value) => setJob(value.job))
                 .catch((e) => setError(e instanceof Error ? e.message : String(e)));
             } }, '取消任务') : null,
-            !running ? h('button', { className: 'dcr-btn g', onClick: () => setJob(null) }, '关闭') : null,
+            !running ? h('button', { className: 'dcr-btn g', onClick: () => {
+              if (auditJobsBySession.get(session) === job.id) auditJobsBySession.delete(session);
+              setJob(null);
+            } }, '关闭') : null,
           ),
           running ? h('div', { className: 'dcr-small dcr-muted dcr-mono', style: { marginTop: 6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, lastLine) : null,
           job.error ? h('div', { className: 'dcr-banner err', style: { marginTop: 8 } }, job.error) : null,
           result?.reason ? h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 6 } }, `reason：${String(result.reason)}`) : null,
           result?.message ? h('div', { className: `dcr-banner ${outcomeIsErr ? 'err' : 'info'}`, style: { marginTop: 8 } }, result.message) : null,
+          validation.length > 0 ? h('div', { className: 'dcr-banner ' + (validation.some((file) => file.errors.length > 0) ? 'err' : 'info'), style: { marginTop: 8 } },
+            h('strong', null, `评审文件校验 · ${String(validation.filter((file) => file.errors.length === 0).length)}/${String(validation.length)} 个文件通过`),
+            ...validation.filter((file) => file.errors.length > 0).map((file) => h('div', { key: file.path, style: { marginTop: 8 } },
+              h('code', { style: { overflowWrap: 'anywhere' } }, file.path),
+              h('ul', null, ...file.errors.map((error, index) => h('li', {
+                key: index, style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' },
+              }, error))),
+            )),
+          ) : null,
           result?.commitRevision ? h('div', { className: 'dcr-small dcr-mono dcr-muted', style: { marginTop: 6 } }, `commit ${short(result.commitRevision)}`) : null,
           h('details', { className: 'dcr-joblog', open: running ? true : undefined },
             h('summary', null, `${running ? '实时日志' : '运行日志'}（${String(job.log.length)} 行）`),

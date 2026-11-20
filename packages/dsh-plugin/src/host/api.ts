@@ -654,8 +654,8 @@ export class ReviewApi implements ApiHost {
     (job as { cancelRequested?: boolean }).cancelRequested = true;
     this.jobs.abort(job.id);
     const auditId = this.auditJobLeases.get(job.id);
-    if (auditId) {
-      this.auditRuntime.stopStages(auditId);
+    if (auditId) this.auditRuntime.stopStages(auditId);
+    if (auditId && !this.auditRuntime.isFinalizing(auditId)) {
       await this.auditLifecycle.markReleasable(auditId).catch(() => false);
       this.auditJobFinishes.get(auditId)?.({
         status: 'ABORTED',

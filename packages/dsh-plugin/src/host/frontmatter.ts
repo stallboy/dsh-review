@@ -1,4 +1,4 @@
-import { load, dump } from './yaml.js';
+import { readMarkdownFrontmatter, dump } from './yaml.js';
 import type {
   ApprovalMeta,
   AuditType,
@@ -243,16 +243,12 @@ export interface ParsedReview {
 }
 
 export function parseReviewMarkdown(text: string): ParsedReview {
-  const normalized = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
-  const match = /^---\n([\s\S]*?)\n---\n?/.exec(normalized);
-  if (!match) throw new ReviewFormatError('review.md 缺少 YAML Frontmatter（应以 --- 开头）');
-  const yamlText = match[1] ?? '';
-  const body = normalized.slice(match[0].length);
   let doc: unknown;
+  let body: string;
   try {
-    doc = load(yamlText, { json: true });
+    ({ doc, body } = readMarkdownFrontmatter(text, 'review.md'));
   } catch (error) {
-    throw new ReviewFormatError(`YAML 解析失败：${error instanceof Error ? error.message : String(error)}`);
+    throw new ReviewFormatError(error instanceof Error ? error.message : String(error));
   }
   if (!isRecord(doc)) throw new ReviewFormatError('review.md Frontmatter 必须是 YAML 对象');
 

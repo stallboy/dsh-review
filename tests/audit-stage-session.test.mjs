@@ -76,7 +76,7 @@ async function runRetryAudit(t, tamper) {
     const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
     const requests = [];
     const stageContexts = [];
-    const turns = [];
+    let finishTurn;
     let gateCalls = 0;
     let generatedCandidate;
     const settings = { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType: 'git', gateTimeoutMs: 10_000 };
@@ -99,7 +99,15 @@ async function runRetryAudit(t, tamper) {
             await input.onCreated('dsh-audit-retry');
             return { sessionId: 'dsh-audit-retry' };
         },
-        onAuditTurnEnd: (_id, cb) => { turns.push(cb); return () => {}; },
+        withAuditSessionIdle: async (id, requestId, signal, finalize) => {
+            assert.equal(id, 'dsh-audit-retry');
+            assert.equal(requestId, requests[0].requestId);
+            while (!signal.aborted) {
+                await new Promise(resolve => { finishTurn = resolve; });
+                if (await finalize(signal) !== false) return true;
+            }
+            return false;
+        },
     });
     await api.init();
     const tools = new Map();
@@ -117,7 +125,7 @@ async function runRetryAudit(t, tamper) {
     assert.equal(status, 202, JSON.stringify(body));
     assert.match(requests[0].prompt, /兼容旧备注 \{\{taskJson\}\}/);
     assert.match(requests[0].prompt, /分别记录两个入口的覆盖情况/);
-    turns[0]();
+    finishTurn();
     assert.equal((await post('/audit/finalize', { auditId: body.auditId })).status, 409);
     const scanTask = { taskScope: ['src'], scenarios: ['成功写入后响应超时，以同一 ID 重试'],
         questions: ['后台任务与客户端是否各只写入一次？'], constraints: ['校验两个入口'] };
@@ -163,7 +171,7 @@ async function runRetryAudit(t, tamper) {
     });
     assert.equal(published.reportPath, body.reportPath);
     assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), base);
-    turns[0]();
+    finishTurn();
     let job;
     for (let attempt = 0; attempt < 150; attempt += 1) {
         ({ body: job } = await api.invoke({ method: 'GET', path: '/jobs/' + body.jobId }));

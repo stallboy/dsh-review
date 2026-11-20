@@ -10,7 +10,7 @@ export function isRepoRelativePath(value: string): boolean {
   return true;
 }
 
-function parseTime(value: string, field: string, errors: string[]): Date | null {
+export function parseTime(value: string, field: string, errors: string[]): Date | null {
   if (!TIME_WITH_ZONE.test(value)) {
     errors.push(`I13: ${field} 不是含时区偏移的 ISO 时间：${value || '(空)'}`);
     return null;

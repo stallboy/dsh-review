@@ -96,7 +96,7 @@ export function reviewFixture(slug, overrides = {}) {
     `    patch: ${base.patch}`,
     `    author: ${base.author}`,
     `gate_checks: ${base.gateChecks}`,
-    `comments: ${base.comments}`,
+    `comments:${base.comments.startsWith("\n") ? "" : " "}${base.comments}`,
     `human_decisions: ${base.humanDecisions}`,
     `approval: ${base.approval}`,
     `rejection: ${base.rejection}`,
@@ -115,7 +115,7 @@ export function humanDecisionsFixture(items) {
 }
 
 export function commentFixture(items) {
-  return items.map((item) => [
+  return '\n' + items.map((item) => [
     `  - id: ${item.id ?? 'c1'}`,
     `    revision: ${String(item.revision ?? 1)}`,
     `    file: ${item.file ?? DEFAULT_PATCH_FILE}`,

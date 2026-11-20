@@ -1,9 +1,8 @@
 import { existsSync } from 'node:fs';
-import { readdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { auditFiles } from './audit-files.js';
 import path from 'node:path';
-import process from 'node:process';
-import { load, dump } from './yaml.js';
-import { isRepoRelativePath } from './invariants.js';
+import { readMarkdownFrontmatter, dump } from './yaml.js';
+import { isRepoRelativePath, parseTime } from './invariants.js';
 
 /** 审查档案的读写、校验与审查项投影。档案以 audits/<audit_id>/audit.md 为单位。 */
 
@@ -56,75 +55,88 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function requiredField(doc: Record<string, unknown>, key: string, prefix = ''): unknown {
+    if (!Object.hasOwn(doc, key)) throw new AuditFormatError(`${prefix}${key} 是必填字段，不得缺省`);
+    return doc[key];
+}
+
 function asString(value: unknown, field: string): string {
-  // YAML 解析器可能已经把未加引号的时间戳转换成 Date。
-  if (value instanceof Date) return value.toISOString();
-  if (typeof value !== 'string') throw new AuditFormatError(`${field} 必须是字符串`);
-  return value;
+    if (typeof value !== 'string' || !value.trim()) throw new AuditFormatError(`${field} 必须是非空字符串`);
+    return value;
+}
+
+function asNullableString(value: unknown, field: string): string | null {
+    return value === null ? null : asString(value, field);
+}
+
+function asArray(value: unknown, field: string): unknown[] {
+    if (!Array.isArray(value)) throw new AuditFormatError(`${field} 必须是数组`);
+    return value;
+}
+
+function asStringArray(value: unknown, field: string): string[] {
+    return asArray(value, field).map((item, index) => asString(item, `${field}[${String(index)}]`));
 }
 
 function parseItem(value: unknown, index: number): AuditItem {
-  if (!isRecord(value)) throw new AuditFormatError(`items[${String(index)}] 必须是对象`);
-  const kind = asString(value['kind'], `items[${String(index)}].kind`);
-  if (kind !== 'confirm' && kind !== 'deferred') {
-    throw new AuditFormatError(`items[${String(index)}].kind 只能是 confirm | deferred`);
-  }
-  const status = asString(value['status'], `items[${String(index)}].status`);
-  if (!['pending', 'converted', 'dismissed', 'resolved'].includes(status)) {
-    throw new AuditFormatError(`items[${String(index)}].status 非法：${status}`);
-  }
-  const itemStatus = status as AuditItemStatus;
-  const dependsOn = value['depends_on'] === null || value['depends_on'] === undefined ? null : asString(value['depends_on'], `items[${String(index)}].depends_on`);
-  const candidate = value['candidate'] === null || value['candidate'] === undefined ? null : asString(value['candidate'], `items[${String(index)}].candidate`);
-  const findingId = asString(value['finding_id'], `items[${String(index)}].finding_id`);
-  if (!FINDING_ID_PATTERN.test(findingId)) {
-    throw new AuditFormatError(`items[${String(index)}].finding_id 格式非法：${findingId}`);
-  }
-  return {
-    findingId,
-    kind,
-    title: asString(value['title'], `items[${String(index)}].title`),
-    summary: asString(value['summary'], `items[${String(index)}].summary`),
-    targetFiles: Array.isArray(value['target_files']) ? value['target_files'].map((f) => String(f)) : [],
-    dependsOn,
-    status: itemStatus,
-    candidate,
-  };
+    const name = `items[${String(index)}].`;
+    if (!isRecord(value)) throw new AuditFormatError(`items[${String(index)}] 必须是对象`);
+    const field = (key: string) => requiredField(value, key, name);
+    const kind = asString(field('kind'), `${name}kind`);
+    if (kind !== 'confirm' && kind !== 'deferred') {
+        throw new AuditFormatError(`${name}kind 只能是 confirm | deferred`);
+    }
+    const status = asString(field('status'), `${name}status`);
+    if (!['pending', 'converted', 'dismissed', 'resolved'].includes(status)) {
+        throw new AuditFormatError(`${name}status 非法：${status}`);
+    }
+    const findingId = asString(field('finding_id'), `${name}finding_id`);
+    if (!FINDING_ID_PATTERN.test(findingId)) {
+        throw new AuditFormatError(`${name}finding_id 格式非法：${findingId}`);
+    }
+    return {
+        findingId,
+        kind,
+        title: asString(field('title'), `${name}title`),
+        summary: asString(field('summary'), `${name}summary`),
+        targetFiles: asStringArray(field('target_files'), `${name}target_files`),
+        dependsOn: asNullableString(field('depends_on'), `${name}depends_on`),
+        status: status as AuditItemStatus,
+        candidate: asNullableString(field('candidate'), `${name}candidate`),
+    };
 }
 
 export function parseAuditMarkdown(text: string): { meta: AuditFrontmatter; body: string } {
-  const normalized = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
-  const match = /^---\n([\s\S]*?)\n---\n?/.exec(normalized);
-  if (!match) throw new AuditFormatError('audit.md 缺少 YAML Frontmatter');
-  let doc: unknown;
-  try {
-    doc = load(match[1] ?? '', { json: true });
-  } catch (error) {
-    throw new AuditFormatError(`YAML 解析失败：${error instanceof Error ? error.message : String(error)}`);
-  }
-  if (!isRecord(doc)) throw new AuditFormatError('audit.md Frontmatter 必须是 YAML 对象');
-  const schemaVersion = Number(doc['schema_version']);
-  if (schemaVersion !== 1) throw new AuditFormatError(`不支持的 schema_version：${String(doc['schema_version'])}`);
-  const trigger = asString(doc['trigger'], 'trigger');
-  if (trigger !== 'manual' && trigger !== 'scheduled') throw new AuditFormatError('trigger 只能是 manual | scheduled');
-  const scope = asString(doc['scope'], 'scope');
-  if (scope !== '.' && (scope.startsWith('/') || scope.includes('..') || scope.includes('\\') || scope.startsWith('./') || scope.endsWith('/'))) {
-    throw new AuditFormatError(`scope 非法：${scope}`);
-  }
-  return {
-    meta: {
-      schemaVersion,
-      auditId: asString(doc['audit_id'], 'audit_id'),
-      createdAt: asString(doc['created_at'], 'created_at'),
-      baseRevision: asString(doc['base_revision'], 'base_revision'),
-      scope,
-      trigger,
-      previousAudit: doc['previous_audit'] === null || doc['previous_audit'] === undefined ? null : asString(doc['previous_audit'], 'previous_audit'),
-      candidates: Array.isArray(doc['candidates']) ? doc['candidates'].map((c) => String(c)) : [],
-      items: (Array.isArray(doc['items']) ? doc['items'] : []).map(parseItem),
-    },
-    body: normalized.slice(match[0].length),
-  };
+    let doc: unknown;
+    let body: string;
+    try {
+        ({ doc, body } = readMarkdownFrontmatter(text, 'audit.md'));
+    } catch (error) {
+        throw new AuditFormatError(error instanceof Error ? error.message : String(error));
+    }
+    if (!isRecord(doc)) throw new AuditFormatError('audit.md Frontmatter 必须是 YAML 对象');
+    const field = (key: string) => requiredField(doc, key);
+    const schemaVersion = field('schema_version');
+    if (schemaVersion !== 1) throw new AuditFormatError('schema_version 必须是数字 1；更高版本需要升级插件');
+    const trigger = asString(field('trigger'), 'trigger');
+    if (trigger !== 'manual' && trigger !== 'scheduled') throw new AuditFormatError('trigger 只能是 manual | scheduled');
+    const scope = asString(field('scope'), 'scope');
+    if (scope !== '.' && !isRepoRelativePath(scope)) throw new AuditFormatError(`scope 非法：${scope}`);
+    const createdAt = field('created_at');
+    return {
+        meta: {
+            schemaVersion,
+            auditId: asString(field('audit_id'), 'audit_id'),
+            createdAt: createdAt instanceof Date ? createdAt.toISOString() : asString(createdAt, 'created_at'),
+            baseRevision: asString(field('base_revision'), 'base_revision'),
+            scope,
+            trigger,
+            previousAudit: asNullableString(field('previous_audit'), 'previous_audit'),
+            candidates: asStringArray(field('candidates'), 'candidates'),
+            items: asArray(field('items'), 'items').map(parseItem),
+        },
+        body,
+    };
 }
 
 export function serializeAuditMarkdown(meta: AuditFrontmatter, body: string): string {
@@ -195,14 +207,10 @@ export function auditInvariantErrors(meta: AuditFrontmatter, dirName: string): s
   }
   // 用 UTC 比较档案编号与创建时间，避免跨时区读取时误报。
   const stamp = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/.exec(meta.auditId);
-  if (stamp) {
-    const created = new Date(meta.createdAt);
-    if (Number.isNaN(created.getTime())) {
-      errors.push('I13: created_at 无法解析');
-    } else {
-      const compact = created.toISOString().replace(/[-:T]/g, '').slice(0, 14);
-      if (compact !== stamp.slice(1).join('')) errors.push(`I13: audit_id 时间戳与 created_at 不一致：${meta.auditId} vs ${meta.createdAt}`);
-    }
+  const created = parseTime(meta.createdAt, 'created_at', errors);
+  if (stamp && created) {
+    const compact = created.toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    if (compact !== stamp.slice(1).join('')) errors.push(`I13: audit_id 时间戳与 created_at 不一致：${meta.auditId} vs ${meta.createdAt}`);
   }
   return errors;
 }
@@ -217,6 +225,12 @@ export class AuditArchive {
 
   private get auditsRoot(): string {
     return path.join(this.repoRoot, '.ai-review', 'audits');
+  }
+
+  async readDraft(dirName: string): Promise<string | null> {
+    if (!AUDIT_DIR_PATTERN.test(dirName)) throw new AuditFormatError(`审查目录名非法：${dirName}`);
+    const result = await auditFiles(this.repoRoot, { op: 'read', paths: [`.ai-review/audits/${dirName}/audit.md`] });
+    return result.bytes?.toString('utf8') ?? null;
   }
 
   /** 写路径可省略 source 检查工作区。共享读路径须传入快照，而且不会扫描旧的扁平报告。 */
@@ -238,18 +252,15 @@ export class AuditArchive {
       return records;
     }
     try {
-      dirs = (await readdir(this.auditsRoot, { withFileTypes: true }))
-        .filter((entry) => entry.isDirectory() && AUDIT_DIR_PATTERN.test(entry.name))
-        .map((entry) => entry.name);
+      const result = await auditFiles(this.repoRoot, { op: 'list', paths: ['.ai-review/audits'] });
+      dirs = (result.names ?? []).filter(name => AUDIT_DIR_PATTERN.test(name));
     } catch {
       return records;
     }
     dirs.sort();
     for (const dirName of dirs) {
-      const reviewPath = path.join(this.auditsRoot, dirName, 'audit.md');
-      if (!existsSync(reviewPath)) continue;
-      const record = await this.read(dirName);
-      records.push(record);
+      const record = await this.read(dirName).catch(() => null);
+      if (record) records.push(record);
     }
     return records;
   }
@@ -258,7 +269,7 @@ export class AuditArchive {
     const reviewPath = path.join(this.auditsRoot, dirName, 'audit.md');
     const text = source
       ? await source.readAuditText(dirName).catch(() => null)
-      : await readFile(reviewPath, 'utf8');
+      : await this.readDraft(dirName);
     if (text === null) throw new Error(`审查档案不存在：${dirName}`);
     return this.recordFromText(dirName, reviewPath, text);
   }
@@ -287,27 +298,19 @@ export class AuditArchive {
   }
 
   async write(meta: AuditFrontmatter, body: string): Promise<AuditRecord> {
-    const errors = auditInvariantErrors(meta, meta.auditId);
-    if (errors.length > 0) throw new AuditFormatError(errors.join('；'));
-    const dir = path.join(this.auditsRoot, meta.auditId);
-    if (existsSync(dir)) throw new AuditFormatError(`审查目录已存在：${meta.auditId}`);
-    const { mkdir } = await import('node:fs/promises');
-    await mkdir(dir, { recursive: true });
-    return this.writeExisting(meta, body);
+    return this.writeArchive(meta, body, true);
   }
 
-  /** 仅用于 Host 收尾。要求 Agent 已在目标目录写入报告，再用验证过的完整档案覆盖。 */
   async writeExisting(meta: AuditFrontmatter, body: string): Promise<AuditRecord> {
+    return this.writeArchive(meta, body, false);
+  }
+
+  private async writeArchive(meta: AuditFrontmatter, body: string, createOnly: boolean): Promise<AuditRecord> {
     const errors = auditInvariantErrors(meta, meta.auditId);
     if (errors.length > 0) throw new AuditFormatError(errors.join('；'));
-    const dir = path.join(this.auditsRoot, meta.auditId);
-    const { mkdir } = await import('node:fs/promises');
-    await mkdir(dir, { recursive: true });
-    const reviewPath = path.join(dir, 'audit.md');
-    const temp = `${reviewPath}.tmp-${String(process.pid)}`;
-    await writeFile(temp, serializeAuditMarkdown(meta, body), 'utf8');
-    await rename(temp, reviewPath);
-    return { meta, body, dirName: meta.auditId, reviewPath };
+    const file = `.ai-review/audits/${meta.auditId}/audit.md`;
+    await auditFiles(this.repoRoot, { op: 'write', paths: [file], text: serializeAuditMarkdown(meta, body), createOnly });
+    return { meta, body, dirName: meta.auditId, reviewPath: path.join(this.repoRoot, file) };
   }
 
   async nextAuditId(scope: string, now: Date): Promise<string> {
@@ -346,11 +349,7 @@ export class AuditArchive {
     const body = note
       ? `${record.body.replace(/\s+$/, '')}\n\n# 审查项处理记录\n\n- ${note}\n`
       : record.body;
-    const temp = `${record.reviewPath}.tmp-${String(process.pid)}`;
-    const { writeFile: writeAtomic, rename: renameAtomic } = await import('node:fs/promises');
-    await writeAtomic(temp, serializeAuditMarkdown(record.meta, body), 'utf8');
-    await renameAtomic(temp, record.reviewPath);
-    return { ...record, body };
+    return this.writeExisting(record.meta, body);
   }
 }
 

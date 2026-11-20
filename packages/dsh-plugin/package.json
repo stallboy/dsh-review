@@ -5,6 +5,7 @@
     "type": "module",
     "description": "DeepSeek Harness 代码评审插件及中央托管执行节点。",
     "main": "./dist/index.js",
+    "bin": { "dsh-review-validate": "./dist/host/validate-review-data.js" },
     "exports": {
         ".": "./dist/index.js",
         "./client": "./dist/client.js",
