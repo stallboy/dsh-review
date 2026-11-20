@@ -86,6 +86,8 @@ host 代码更新后仍需在插件管理中禁用再启用一次 `dsh-code-revi
 
 ## 安装
 
+Windows 上的本地 Git 分阶段审查可使用 [WSL2 + bubblewrap 隔离门禁](docs/audit-gate-wsl.md)。
+
 开发时可以用 DSH 的「发现」页安装包含本机中央服务的整合包。在仓库根目录运行 `npm ci` 和 `npm run preview:market`，在使用独立 `DSH_HOME` 的测试 profile 中添加输出的本机索引地址。安装、启用与首次启动步骤见[本机整合插件](docs/central-deployment.md#11-同一机器上的插件内中央)。
 
 中央服务和 DSH 节点均可使用[一键部署与启动脚本](docs/oneclick-deployment.md)：Windows 为 `deploy.cmd` / `start.cmd`，Linux 为 `deploy.sh` / `start.sh`，macOS 为 `deploy.command` / `start.command`。部署与启动独立；部署可反复覆盖程序并保留数据，添加 `--git` 会先获取仓库最新代码。要求 Node.js 24 或更新版本。

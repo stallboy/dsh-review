@@ -1,15 +1,18 @@
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { patchTouchesReviewData, collectCommitEntries, gitBlobHash, type VcsAdapter } from './vcs.js';
+import { patchTouchesReviewData, gitBlobHash, type VcsAdapter } from './vcs.js';
+import { auditFiles } from './audit-files.js';
 import { reviewersPath } from './reviewers.js';
 import { runAgent, wrapAgentPrompt } from './runner.js';
+import { AuditStopUnknown } from './audit-stage-runner.js';
+import { compatibleAuditBase, type StageSeal } from './audit-stage-artifacts.js';
 import { captureReviewWorktree, reviewWorktreeFingerprint, scheduledGateState, scheduledPatch, undoScheduledGatePatch,
   type ReviewWorktreeState } from './scheduled-audit-vcs.js';
 import { ReviewStore } from './store.js';
 import type { CandidateSource } from './store.js';
-import { AuditArchive, type AuditItem } from './audit-archive.js';
+import { AuditArchive, serializeAuditMarkdown, type AuditFrontmatter, type AuditItem } from './audit-archive.js';
 import { auditRecheckPrompt, auditRecheckSection, loadAuditHistory, verifyAuditRecheck, type AuditRecheck } from './audit-history.js';
 import { validateReviewData } from './review-data-validation.js';
 import type { AuditLeaseRecord } from './audit-lifecycle.js';
@@ -237,7 +240,7 @@ async function collectOutline(repoRoot: string, targetAbsolute: string, limit = 
   return lines.join('\n');
 }
 
-async function existingCandidateLines(
+export async function existingCandidateLines(
   store: ReviewStore,
   baseRevision: string,
   source?: CandidateSource,
@@ -255,7 +258,7 @@ async function existingCandidateLines(
   }
 }
 
-async function negativeMemoryLines(
+export async function negativeMemoryLines(
   repoRoot: string,
   source?: import('./shared-facts.js').SharedCandidateSource,
 ): Promise<string> {
@@ -521,6 +524,10 @@ function fallbackReport(input: {
 export interface AuditFinalizeInput {
   auditId: string;
   beforeIds: Set<string>;
+  phasedItems?: AuditItem[];
+  phasedSeal?: StageSeal;
+  phasedGate?: (patch: string, commands: string[]) => ReturnType<typeof import('./validator.js').runGateChecks>;
+  beforeCommit?: () => Promise<unknown>;
   baseRevision: string;
   targetPath: string;
   trigger: 'manual' | 'scheduled';
@@ -582,7 +589,7 @@ export function auditIdToCreatedAt(auditId: string): string {
 }
 
 /** 跨轮相同类别和标题必须得到同一个编号，投影才能合并它们的观察。 */
-function findingIdOf(kind: 'confirm' | 'deferred', title: string): string {
+export function findingIdOf(kind: 'confirm' | 'deferred', title: string): string {
   const normalized = title.trim().toLowerCase().replace(/\s+/g, ' ');
   const hash = createHash('sha1').update(`${kind}:${normalized}`).digest('hex').slice(0, 10);
   return `f-${hash}`;
@@ -691,6 +698,11 @@ function filterAClassSection(body: string, validIds: string[], createdIds: strin
       continue;
     }
     if (inSection && /^\s*[-*]\s/.test(line) && invalid.some((id) => line.includes(id))) continue;
+    const resolution = /^(\|.*\|) A · ([^ |]+) \|$/.exec(line);
+    if (resolution && invalid.includes(resolution[2] ?? '')) {
+      out.push(resolution[1] + ' 候选未通过收尾 |');
+      continue;
+    }
     out.push(line);
   }
   return `${out.join('\n').replace(/\s+$/, '')}\n-（${String(invalid.length)} 个候选未通过收尾校验，未纳入共享提交；详见插件复核块。）\n`;
@@ -954,15 +966,11 @@ export class Auditor {
     const reportPath = `.ai-review/audits/${input.auditId}/audit.md`;
     const dataValidation: ReviewDataFileValidation[] = [];
     const checkedHashes = new Map<string, string>();
-    const realRoot = await realpath(store.repoRoot);
     const checkFile = async (file: string): Promise<string[]> => {
       let errors: string[];
       try {
-        const absolute = await realpath(path.join(realRoot, file));
-        if (path.relative(realRoot, absolute).split(path.sep).join('/') !== file) {
-          throw new Error('评审文件必须位于原目录，不得通过符号链接重定向');
-        }
-        const bytes = await readFile(absolute);
+        const { bytes } = await auditFiles(store.repoRoot, { op: 'read', paths: [file] });
+        if (bytes == null) throw new Error('文件不存在');
         errors = validateReviewData(file, bytes);
         if (!errors.length) checkedHashes.set(file, gitBlobHash(bytes));
       } catch (error) {
@@ -988,13 +996,25 @@ export class Auditor {
         reason, detail, message: '审查收尾需要核验现场',
     });
     const cancelled = () => input.scheduledScan ? recovery('SCHEDULE_SCAN_DIRTY', '全仓扫描收尾已取消，现场保留待核验') : aborted();
+    const baseSafe = async () => await this.scheduledBaseSafe(input.baseRevision)
+      && (input.scheduledScan !== undefined || await compatibleAuditBase(vcs, input.baseRevision).catch(() => false));
+    const businessClean = async () => (await vcs.ensureCleanWorkspace().catch(() => null))?.clean === true;
     if (this.deps.signal?.aborted) return cancelled();
-    if (!await this.scheduledBaseSafe(input.baseRevision)) return recovery();
+    if (!await baseSafe() || !await businessClean()) {
+      return recovery('SYNC_STATE_UNKNOWN', '审查收尾前基线或业务工作区发生变化，现场保留待核验');
+    }
+    const archive = new AuditArchive(store.repoRoot);
+    let body: string | null;
+    try {
+      body = await archive.readDraft(input.auditId);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      dataValidation.push({ path: reportPath, errors: [detail] });
+      return recovery('SYNC_STATE_UNKNOWN', '无法安全读取审查报告，现场保留待核验');
+    }
     const created = await this.verifyCandidates(input.beforeIds, input.baseRevision, warnings, input.reviewersCreated === true, checkFile);
     this.log(`收尾：新增候选 ${String(created.length)} 个，校验问题 ${String(created.filter((item) => item.errors.length > 0).length)} 个`);
 
-    const absolute = path.join(store.repoRoot, reportPath);
-    let body = await readFile(absolute, 'utf8').catch(() => null);
     if (body === null) {
       body = fallbackReport({
         baseRevision: input.baseRevision,
@@ -1025,28 +1045,46 @@ export class Auditor {
       for (const candidate of created) {
         if (candidate.errors.length > 0) continue;
         this.log(`收尾门禁复算：候选 ${candidate.id}（${gateMode}）`);
-        let gatePatch: { path: string; targetFiles: string[]; appliedState: string } | undefined;
+        let gatePatch: { path: string; targetFiles: string[]; appliedState: string; base: string; hash: string } | undefined;
+        let applying = false;
         try {
           const detail = await store.get(candidate.id, null);
           const current = detail.candidate.meta.revisions.find((revision) => revision.id === detail.candidate.meta.currentRevision);
           if (!current) continue;
           const patchPath = path.join(detail.candidate.dirPath, current.patch);
           const targetFiles = detail.candidate.meta.targetFiles;
+          const commands = gateMode === 'smoke' ? reviewersConfig.auditSmokeCommands : detail.candidate.meta.gateChecks;
+          if (input.phasedItems) {
+            if (!input.phasedGate) throw new Error('缺少受限门禁环境');
+            const report = await input.phasedGate(patchPath, commands);
+            if (report.allPassed) gateRechecked.push(candidate.id);
+            else candidate.errors.push('收尾门禁（' + gateMode + '）未通过：\n' + report.formattedEvidenceMarkdown);
+            continue;
+          }
           if (input.scheduledScan) {
             const review = await captureReviewWorktree(store.repoRoot, vcs.type, true);
-            if (!sameReviewWorktree(input.scheduledScan, review) || !await this.scheduledBaseSafe(input.baseRevision)
-              || !(await vcs.ensureCleanWorkspace()).clean) {
+            if (!sameReviewWorktree(input.scheduledScan, review)) {
               return recovery('SCHEDULE_SCAN_DIRTY', '门禁应用补丁前工作区状态发生变化，现场保留待核验');
             }
           }
-          const applied = input.scheduledScan ? await scheduledPatch(vcs, patchPath, false) : await vcs.applyPatch(patchPath, false);
+          if (!await baseSafe() || !await businessClean()) {
+            return recovery('SYNC_STATE_UNKNOWN', '门禁应用补丁前基线或业务工作区发生变化，现场保留待核验');
+          }
+          const cleanBase = await vcs.getCurrentBase();
+          if (!cleanBase) return recovery();
+          const relativePatch = `.ai-review/${candidate.id}/${current.patch}`;
+          const { entries } = await auditFiles(store.repoRoot, { op: 'snapshot', paths: [relativePatch] });
+          const patchHash = entries?.[0]?.blobHash;
+          if (!patchHash) return recovery();
+          applying = true;
+          const applied = await scheduledPatch(vcs, patchPath, false);
           if (!applied.ok) {
-            if (input.scheduledScan) return recovery('SCHEDULE_SCAN_DIRTY', '无法确认门禁补丁已完整应用，现场保留待核验');
+            if (!await businessClean()) return recovery('SYNC_STATE_UNKNOWN', '门禁补丁未完整应用，现场保留待核验');
             candidate.errors.push(`收尾门禁：补丁无法应用——${applied.message}`);
             continue;
           }
-          if (input.scheduledScan) gatePatch = { path: patchPath, targetFiles, appliedState: await scheduledGateState(vcs, targetFiles) };
-          const commands = gateMode === 'smoke' ? reviewersConfig.auditSmokeCommands : detail.candidate.meta.gateChecks;
+          if (await vcs.getCurrentBase() !== cleanBase) return recovery();
+          gatePatch = { path: patchPath, targetFiles, appliedState: await scheduledGateState(vcs, targetFiles), base: cleanBase, hash: patchHash };
           const report = await runGateChecks(commands, {
             cwd: store.repoRoot,
             baseRevision: input.baseRevision,
@@ -1062,26 +1100,33 @@ export class Auditor {
             gateRechecked.push(candidate.id);
           }
         } catch (error) {
-          if (input.scheduledScan && !gatePatch) return recovery('SCHEDULE_SCAN_DIRTY', '无法核验定时门禁应用的补丁，现场保留待核验');
+          if (input.phasedItems && (error instanceof AuditStopUnknown || this.deps.signal?.aborted)) return recovery();
+          if (applying && !gatePatch) return recovery('SYNC_STATE_UNKNOWN', '无法核验门禁应用的补丁，现场保留待核验');
           candidate.errors.push(`收尾门禁执行异常：${error instanceof Error ? error.message : String(error)}`);
-        } finally {
-          if (!input.scheduledScan) await vcs.revertBusinessWorkspace().catch(() => undefined);
         }
-        if (!await this.scheduledBaseSafe(input.baseRevision)) return recovery();
-        if (gatePatch && input.scheduledScan) {
+        if (!await baseSafe()) return recovery();
+        if (gatePatch) {
           const worktree = await scheduledGateState(vcs, gatePatch.targetFiles).catch(() => null);
-          const review = await captureReviewWorktree(store.repoRoot, vcs.type, true).catch(() => null);
-          if (worktree !== gatePatch.appliedState || !review || !sameReviewWorktree(input.scheduledScan, review)) {
-            return recovery('SCHEDULE_SCAN_DIRTY', '门禁期间出现本轮补丁以外的工作区改动，现场保留待核验');
+          const relativePatch = path.relative(store.repoRoot, gatePatch.path).split(path.sep).join('/');
+          const patch = await auditFiles(store.repoRoot, { op: 'snapshot', paths: [relativePatch] }).catch(() => null);
+          if (worktree !== gatePatch.appliedState || await vcs.getCurrentBase() !== gatePatch.base
+            || patch?.entries?.[0]?.blobHash !== gatePatch.hash) {
+            return recovery('SYNC_STATE_UNKNOWN', '门禁期间出现本轮补丁以外的工作区改动，现场保留待核验');
+          }
+          if (input.scheduledScan) {
+            const review = await captureReviewWorktree(store.repoRoot, vcs.type, true).catch(() => null);
+            if (!review || !sameReviewWorktree(input.scheduledScan, review)) {
+              return recovery('SCHEDULE_SCAN_DIRTY', '门禁期间评审数据发生变化，现场保留待核验');
+            }
           }
           const undone = await undoScheduledGatePatch(vcs, gatePatch.path, gatePatch.targetFiles).catch(() => false);
-          if (!undone || !(await vcs.ensureCleanWorkspace().catch(() => null))?.clean) {
-            return recovery('SCHEDULE_SCAN_DIRTY', '无法完整还原定时门禁的补丁，现场保留待核验');
+          if (!undone || !await businessClean()) {
+            return recovery('SYNC_STATE_UNKNOWN', '无法完整还原门禁的补丁，现场保留待核验');
           }
         }
       }
     }
-    if (input.recheck && !(await vcs.ensureCleanWorkspace().catch(() => null))?.clean) return recovery();
+    if (!await baseSafe() || !await businessClean()) return recovery();
     if (input.scheduledScan) {
         const afterChecks = await captureReviewWorktree(store.repoRoot, vcs.type, true).catch(() => null);
         if (!afterChecks || !sameReviewWorktree(input.scheduledScan, afterChecks)) {
@@ -1110,8 +1155,7 @@ export class Auditor {
       ? '门禁未由 Host 复算（audit 期门禁为 AI 报告；批准时 Host 仍会重新执行全部门禁）'
       : `门禁已由 Host 复算（${gateMode}）：${String(gateRechecked.length)} 通过，${String(gateFailed)} 失败（失败候选已从 candidates 与 A 类列表剔除）`;
     const bodyWithGateNote = `${filteredBody.replace(/\s+$/, '')}\n\n> 收尾说明：${gateNote}\n`;
-    const archive = new AuditArchive(store.repoRoot);
-    let items = buildAuditItems(deferredItems, warnings, input.targetPath || '.');
+    let items = input.phasedItems ?? buildAuditItems(deferredItems, warnings, input.targetPath || '.');
     if (input.recheck) {
         const historicalIds = new Set(input.recheck.knownFindings.flatMap(item => [item.findingId, findingIdOf(item.kind, item.title)]));
         items = [...new Map(items.filter(item => !historicalIds.has(item.findingId)).map(item => [item.findingId, item])).values(),
@@ -1135,18 +1179,19 @@ export class Auditor {
       warnings,
       message,
     });
+    const auditMeta: AuditFrontmatter = {
+      schemaVersion: 1,
+      auditId: input.auditId,
+      createdAt,
+      baseRevision: input.baseRevision,
+      scope: input.targetPath || '.',
+      trigger: input.trigger,
+      previousAudit: previous,
+      candidates: validAfterGates,
+      items,
+    };
     try {
-      await archive.writeExisting({
-        schemaVersion: 1,
-        auditId: input.auditId,
-        createdAt,
-        baseRevision: input.baseRevision,
-        scope: input.targetPath || '.',
-        trigger: input.trigger,
-        previousAudit: previous,
-        candidates: validAfterGates,
-        items,
-      }, bodyWithGateNote);
+      await archive.writeExisting(auditMeta, bodyWithGateNote);
     } catch (error) {
       dataValidation.push({ path: reportPath, errors: [error instanceof Error ? error.message : String(error)] });
       return rejected('无法生成正式审查档案，未提交本轮产物');
@@ -1157,8 +1202,9 @@ export class Auditor {
     this.log(`审查档案：${reportPath}（B/Deferred ${String(items.length)} 项；${gateNote}）`);
 
     const commitPaths = [
-      `.ai-review/audits/${input.auditId}`,
-      ...validAfterGates.map((id) => `.ai-review/${id}`),
+      ...(input.phasedItems ? [reportPath, ...validAfterGates.flatMap(id => [
+        '.ai-review/' + id + '/review.md', '.ai-review/' + id + '/001.patch',
+      ])] : [`.ai-review/audits/${input.auditId}`, ...validAfterGates.map(id => `.ai-review/${id}`)]),
       ...(reviewersCreated ? ['.ai-review/reviewers.yml'] : []),
     ];
     let commitRevision: string | null = null;
@@ -1172,7 +1218,20 @@ export class Auditor {
       const probePaths = [reportPath, ...validAfterGates.map((id) => `.ai-review/${id}`)];
       const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
       // 提交目录前校验展开后的完整文件集合，防止夹带未验证内容。
-      const { entries: commitEntries } = await collectCommitEntries(store.repoRoot, commitPaths);
+      const snapshot = await auditFiles(store.repoRoot, { op: 'snapshot', paths: commitPaths }).catch((error: unknown) => {
+        const detail = error instanceof Error ? error.message : String(error);
+        dataValidation.push({ path: reportPath, errors: [detail] });
+        return null;
+      });
+      if (!snapshot?.entries) return rejected('无法安全读取收尾提交范围，未提交本轮产物');
+      const { entries: commitEntries } = snapshot;
+      if (input.phasedItems) {
+        const expectedReport = gitBlobHash(serializeAuditMarkdown(auditMeta, bodyWithGateNote));
+        if (!input.phasedSeal || commitEntries.length !== commitPaths.length || commitEntries.some(entry =>
+          entry.blobHash !== (entry.path === reportPath ? expectedReport : input.phasedSeal![entry.path]))) {
+          return recovery('SYNC_STATE_UNKNOWN', '收尾提交快照与本轮封存内容不符');
+        }
+      }
       const entriesByPath = new Map(commitEntries.map((entry) => [entry.path, entry.blobHash]));
       const checkedFiles = [reportPath, ...validAfterGates.map((id) => `.ai-review/${id}/review.md`)];
       const changedFiles = checkedFiles.filter((file) => !checkedHashes.has(file) || checkedHashes.get(file) !== entriesByPath.get(file));
@@ -1182,7 +1241,9 @@ export class Auditor {
         }
         return rejected('收尾文件在校验后发生变化，未提交本轮产物');
       }
-      if (!await this.scheduledBaseSafe(input.baseRevision)) return recovery();
+      if (!await baseSafe() || !await businessClean()) return recovery();
+      if (this.deps.signal?.aborted) return cancelled();
+      await input.beforeCommit?.();
       if (this.deps.signal?.aborted) return cancelled();
       const commit = await vcs.atomicCommit({
         message: `audit(${scopeLabel}): 仓库审查生成 ${String(created.length)} 个候选${created.length === 0 ? '（仅报告）' : ''} [skip ci]`,
@@ -1227,9 +1288,20 @@ export class Auditor {
           warnings.push(warning);
           this.log(warning);
         } else {
+          const after = await auditFiles(store.repoRoot, { op: 'snapshot', paths: commitPaths }).catch(() => null);
+          if (!after || JSON.stringify(after.entries) !== JSON.stringify(commitEntries)) {
+            return recovery('SYNC_STATE_UNKNOWN', '提交失败后本轮产物发生变化，现场保留待核验');
+          }
+          try {
+            await commit.restorePreparation?.();
+            const removePaths = reviewersCreated && !input.scheduledScan
+              ? commitPaths.filter(file => file !== '.ai-review/reviewers.yml') : commitPaths;
+            const removeEntries = commitEntries.filter(entry => removePaths.some(file => entry.path === file || entry.path.startsWith(`${file}/`)));
+            await auditFiles(store.repoRoot, { op: 'remove', paths: removePaths, entries: removeEntries });
+          } catch {
+            return recovery('SYNC_STATE_UNKNOWN', '提交失败后无法完整清理本轮产物，现场保留待核验');
+          }
           status = 'ABORTED';
-          await this.removeFinalizeArtifacts(input.auditId, created.map((item) => item.id),
-            Boolean(input.scheduledScan && reviewersCreated), Boolean(input.scheduledScan)).catch(() => undefined);
           const warning = `提交 .ai-review 失败，已清理本轮本地写入：${commit.errorOutput}`;
           warnings.push(warning);
           this.log(warning);
@@ -1255,18 +1327,6 @@ export class Auditor {
       warnings,
       message,
     };
-  }
-
-  /** 仅当已证明没有发生收尾提交时才能删除本轮产物。 */
-  private async removeFinalizeArtifacts(auditId: string, candidateIds: string[], removeReviewers = false, scheduled = false): Promise<void> {
-    const { rm } = await import('node:fs/promises');
-    await rm(path.join(this.deps.store.repoRoot, '.ai-review', 'audits', auditId), { recursive: true, force: true }).catch(() => undefined);
-    for (const id of candidateIds) {
-      await rm(path.join(this.deps.store.repoRoot, '.ai-review', id), { recursive: true, force: true }).catch(() => undefined);
-    }
-    if (removeReviewers) await rm(reviewersPath(this.deps.store.repoRoot), { force: true });
-    // 失败提交可能留下暂存项，重试收尾前须先清理。
-    if (!scheduled) await this.deps.vcs.revertBusinessWorkspace().catch(() => undefined);
   }
 
   private async verifyCandidates(
@@ -1308,6 +1368,7 @@ export class Auditor {
           const errors = await checkFile(`.ai-review/${id}/review.md`);
           if (errors.length) throw new Error(errors.join('；'));
         }
+        await auditFiles(store.repoRoot, { op: 'snapshot', paths: [`.ai-review/${id}`] });
         const detail = await store.get(id, baseRevision);
         if (detail.candidate.parseError) throw new Error(detail.candidate.parseError);
         const meta = detail.candidate.meta;
@@ -1338,17 +1399,11 @@ export class Auditor {
           result.errors.push('补丁包含 .ai-review/ 自身改动');
         }
         const patchPath = path.join(detail.candidate.dirPath, current.patch);
-        const applied = scheduled ? await scheduledPatch(vcs, patchPath, true) : await vcs.applyPatch(patchPath, false);
+        const applied = await scheduledPatch(vcs, patchPath, true);
         if (!applied.ok) result.errors.push(`补丁无法应用到当前基线：${applied.message}`);
         else this.log(`候选 ${id} 补丁可干净应用`);
       } catch (error) {
         result.errors.push(error instanceof Error ? error.message : String(error));
-      } finally {
-        try {
-          if (!scheduled) await vcs.revertBusinessWorkspace();
-        } catch (error) {
-          warnings.push(`校验候选 ${id} 后还原工作区失败：${error instanceof Error ? error.message : String(error)}`);
-        }
       }
       if (result.errors.length > 0) {
         this.log(`候选 ${id} 校验问题：${result.errors.join('；')}`);

@@ -73,6 +73,8 @@ export function internalRequest(method: string, url: string, body: Record<string
 }
 
 export interface ApiDeps {
+  auditStageExecutor?: import('./audit-stage-runner.js').ExecuteAuditStage;
+  auditStageGates?: typeof import('./validator.js').runGateChecks;
   settings: AppSettings;
   saveSettings: (settings: AppSettings) => Promise<AppSettings>;
   resolveCredential?: (reference: string) => Promise<string | undefined>;
@@ -85,6 +87,7 @@ export interface ApiDeps {
     requestId?: string;
     /** 新会话继承面板所属会话的权限预设与审批策略。 */
     ownerSessionId?: string;
+    onCreated?: (sessionId: string) => Promise<void>;
   }) => Promise<{ sessionId: string }>;
   /** 未注入时宿主没有交互式修复执行器，受理端会返回诊断。 */
   createFixSession?: (input: {
@@ -94,7 +97,7 @@ export interface ApiDeps {
     ownerSessionId?: string;
   }) => Promise<{ sessionId: string }>;
   withAuditSessionIdle?: (sessionId: string, requestId: string, signal: AbortSignal,
-    finalize: (signal: AbortSignal) => Promise<void>) => Promise<boolean>;
+    finalize: (signal: AbortSignal) => Promise<void | false>) => Promise<boolean>;
   onAuditTurnEnd?: (sessionId: string, callback: () => void) => () => void;
   clientEntry?: () => unknown;
   /** 缺省落在 DSH_HOME/dsh-code-review/runtime-state.json，使未释放的租约在宿主重启后仍能阻塞写入。 */

@@ -14,6 +14,10 @@ export interface AuditLeaseRecord {
   candidateIdsBefore: string[];
   state: AuditLeaseState;
   sessionId?: string;
+  phased?: boolean;
+  stageSeal?: Record<string, string>;
+  stageItems?: import('./audit-archive.js').AuditItem[];
+  commitOutcomeUnknown?: true;
 }
 
 export type BlockingLease = AuditLeaseRecord & { state: 'active' | 'releasable' };
@@ -65,19 +69,26 @@ export class AuditLifecycle {
   }
 
   /** 已释放是终态，重复释放允许幂等重试。若状态无法持久化，则恢复内存中的原状态。 */
-  async transition(auditId: string, next: AuditLeaseState): Promise<{ changed: boolean; lease: AuditLeaseRecord }> {
+  async transition(auditId: string, next: AuditLeaseState, commitOutcomeUnknown?: boolean): Promise<{ changed: boolean; lease: AuditLeaseRecord }> {
     const lease = this.find(auditId);
     if (!lease) throw new LeaseTransitionError(`审查租约不存在：${auditId}`);
-    if (lease.state === next) return { changed: false, lease };
-    if (!TRANSITIONS[lease.state].includes(next)) {
+    if (lease.state === next && (commitOutcomeUnknown === undefined || commitOutcomeUnknown === !!lease.commitOutcomeUnknown)) {
+      return { changed: false, lease };
+    }
+    if (lease.state !== next && !TRANSITIONS[lease.state].includes(next)) {
       throw new LeaseTransitionError(`非法租约迁移：${lease.state} → ${next}（${auditId}）`);
     }
     const previous = lease.state;
+    const previousOutcome = lease.commitOutcomeUnknown;
     lease.state = next;
+    if (commitOutcomeUnknown) lease.commitOutcomeUnknown = true;
+    else if (commitOutcomeUnknown === false) delete lease.commitOutcomeUnknown;
     try {
       await this.store.save(this.leases);
     } catch (error) {
       lease.state = previous;
+      if (previousOutcome) lease.commitOutcomeUnknown = true;
+      else delete lease.commitOutcomeUnknown;
       throw error;
     }
     return { changed: true, lease };

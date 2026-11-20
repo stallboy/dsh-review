@@ -19,6 +19,7 @@ export interface ProcessOptions {
   cwd: string;
   timeoutMs?: number;
   env?: Record<string, string>;
+  inheritEnv?: boolean;
   input?: string;
   onLine?: (line: string, stream: 'stdout' | 'stderr') => void;
   maxBytes?: number;
@@ -79,7 +80,7 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
         windowsHide: true,
         // 独立的 POSIX 进程组可在取消时一次停止所有后代进程。
         detached: process.platform !== 'win32',
-        env: { ...process.env, ...options.env },
+        env: options.inheritEnv === false ? options.env ?? {} : { ...process.env, ...options.env },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (error) {

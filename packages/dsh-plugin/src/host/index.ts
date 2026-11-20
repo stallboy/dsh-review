@@ -3,6 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { withDshAuditSessionIdle } from './audit-session-idle.js';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from './api.js';
+import { executeAuditCli } from './audit-stage-runner.js';
+import { configuredAuditStageGates } from './audit-stage-gates.js';
+import { registerAuditStageTools, type AuditToolRegistry } from './audit-stage-tools.js';
 import { dshHome, loadSettings, saveSettings } from './settings.js';
 import type { AppSettings } from './types.js';
 import { loadManagedNode, type ManagedHandle } from '../managed/managed-config.js';
@@ -173,7 +176,7 @@ function inheritOwnerPolicy(
 
 export async function createDshAuditSession(
   host: AuditSessionHost,
-  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string; requestId?: string },
+  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string; requestId?: string; onCreated?: (id: string) => Promise<void> },
 ): Promise<{ sessionId: string }> {
   return createDshSession(host, input, '审查');
 }
@@ -189,7 +192,7 @@ export async function createDshFixSession(
 /** 将会话挂到 cwd 对应的工作区，才能让侧栏在正确的工作区展示它。 */
 async function createDshSession(
   host: AuditSessionHost,
-  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string; requestId?: string },
+  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string; requestId?: string; onCreated?: (id: string) => Promise<void> },
   label: string,
 ): Promise<{ sessionId: string }> {
   const controller = host.get('sessionController') as DshSessionController | undefined;
@@ -224,6 +227,7 @@ async function createDshSession(
     }
   }
   const inherited = inheritOwnerPolicy(host, input.ownerSessionId ?? '', sessionId);
+  await input.onCreated?.(sessionId);
   try {
     const prompted = await controller.prompt(
       {
@@ -253,6 +257,7 @@ export function apply(ctx: HostContext): void {
   const shutdown = new AbortController();
   let initError: Error | undefined;
   let localWrites = 0;
+  let removeStageTools: (() => void) | undefined;
 
   const resolveCredential = async (reference: string): Promise<string | undefined> => {
     try {
@@ -303,8 +308,10 @@ export function apply(ctx: HostContext): void {
       const { DEFAULT_SETTINGS } = await import('./settings.js');
       settings = { ...DEFAULT_SETTINGS };
     }
+    const tools = ctx.get('tools') as AuditToolRegistry | undefined;
     const instance = new ReviewApi({
       settings,
+      ...(typeof tools?.register === 'function' ? { auditStageExecutor: executeAuditCli, auditStageGates: configuredAuditStageGates() } : {}),
       saveSettings: async (next) => {
         const saved = await saveSettings(next);
         logger?.info(`dsh-code-review: 设置已保存（repo=${saved.repoRoot || '未配置'}）`);
@@ -333,6 +340,7 @@ export function apply(ctx: HostContext): void {
     });
     await instance.init();
     if (disposed) return;
+    if (typeof tools?.register === 'function') removeStageTools = registerAuditStageTools(tools, instance);
     api = instance;
     logger?.info(`dsh-code-review host mounted（repo=${settings.repoRoot || '未配置'}）`);
   })().catch((error: unknown) => {
@@ -381,6 +389,7 @@ export function apply(ctx: HostContext): void {
       disposed = true;
       shutdown.abort();
       off();
+      removeStageTools?.();
       offConnection();
       offCentral();
       const results = await Promise.allSettled([connection.stop(), managed?.stop()]);

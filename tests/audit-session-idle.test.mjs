@@ -33,7 +33,10 @@ function fixture() {
         wait: async () => ({ reason: 'idle', state: getState() }),
         state: async () => getState(),
     };
-    const services = { sessionController: controller, agents: { get: () => agent }, goals: { get: () => goal } };
+    const services = {
+        sessionController: controller, agents: { get: () => agent }, goals: { get: () => goal },
+        subagents: { waitForTreeWork: async () => false, listDescendants: async () => [] },
+    };
     return {
         agent, controller, events, services, getState, setGoal: value => { goal = value; },
         get maintenance() { return maintenance; },
@@ -55,6 +58,40 @@ test('单轮审查确认结束后进入维护窗口，新输入在收尾期间�
     }), true);
     assert.equal(f.queuedAfterMaintenance, true);
     assert.equal(calls, 1);
+});
+
+test('等待后台创建收束，子任务仍可独立接收输入时保留手动收尾', async () => {
+    const f = fixture();
+    const { promise, resolve } = Promise.withResolvers();
+    let waiting = false;
+    f.services.subagents.waitForTreeWork = async () => {
+        waiting = true;
+        assert.equal(f.maintenance, false);
+        return promise;
+    };
+    f.services.subagents.listDescendants = async () => {
+        assert.equal(f.maintenance, true);
+        return [{ kind: 'child', activity: 'inactive' }];
+    };
+    const result = f.run(async () => assert.fail('有子任务时不能自动收尾'));
+    await Promise.resolve();
+    assert.equal(waiting, true);
+    assert.equal(f.maintenance, false);
+    resolve(true);
+    assert.equal(await result, false);
+});
+
+test('后台等待可取消，宿主缺少子任务接口时保留手动收尾', async () => {
+    const f = fixture();
+    f.services.subagents.waitForTreeWork = () => new Promise(() => {});
+    const controller = new AbortController();
+    const result = f.run(async () => assert.fail('等待未完成'), controller.signal);
+    await Promise.resolve();
+    controller.abort();
+    await assert.rejects(result, { name: 'AbortError' });
+    assert.equal(f.maintenance, false);
+    delete f.services.subagents;
+    assert.equal(await f.run(async () => assert.fail('缺少后台任务状态')), false);
 });
 
 test('排队续轮、待确认输入和尚未入队的 goal 续轮都阻止自动收尾', async () => {

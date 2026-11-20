@@ -1,7 +1,6 @@
 import { existsSync } from 'node:fs';
-import { readdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { auditFiles } from './audit-files.js';
 import path from 'node:path';
-import process from 'node:process';
 import { readMarkdownFrontmatter, dump } from './yaml.js';
 import { isRepoRelativePath, parseTime } from './invariants.js';
 
@@ -228,6 +227,12 @@ export class AuditArchive {
     return path.join(this.repoRoot, '.ai-review', 'audits');
   }
 
+  async readDraft(dirName: string): Promise<string | null> {
+    if (!AUDIT_DIR_PATTERN.test(dirName)) throw new AuditFormatError(`审查目录名非法：${dirName}`);
+    const result = await auditFiles(this.repoRoot, { op: 'read', paths: [`.ai-review/audits/${dirName}/audit.md`] });
+    return result.bytes?.toString('utf8') ?? null;
+  }
+
   /** 写路径可省略 source 检查工作区。共享读路径须传入快照，而且不会扫描旧的扁平报告。 */
   async list(source?: AuditSnapshotSource): Promise<AuditRecord[]> {
     const records: AuditRecord[] = [];
@@ -247,18 +252,15 @@ export class AuditArchive {
       return records;
     }
     try {
-      dirs = (await readdir(this.auditsRoot, { withFileTypes: true }))
-        .filter((entry) => entry.isDirectory() && AUDIT_DIR_PATTERN.test(entry.name))
-        .map((entry) => entry.name);
+      const result = await auditFiles(this.repoRoot, { op: 'list', paths: ['.ai-review/audits'] });
+      dirs = (result.names ?? []).filter(name => AUDIT_DIR_PATTERN.test(name));
     } catch {
       return records;
     }
     dirs.sort();
     for (const dirName of dirs) {
-      const reviewPath = path.join(this.auditsRoot, dirName, 'audit.md');
-      if (!existsSync(reviewPath)) continue;
-      const record = await this.read(dirName);
-      records.push(record);
+      const record = await this.read(dirName).catch(() => null);
+      if (record) records.push(record);
     }
     return records;
   }
@@ -267,7 +269,7 @@ export class AuditArchive {
     const reviewPath = path.join(this.auditsRoot, dirName, 'audit.md');
     const text = source
       ? await source.readAuditText(dirName).catch(() => null)
-      : await readFile(reviewPath, 'utf8');
+      : await this.readDraft(dirName);
     if (text === null) throw new Error(`审查档案不存在：${dirName}`);
     return this.recordFromText(dirName, reviewPath, text);
   }
@@ -296,27 +298,19 @@ export class AuditArchive {
   }
 
   async write(meta: AuditFrontmatter, body: string): Promise<AuditRecord> {
-    const errors = auditInvariantErrors(meta, meta.auditId);
-    if (errors.length > 0) throw new AuditFormatError(errors.join('；'));
-    const dir = path.join(this.auditsRoot, meta.auditId);
-    if (existsSync(dir)) throw new AuditFormatError(`审查目录已存在：${meta.auditId}`);
-    const { mkdir } = await import('node:fs/promises');
-    await mkdir(dir, { recursive: true });
-    return this.writeExisting(meta, body);
+    return this.writeArchive(meta, body, true);
   }
 
-  /** 仅用于 Host 收尾。要求 Agent 已在目标目录写入报告，再用验证过的完整档案覆盖。 */
   async writeExisting(meta: AuditFrontmatter, body: string): Promise<AuditRecord> {
+    return this.writeArchive(meta, body, false);
+  }
+
+  private async writeArchive(meta: AuditFrontmatter, body: string, createOnly: boolean): Promise<AuditRecord> {
     const errors = auditInvariantErrors(meta, meta.auditId);
     if (errors.length > 0) throw new AuditFormatError(errors.join('；'));
-    const dir = path.join(this.auditsRoot, meta.auditId);
-    const { mkdir } = await import('node:fs/promises');
-    await mkdir(dir, { recursive: true });
-    const reviewPath = path.join(dir, 'audit.md');
-    const temp = `${reviewPath}.tmp-${String(process.pid)}`;
-    await writeFile(temp, serializeAuditMarkdown(meta, body), 'utf8');
-    await rename(temp, reviewPath);
-    return { meta, body, dirName: meta.auditId, reviewPath };
+    const file = `.ai-review/audits/${meta.auditId}/audit.md`;
+    await auditFiles(this.repoRoot, { op: 'write', paths: [file], text: serializeAuditMarkdown(meta, body), createOnly });
+    return { meta, body, dirName: meta.auditId, reviewPath: path.join(this.repoRoot, file) };
   }
 
   async nextAuditId(scope: string, now: Date): Promise<string> {
@@ -355,11 +349,7 @@ export class AuditArchive {
     const body = note
       ? `${record.body.replace(/\s+$/, '')}\n\n# 审查项处理记录\n\n- ${note}\n`
       : record.body;
-    const temp = `${record.reviewPath}.tmp-${String(process.pid)}`;
-    const { writeFile: writeAtomic, rename: renameAtomic } = await import('node:fs/promises');
-    await writeAtomic(temp, serializeAuditMarkdown(record.meta, body), 'utf8');
-    await renameAtomic(temp, record.reviewPath);
-    return { ...record, body };
+    return this.writeExisting(record.meta, body);
   }
 }
 

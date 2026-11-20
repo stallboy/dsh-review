@@ -161,6 +161,7 @@ export class ReadModels {
         baseRevision: string;
         targetPath: string;
         sessionId?: string;
+        commitOutcomeUnknown?: true;
       }
       | undefined;
     try {
@@ -175,6 +176,7 @@ export class ReadModels {
           baseRevision: lease.baseRevision,
           targetPath: lease.targetPath,
           ...(lease.sessionId ? { sessionId: lease.sessionId } : {}),
+          ...(lease.commitOutcomeUnknown ? { commitOutcomeUnknown: true as const } : {}),
         };
       }
     } catch {

@@ -123,7 +123,7 @@
   /** releasable 租约仍阻塞共享写入，直到显式释放或收尾。 */
   interface AuditLeaseInfo {
     auditId: string; state: 'active' | 'releasable'; trigger: string; createdAt: string;
-    owner: string; baseRevision: string; targetPath: string; sessionId?: string;
+    owner: string; baseRevision: string; targetPath: string; sessionId?: string; commitOutcomeUnknown?: true;
   }
   interface Queue {
     configured: boolean; items: QueueItem[]; errors: string[]; currentBase: string | null;
@@ -1097,6 +1097,7 @@
       const [auditOpen, setAuditOpen] = useState(false);
       const [auditTarget, setAuditTarget] = useState('');
       const [auditNote, setAuditNote] = useState('');
+      const [auditExtra, setAuditExtra] = useState('');
       const [auditPrompt, setAuditPrompt] = useState('');
       const [auditPromptLoading, setAuditPromptLoading] = useState(false);
       const [auditLaunching, setAuditLaunching] = useState(false);
@@ -1526,7 +1527,10 @@
       };
 
       const fetchAuditPrompt = async (): Promise<string> => {
-        const query = new URLSearchParams({ targetPath: auditTarget, note: auditNote, mode: 'session' });
+        const query = new URLSearchParams({ targetPath: auditTarget, note: auditNote, mode: 'session',
+          focus: JSON.stringify(auditNote.trim() ? [auditNote.trim()] : []),
+          extraRequirements: JSON.stringify(auditExtra.split(/\r?\n/).map(text => text.trim()).filter(Boolean)),
+        });
         const value = await api.get<{ prompt: string }>(`/audit/prompt?${query.toString()}`);
         return value.prompt;
       };
@@ -1560,6 +1564,8 @@
         try {
           const value = await api.post<{ sessionId: string; auditId: string; job: Job }>('/audit/session', {
             targetPath: auditTarget, note: auditNote,
+            focus: auditNote.trim() ? [auditNote.trim()] : [],
+            extraRequirements: auditExtra.split(/\r?\n/).map(text => text.trim()).filter(Boolean),
           });
           setAuditSessionId(value.sessionId);
           setAuditLeaseId(value.auditId);
@@ -1607,7 +1613,10 @@
         if (!releaseArmed) { setReleaseArmed(true); return; }
         setBusy(true);
         try {
-          await api.post('/audit/release', { auditId: leaseId, confirmStopped: true });
+          await api.post('/audit/release', {
+            auditId: leaseId, confirmStopped: true,
+            ...(queue?.auditLease?.commitOutcomeUnknown ? { confirmCommitChecked: true } : {}),
+          });
           setAuditLeaseId('');
           setReleaseArmed(false);
           setJob(null);
@@ -1669,11 +1678,12 @@
         return h('div', { className: 'dcr-card' },
           h('div', { className: 'dcr-row' },
             h('div', { className: 'dcr-grow' },
-              h('h3', { style: { margin: 0 } }, active ? '仓库审查执行中（待收尾）' : '审查待处理：执行租约已超时或被取消'),
+              h('h3', { style: { margin: 0 } }, info.commitOutcomeUnknown ? '审查提交待核验'
+                : active ? '仓库审查执行中（待收尾）' : '审查待处理：执行租约等待确认'),
               h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 4 } },
                 `${info.auditId} · 始于 ${dateText(info.createdAt)} · 基线 ${short(info.baseRevision)}${info.sessionId ? ` · 审查会话 ${short(info.sessionId)}` : ''}`),
             ),
-            h('button',
+            info.commitOutcomeUnknown ? null : h('button',
               {
                 className: 'dcr-btn p', disabled: busy, onClick: finalizeAuditLease,
                 ...(active ? { title: '审查会话可能仍在执行：再次点击确认收尾' } : {}),
@@ -1682,10 +1692,13 @@
                 ? (finalizeArmed ? '确认收尾（审查仍在执行）' : '收尾并提交候选')
                 : '收尾并提交候选'),
             active ? null : h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void releaseAuditLease(); } },
-              releaseArmed ? '确认释放（不提交）' : '释放租约'),
+              info.commitOutcomeUnknown ? (releaseArmed ? '再次确认已核验并释放' : '确认已核验并释放')
+                : (releaseArmed ? '确认释放（不提交）' : '释放租约')),
           ),
           h('div', { className: `dcr-banner ${active ? 'info' : 'warn'}`, style: { marginTop: 8 } },
-            active
+            info.commitOutcomeUnknown
+              ? '请核对版本历史和本轮评审文件，确认提交结果且外部执行已停止后，再释放租约。'
+              : active
               ? 'Host 确认审查会话结束后会自动收尾。若未自动启动，请先确认会话已结束，再手动收尾。收尾前共享写保持互斥。'
               : '执行租约仍在阻塞共享写（approve / AI 修复 / rebase / sync 均被拒绝）。若审查会话已完成并产出候选，「收尾并提交候选」会校验并提交它们；确认外部执行已停止且不需要提交时，才释放租约（本地候选保持未提交状态）。'),
         );
@@ -1786,7 +1799,11 @@
             ),
             h('div', { className: 'dcr-field' },
               h('label', null, '补充关注点（可选）'),
-              h('textarea', { className: 'dcr-textarea', value: auditNote, placeholder: '例如：重点关注并发关闭竞态与资源泄漏；不要修改公开 API。', onChange: (e: any) => setAuditNote(e.target.value) }),
+              h('textarea', { className: 'dcr-textarea', value: auditNote, placeholder: '例如：覆盖写入成功后响应超时的重试链路。', onChange: (e: any) => setAuditNote(e.target.value) }),
+            ),
+            h('div', { className: 'dcr-field' },
+              h('label', null, '额外要求（可选）'),
+              h('textarea', { className: 'dcr-textarea', value: auditExtra, placeholder: '每行一条，例如：保留公开 API。', onChange: (e: any) => setAuditExtra(e.target.value) }),
             ),
             h('div', { className: 'dcr-row' },
               h('button', { className: 'dcr-btn p', disabled: busy || auditLaunching || auditPromptLoading || !auditReady, onClick: () => { void launchAuditSession(); } }, auditLaunching ? '正在创建会话…' : '启动审查会话'),

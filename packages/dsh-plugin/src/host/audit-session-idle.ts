@@ -1,4 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import { addAbortListener } from 'node:events';
 import type { AuditSessionHost } from './index.js';
 
 interface SessionState {
@@ -48,13 +49,18 @@ function completed(events: readonly SessionEvent[], requestId: string): boolean 
 
 export async function withDshAuditSessionIdle(
     host: AuditSessionHost, sessionId: string, requestId: string, signal: AbortSignal,
-    finalize: (signal: AbortSignal) => Promise<void>,
+    finalize: (signal: AbortSignal) => Promise<void | false>,
 ): Promise<boolean> {
     const controller = host.get('sessionController') as SessionController | undefined;
     const agents = host.get('agents') as { get(id: string): AuditAgent | undefined } | undefined;
     const goals = host.get('goals') as { get(agent: AuditAgent): { phase: string } | undefined } | undefined;
+    const subagents = host.get('subagents') as {
+        waitForTreeWork(agent: AuditAgent): Promise<boolean>;
+        listDescendants(sessionId: string, signal: AbortSignal): Promise<unknown[]>;
+    } | undefined;
     if (typeof controller?.wait !== 'function' || typeof controller.state !== 'function'
-        || typeof agents?.get !== 'function' || typeof goals?.get !== 'function') return false;
+        || typeof agents?.get !== 'function' || typeof goals?.get !== 'function'
+        || typeof subagents?.waitForTreeWork !== 'function' || typeof subagents.listDescendants !== 'function') return false;
 
     while (!signal.aborted) {
         const { reason, state } = await controller.wait({ sessionId, timeoutMs: 30_000, maxMessages: 1 }, signal);
@@ -70,18 +76,31 @@ export async function withDshAuditSessionIdle(
                 return (!goal || goal.phase === 'complete') && completed(agent.session.snapshotEvents(0), requestId);
             };
             if (canFinalize(state)) {
+                signal.throwIfAborted();
+                let onAbort: ReturnType<typeof addAbortListener> | undefined;
+                try {
+                    const abort = new Promise<never>((_, reject) => {
+                        onAbort = addAbortListener(signal, () => reject(signal.reason));
+                    });
+                    await Promise.race([subagents.waitForTreeWork(agent), abort]);
+                } finally {
+                    onAbort?.[Symbol.dispose]();
+                }
                 let entered = false;
                 try {
                     signal.throwIfAborted();
                     const finalized = await agent.runMaintenance(async maintenance => {
                         entered = true;
                         const combined = AbortSignal.any([signal, maintenance]);
+                        const descendants = await subagents.listDescendants(sessionId, combined);
+                        // 根会话维护窗无法拦截直接投递给子会话的新输入。
+                        if (!Array.isArray(descendants) || descendants.length) return 'manual';
                         const fresh = await controller.state({ sessionId }, combined);
                         combined.throwIfAborted();
                         if (fresh.cursor !== state.cursor || !canFinalize(fresh)) return false;
-                        await finalize(combined);
-                        return true;
+                        return await finalize(combined) !== false;
                     });
+                    if (finalized === 'manual') return false;
                     if (finalized) return true;
                 } catch (error) {
                     if (entered || signal.aborted) throw error;
