@@ -378,6 +378,38 @@ test('未决中央任务阻止停用和更换中央，节点凭据与用户身�
     assert.equal((await value.status()).centralId, app.database.centralId);
 });
 
+test('删除配置先校验原中央，凭据清理后中断仍可继续删除', async t => {
+    const { value, directory } = await controller(t);
+    const requests = [];
+    const server = createServer((req, res) => {
+        requests.push({ path: req.url, authorized: Boolean(req.headers.authorization) });
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ centralId: 'different-central-id', protocolVersion: 1 }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise(resolve => server.close(resolve)));
+    const centralId = 'original-central-id';
+    const centerUrl = `http://127.0.0.1:${server.address().port}/`;
+    const configFile = path.join(directory, 'connection.json');
+    const secretsFile = path.join(directory, 'connection-secrets.json');
+    const config = {
+        version: 1, enabled: true, mode: 'external', centralId, centerUrl, reviewIdentity: '', profiles: {},
+    };
+    await writeFile(configFile, JSON.stringify(config));
+    await writeFile(secretsFile, JSON.stringify({
+        password: 'fixture', nodes: { [centralId]: { nodeId: 'original-node-id', token: 'original-credential-value' } },
+    }));
+    await assert.rejects(value.forget({ centralId, stopCurrent: true }), { code: 'central_identity_changed' });
+    assert.deepEqual(requests, [{ path: '/api/v1/info', authorized: false }]);
+    assert.equal((await value.status()).centralId, centralId);
+
+    await writeFile(configFile, JSON.stringify({ ...config, enabled: false }));
+    await writeFile(secretsFile, JSON.stringify({ password: 'fixture', nodes: {} }));
+    await value.forget({ centralId, stopCurrent: false });
+    assert.equal((await value.status()).centralId, '');
+    assert.equal(requests.length, 1);
+});
+
 test('两个首次配置实例不能在取得锁之前覆盖活动实例的设置和秘密', async t => {
     const { value, directory, ConnectionController } = await controller(t);
     const other = new ConnectionController({ directory, candidates: async () => [], localEntry: new URL('../apps/server/dist/owned.js', import.meta.url) });

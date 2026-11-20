@@ -428,6 +428,10 @@ export class ConnectionController {
         if (!this.config.enabled) return null;
         const credentials = this.secrets.nodes[this.config.centralId];
         if (!credentials) throw new Error('无法核验原中央节点状态，请恢复原连接');
+        const verified = await this.inspectCentral(this.config.centerUrl);
+        if (verified.centralId !== this.config.centralId) {
+            throw new ConnectionIssueError('server', 'central_identity_changed', '该地址已属于另一中央，请核对原中央地址');
+        }
         const status = await this.request(this.config.centerUrl, 'node-api/v1/status', credentials.token, {}) as NodeStatus;
         if (status.centralId !== this.config.centralId || status.nodeId !== credentials.nodeId) throw new Error('原中央或节点身份已变化，请核对原连接');
         if (status.pending) throw new ConnectionIssueError('startup', 'connection_busy', '原中央仍有未决任务，请先处理后再切换或停止连接');
@@ -564,43 +568,42 @@ export class ConnectionController {
             const centralId = typeof input.centralId === 'string' ? input.centralId : '';
             const config = this.config;
             if (!config || !this.savedAddress(centralId)) throw new Error('已保存的连接不存在，请刷新连接列表');
+            const configFile = path.join(this.options.directory, 'connection.json');
             const current = config.mode === 'external' && config.centralId === centralId;
             if (current) {
                 if (config.enabled && input.stopCurrent !== true) throw new Error('该连接正在使用，请刷新后确认停止并删除');
                 await this.idle();
                 await this.shutdown(false);
+                if (config.enabled) {
+                    const stopped = { ...config, enabled: false };
+                    await saveJson(configFile, stopped);
+                    this.config = stopped;
+                }
+                this.runtimeProgress = undefined;
+                this.error = '';
+                this.issue = undefined;
+                this.generation++;
             }
 
-            const previous = current ? { ...config, enabled: false } : config;
-            const next = structuredClone(previous);
+            const next = structuredClone(config);
             const profile = next.profiles[centralId];
             if (profile) {
                 delete profile.centerUrl;
                 delete profile.label;
             }
             if (current) {
+                next.enabled = false;
                 next.centerUrl = '';
                 next.centralId = '';
                 next.reviewIdentity = '';
-                this.runtimeProgress = undefined;
-                this.error = '';
-                this.issue = undefined;
-                this.generation++;
             }
             const nextSecrets = { ...this.secrets, nodes: { ...this.secrets.nodes } };
             delete nextSecrets.nodes[centralId];
-            const configFile = path.join(this.options.directory, 'connection.json');
-            this.config = previous;
+            // 凭据移除后才隐藏配置，中断后仍可从列表继续删除。
+            await saveJson(path.join(this.options.directory, 'connection-secrets.json'), nextSecrets);
+            this.secrets = nextSecrets;
             await saveJson(configFile, next);
             this.config = next;
-            try {
-                await saveJson(path.join(this.options.directory, 'connection-secrets.json'), nextSecrets);
-            } catch (error) {
-                await saveJson(configFile, previous);
-                this.config = previous;
-                throw error;
-            }
-            this.secrets = nextSecrets;
         }));
     }
 
