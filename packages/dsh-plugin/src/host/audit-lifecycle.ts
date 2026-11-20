@@ -14,6 +14,9 @@ export interface AuditLeaseRecord {
   candidateIdsBefore: string[];
   state: AuditLeaseState;
   sessionId?: string;
+  phased?: boolean;
+  stageSeal?: Record<string, string>;
+  stageItems?: import('./audit-archive.js').AuditItem[];
 }
 
 export type BlockingLease = AuditLeaseRecord & { state: 'active' | 'releasable' };

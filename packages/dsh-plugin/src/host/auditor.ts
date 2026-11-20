@@ -5,11 +5,13 @@ import path from 'node:path';
 import { patchTouchesReviewData, collectCommitEntries, gitBlobHash, type VcsAdapter } from './vcs.js';
 import { reviewersPath } from './reviewers.js';
 import { runAgent, wrapAgentPrompt } from './runner.js';
+import { AuditStopUnknown } from './audit-stage-runner.js';
+import { compatibleAuditBase, type StageSeal } from './audit-stage-artifacts.js';
 import { captureReviewWorktree, reviewWorktreeFingerprint, scheduledGateState, scheduledPatch, undoScheduledGatePatch,
   type ReviewWorktreeState } from './scheduled-audit-vcs.js';
 import { ReviewStore } from './store.js';
 import type { CandidateSource } from './store.js';
-import { AuditArchive, type AuditItem } from './audit-archive.js';
+import { AuditArchive, serializeAuditMarkdown, type AuditFrontmatter, type AuditItem } from './audit-archive.js';
 import { auditRecheckPrompt, auditRecheckSection, loadAuditHistory, verifyAuditRecheck, type AuditRecheck } from './audit-history.js';
 import type { AuditLeaseRecord } from './audit-lifecycle.js';
 import type {
@@ -235,7 +237,7 @@ async function collectOutline(repoRoot: string, targetAbsolute: string, limit = 
   return lines.join('\n');
 }
 
-async function existingCandidateLines(
+export async function existingCandidateLines(
   store: ReviewStore,
   baseRevision: string,
   source?: CandidateSource,
@@ -253,7 +255,7 @@ async function existingCandidateLines(
   }
 }
 
-async function negativeMemoryLines(
+export async function negativeMemoryLines(
   repoRoot: string,
   source?: import('./shared-facts.js').SharedCandidateSource,
 ): Promise<string> {
@@ -519,6 +521,9 @@ function fallbackReport(input: {
 export interface AuditFinalizeInput {
   auditId: string;
   beforeIds: Set<string>;
+  phasedItems?: AuditItem[];
+  phasedSeal?: StageSeal;
+  phasedGate?: (patch: string, commands: string[]) => ReturnType<typeof import('./validator.js').runGateChecks>;
   baseRevision: string;
   targetPath: string;
   trigger: 'manual' | 'scheduled';
@@ -579,7 +584,7 @@ export function auditIdToCreatedAt(auditId: string): string {
 }
 
 /** 跨轮相同类别和标题必须得到同一个编号，投影才能合并它们的观察。 */
-function findingIdOf(kind: 'confirm' | 'deferred', title: string): string {
+export function findingIdOf(kind: 'confirm' | 'deferred', title: string): string {
   const normalized = title.trim().toLowerCase().replace(/\s+/g, ' ');
   const hash = createHash('sha1').update(`${kind}:${normalized}`).digest('hex').slice(0, 10);
   return `f-${hash}`;
@@ -688,6 +693,11 @@ function filterAClassSection(body: string, validIds: string[], createdIds: strin
       continue;
     }
     if (inSection && /^\s*[-*]\s/.test(line) && invalid.some((id) => line.includes(id))) continue;
+    const resolution = /^(\|.*\|) A · ([^ |]+) \|$/.exec(line);
+    if (resolution && invalid.includes(resolution[2] ?? '')) {
+      out.push(resolution[1] + ' 候选未通过收尾 |');
+      continue;
+    }
     out.push(line);
   }
   return `${out.join('\n').replace(/\s+$/, '')}\n-（${String(invalid.length)} 个候选未通过收尾校验，未纳入共享提交；详见插件复核块。）\n`;
@@ -1008,6 +1018,14 @@ export class Auditor {
           if (!current) continue;
           const patchPath = path.join(detail.candidate.dirPath, current.patch);
           const targetFiles = detail.candidate.meta.targetFiles;
+          const commands = gateMode === 'smoke' ? reviewersConfig.auditSmokeCommands : detail.candidate.meta.gateChecks;
+          if (input.phasedItems) {
+            if (!input.phasedGate) throw new Error('缺少受限门禁环境');
+            const report = await input.phasedGate(patchPath, commands);
+            if (report.allPassed) gateRechecked.push(candidate.id);
+            else candidate.errors.push('收尾门禁（' + gateMode + '）未通过：\n' + report.formattedEvidenceMarkdown);
+            continue;
+          }
           if (input.scheduledScan) {
             const review = await captureReviewWorktree(store.repoRoot, vcs.type, true);
             if (!sameReviewWorktree(input.scheduledScan, review) || !await this.scheduledBaseSafe(input.baseRevision)
@@ -1022,7 +1040,6 @@ export class Auditor {
             continue;
           }
           if (input.scheduledScan) gatePatch = { path: patchPath, targetFiles, appliedState: await scheduledGateState(vcs, targetFiles) };
-          const commands = gateMode === 'smoke' ? reviewersConfig.auditSmokeCommands : detail.candidate.meta.gateChecks;
           const report = await runGateChecks(commands, {
             cwd: store.repoRoot,
             baseRevision: input.baseRevision,
@@ -1038,10 +1055,11 @@ export class Auditor {
             gateRechecked.push(candidate.id);
           }
         } catch (error) {
+          if (input.phasedItems && (error instanceof AuditStopUnknown || this.deps.signal?.aborted)) return recovery();
           if (input.scheduledScan && !gatePatch) return recovery('SCHEDULE_SCAN_DIRTY', '无法核验定时门禁应用的补丁，现场保留待核验');
           candidate.errors.push(`收尾门禁执行异常：${error instanceof Error ? error.message : String(error)}`);
         } finally {
-          if (!input.scheduledScan) await vcs.revertBusinessWorkspace().catch(() => undefined);
+          if (!input.scheduledScan && !input.phasedItems) await vcs.revertBusinessWorkspace().catch(() => undefined);
         }
         if (!await this.scheduledBaseSafe(input.baseRevision)) return recovery();
         if (gatePatch && input.scheduledScan) {
@@ -1087,7 +1105,7 @@ export class Auditor {
       : `门禁已由 Host 复算（${gateMode}）：${String(gateRechecked.length)} 通过，${String(gateFailed)} 失败（失败候选已从 candidates 与 A 类列表剔除）`;
     const bodyWithGateNote = `${filteredBody.replace(/\s+$/, '')}\n\n> 收尾说明：${gateNote}\n`;
     const archive = new AuditArchive(store.repoRoot);
-    let items = buildAuditItems(deferredItems, warnings, input.targetPath || '.');
+    let items = input.phasedItems ?? buildAuditItems(deferredItems, warnings, input.targetPath || '.');
     if (input.recheck) {
         const historicalIds = new Set(input.recheck.knownFindings.flatMap(item => [item.findingId, findingIdOf(item.kind, item.title)]));
         items = [...new Map(items.filter(item => !historicalIds.has(item.findingId)).map(item => [item.findingId, item])).values(),
@@ -1100,7 +1118,7 @@ export class Auditor {
       .sort()
       .pop() ?? null;
     const reviewersCreated = input.scheduledScan ? await ensureReviewScaffold(store, this.deps.owner) : input.reviewersCreated;
-    await archive.writeExisting({
+    const auditMeta: AuditFrontmatter = {
       schemaVersion: 1,
       auditId: input.auditId,
       createdAt,
@@ -1110,12 +1128,14 @@ export class Auditor {
       previousAudit: previous,
       candidates: validAfterGates,
       items,
-    }, bodyWithGateNote);
+    };
+    await archive.writeExisting(auditMeta, bodyWithGateNote);
     this.log(`审查档案：${reportPath}（B/Deferred ${String(items.length)} 项；${gateNote}）`);
 
     const commitPaths = [
-      `.ai-review/audits/${input.auditId}`,
-      ...validAfterGates.map((id) => `.ai-review/${id}`),
+      ...(input.phasedItems ? [reportPath, ...validAfterGates.flatMap(id => [
+        '.ai-review/' + id + '/review.md', '.ai-review/' + id + '/001.patch',
+      ])] : [`.ai-review/audits/${input.auditId}`, ...validAfterGates.map(id => `.ai-review/${id}`)]),
       ...(reviewersCreated ? ['.ai-review/reviewers.yml'] : []),
     ];
     let commitRevision: string | null = null;
@@ -1130,6 +1150,14 @@ export class Auditor {
       const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
       // 提交目录前校验展开后的完整文件集合，防止夹带未验证内容。
       const { entries: commitEntries } = await collectCommitEntries(store.repoRoot, commitPaths);
+      if (input.phasedItems) {
+        const expectedReport = gitBlobHash(serializeAuditMarkdown(auditMeta, bodyWithGateNote));
+        if (!input.phasedSeal || commitEntries.length !== commitPaths.length || commitEntries.some(entry =>
+          entry.blobHash !== (entry.path === reportPath ? expectedReport : input.phasedSeal![entry.path]))) {
+          return recovery('SYNC_STATE_UNKNOWN', '收尾提交快照与本轮封存内容不符');
+        }
+        if (!await compatibleAuditBase(vcs, input.baseRevision)) return recovery();
+      }
       if (!await this.scheduledBaseSafe(input.baseRevision)) return recovery();
       if (this.deps.signal?.aborted) return cancelled();
       const commit = await vcs.atomicCommit({
