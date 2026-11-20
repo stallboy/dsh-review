@@ -44,6 +44,23 @@ window.fetch=async(url,init={})=>{
             }
         }
         value={...status};
+    }else if(test.auditFixture && String(url).includes('/api/health')){
+        value={configured:true,repoRoot:'/test/repo',owner:'tester',counts:{}};
+    }else if(test.auditFixture && String(url).includes('/api/settings')){
+        value={settings:{owner:'tester'},validation:{ok:true,errors:[]}};
+    }else if(test.auditFixture && String(url).includes('/api/queue')){
+        value={configured:true,items:[],errors:[],counts:{},currentBase:'commit',auditLease:{auditId:'20261119-120000-repo',state:'releasable',createdAt:'2026-11-19T12:00:00Z',baseRevision:'commit'}};
+    }else if(test.auditFixture && String(url).includes('/api/audit/finalize')){
+        value={job:{id:'format-check',type:'audit',status:'running',startedAt:'2026-11-19T12:00:00Z',log:[]}};
+    }else if(test.auditFixture && String(url).includes('/api/jobs/format-check')){
+        value={id:'format-check',type:'audit',status:'succeeded',startedAt:'2026-11-19T12:00:00Z',log:[],result:{
+            status:'ABORTED',message:'正式审查档案校验失败，未提交本轮产物',
+            dataValidation:[
+                {path:'.ai-review/2026-11/bad/review.md',errors:['owner 是必填字段，不得缺省']},
+                {path:'.ai-review/2026-11/ok/review.md',errors:[]},
+                {path:'.ai-review/audits/20261119-120000-repo/audit.md',errors:['previous_audit 是必填字段，不得缺省']},
+            ],
+        }};
     }else if(String(url).includes('/candidate?')){
         value={data:{candidate:{id:'2026-11/demo',meta:{title:'Demo',owner:'张三',status:'pending',currentRevision:2,updatedAt:'2026-11-17T00:00:00Z',humanDecisions:[],comments:[],revisions:[{id:1},{id:2}],gateChecks:[],approval:null},sections:{...${JSON.stringify(sections)},...(test.emptySolution ? {solution:""} : {})},humanJudgmentDeclared:true,humanJudgment:[]},patchText:patch,comments:[],validation:[],isBaseBehind:false}};
     }else if(String(url).includes('/diff?')) value={data:{unifiedDiff:patch}};
@@ -98,6 +115,15 @@ try {
     await send('Page.navigate', { url: `http://127.0.0.1:${server.address().port}/` });
     await send('Page.bringToFront');
     await send('Emulation.setFocusEmulationEnabled', { enabled: true });
+    await waitFor(`document.querySelector('input[aria-label="审核身份"]')!==null`);
+    await evaluate('test.auditFixture=true');
+    await click('本地评审');
+    await waitFor(`[...document.querySelectorAll('button')].some(button=>button.textContent==='收尾并提交候选')`);
+    await click('收尾并提交候选');
+    await waitFor(`document.querySelector('.dcr-job')?.textContent.includes('评审文件校验')`);
+    await check('主会话收尾后直接展示两类文件及字段错误', `(()=>{const job=document.querySelector('.dcr-job');return job.textContent.includes('1/3 个文件通过') && job.textContent.includes('.ai-review/2026-11/bad/review.md') && job.textContent.includes('owner 是必填字段') && job.textContent.includes('.ai-review/audits/20261119-120000-repo/audit.md') && job.textContent.includes('previous_audit 是必填字段')})()`);
+    await click('中央连接');
+    await evaluate('test.auditFixture=false');
     await waitFor(`document.querySelector('input[aria-label="审核身份"]')!==null`);
     await check('仅评审会话底部隐藏且零高度', `getComputedStyle(document.getElementById('seat')).display==='none' && document.getElementById('seat').offsetHeight===0 && document.getElementById('other-seat').offsetHeight===80`);
     await evaluate(`(()=>{const input=document.querySelector('input[aria-label="审核身份"]');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,'张三');input.dispatchEvent(new Event('input',{bubbles:true}))})()`);

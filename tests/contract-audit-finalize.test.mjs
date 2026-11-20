@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { AuditArchive } from '../packages/dsh-plugin/dist/host/audit-archive.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
@@ -202,6 +203,8 @@ test('收尾拒绝重复键和缺失字段，Job 保留原始格式错误', asyn
     })).json();
     const { auditId } = await post('/audit/manual', { targetPath: '', note: '' });
     const duplicate = '20261109-duplicate-owner', missing = '20261109-missing-owner';
+    const valid = '20261109-valid-owner';
+    await writeCandidate(root, valid);
     await writeCandidate(root, duplicate, 'other\nowner: tester');
     await writeCandidate(root, missing);
     const missingReview = path.join(root, '.ai-review', '2026-11', missing, 'review.md');
@@ -213,5 +216,47 @@ test('收尾拒绝重复键和缺失字段，Job 保留原始格式错误', asyn
     const results = new Map(job.result.created.map(candidate => [candidate.id, candidate.errors]));
     assert.match(results.get(`2026-11/${duplicate}`)[0], /duplicated mapping key/);
     assert.match(results.get(`2026-11/${missing}`)[0], /owner.*必填/);
-    assert.equal(runCommand('git', ['ls-files', '.ai-review/2026-11'], root).stdout.trim(), '');
+    const validation = new Map(job.result.dataValidation.map(file => [file.path, file.errors]));
+    assert.equal(validation.size, 4);
+    assert.deepEqual(validation.get(`.ai-review/2026-11/${valid}/review.md`), []);
+    assert.match(validation.get(`.ai-review/2026-11/${duplicate}/review.md`)[0], /duplicated mapping key[\s\S]*owner:/);
+    assert.match(validation.get(`.ai-review/2026-11/${missing}/review.md`)[0], /owner.*必填/);
+    assert.deepEqual(validation.get(`.ai-review/audits/${auditId}/audit.md`), []);
+    const committed = runCommand('git', ['ls-files', '.ai-review/2026-11'], root).stdout.trim().split('\n');
+    assert.deepEqual(committed, [`.ai-review/2026-11/${valid}/001.patch`, `.ai-review/2026-11/${valid}/review.md`]);
+});
+
+test('正式 audit.md 校验失败时 Job 指明字段并保留租约和本轮文件', async (t) => {
+    const write = AuditArchive.prototype.writeExisting;
+    t.mock.method(AuditArchive.prototype, 'writeExisting', async function (meta, body) {
+        const record = await write.call(this, meta, body);
+        const text = await readFile(record.reviewPath, 'utf8');
+        await writeFile(record.reviewPath, text.replace(/^previous_audit: .*\n/m, ''), 'utf8');
+        return record;
+    });
+    const root = await createGitFixture();
+    await ensureReviewers(root);
+    const { base } = await startApi(root);
+    const post = async (route, data) => (await fetch(base + route, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data),
+    })).json();
+    const { auditId } = await post('/audit/manual', { targetPath: '', note: '' });
+    const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+    const slug = '20261109-valid-review';
+    await writeCandidate(root, slug);
+
+    const { jobId } = await post('/audit/finalize', { auditId });
+    const job = await waitForJob(base, jobId);
+    const auditPath = `.ai-review/audits/${auditId}/audit.md`;
+    assert.equal(job.result.status, 'ABORTED');
+    assert.equal(job.result.commitRevision, null);
+    assert.deepEqual(job.result.dataValidation, [
+        { path: `.ai-review/2026-11/${slug}/review.md`, errors: [] },
+        { path: auditPath, errors: ['previous_audit 是必填字段，不得缺省'] },
+    ]);
+    assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), head);
+    assert.match(await readFile(path.join(root, auditPath), 'utf8'), /schema_version: 1/);
+    assert.match(await readFile(path.join(root, '.ai-review', '2026-11', slug, 'review.md'), 'utf8'), /owner: tester/);
+    const queue = await fetch(base + '/queue').then(response => response.json());
+    assert.equal(queue.auditLease.auditId, auditId);
 });

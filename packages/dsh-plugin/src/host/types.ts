@@ -165,6 +165,11 @@ export interface AuditCandidateResult {
   errors: string[];
 }
 
+export interface ReviewDataFileValidation {
+    path: string;
+    errors: string[];
+}
+
 export interface AuditDeferredItem {
   label: string;
   text: string;
@@ -186,6 +191,7 @@ export interface AuditOutcome {
   created: AuditCandidateResult[];
   deferred: AuditDeferredItem[];
   report: AuditReportInfo | null;
+  dataValidation?: ReviewDataFileValidation[];
   commitRevision: string | null;
   reason?: 'COMMIT_OUTCOME_UNKNOWN' | 'SYNC_STATE_UNKNOWN' | 'SCHEDULE_RECHECK_DIRTY' | 'SCHEDULE_SCAN_DIRTY';
   detail?: string;

@@ -160,6 +160,7 @@
     mode: 'full' | 'incremental'; unifiedDiff: string; fromRevision: number | null; toRevision: number;
     fromBase: string | null; toBase: string; resolutionMode: string | null; notes: string[];
   }
+  interface ReviewDataFileValidation { path: string; errors: string[] }
   interface Job {
     id: string; type: string; status: 'running' | 'succeeded' | 'failed'; startedAt: string;
     finishedAt?: string; log: string[]; result?: any; error?: string;
@@ -2365,6 +2366,8 @@
       const renderJob = (): any => {
         if (!job) return null;
         const result = job.result;
+        const validation: ReviewDataFileValidation[] = job.type === 'audit' && Array.isArray(result?.dataValidation)
+          ? result.dataValidation : [];
         const running = job.status === 'running';
         const failed = job.status === 'failed';
         const lastLine = job.log.length > 0 ? job.log[job.log.length - 1] : '等待输出…';
@@ -2394,6 +2397,15 @@
           job.error ? h('div', { className: 'dcr-banner err', style: { marginTop: 8 } }, job.error) : null,
           result?.reason ? h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 6 } }, `reason：${String(result.reason)}`) : null,
           result?.message ? h('div', { className: `dcr-banner ${outcomeIsErr ? 'err' : 'info'}`, style: { marginTop: 8 } }, result.message) : null,
+          validation.length > 0 ? h('div', { className: 'dcr-banner ' + (validation.some((file) => file.errors.length > 0) ? 'err' : 'info'), style: { marginTop: 8 } },
+            h('strong', null, `评审文件校验 · ${String(validation.filter((file) => file.errors.length === 0).length)}/${String(validation.length)} 个文件通过`),
+            ...validation.filter((file) => file.errors.length > 0).map((file) => h('div', { key: file.path, style: { marginTop: 8 } },
+              h('code', { style: { overflowWrap: 'anywhere' } }, file.path),
+              h('ul', null, ...file.errors.map((error, index) => h('li', {
+                key: index, style: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' },
+              }, error))),
+            )),
+          ) : null,
           result?.commitRevision ? h('div', { className: 'dcr-small dcr-mono dcr-muted', style: { marginTop: 6 } }, `commit ${short(result.commitRevision)}`) : null,
           h('details', { className: 'dcr-joblog', open: running ? true : undefined },
             h('summary', null, `${running ? '实时日志' : '运行日志'}（${String(job.log.length)} 行）`),

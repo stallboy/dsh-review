@@ -531,6 +531,7 @@ export class AuditRuntime {
         auditId: current.auditId,
         commitRevision: result.commitRevision,
         created: result.created,
+        dataValidation: result.dataValidation,
         reportPath: result.reportPath,
         ...(result.reason ? { reason: result.reason } : {}),
         ...(result.detail ? { detail: result.detail } : {}),

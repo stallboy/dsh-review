@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { patchTouchesReviewData, collectCommitEntries, gitBlobHash, type VcsAdapter } from './vcs.js';
@@ -11,6 +11,7 @@ import { ReviewStore } from './store.js';
 import type { CandidateSource } from './store.js';
 import { AuditArchive, type AuditItem } from './audit-archive.js';
 import { auditRecheckPrompt, auditRecheckSection, loadAuditHistory, verifyAuditRecheck, type AuditRecheck } from './audit-history.js';
+import { validateReviewData } from './review-data-validation.js';
 import type { AuditLeaseRecord } from './audit-lifecycle.js';
 import type {
   AppSettings,
@@ -19,6 +20,7 @@ import type {
   AuditOutcome,
   AuditReportInfo,
   PatchStats,
+  ReviewDataFileValidation,
   VcsType,
 } from './types.js';
 import { ApiError } from './types.js';
@@ -533,6 +535,7 @@ export interface AuditFinalizeInput {
 }
 
 export interface AuditFinalizeResult {
+  dataValidation: ReviewDataFileValidation[];
   created: AuditCandidateResult[];
   deferred: AuditDeferredItem[];
   reportPath: string;
@@ -916,7 +919,7 @@ export class Auditor {
       ...(scheduledScan ? { scheduledScan } : {}),
     });
 
-    const created = prechecked ?? result.created;
+    const created = result.created.length ? result.created : (prechecked ?? result.created);
     if (runError && created.length === 0 && !recheck) {
       throw new Error(`${runError}${result.reportPath ? `；审查报告：${result.reportPath}` : ''}`);
     }
@@ -936,6 +939,7 @@ export class Auditor {
       baseRevision: base,
       targetPath: target.targetPath,
       warnings: result.warnings,
+      dataValidation: result.dataValidation,
       ...(result.reason ? { reason: result.reason } : {}),
       ...(result.detail ? { detail: result.detail } : {}),
       message: recheck && result.status !== 'COMMITTED' ? runError ?? result.message : message,
@@ -948,7 +952,27 @@ export class Auditor {
     const { store, vcs } = this.deps;
     const warnings = [...(input.extraWarnings ?? [])];
     const reportPath = `.ai-review/audits/${input.auditId}/audit.md`;
+    const dataValidation: ReviewDataFileValidation[] = [];
+    const checkedHashes = new Map<string, string>();
+    const realRoot = await realpath(store.repoRoot);
+    const checkFile = async (file: string): Promise<string[]> => {
+      let errors: string[];
+      try {
+        const absolute = await realpath(path.join(realRoot, file));
+        if (path.relative(realRoot, absolute).split(path.sep).join('/') !== file) {
+          throw new Error('评审文件必须位于原目录，不得通过符号链接重定向');
+        }
+        const bytes = await readFile(absolute);
+        errors = validateReviewData(file, bytes);
+        if (!errors.length) checkedHashes.set(file, gitBlobHash(bytes));
+      } catch (error) {
+        errors = [`无法读取评审文件：${error instanceof Error ? error.message : String(error)}`];
+      }
+      dataValidation.push({ path: file, errors });
+      return errors;
+    };
     const aborted = (): AuditFinalizeResult => ({
+      dataValidation,
       created: [],
       deferred: [],
       reportPath,
@@ -960,13 +984,13 @@ export class Auditor {
     });
     const recovery = (reason: AuditFinalizeResult['reason'] = 'SYNC_STATE_UNKNOWN',
         detail = '审查收尾期间无法确认绑定、基线或工作区状态'): AuditFinalizeResult => ({
-        created: [], deferred: [], reportPath, body: '', commitRevision: null, status: 'RECOVERY_REQUIRED', warnings,
+        created: [], deferred: [], reportPath, body: '', commitRevision: null, status: 'RECOVERY_REQUIRED', warnings, dataValidation,
         reason, detail, message: '审查收尾需要核验现场',
     });
     const cancelled = () => input.scheduledScan ? recovery('SCHEDULE_SCAN_DIRTY', '全仓扫描收尾已取消，现场保留待核验') : aborted();
     if (this.deps.signal?.aborted) return cancelled();
     if (!await this.scheduledBaseSafe(input.baseRevision)) return recovery();
-    const created = await this.verifyCandidates(input.beforeIds, input.baseRevision, warnings, input.reviewersCreated === true);
+    const created = await this.verifyCandidates(input.beforeIds, input.baseRevision, warnings, input.reviewersCreated === true, checkFile);
     this.log(`收尾：新增候选 ${String(created.length)} 个，校验问题 ${String(created.filter((item) => item.errors.length > 0).length)} 个`);
 
     const absolute = path.join(store.repoRoot, reportPath);
@@ -1100,17 +1124,36 @@ export class Auditor {
       .sort()
       .pop() ?? null;
     const reviewersCreated = input.scheduledScan ? await ensureReviewScaffold(store, this.deps.owner) : input.reviewersCreated;
-    await archive.writeExisting({
-      schemaVersion: 1,
-      auditId: input.auditId,
-      createdAt,
-      baseRevision: input.baseRevision,
-      scope: input.targetPath || '.',
-      trigger: input.trigger,
-      previousAudit: previous,
-      candidates: validAfterGates,
-      items,
-    }, bodyWithGateNote);
+    const rejected = (message: string): AuditFinalizeResult => ({
+      created,
+      deferred: deferredItems,
+      reportPath,
+      body: bodyWithGateNote,
+      commitRevision: null,
+      status: 'ABORTED',
+      dataValidation,
+      warnings,
+      message,
+    });
+    try {
+      await archive.writeExisting({
+        schemaVersion: 1,
+        auditId: input.auditId,
+        createdAt,
+        baseRevision: input.baseRevision,
+        scope: input.targetPath || '.',
+        trigger: input.trigger,
+        previousAudit: previous,
+        candidates: validAfterGates,
+        items,
+      }, bodyWithGateNote);
+    } catch (error) {
+      dataValidation.push({ path: reportPath, errors: [error instanceof Error ? error.message : String(error)] });
+      return rejected('无法生成正式审查档案，未提交本轮产物');
+    }
+    if ((await checkFile(reportPath)).length > 0) {
+      return rejected('正式审查档案校验失败，未提交本轮产物');
+    }
     this.log(`审查档案：${reportPath}（B/Deferred ${String(items.length)} 项；${gateNote}）`);
 
     const commitPaths = [
@@ -1130,6 +1173,15 @@ export class Auditor {
       const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
       // 提交目录前校验展开后的完整文件集合，防止夹带未验证内容。
       const { entries: commitEntries } = await collectCommitEntries(store.repoRoot, commitPaths);
+      const entriesByPath = new Map(commitEntries.map((entry) => [entry.path, entry.blobHash]));
+      const checkedFiles = [reportPath, ...validAfterGates.map((id) => `.ai-review/${id}/review.md`)];
+      const changedFiles = checkedFiles.filter((file) => !checkedHashes.has(file) || checkedHashes.get(file) !== entriesByPath.get(file));
+      if (changedFiles.length > 0) {
+        for (const file of changedFiles) {
+          dataValidation.find((entry) => entry.path === file)?.errors.push('校验后文件内容发生变化或文件已移除');
+        }
+        return rejected('收尾文件在校验后发生变化，未提交本轮产物');
+      }
       if (!await this.scheduledBaseSafe(input.baseRevision)) return recovery();
       if (this.deps.signal?.aborted) return cancelled();
       const commit = await vcs.atomicCommit({
@@ -1195,6 +1247,7 @@ export class Auditor {
       deferred: deferredItems,
       reportPath,
       body: filteredBody,
+      dataValidation,
       commitRevision,
       status,
       ...(recoveryReason ? { reason: recoveryReason } : {}),
@@ -1221,6 +1274,7 @@ export class Auditor {
     baseRevision: string,
     warnings: string[],
     allowNewReviewers = false,
+    checkFile?: (file: string) => Promise<string[]>,
   ): Promise<AuditCandidateResult[]> {
     const { store, vcs } = this.deps;
     const scheduled = this.deps.lease?.trigger === 'scheduled';
@@ -1250,6 +1304,10 @@ export class Auditor {
         errors: [],
       };
       try {
+        if (checkFile) {
+          const errors = await checkFile(`.ai-review/${id}/review.md`);
+          if (errors.length) throw new Error(errors.join('；'));
+        }
         const detail = await store.get(id, baseRevision);
         if (detail.candidate.parseError) throw new Error(detail.candidate.parseError);
         const meta = detail.candidate.meta;

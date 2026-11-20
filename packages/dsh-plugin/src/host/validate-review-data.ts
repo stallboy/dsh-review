@@ -1,28 +1,13 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { auditInvariantErrors, parseAuditMarkdown } from './audit-archive.js';
-import { parseReviewMarkdown } from './frontmatter.js';
-import { quickReviewInvariants } from './invariants.js';
+import { validateReviewData } from './review-data-validation.js';
 
 const help = '用法：dsh-review-validate <review.md 或 audit.md 的路径> [...]';
 
 async function validate(file: string): Promise<{ path: string; errors: string[] }> {
     try {
-        const filename = path.basename(file);
-        if (filename !== 'review.md' && filename !== 'audit.md') {
-            throw new Error('仅支持 review.md 和 audit.md');
-        }
-        const text = new TextDecoder('utf-8', { fatal: true }).decode(await readFile(file));
-        const parent = path.dirname(file);
-        const slug = path.basename(parent);
-        if (filename === 'review.md') {
-            const month = path.basename(path.dirname(parent));
-            const { meta } = parseReviewMarkdown(text);
-            return { path: file, errors: quickReviewInvariants({ id: `${month}/${slug}`, month, slug, meta }) };
-        }
-        const { meta } = parseAuditMarkdown(text);
-        return { path: file, errors: auditInvariantErrors(meta, slug) };
+        return { path: file, errors: validateReviewData(file, await readFile(file)) };
     } catch (error) {
         return { path: file, errors: [error instanceof Error ? error.message : String(error)] };
     }
