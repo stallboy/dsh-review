@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { withDshAuditSessionIdle } from './audit-session-idle.js';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from './api.js';
 import { dshHome, loadSettings, saveSettings } from './settings.js';
@@ -172,7 +173,7 @@ function inheritOwnerPolicy(
 
 export async function createDshAuditSession(
   host: AuditSessionHost,
-  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string },
+  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string; requestId?: string },
 ): Promise<{ sessionId: string }> {
   return createDshSession(host, input, '审查');
 }
@@ -188,7 +189,7 @@ export async function createDshFixSession(
 /** 将会话挂到 cwd 对应的工作区，才能让侧栏在正确的工作区展示它。 */
 async function createDshSession(
   host: AuditSessionHost,
-  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string },
+  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string; requestId?: string },
   label: string,
 ): Promise<{ sessionId: string }> {
   const controller = host.get('sessionController') as DshSessionController | undefined;
@@ -226,7 +227,7 @@ async function createDshSession(
   try {
     const prompted = await controller.prompt(
       {
-        requestId: `dsh-code-review-${randomUUID()}`,
+        requestId: input.requestId ?? `dsh-code-review-${randomUUID()}`,
         sessionId,
         mode: 'queue',
         content: [{ type: 'text', text: input.prompt }],
@@ -249,6 +250,7 @@ export function apply(ctx: HostContext): void {
   let api: ReviewApi | undefined;
   let managed: ManagedHandle | null = null;
   let disposed = false;
+  const shutdown = new AbortController();
   let initError: Error | undefined;
   let localWrites = 0;
 
@@ -310,6 +312,9 @@ export function apply(ctx: HostContext): void {
       },
       resolveCredential,
       createAuditSession: (input) => createDshAuditSession(ctx, input),
+      withAuditSessionIdle: (sessionId, requestId, signal, finalize) => withDshAuditSessionIdle(
+        ctx, sessionId, requestId, AbortSignal.any([signal, shutdown.signal]), finalize,
+      ),
       createFixSession: (input) => createDshFixSession(ctx, input),
       resolveSessionCwd: (sessionId) => {
         const sessions = ctx.get('sessions') as {
@@ -374,6 +379,7 @@ export function apply(ctx: HostContext): void {
   ctx.effect(
     () => async () => {
       disposed = true;
+      shutdown.abort();
       off();
       offConnection();
       offCentral();

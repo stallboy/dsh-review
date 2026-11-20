@@ -921,7 +921,7 @@
                     h('p', null, '请通过中央工作台查看项目并执行评审。已保存中央配置时，本地评审写入保持停用。'),
                     h('button', { className: 'dcr-btn p', onClick: () => setTab('central') }, '进入中央工作台'),
                 ))
-                : h(App, props);
+                : h(App, { ...props, key: props.sessionId });
         else if (tab === 'central') content = status?.legacy
             ? status.centerUrl
                 ? h('div', { className: 'dcr-body' }, h('section', { className: 'dcr-card' },
@@ -1048,6 +1048,8 @@
             content,
         );
     }
+
+    const auditJobsBySession = new Map<string, string>();
 
     function App(props: { t: (key: string) => string; sessionId: string }) {
       const session = props.sessionId || '';
@@ -1186,9 +1188,17 @@
         void (async () => {
           const current = await refreshHealth();
           try { await loadSettings(); } catch { /* 健康检查已足以决定打开哪个页面。 */ }
+          const auditJobId = auditJobsBySession.get(session);
+          if (current?.configured && auditJobId) {
+            try {
+              const restored = await api.get<Job>(`/jobs/${encodeURIComponent(auditJobId)}`);
+              setJob(restored);
+              setBusy(restored.status === 'running');
+            } catch { /* 回到队列后仍可使用租约入口。 */ }
+          }
           setScreen(current?.configured ? 'queue' : 'setup');
         })();
-      }, [refreshHealth, loadSettings]);
+      }, [api, session, refreshHealth, loadSettings]);
 
       useEffect(() => {
         if (screen !== 'queue') return;
@@ -1555,6 +1565,7 @@
           setAuditLeaseId(value.auditId);
           jobLogRef.current = [];
           jobLogOffsetRef.current = null;
+          auditJobsBySession.set(session, value.job.id);
           setJob(value.job);
           setBusy(value.job.status === 'running');
           setAuditOpen(false);
@@ -1675,7 +1686,7 @@
           ),
           h('div', { className: `dcr-banner ${active ? 'info' : 'warn'}`, style: { marginTop: 8 } },
             active
-              ? '审查会话结束后请回到这里执行收尾：Host 将校验本轮候选并原子提交 .ai-review，随后候选进入下方队列；收尾前共享写保持互斥。'
+              ? 'Host 确认审查会话结束后会自动收尾。若未自动启动，请先确认会话已结束，再手动收尾。收尾前共享写保持互斥。'
               : '执行租约仍在阻塞共享写（approve / AI 修复 / rebase / sync 均被拒绝）。若审查会话已完成并产出候选，「收尾并提交候选」会校验并提交它们；确认外部执行已停止且不需要提交时，才释放租约（本地候选保持未提交状态）。'),
         );
       };
@@ -2391,7 +2402,10 @@
                 .then((value) => setJob(value.job))
                 .catch((e) => setError(e instanceof Error ? e.message : String(e)));
             } }, '取消任务') : null,
-            !running ? h('button', { className: 'dcr-btn g', onClick: () => setJob(null) }, '关闭') : null,
+            !running ? h('button', { className: 'dcr-btn g', onClick: () => {
+              if (auditJobsBySession.get(session) === job.id) auditJobsBySession.delete(session);
+              setJob(null);
+            } }, '关闭') : null,
           ),
           running ? h('div', { className: 'dcr-small dcr-muted dcr-mono', style: { marginTop: 6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, lastLine) : null,
           job.error ? h('div', { className: 'dcr-banner err', style: { marginTop: 8 } }, job.error) : null,

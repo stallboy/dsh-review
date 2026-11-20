@@ -50,10 +50,13 @@ window.fetch=async(url,init={})=>{
         value={settings:{owner:'tester'},validation:{ok:true,errors:[]}};
     }else if(test.auditFixture && String(url).includes('/api/queue')){
         value={configured:true,items:[],errors:[],counts:{},currentBase:'commit',auditLease:{auditId:'20261119-120000-repo',state:'releasable',createdAt:'2026-11-19T12:00:00Z',baseRevision:'commit'}};
+    }else if(test.auditFixture && String(url).includes('/api/audit/session')){
+        value={sessionId:'audit-child',auditId:'20261119-120000-repo',job:{id:'auto-check',type:'audit',status:'running',startedAt:'2026-11-19T12:00:00Z',log:[]}};
     }else if(test.auditFixture && String(url).includes('/api/audit/finalize')){
+        test.manualFinalizes=(test.manualFinalizes||0)+1;
         value={job:{id:'format-check',type:'audit',status:'running',startedAt:'2026-11-19T12:00:00Z',log:[]}};
-    }else if(test.auditFixture && String(url).includes('/api/jobs/format-check')){
-        value={id:'format-check',type:'audit',status:'succeeded',startedAt:'2026-11-19T12:00:00Z',log:[],result:{
+    }else if(test.auditFixture && ['/api/jobs/format-check','/api/jobs/auto-check'].some(route=>String(url).includes(route))){
+        value={id:String(url).includes('/auto-check')?'auto-check':'format-check',type:'audit',status:'succeeded',startedAt:'2026-11-19T12:00:00Z',log:[],result:{
             status:'ABORTED',message:'正式审查档案校验失败，未提交本轮产物',
             dataValidation:[
                 {path:'.ai-review/2026-11/bad/review.md',errors:['owner 是必填字段，不得缺省']},
@@ -122,6 +125,17 @@ try {
     await click('收尾并提交候选');
     await waitFor(`document.querySelector('.dcr-job')?.textContent.includes('评审文件校验')`);
     await check('主会话收尾后直接展示两类文件及字段错误', `(()=>{const job=document.querySelector('.dcr-job');return job.textContent.includes('1/3 个文件通过') && job.textContent.includes('.ai-review/2026-11/bad/review.md') && job.textContent.includes('owner 是必填字段') && job.textContent.includes('.ai-review/audits/20261119-120000-repo/audit.md') && job.textContent.includes('previous_audit 是必填字段')})()`);
+    await click('中央连接');
+    await click('本地评审');
+    await waitFor(`[...document.querySelectorAll('button')].some(button=>button.textContent==='审查仓库')`);
+    await click('审查仓库');
+    await click('启动审查会话');
+    await waitFor(`document.querySelector('.dcr-job')!==null`);
+    await evaluate('test.hideReview();test.mountReview()');
+    await waitFor(`[...document.querySelectorAll('button')].some(button=>button.textContent==='本地评审')`);
+    await click('本地评审');
+    await waitFor(`document.querySelector('.dcr-job')?.textContent.includes('评审文件校验')`);
+    await check('切回主会话后恢复自动收尾诊断', `test.manualFinalizes===1 && document.querySelector('.dcr-job').textContent.includes('previous_audit 是必填字段')`);
     await click('中央连接');
     await evaluate('test.auditFixture=false');
     await waitFor(`document.querySelector('input[aria-label="审核身份"]')!==null`);

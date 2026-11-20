@@ -82,6 +82,7 @@ export interface ApiDeps {
     cwd: string;
     title: string;
     prompt: string;
+    requestId?: string;
     /** 新会话继承面板所属会话的权限预设与审批策略。 */
     ownerSessionId?: string;
   }) => Promise<{ sessionId: string }>;
@@ -92,7 +93,8 @@ export interface ApiDeps {
     prompt: string;
     ownerSessionId?: string;
   }) => Promise<{ sessionId: string }>;
-  /** 依赖宿主的真实 turn 结束事件，避免把仍在写入的会话误判为已结束。 */
+  withAuditSessionIdle?: (sessionId: string, requestId: string, signal: AbortSignal,
+    finalize: (signal: AbortSignal) => Promise<void>) => Promise<boolean>;
   onAuditTurnEnd?: (sessionId: string, callback: () => void) => () => void;
   clientEntry?: () => unknown;
   /** 缺省落在 DSH_HOME/dsh-code-review/runtime-state.json，使未释放的租约在宿主重启后仍能阻塞写入。 */
