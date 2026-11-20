@@ -3,6 +3,7 @@ import type { ApiRequest, ApiResponse } from './api-context.js';
 import path from 'node:path';
 import process from 'node:process';
 import { ApprovalOrchestrator } from './approval.js';
+import { FindingApprovalState } from './finding-approval-state.js';
 import type { AuditLifecycle, AuditLeaseRecord } from './audit-lifecycle.js';
 import { JobManager } from './jobs.js';
 import { RouteTable, blockedByRunningAudit, holdsRepoLock, isAuditSelfManaged } from './routes.js';
@@ -13,10 +14,12 @@ import { detectVcs, suggestOwner, validateSettings } from './settings.js';
 import type {
   AppSettings,
   AiFixOutcome,
+  ApprovalOutcome,
   ConcurrencyGuard,
   HealthInfo,
   JobRecord,
   ReviewStatus,
+  ReviewCandidate,
   VcsType,
 } from './types.js';
 import { ApiError } from './types.js';
@@ -101,6 +104,10 @@ export class ReviewApi implements ApiHost {
 
   publishAuditStages(sessionId: string, input: unknown): Promise<{ reportPath: string }> {
     return this.auditRuntime.publishStages(sessionId, input);
+  }
+
+  queryAuditHistory(sessionId: string, disposition?: string): Promise<unknown> {
+    return this.auditRuntime.queryHistory(sessionId, disposition);
   }
 
   leaseLookup(auditId: string): AuditLeaseRecord | undefined {
@@ -291,6 +298,7 @@ export class ReviewApi implements ApiHost {
     { method: 'POST', path: '/reopen', kind: 'candidate-write', handler: ({ req, res, url }) => this.writers.reopen(req, res, url) },
     { method: 'POST', path: '/convert', kind: 'candidate-write', handler: ({ req, res, url }) => this.writers.convert(req, res, url) },
     { method: 'POST', path: '/dismiss-finding', kind: 'candidate-write', handler: ({ req, res, url }) => this.writers.dismissFinding(req, res, url) },
+    { method: 'POST', path: '/finding/decision', kind: 'candidate-write', handler: ({ req, res, url }) => this.writers.findingDecision(req, res, url) },
     { method: 'POST', path: '/candidate/finalize', kind: 'candidate-write', handler: ({ req, res, url }) => this.writers.candidateFinalize(req, res, url) },
     { method: 'POST', path: '/rebase', kind: 'workspace-txn', handler: ({ req, res, url }) => this.writers.rebase(req, res, url) },
     // 创建会话可能长时间等待。路由仍检查审查互斥，由 FixSessions 单独占用该仓库，避免阻塞其他写事务。
@@ -455,15 +463,36 @@ export class ReviewApi implements ApiHost {
       if (!normalized) throw new ApiError(422, 'bad_request', "commitDetail 只能是 'simple' 或 'detailed'");
       commitDetail = normalized;
     }
+    const expectedFindingVersion = stringField(body, 'expectedFindingVersion');
+    const findingState = (findingId: string) => new FindingApprovalState(runtime.root, findingId, this.deps.statePath);
+    const checkFinding = async (candidate: ReviewCandidate, verifyRecovery: boolean) => {
+      if (!candidate.meta.findingId) return null;
+      const { findings } = await this.readModels.findingProjection(runtime);
+      const finding = findings.find((item) => item.findingId === candidate.meta.findingId);
+      if (finding?.disposition !== 'undecided' || !finding.options?.some(option => option.candidateId === id && option.status === 'pending')) {
+        return { reason: 'STATE_CONFLICT' as const, message: '发现已处置、已有获批补丁或此候选已退出选项' };
+      }
+      if (finding.findingVersion !== expectedFindingVersion) {
+        return { reason: 'CONCURRENCY_MISMATCH' as const, message: '发现版本已更新，请刷新后重新选择补丁' };
+      }
+      if (verifyRecovery && !await findingState(candidate.meta.findingId).canRetry(vcs).catch(() => false)) {
+        return { reason: 'STATE_CONFLICT' as const, message: '该发现的上一次审批提交结果仍待核验' };
+      }
+      return null;
+    };
     await this.writers.requireOwnerOf(store, id);
     await this.writers.requireSharedCandidate(runtime, id);
     const approvalCommitInput = commitDetail === undefined && commitMessage === undefined
       ? undefined
       : { ...(commitMessage !== undefined ? { commitMessage } : {}), ...(commitDetail ? { commitDetail } : {}) };
+    let findingId: string | undefined;
     {
       const detail = await store.get(id, null, await sharedSourceFor(runtime));
-      if (detail.candidate.meta.schemaVersion === 2) {
-        throw new ApiError(409, 'conflict', '发现候选尚不能在此版本批准。');
+      findingId = detail.candidate.meta.findingId;
+      if (detail.candidate.meta.findingId) {
+        if (!expectedFindingVersion) throw new ApiError(422, 'bad_request', '新版候选缺少 expectedFindingVersion');
+        const conflict = await checkFinding(detail.candidate, false);
+        if (conflict) throw new ApiError(409, conflict.reason === 'CONCURRENCY_MISMATCH' ? 'stale' : 'conflict', conflict.message);
       }
       if (detail.candidate.meta.currentRevision !== guard.expectedRevision
         || detail.candidate.meta.owner !== guard.expectedOwner
@@ -501,6 +530,9 @@ export class ReviewApi implements ApiHost {
         settings: this.settings,
         makeRunner: (request) => new Runner(request),
         checkDuplicate,
+        checkFinding: candidate => checkFinding(candidate, true),
+        beginFindingCommit: (candidate, paths, probe) => findingState(candidate.meta.findingId!).begin(paths, probe),
+        finishFindingCommit: candidate => findingState(candidate.meta.findingId!).clear(),
         validateNewRevision: (previous, latest) => this.writers.validateNewRevision(runtime, previous, latest),
         sharedSource: () => sharedSourceFor(runtime),
         shouldCancel: () => Boolean((job as { cancelRequested?: boolean }).cancelRequested),
@@ -508,7 +540,16 @@ export class ReviewApi implements ApiHost {
         signal,
       });
       const me = await this.ownerFor(store.repoRoot);
-      const outcome = await this.withWriteLock(store.repoRoot, () => orchestrator.approve(id, guard, jobId, log, { confirmed, waived }, me, commitMessage, approvalCommitInput));
+      const outcome = await this.withWriteLock(store.repoRoot, async (): Promise<ApprovalOutcome> => {
+        try {
+          return await orchestrator.approve(id, guard, jobId, log, { confirmed, waived }, me, commitMessage, approvalCommitInput);
+        } catch (error) {
+          if (!findingId || !await findingState(findingId).pending().catch(() => true)) throw error;
+          return { status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN', jobId,
+            message: '发现审批提交未返回可核验结果，请保留现场',
+            detail: error instanceof Error ? error.message : String(error) };
+        }
+      });
       log(`结果：${outcome.status}${outcome.reason ? ` (${outcome.reason})` : ''} — ${outcome.message}`);
       return outcome;
     });

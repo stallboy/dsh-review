@@ -89,6 +89,9 @@ export interface ApprovalDeps {
   sharedSource?: () => Promise<CandidateSource | undefined>;
   /** 返回阻止批准的被拒候选 ID。窗口与人工重开豁免由提供者判定。 */
   checkDuplicate?: () => Promise<string | null>;
+  checkFinding?: (candidate: ReviewCandidate) => Promise<{ reason: 'STATE_CONFLICT' | 'CONCURRENCY_MISMATCH'; message: string } | null>;
+  beginFindingCommit?: (candidate: ReviewCandidate, paths: string[], probe: string | null) => Promise<void>;
+  finishFindingCommit?: (candidate: ReviewCandidate) => Promise<void>;
   validateNewRevision?: (previous: ReviewCandidate, latest: ReviewCandidate) => Promise<string[]>;
   /** 只在仍可安全中止的检查点轮询。 */
   shouldCancel?: () => boolean;
@@ -310,9 +313,10 @@ export class ApprovalOrchestrator {
         };
       }
       const fresh = freshReload.candidate;
-      if (fresh.meta.schemaVersion === 2) {
+      const findingConflict = await this.findingConflict(fresh);
+      if (findingConflict) {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
-        return { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '发现候选尚不能在此版本批准。', jobId };
+        return { status: 'ABORTED', ...findingConflict, jobId };
       }
       if (messageOverride !== undefined) {
         fresh.meta.commitMessage = messageOverride;
@@ -341,11 +345,25 @@ export class ApprovalOrchestrator {
         };
       }
       const backup = await this.backup(fresh);
-      await store.applyApproval(fresh, operator?.trim() || guard.expectedOwner, report, decisions);
       const patchPaths = fresh.meta.revisions.map((revision) =>
         relative(store.repoRoot, path.join(fresh.dirPath, revision.patch)),
       );
       const reviewRelPath = relative(store.repoRoot, fresh.reviewPath);
+      const probePaths = [reviewRelPath, ...patchPaths];
+      const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
+      if (fresh.meta.findingId) {
+        try {
+          if (!this.deps.beginFindingCommit || !this.deps.finishFindingCommit) throw new Error('缺少发现审批状态存储');
+          await this.deps.beginFindingCommit(fresh, probePaths, probeBefore);
+        } catch (error) {
+          await vcs.revertBusinessWorkspace().catch(() => undefined);
+          return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: error instanceof Error ? error.message : String(error), jobId };
+        }
+      }
+      const finishFinding = async (): Promise<void> => {
+        if (fresh.meta.findingId) await this.deps.finishFindingCommit?.(fresh).catch(error => log(String(error)));
+      };
+      await store.applyApproval(fresh, operator?.trim() || guard.expectedOwner, report, decisions);
       const reviewText = await readFile(fresh.reviewPath, 'utf8');
       const reviewStat = await stat(fresh.reviewPath);
       const verifyEntries = businessPaths.flatMap((rel) => {
@@ -364,8 +382,6 @@ export class ApprovalOrchestrator {
       const businessMessage = (await businessMessageFor(fresh))
         ?? (fresh.meta.commitMessage || `review(${id}): approve rev ${String(fresh.meta.currentRevision)}`);
       if (commitInput?.commitDetail) log(`提交信息模式：${commitInput.commitDetail === 'detailed' ? '详细（单行综述 + 空行 + 事实正文）' : '简略（单行）'}`);
-      const probePaths = [reviewRelPath, ...patchPaths];
-      const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
       const commit = await vcs.atomicCommit({
         message: businessMessage,
         paths: [...businessPaths, relative(store.repoRoot, fresh.dirPath)],
@@ -394,6 +410,7 @@ export class ApprovalOrchestrator {
           jobId,
           log,
         });
+        if (outcome?.status !== 'RECOVERY_REQUIRED') await finishFinding();
         if (outcome) return outcome;
         continue;
       }
@@ -413,6 +430,7 @@ export class ApprovalOrchestrator {
         commitRevision = probeAfter;
       }
       log(`批准提交成功：${commitRevision.slice(0, 12)}`);
+      await finishFinding();
       return {
         status: 'COMMITTED',
         message: `已批准并原子提交版本 ${String(fresh.meta.currentRevision)}`,
@@ -544,6 +562,12 @@ export class ApprovalOrchestrator {
     }
   }
 
+  private findingConflict(candidate: ReviewCandidate) {
+    if (!candidate.meta.findingId) return null;
+    return this.deps.checkFinding?.(candidate)
+      ?? { reason: 'STATE_CONFLICT' as const, message: '发现候选缺少同组审批守卫' };
+  }
+
   private async runPrechecks(
     id: string,
     guard: ConcurrencyGuard,
@@ -575,9 +599,8 @@ export class ApprovalOrchestrator {
       };
     }
     const candidate = reload.candidate;
-    if (candidate.meta.schemaVersion === 2) {
-      return { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '发现候选尚不能在此版本批准。', jobId } };
-    }
+    const findingConflict = await this.findingConflict(candidate);
+    if (findingConflict) return { outcome: { status: 'ABORTED', ...findingConflict, jobId } };
     if (commitMessage !== undefined) candidate.meta.commitMessage = commitMessage;
     const decisionErrors = checkDecisionCoverage(candidate.meta.humanDecisions, decisions.confirmed, decisions.waived);
     if (decisionErrors.length > 0) {

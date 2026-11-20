@@ -174,6 +174,10 @@ function run(request: AuditFilesRequest & { root: string }): AuditFilesResult {
         const leaf = components.pop()!;
         const directory = enter(root, components, request.op === 'write', request.createOnly);
         if (request.op === 'read') return { bytes: readLeaf(leaf, directory) };
+        if (request.expectedText !== undefined
+            && (readLeaf(leaf, directory)?.toString('utf8') ?? null) !== request.expectedText) {
+            throw new Error('评审产物在写入前已更新');
+        }
         writeLeaf(leaf, directory, request.text ?? '');
         return {};
     } catch (error) {

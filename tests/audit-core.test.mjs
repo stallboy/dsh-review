@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { buildAuditPrompt, normalizeAuditTarget, parseAuditReport, Auditor } from '../packages/dsh-plugin/dist/host/auditor.js';
+import { parseAuditMarkdown } from '../packages/dsh-plugin/dist/host/audit-archive.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
 import { createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
@@ -202,6 +203,21 @@ function auditorFor(root, overrides = {}) {
   });
   return { auditor, logs };
 }
+
+test('进程型审查将结构化补丁和文字方案收尾为新版档案', async () => {
+  const root = await createGitFixture();
+  const { auditor } = auditorFor(root, {
+    externalCommand: `"${process.execPath}" "${fakeAuditAgentPath()}" --finding-workflow`,
+  });
+  const outcome = await auditor.run();
+  assert.equal(outcome.status, 'COMMITTED', JSON.stringify(outcome));
+  const committed = runCommand('git', ['show', `HEAD:${outcome.report.path}`], root).stdout;
+  const { meta } = parseAuditMarkdown(committed);
+  assert.equal(meta.schemaVersion, 2);
+  assert.equal(meta.items[0].options[0].candidateId, '2026-10/20261031-math-fix');
+  assert.equal(meta.items[1].repairPlan, '核对既有接口约定并补充验收用例。');
+  assert.deepEqual(meta.candidates, ['2026-10/20261031-math-fix']);
+});
 
 test('Auditor runs an agent, verifies candidates, writes report and commits .ai-review', async () => {
   const root = await createGitFixture();

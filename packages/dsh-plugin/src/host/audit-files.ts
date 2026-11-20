@@ -7,6 +7,7 @@ export interface AuditFilesRequest {
     op: 'read' | 'list' | 'write' | 'snapshot' | 'remove';
     paths: string[];
     text?: string;
+    expectedText?: string | null;
     createOnly?: boolean;
     entries?: ExpectedCommitEntry[];
 }

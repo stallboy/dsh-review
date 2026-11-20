@@ -3,6 +3,9 @@ import { readFile } from 'node:fs/promises';
 import type { ApiRequest, ApiResponse } from './api-context.js';
 import path from 'node:path';
 import { AuditArchive } from './audit-archive.js';
+import { auditFiles } from './audit-files.js';
+import { findingDecisionFromRequest, findingRecordPath, parseFindingEvents, serializeFindingEvents } from './finding-decisions.js';
+import { FindingApprovalState } from './finding-approval-state.js';
 import { isAiReviewPath, parsePatch } from './patch.js';
 import { loadReviewers, resolveOwner } from './reviewers.js';
 import { runGateChecks } from './validator.js';
@@ -105,6 +108,9 @@ export class Writers {
     const preserves = (before: Record<string, unknown> | undefined, after: Record<string, unknown> | undefined): boolean =>
       Object.entries(before ?? {}).every(([key, value]) => JSON.stringify(after?.[key]) === JSON.stringify(value));
     if (latest.meta.createdAt !== previous.meta.createdAt) errors.push('created_at 在迭代中必须保持不变');
+    if (latest.meta.schemaVersion !== previous.meta.schemaVersion || latest.meta.findingId !== previous.meta.findingId) {
+      errors.push('候选的发现归属和格式版本在迭代中必须保持不变');
+    }
     previous.meta.revisions.forEach((oldRevision, index) => {
       if (latest.meta.revisions[index]?.id !== oldRevision.id) errors.push('历史 revisions 顺序必须保持，只能在末尾追加');
     });
@@ -594,6 +600,64 @@ export class Writers {
     const candidate = await store.reopen(id, from, reason, guard, source);
     const commit = await this.commitSharedWrite(`review(${id}): 人工重开（来自 ${from}）`, candidate, runtime, backupText);
     sendJson(res, 200, { candidate, commit });
+  }
+
+  async findingDecision(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
+    const runtime = await this.host.runtimeFor(url);
+    const body = await readJson(req);
+    const id = stringField(body, 'findingId');
+    const version = stringField(body, 'expectedFindingVersion');
+    let decision;
+    let file;
+    try {
+      file = findingRecordPath(id);
+      decision = findingDecisionFromRequest(body);
+    } catch (error) {
+      throw new ApiError(422, 'bad_request', error instanceof Error ? error.message : String(error));
+    }
+    if (!version) throw new ApiError(422, 'bad_request', '缺少发现版本');
+    const view = await sharedViewFor(runtime);
+    if (!view?.source) throw new ApiError(409, 'conflict', '无法建立共享 VCS 快照');
+    const { findings } = await this.readModels.findingProjection(runtime, view);
+    const finding = findings.find((item) => item.findingId === id);
+    if (!finding?.findingVersion) throw new ApiError(409, 'conflict', '找不到可处理的新版发现');
+    if (finding.findingVersion !== version) throw new ApiError(409, 'stale', '发现已更新，请刷新');
+    if (finding.disposition === 'applied' || finding.disposition === 'resolved'
+      || (decision.action === 'add_repair_hint' && finding.disposition !== 'human_takeover')
+      || (decision.action === 'resume_review' && finding.disposition === 'undecided')) {
+      throw new ApiError(409, 'conflict', '当前发现状态不允许此操作');
+    }
+    const actor = await this.host.ownerFor(runtime.root);
+    const reviewers = await loadReviewers(runtime.root, view.source);
+    if (resolveOwner(reviewers, { paths: finding.targetFiles, tags: [] }).owner !== actor) {
+      throw new ApiError(403, 'forbidden', '只有发现负责人可以记录处置');
+    }
+    const state = new FindingApprovalState(runtime.root, id, this.host.deps.statePath);
+    if (!await state.canRetry(runtime.vcs).catch(() => false)) {
+      throw new ApiError(409, 'conflict', '该发现的上一次审批提交结果仍待核验');
+    }
+    const before = await view.source.readFindingText(id);
+    const local = (await auditFiles(runtime.root, { op: 'read', paths: [file] })).bytes?.toString('utf8') ?? null;
+    if (local !== before) throw new ApiError(409, 'conflict', '处置记录存在本地修改');
+    const events = before === null ? [] : parseFindingEvents(before, id);
+    const text = serializeFindingEvents(id, [...events, {
+      ...decision, revision: events.length + 1, auditId: finding.lastObservedAudit, actor, at: new Date().toISOString(),
+    }]);
+    await auditFiles(runtime.root, { op: 'write', paths: [file], text, expectedText: before });
+    const commit = await this.commitAndClassify({
+      runtime, message: `review(${id}): ${decision.action}`, paths: [file], expectedFiles: [{ relPath: file, text }],
+    });
+    if (!commit.landed) {
+      if (commit.outcome === 'RECOVERY_REQUIRED') {
+        throw new ApiError(409, 'conflict', '处置提交结果待核验', { status: commit.outcome, detail: commit.detail });
+      }
+      await auditFiles(runtime.root, before === null
+        ? { op: 'remove', paths: [file], entries: [{ path: file, blobHash: gitBlobHash(text), mode: '100644' }] }
+        : { op: 'write', paths: [file], text: before, expectedText: text });
+      throw new ApiError(500, 'internal', commit.detail);
+    }
+    const updated = await this.readModels.findingProjection(runtime);
+    sendJson(res, 200, { finding: updated.findings.find((item) => item.findingId === id), commitRevision: commit.commitRevision });
   }
 
   async dismissFinding(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {

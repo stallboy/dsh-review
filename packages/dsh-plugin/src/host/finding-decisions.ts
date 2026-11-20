@@ -1,5 +1,5 @@
 import { FINDING_ID_PATTERN, parseTime } from './invariants.js';
-import { readYamlDocument } from './yaml.js';
+import { dump, readYamlDocument } from './yaml.js';
 
 export type FindingDecision =
     | { action: 'accept_as_is'; reason: string }
@@ -64,6 +64,28 @@ function parseDecision(input: Record<string, unknown>): FindingDecision {
     }
 }
 
+export function findingDecisionFromRequest(input: Record<string, unknown>): FindingDecision {
+    return parseDecision({ ...input, review_after: input['reviewAfter'], review_when: input['reviewWhen'] });
+}
+
+export function serializeFindingEvents(findingId: string, events: FindingEvent[]): string {
+    return dump({
+        schema_version: 1,
+        finding_id: findingId,
+        events: events.map(({ auditId, ...event }) => {
+            const { reviewAfter, reviewWhen } = event.action === 'defer' ? event : { reviewAfter: undefined, reviewWhen: undefined };
+            const { revision, actor, at, action } = event;
+            return {
+                revision, audit_id: auditId, actor, at, action,
+                ...('reason' in event && event.reason !== undefined ? { reason: event.reason } : {}),
+                ...('hint' in event ? { hint: event.hint } : {}),
+                ...(reviewAfter !== undefined ? { review_after: reviewAfter } : {}),
+                ...(reviewWhen !== undefined ? { review_when: reviewWhen } : {}),
+            };
+        }),
+    }, { lineWidth: -1, noRefs: true });
+}
+
 export function parseFindingEvents(text: string, findingId: string): FindingEvent[] {
     const doc = record(readYamlDocument(text));
     if (doc['schema_version'] !== 1 || !FINDING_ID_PATTERN.test(findingId) || doc['finding_id'] !== findingId
@@ -91,4 +113,22 @@ export function parseFindingEvents(text: string, findingId: string): FindingEven
         }
         return { revision, auditId, actor, at, ...decision };
     });
+}
+
+export async function loadFindingEvents(
+    source: Pick<import('./shared-facts.js').SharedCandidateSource, 'readFindingText'>,
+    records: import('./audit-archive.js').AuditRecord[],
+): Promise<Map<string, FindingEvent[] | Error>> {
+    const ids = new Set(records.filter(record => !record.parseError && record.meta.schemaVersion === 2)
+        .flatMap(record => record.meta.items.filter(item => item.repairPlan !== undefined).map(item => item.findingId)));
+    const events = new Map<string, FindingEvent[] | Error>();
+    for (const id of ids) {
+        try {
+            const text = await source.readFindingText(id);
+            if (text !== null) events.set(id, parseFindingEvents(text, id));
+        } catch (error) {
+            events.set(id, error instanceof Error ? error : new Error(String(error)));
+        }
+    }
+    return events;
 }

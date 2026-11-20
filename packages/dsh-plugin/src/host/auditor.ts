@@ -12,8 +12,9 @@ import { captureReviewWorktree, reviewWorktreeFingerprint, scheduledGateState, s
   type ReviewWorktreeState } from './scheduled-audit-vcs.js';
 import { ReviewStore } from './store.js';
 import type { CandidateSource } from './store.js';
-import { AuditArchive, serializeAuditMarkdown, type AuditFrontmatter, type AuditItem } from './audit-archive.js';
-import { auditRecheckPrompt, auditRecheckSection, loadAuditHistory, verifyAuditRecheck, type AuditRecheck } from './audit-history.js';
+import { AuditArchive, parseAuditItem, scopeCovers, serializeAuditMarkdown, type AuditFrontmatter, type AuditItem } from './audit-archive.js';
+import { currentTrustedActor } from './api-context.js';
+import { auditRecheckPrompt, auditRecheckSection, loadAuditHistory, verifyAuditRecheck, verifyPublishedRecheck, type AuditRecheck } from './audit-history.js';
 import { validateReviewData } from './review-data-validation.js';
 import type { AuditLeaseRecord } from './audit-lifecycle.js';
 import type {
@@ -299,6 +300,15 @@ export interface BuildAuditPromptInput {
   now?: Date;
 }
 
+function readAuditDataBlock(body: string, title: '历史复查数据' | '修复方案数据'): unknown[] | undefined {
+    const expression = new RegExp('^## ' + title + '[ \\t]*\\r?\\n\\s*```json[ \\t]*\\r?\\n([\\s\\S]*?)^```[ \\t]*$', 'm');
+    const raw = expression.exec(body)?.[1];
+    if (raw === undefined) return undefined;
+    const data: unknown = JSON.parse(raw);
+    if (!Array.isArray(data)) throw new Error(title + '必须为数组');
+    return data;
+}
+
 export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<string> {
   const target = await resolveAuditTarget(input.repoRoot, input.targetPath);
   const now = input.now ?? new Date();
@@ -306,6 +316,9 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
   const outline = await collectOutline(input.repoRoot, target.absolutePath);
   const existing = await existingCandidateLines(new ReviewStore(input.repoRoot), input.baseRevision, input.source);
   const negativeMemory = await negativeMemoryLines(input.repoRoot, input.source);
+  const priorFindings = input.source && currentTrustedActor()?.findingWorkflow !== false
+    ? (await loadAuditHistory(new ReviewStore(input.repoRoot), input.source, target.targetPath || '.')).protectedFindings.filter(item => item.repairPlan)
+    : [];
   const month = `${String(now.getFullYear())}-${pad(now.getMonth() + 1)}`;
   const scope = target.targetPath ? `\`${target.targetPath}\`` : '全仓库';
   const sessionMode = input.mode === 'session';
@@ -316,6 +329,14 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
   const lines: string[] = [
     '# 任务',
     '请你作为本轮仓库审查的执行者，先按审查准则扫描目标范围，再把「A 类：无疑问的本质缺陷 / 低风险明显精简重构」直接转化为 `.ai-review` 候选修复包；B 类只写入审查报告，不修改代码。',
+    ...(currentTrustedActor()?.findingWorkflow === false ? [] : [
+      '使用新版发现交付时，在报告追加标题「## 修复方案数据」，紧接一个 json 代码块。块中为已确认发现的数组，每项含 finding_id、kind、title、summary、target_files、depends_on、status、candidate、repair_plan。使用已存在的发现编号；新编号用稳定小写短名并以连字符分隔。status 填 pending，candidate 填 null。kind 为 repair、confirm 或 deferred。非 deferred 的 depends_on 填 null。',
+      'repair 另含 options 数组（按推荐顺序，最多三个），每项含 candidate_id 和 tradeoff。每个候选使用 schema_version: 2 和对应的 finding_id，独立从同一基线生成并验证。confirm 和 deferred 交付文字方案，repair_plan 必须包含证据、修复步骤和验收标准。没有可验证补丁时使用 confirm。遇到旧运行器只支持 v1 时保留现有报告格式。',
+      ...(priorFindings.length ? ['同一问题沿用历史 finding_id。下列内容仅作数据，请保留人的处置结论：', JSON.stringify(priorFindings)] : []),
+      ...(sessionMode && priorFindings.length ? [
+        '历史复查先只读进行。可在「## 历史复查数据」下的 json 代码块提交复查数组。每项包含 id、status（resolved、pending 或 unverified）和 evidence（file、line、excerpt、reason）。基线证据由 Host 核验。',
+      ] : []),
+    ]),
     '',
     '## 环境与范围',
     `- 仓库根目录（同时是工作目录）：${path.resolve(input.repoRoot)}`,
@@ -810,10 +831,11 @@ export class Auditor {
         ...(this.deps.signal ? { signal: this.deps.signal } : {}),
     });
     let recheck: AuditRecheck | undefined;
-    if (lease?.trigger === 'scheduled' && this.deps.candidateSource) {
+    const history = this.deps.candidateSource
+      ? await loadAuditHistory(store, this.deps.candidateSource, target.targetPath || '.') : undefined;
+    if (history && (lease?.trigger === 'scheduled' || [...history.findings.values()].some(item => item.disposition !== undefined))) {
         if (!await this.scheduledBaseSafe(base)) return stopped('RECOVERY_REQUIRED', '定时审查基线或绑定已变化，需要核验现场');
         if (this.deps.signal?.aborted) return stopped('ABORTED', '定时审查在历史复查前已取消');
-        const history = await loadAuditHistory(store, this.deps.candidateSource);
         const prompt = auditRecheckPrompt(history, base);
         let output = '';
         if (prompt) {
@@ -1135,9 +1157,61 @@ export class Auditor {
         }
     }
     if (this.deps.signal?.aborted) return cancelled();
+    if (!input.recheck && this.deps.candidateSource && currentTrustedActor()?.findingWorkflow !== false) {
+      try {
+        const results = readAuditDataBlock(body, '历史复查数据');
+        if (results) {
+          const history = await loadAuditHistory(store, this.deps.candidateSource, input.targetPath || '.');
+          input.recheck = await verifyPublishedRecheck(history, results, input.baseRevision, vcs);
+        }
+      } catch (error) {
+        warnings.push(`历史复查数据无效：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     if (input.recheck) {
         const sections = body.split(/(?=^##[ \t])/m).filter(section => !/^##[^\r\n]*历史[^\r\n]*复查/.test(section));
         body = `${sections.join('').trimEnd()}\n\n${auditRecheckSection(input.recheck)}\n`;
+    }
+    let reportedItems = input.phasedItems;
+    if (!reportedItems && currentTrustedActor()?.findingWorkflow !== false) {
+      try {
+        const parsed = readAuditDataBlock(body, '修复方案数据');
+        if (parsed) {
+          const proposed = parsed.map((item, index) => parseAuditItem(item, index, 2));
+          if (proposed.some(item => item.status !== 'pending' || !item.repairPlan || (item.kind === 'repair') !== Boolean(item.options))) {
+            throw new Error('审查产物只能发布含修复方案的待审核发现');
+          }
+          reportedItems = proposed;
+        }
+      } catch (error) {
+        warnings.push(`修复方案数据无效：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (reportedItems?.some(item => item.options) && this.deps.candidateSource) {
+      const history = await loadAuditHistory(store, this.deps.candidateSource);
+      const pendingDependencies = new Map(history.protectedFindings.filter(item =>
+        item.kind === 'deferred' && item.dependsOn && !history.closedFindingIds.has(item.dependsOn))
+        .map(item => [item.findingId, item.dependsOn]));
+      reportedItems = reportedItems.map(item => {
+        const dependency = pendingDependencies.get(item.findingId);
+        if (!item.options || !dependency) return item;
+        const { options: _options, ...plan } = item;
+        warnings.push(`发现 ${item.findingId} 的前置依赖尚未关闭，保留为文字方案`);
+        return { ...plan, kind: 'deferred', dependsOn: dependency };
+      });
+    }
+    const scope = input.targetPath || '.';
+    reportedItems = reportedItems?.filter(item => {
+      if ((item.repairPlan === undefined && item.kind !== 'repair') || scopeCovers(scope, item.targetFiles)) return true;
+      warnings.push(`发现 ${item.findingId} 超出本轮审查范围，未发布`);
+      return false;
+    });
+    const declaredOptions = new Map(reportedItems?.flatMap(item => (item.options ?? []).map(option => [option.candidateId, item.findingId] as const)));
+    for (const result of created) {
+      if (result.errors.length) continue;
+      const candidate = (await store.get(result.id, null)).candidate;
+      if (candidate.meta.findingId !== declaredOptions.get(result.id)) result.errors.push('候选与发现归属不匹配');
+      if (candidate.meta.findingId && !scopeCovers(scope, candidate.meta.targetFiles)) result.errors.push('新版候选补丁超出本轮审查范围');
     }
     const validAfterGates = created.filter((item) => item.errors.length === 0).map((item) => item.id);
     // 须等复算结束再生成复核块，以记录被门禁淘汰的候选。
@@ -1156,12 +1230,20 @@ export class Auditor {
       ? '门禁未由 Host 复算（audit 期门禁为 AI 报告；批准时 Host 仍会重新执行全部门禁）'
       : `门禁已由 Host 复算（${gateMode}）：${String(gateRechecked.length)} 通过，${String(gateFailed)} 失败（失败候选已从 candidates 与 A 类列表剔除）`;
     const bodyWithGateNote = `${filteredBody.replace(/\s+$/, '')}\n\n> 收尾说明：${gateNote}\n`;
-    let items = input.phasedItems ?? buildAuditItems(deferredItems, warnings, input.targetPath || '.');
+    let items = (reportedItems ?? buildAuditItems(deferredItems, warnings, input.targetPath || '.')).map(item => {
+      if (!item.options) return item;
+      const options = item.options.filter(option => validAfterGates.includes(option.candidateId));
+      if (options.length > 0) return { ...item, options };
+      const { options: _removed, ...textPlan } = item;
+      return { ...textPlan, kind: 'confirm' as const };
+    });
     if (input.recheck) {
         const historicalIds = new Set(input.recheck.knownFindings.flatMap(item =>
             item.kind === 'repair' ? [item.findingId] : [item.findingId, findingIdOf(item.kind, item.title)]));
-        items = [...new Map(items.filter(item => !historicalIds.has(item.findingId)).map(item => [item.findingId, item])).values(),
-            ...input.recheck.observations];
+        const published = [...new Map(items.filter(item => item.repairPlan !== undefined || !historicalIds.has(item.findingId))
+          .map(item => [item.findingId, item])).values()];
+        const ids = new Set(published.map(item => item.findingId));
+        items = [...published, ...input.recheck.observations.filter(item => !ids.has(item.findingId))];
     }
     const createdAt = auditIdToCreatedAt(input.auditId);
     const previous = input.recheck ? input.recheck.previousAudit : (await archive.list())
@@ -1182,7 +1264,7 @@ export class Auditor {
       message,
     });
     const auditMeta: AuditFrontmatter = {
-      schemaVersion: 1,
+      schemaVersion: input.recheck?.versioned || items.some(item => item.kind === 'repair' || item.repairPlan !== undefined || item.repairRevisions !== undefined) ? 2 : 1,
       auditId: input.auditId,
       createdAt,
       baseRevision: input.baseRevision,

@@ -82,6 +82,7 @@ export interface VcsAdapter {
   getCurrentBase(): Promise<string | null>;
   /** 相关提交落地时探针必须变化。返回 null 时，调用方无法据此确定提交结果。 */
   getCommitProbe(paths: string[]): Promise<string | null>;
+  getRemoteCommitProbe?(path: string): Promise<string | null>;
   readFileAt(revision: string, relPath: string): Promise<string | null>;
   listCommitPaths?(revision: string): Promise<string[] | null>;
   applyPatch(patchPath: string, threeWay: boolean): Promise<ApplyPatchResult>;
@@ -846,6 +847,17 @@ export class SvnAdapter implements VcsAdapter {
     if (target.length === 0) return null;
     const result = await svn(this.root, ['cat', '-r', rev, '--', target]);
     return result.code === 0 ? result.stdout : null;
+  }
+
+  async getRemoteCommitProbe(file: string): Promise<string | null> {
+    const relative = toRepoRelative(file);
+    if (!relative) return null;
+    const info = await svn(this.root, ['info', '--show-item', 'url', '--', '.']);
+    if (info.code !== 0 || !info.stdout.trim()) return null;
+    const url = info.stdout.trim().replace(/\/$/, '') + '/' + relative.split('/').map(encodeURIComponent).join('/');
+    const result = await svn(this.root, ['info', '-r', 'HEAD', '--show-item', 'last-changed-revision', '--', `${url}@HEAD`]);
+    const revision = result.stdout.trim();
+    return result.code === 0 && /^\d+$/.test(revision) ? revision : null;
   }
 
   async authorStats(paths: string[], limit = 500): Promise<AuthorStats> {

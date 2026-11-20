@@ -46,8 +46,9 @@ export function registerAuditStageTools(registry: AuditToolRegistry, api: Review
             return { json: JSON.stringify(result) };
         },
     });
+    const unregister = [run];
     try {
-        const publish = registry.register({
+        unregister.push(registry.register({
             name: 'publishAuditArtifacts', description: '发布已核验的正式发现和候选，供 Host 收尾。publication 为 JSON 字符串。',
             parameters: {
                 type: 'object', properties: { publication: { type: 'string' } }, required: ['publication'], additionalProperties: false,
@@ -58,10 +59,22 @@ export function registerAuditStageTools(registry: AuditToolRegistry, api: Review
                 const result = await api.publishAuditStages(sessionId(context), parse(args['publication']));
                 return { json: JSON.stringify(result) };
             },
-        });
-        return () => { publish(); run(); };
+        }));
+        unregister.push(registry.register({
+            name: 'queryAuditHistory', description: '只读查询本轮审查范围内的历史发现及人的处置。',
+            parameters: { type: 'object', properties: { disposition: {
+                type: 'string', enum: ['undecided', 'accept_as_is', 'defer', 'human_takeover', 'applied', 'resolved'],
+            } }, additionalProperties: false },
+            output, timeoutMs: 60_000,
+            async execute(args, context) {
+                context.signal.throwIfAborted();
+                const result = await api.queryAuditHistory(sessionId(context), typeof args['disposition'] === 'string' ? args['disposition'] : undefined);
+                return { json: JSON.stringify(result) };
+            },
+        }));
+        return () => { for (const remove of [...unregister].reverse()) remove(); };
     } catch (error) {
-        run();
+        for (const remove of unregister.reverse()) remove();
         throw error;
     }
 }

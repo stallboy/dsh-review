@@ -17,14 +17,16 @@ import {
   type AuditLeaseRecord,
 } from './audit-lifecycle.js';
 import { AuditArchive } from './audit-archive.js';
+import { loadAuditHistory, verifyPublishedRecheck, type AuditRecheck } from './audit-history.js';
 import { SCHEDULED_AUDIT_ACTOR } from '@dsh-review/protocol';
 import { assertScheduledCheckout, matchesAuditTarget, scheduledReviewDataClean, syncScheduledAudit } from './scheduled-audit-vcs.js';
 import { wrapAgentPrompt } from './runner.js';
 import { loadReviewers } from './reviewers.js';
 import { ReviewStore } from './store.js';
+import { GitHeadCandidateSource } from './shared-facts.js';
 import { AuditStages, auditUserFields, renderAuditCoordinator } from './audit-stages.js';
 import { assertStageArtifacts, compatibleAuditBase, publishStageArtifacts, verifyStageGates } from './audit-stage-artifacts.js';
-import { AuditStopUnknown, type AuditExecutor } from './audit-stage-runner.js';
+import { auditObject, AuditStopUnknown, type AuditExecutor } from './audit-stage-runner.js';
 import type { AuditStage } from './audit-prompts.js';
 import { dshHome } from './settings.js';
 import type { JobRecord } from './types.js';
@@ -77,6 +79,14 @@ export class AuditRuntime {
     }
   }
 
+  async queryHistory(sessionId: string, disposition?: string): Promise<unknown> {
+    const stage = this.stageForSession(sessionId);
+    const source = await GitHeadCandidateSource.create(stage.lease.root);
+    if (!source || await source.snapshotId() !== stage.lease.baseRevision) throw new Error('无法读取绑定基线的历史发现');
+    const values = (await loadAuditHistory(new ReviewStore(stage.lease.root), source, stage.lease.targetPath || '.')).protectedFindings;
+    return values.filter(item => item.repairPlan && (!disposition || ('disposition' in item && item.disposition === disposition)));
+  }
+
   async publishStages(sessionId: string, input: unknown): Promise<{ reportPath: string }> {
     const stage = this.stageForSession(sessionId);
     const lease = stage.lease;
@@ -85,7 +95,16 @@ export class AuditRuntime {
         await this.auditLifecycle.markReleasable(lease.auditId);
         throw new Error('发布前业务基线或工作区发生变化');
       }
-      const output = stage.publication(input);
+      const { reviewedFindings, ...publication } = auditObject(input);
+      const output = stage.publication(publication);
+      let recheck: AuditRecheck | undefined;
+      if (reviewedFindings !== undefined) {
+        if (!Array.isArray(reviewedFindings)) throw new Error('reviewedFindings 必须是数组');
+        const source = await GitHeadCandidateSource.create(lease.root);
+        if (!source || await source.snapshotId() !== lease.baseRevision) throw new Error('无法固定历史复查基线');
+        const history = await loadAuditHistory(new ReviewStore(lease.root), source, lease.targetPath || '.');
+        recheck = await verifyPublishedRecheck(history, reviewedFindings, lease.baseRevision, stage.vcs);
+      }
       stage.busy = true;
       try {
         const before = new Set(lease.candidateIdsBefore);
@@ -96,9 +115,11 @@ export class AuditRuntime {
           if (lease.state !== 'active' || stage.uncertain) throw new Error('审查租约已停止');
           lease.stageSeal = manifest;
           lease.stageItems = output.items;
+          if (recheck) lease.stageRecheck = recheck;
           try { await this.upsertLease(lease); } catch (error) {
             delete lease.stageSeal;
             delete lease.stageItems;
+            delete lease.stageRecheck;
             throw error;
           }
         });
@@ -118,13 +139,15 @@ export class AuditRuntime {
 
   private async coordinatorPrompt(runtime: Runtime, lease: AuditLeaseRecord, fields: ReturnType<typeof auditUserFields>, note: string): Promise<string> {
     const source = await sharedSourceFor(runtime);
-    const [reviewers, activeCandidates, negativeMemory] = await Promise.all([
+    const [reviewers, activeCandidates, negativeMemory, prior] = await Promise.all([
       loadReviewers(runtime.root, source),
       existingCandidateLines(runtime.store, lease.baseRevision, source),
       negativeMemoryLines(runtime.root, source),
+      source ? loadAuditHistory(runtime.store, source, lease.targetPath || '.') : undefined,
     ]);
     return renderAuditCoordinator({ lease, reviewers, repoOutline: [lease.targetPath || '.'],
-      history: { activeCandidates, negativeMemory }, legacyNote: fields.focus.includes(note.trim()) ? '' : note,
+      history: { activeCandidates, negativeMemory, findings: prior?.protectedFindings.filter(item => item.repairPlan) ?? [] },
+      legacyNote: fields.focus.includes(note.trim()) ? '' : note,
       automaticCandidates: this.host.deps.auditStageGates !== undefined,
       ...fields });
   }
@@ -715,6 +738,7 @@ export class AuditRuntime {
           ...(current.phased ? {
             phasedItems: current.stageItems ?? [],
             phasedSeal: current.stageSeal!,
+            ...(current.stageRecheck ? { recheck: current.stageRecheck } : {}),
             ...(this.host.deps.auditStageGates ? {
               phasedGate: (patch: string, commands: string[]) => verifyStageGates(current, patch, commands,
                 this.host.deps.auditStageGates!, this.host.currentSettings().gateTimeoutMs, signal),

@@ -62,15 +62,18 @@ function fakeExecutor({ prompt, executor }) {
         '    submitFromJob(store, request);', '    submitFromJob(store, request);', '    assert.equal(store.writes.length, 1);', '});', '',
     ].join('\n');
     const insert = 'function submitFromJob(store, request) {\n    return store.insert(request.id, request.value);';
-    return { status: 'ready', summary: '后台重试沿用现有记录', reason: '', edits: [
-        { path: sourcePath, before: insert, after: insert.replace('\n', '\n    const existing = store.find(request.id);\n    if (existing) return existing;\n') },
+    const optional = prompt.includes('使用空值合并');
+    const addition = optional ? '    return store.find(request.id) ?? store.insert(request.id, request.value);'
+        : '    const existing = store.find(request.id);\n    if (existing) return existing;\n    return store.insert(request.id, request.value);';
+    return { status: 'ready', summary: optional ? '查找不到现有记录时才写入' : '后台重试沿用现有记录', reason: '', edits: [
+        { path: sourcePath, before: insert, after: insert.split('\n')[0] + '\n' + addition },
         { path: testPath, before: tests.split('\n').slice(-3).join('\n'), after: tests.split('\n').slice(-3).join('\n') + '\n' + regression },
     ] };
 }
 
-async function runRetryAudit(t, tamper) {
+async function runRetryAudit(t, tamper, versioned = false) {
     const mode = process.env['DSH_AUDIT_LIVE_CLI'];
-    const live = !tamper && (mode === '1' || mode === 'codex');
+    const live = !tamper && !versioned && (mode === '1' || mode === 'codex');
     const verifier = live && mode === 'codex' ? 'codex' : 'claude-code';
     const root = await retryFixture(t);
     const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
@@ -165,6 +168,13 @@ async function runRetryAudit(t, tamper) {
     generatedCandidate = result.candidateId;
     const findings = [{ subjectId: jobId, title: '后台重试重复写入', priority: 'P2', kind: 'A', decision: '', dependsOn: '' }];
     if (!live) findings.push({ subjectId: 'needs-decision', title: '数据语义需要人工决定', priority: 'P0', kind: 'B', decision: '确认同 ID 不同 payload 的规则', dependsOn: '' });
+    let alternative;
+    if (versioned) {
+        alternative = await stage('patch', 'codex', { subjectId: jobId, allowedPaths: [sourcePath, testPath],
+            acceptance: ['保持 API 与存储接口兼容'], gateCommands: [gate], approach: '使用空值合并' });
+        assert.equal(alternative.status, 'ready', JSON.stringify(alternative));
+        for (const finding of findings) finding.repairPlan = '证据见复核。先确认边界，再变更并运行门禁验收。';
+    }
     const published = await invoke('publishAuditArtifacts', {
         publication: JSON.stringify({ findings, coverage: ['客户端与后台入口'],
             requirements: ['REQ-1 API 兼容'], history: [] }),
@@ -188,7 +198,14 @@ async function runRetryAudit(t, tamper) {
     const report = await readFile(path.join(root, body.reportPath), 'utf8');
     assert.match(report, /插件复核/);
     assert.match(report, /declared/);
-    assert.match(report, /1 通过/);
+    assert.match(report, versioned ? /2 通过/ : /1 通过/);
+    if (alternative) {
+        assert.match(report, /schema_version: 2/);
+        const { body: view } = await api.invoke({ method: 'GET', path: '/findings' });
+        const grouped = view.findings.find(item => item.options?.length === 2);
+        assert.deepEqual(grouped.options.map(option => option.candidateId), [result.candidateId, alternative.candidateId]);
+        assert.ok(view.findings.some(item => item.repairPlan && item.options.length === 0));
+    }
     if (!live) {
         assert.ok(report.indexOf('| P0 |') < report.indexOf('| P2 |'));
         assert.match(report, /retry-client：已排除/);
@@ -197,6 +214,7 @@ async function runRetryAudit(t, tamper) {
     const changed = runCommand('git', ['diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD'], root).stdout.trim().split(/\r?\n/);
     assert.deepEqual(changed.sort(), [
         '.ai-review/' + result.candidateId + '/001.patch', '.ai-review/' + result.candidateId + '/review.md', published.reportPath,
+        ...(alternative ? ['.ai-review/' + alternative.candidateId + '/001.patch', '.ai-review/' + alternative.candidateId + '/review.md'] : []),
     ].sort());
     assert.equal(await readFile(path.join(root, sourcePath), 'utf8'), source + '\n');
     assert.equal(api.leaseLookup(body.auditId).state, 'released');
@@ -204,6 +222,9 @@ async function runRetryAudit(t, tamper) {
 
 test('DSH 阶段工具完整运行重试案例，隔离复核，按优先级排序并由 Host 收尾', { timeout: 900_000 },
     t => runRetryAudit(t, false));
+
+test('DSH 阶段工具发布同一发现的两个独立补丁与纯文字方案', { timeout: 900_000 },
+    t => runRetryAudit(t, false, true));
 
 test('Host 门禁期间同一路径被改写时保留租约并拒绝提交', { timeout: 120_000 },
     t => runRetryAudit(t, true));

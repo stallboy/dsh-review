@@ -5,6 +5,9 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { AuditArchive, parseAuditMarkdown } from '../packages/dsh-plugin/dist/host/audit-archive.js';
+import { loadAuditHistory, verifyPublishedRecheck } from '../packages/dsh-plugin/dist/host/audit-history.js';
+import { GitHeadCandidateSource } from '../packages/dsh-plugin/dist/host/shared-facts.js';
+import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
 import { scheduledGateState, scheduledPatch, undoScheduledGatePatch } from '../packages/dsh-plugin/dist/host/scheduled-audit-vcs.js';
 import { createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
@@ -14,6 +17,49 @@ import { createGitFixture, fakeAuditAgentPath, runCommand } from './helpers.mjs'
 const runner = fileURLToPath(new URL('./fixtures/scheduled-audit-integrity-agent.mjs', import.meta.url));
 const previous = '20261117-090000-repo';
 const previousReport = `.ai-review/audits/${previous}/audit.md`;
+
+test('自动核验人工接手项，无人工线索时仍按证据归因多个修复版本', async t => {
+    const root = await createGitFixture();
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const git = (...args) => runCommand('git', args, root).stdout.trim();
+    await writeFile(path.join(root, 'src/range.js'), 'export const valid = () => false;\n');
+    git('add', 'src/range.js');
+    git('commit', '-qm', 'add baseline range');
+    const baseRevision = git('rev-parse', 'HEAD');
+    const findingId = 'validate-arithmetic';
+    await new AuditArchive(root).write({
+        schemaVersion: 2, auditId: previous, scope: '.', createdAt: '2026-11-17T09:00:00Z', baseRevision, trigger: 'manual',
+        previousAudit: null, candidates: [], items: [{ findingId, kind: 'confirm', title: '修复计算与范围', summary: '计算和范围判断错误',
+            targetFiles: ['src/math.js', 'src/range.js'], dependsOn: null, status: 'pending', candidate: null,
+            repairPlan: '检查加法计算和范围判断。' }],
+    }, '历史文字方案');
+    await mkdir(path.join(root, '.ai-review/findings'), { recursive: true });
+    await writeFile(path.join(root, `.ai-review/findings/${findingId}.yml`),
+        `schema_version: 1\nfinding_id: ${findingId}\nevents:\n- {revision: 1, audit_id: ${previous}, actor: tester, at: "2026-11-17T10:00:00Z", action: human_takeover}\n`);
+    git('add', '.ai-review');
+    git('commit', '-qm', 'take over');
+    await writeFile(path.join(root, 'src/math.js'), 'export const add = (a, b) => a + b;\n');
+    git('add', 'src/math.js');
+    git('commit', '-qm', 'repair math');
+    const math = git('rev-parse', 'HEAD');
+    await writeFile(path.join(root, 'src/range.js'), 'export const valid = value => value >= 0;\n');
+    git('add', 'src/range.js');
+    git('commit', '-qm', 'repair range');
+    const range = git('rev-parse', 'HEAD');
+    const vcs = createVcs('git', root);
+    const source = await GitHeadCandidateSource.create(root);
+    const history = await loadAuditHistory(new ReviewStore(root), source, 'src');
+    assert.equal(history.findings.get(findingId).disposition, 'human_takeover');
+    assert.equal((await loadAuditHistory(new ReviewStore(root), source, 'other')).findings.size, 0);
+    const results = [{ id: findingId, status: 'resolved',
+        evidence: { file: 'src/math.js', line: 1, excerpt: 'a + b', reason: '按加法计算' },
+        relatedEvidence: [{ file: 'src/range.js', line: 1, excerpt: 'value >= 0', reason: '允许非负值' }] }];
+    const recheck = await verifyPublishedRecheck(history, results, range, vcs);
+    assert.equal(recheck.versioned, true);
+    assert.equal(recheck.observations[0].status, 'resolved');
+    assert.deepEqual(recheck.observations[0].repairRevisions, [math, range]);
+    assert.deepEqual((await verifyPublishedRecheck(history, [{ ...results[0], evidence: { ...results[0].evidence, excerpt: '伪造代码' } }], range, vcs)).observations, []);
+});
 
 async function setup(t, mode) {
     const root = await createGitFixture();

@@ -84,7 +84,7 @@ function asStringArray(value: unknown, field: string): string[] {
     return asArray(value, field).map((item, index) => asString(item, `${field}[${String(index)}]`));
 }
 
-function parseItem(value: unknown, index: number, schemaVersion: number): AuditItem {
+export function parseAuditItem(value: unknown, index: number, schemaVersion: number): AuditItem {
     const name = `items[${String(index)}].`;
     if (!isRecord(value)) throw new AuditFormatError(`items[${String(index)}] 必须是对象`);
     const field = (key: string) => requiredField(value, key, name);
@@ -161,7 +161,7 @@ export function parseAuditMarkdown(text: string): { meta: AuditFrontmatter; body
             trigger,
             previousAudit: asNullableString(field('previous_audit'), 'previous_audit'),
             candidates: asStringArray(field('candidates'), 'candidates'),
-            items: asArray(field('items'), 'items').map((item, index) => parseItem(item, index, schemaVersion)),
+            items: asArray(field('items'), 'items').map((item, index) => parseAuditItem(item, index, schemaVersion)),
         },
         body,
     };
@@ -247,9 +247,8 @@ export function auditInvariantErrors(meta: AuditFrontmatter, dirName: string): s
       }
     }
   }
-  if (meta.schemaVersion === 2 && (publishedIds.size !== meta.candidates.length
-    || meta.candidates.some((candidateId) => !optionIds.has(candidateId)))) {
-    errors.push('I2: v2 档案的候选清单必须与新发布的修复选项一致');
+  if (meta.schemaVersion === 2 && publishedIds.size !== meta.candidates.length) {
+    errors.push('I2: v2 档案的候选清单不得重复');
   }
   const pendingDeps = new Map<string, string>();
   for (const item of meta.items) {
@@ -449,6 +448,7 @@ export interface FindingProjection {
   decision?: FindingEvent;
   repairHints?: string[];
   repairPlan?: string;
+  baseRevision?: string;
   repairRevisions?: string[];
   repairAttribution?: string;
   options?: { candidateId: string; tradeoff: string; status: CandidateChainInfo['status'] }[];
@@ -553,6 +553,7 @@ export function projectFindings(
       pushBase(findingId, current, disposition === 'resolved' || disposition === 'applied' ? 'closed' : 'open',
         winningId ? { id: winningId, status: 'approved' } : undefined, {
           findingVersion, disposition, options,
+          baseRevision: plan.audit.meta.baseRevision,
           ...(decision ? { decision } : {}),
           ...(plan.item.repairPlan !== undefined ? { repairPlan: plan.item.repairPlan } : {}),
           ...(current.item.repairRevisions ? { repairRevisions: current.item.repairRevisions } : {}),

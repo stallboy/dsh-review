@@ -10,6 +10,28 @@ import { ManagedDelivery } from '../packages/dsh-plugin/dist/managed/managed-del
 import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
 import { ManagedOperations } from '../packages/dsh-plugin/dist/managed/managed-operations.js';
 import { parseAuditMarkdown } from '../packages/dsh-plugin/dist/host/audit-archive.js';
+import { managedSource } from '../packages/dsh-plugin/dist/managed/managed-source.js';
+
+test('托管 SVN 发现处置与档案从同一远端版本读取', async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'finding-svn-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const repo = path.join(directory, 'repo'), reader = path.join(directory, 'reader'), writer = path.join(directory, 'writer');
+    const url = pathToFileURL(repo).href;
+    runCommand('svnadmin', ['create', repo], directory);
+    runCommand('svn', ['checkout', '-q', url, writer], directory);
+    await mkdir(path.join(writer, '.ai-review/findings'), { recursive: true });
+    const record = path.join(writer, '.ai-review/findings/known-finding.yml');
+    await writeFile(record, 'old finding decision\n');
+    runCommand('svn', ['add', '.ai-review'], writer);
+    runCommand('svn', ['commit', '-qm', 'first version'], writer);
+    runCommand('svn', ['checkout', '-q', url, reader], directory);
+    const first = await managedSource(reader, 'svn');
+    await writeFile(record, 'new finding decision\n');
+    runCommand('svn', ['commit', '-qm', 'second version'], writer);
+    const second = await managedSource(reader, 'svn');
+    assert.equal(await first.source.readFindingText('known-finding'), 'old finding decision\n');
+    assert.equal(await second.source.readFindingText('known-finding'), 'new finding decision\n');
+});
 
 test('SVN 子路径提交后固定远端版本读取，批准直接交付原远端版本', async t => {
     const base = await mkdtemp(path.join(os.tmpdir(), 'central-svn-'));
