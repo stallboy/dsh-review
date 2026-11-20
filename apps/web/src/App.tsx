@@ -161,9 +161,16 @@ function Reports() {
     const projectId = params.get('projectId') ?? '';
     const auditId = params.get('auditId') ?? '';
     const hasSelection = Boolean(projectId && auditId);
+    const queue = projects.data?.projects.find(view => view.project.projectId === projectId)?.snapshot?.queue;
     const report = useQuery({
         queryKey: ['report', projectId, auditId],
-        queryFn: ({ signal }) => detail<{ body: string; meta: { items: { findingId: string; title: string; summary: string; status: string; candidate: string | null }[] } }>(entityId(projectId, 'projectId'), 'audit', { id: auditId }, signal),
+        queryFn: ({ signal }) => detail<{
+            body: string;
+            meta: {
+                candidates: string[];
+                items: { findingId: string; title: string; summary: string; status: string; candidate: string | null }[];
+            };
+        }>(entityId(projectId, 'projectId'), 'audit', { id: auditId }, signal),
         enabled: hasSelection,
     });
 
@@ -191,6 +198,16 @@ function Reports() {
                 {!hasSelection ? <Empty>选择左侧记录，查看报告内容。</Empty>
                     : report.isPending ? <Empty>正在向节点读取该版本报告…</Empty>
                     : report.data ? <div className={s.document}>
+                        {report.data.meta.candidates?.length > 0 && <article>
+                            <h3>A 类：已生成候选</h3>
+                            <ul>
+                                {report.data.meta.candidates.map(id => {
+                                    const candidate = queue?.find(item => item.id === id);
+                                    const title = typeof candidate?.title === 'string' && candidate.title ? candidate.title : id;
+                                    return <li key={id}>{candidate?.localOnly ? title : <Link to={candidateUrl(projectId, id)}>{title}</Link>}</li>;
+                                })}
+                            </ul>
+                        </article>}
                         {report.data.meta.items.map(item => <article key={item.findingId}>
                             <Badge value={item.status} />
                             <h3>{item.title}</h3>
