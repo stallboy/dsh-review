@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { createGitFixture, runCommand } from './helpers.mjs';
 import { reviewFixture, patchFixture } from './fixtures/contract.mjs';
+import { registerAuditStageTools } from '../packages/dsh-plugin/dist/host/audit-stage-tools.js';
 import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
 
 async function fixture(t, auditSessions) {
@@ -136,6 +137,49 @@ test('桌面托管手动审查使用绑定工作副本的 DSH 会话并自动收
     assert.match(logs[0], /desktop-audit/);
     assert.equal(runCommand('git', ['rev-parse', `refs/heads/${target}`], remote).stdout.trim(), result.delivery.commitRevision);
     assert.match(runCommand('git', ['log', '-1', '--format=%B'], root).stdout, /Dsh-Command: audit-desktop/);
+});
+
+test('中央桌面节点使用绑定会话访问共享阶段工具', async t => {
+    const created = Promise.withResolvers();
+    const completed = Promise.withResolvers();
+    const sessionId = 'desktop-phased';
+    const capabilities = {
+        auditStageExecutor: async ({ prompt }) => {
+            assert.match(prompt, /固定基线只读视图/);
+            return { leads: [], coverage: ['确认走共享阶段'], limits: [] };
+        },
+        async createAuditSession(input) {
+            assert.match(input.prompt, /仓库审查总调度/);
+            await input.onCreated(sessionId);
+            created.resolve();
+            return { sessionId };
+        },
+        async withAuditSessionIdle(_sessionId, _requestId, signal, finalize) {
+            await completed.promise;
+            return (await finalize(signal)) !== false;
+        },
+    };
+    const { operations, project, journal, root } = await fixture(t, capabilities);
+    const command = auditCommand(project);
+    journal.accept(command);
+    const running = operations.execute(command, new AbortController().signal, () => {}, project);
+    await created.promise;
+    const tools = new Map();
+    t.after(registerAuditStageTools({ register: item => { tools.set(item.name, item); return () => tools.delete(item.name); } },
+        id => operations.auditStageApi(id)));
+    const invoke = (name, args, id = sessionId) => tools.get(name).execute(args, {
+        agent: { session: { id } }, signal: new AbortController().signal,
+    });
+    const scan = { stage: 'scan', runner: 'codex', task: JSON.stringify({ taskScope: ['src'], scenarios: [], questions: [], constraints: [] }) };
+    await assert.rejects(invoke('runAuditStage', scan, 'other-session'), /有效租约/);
+    await invoke('runAuditStage', scan);
+    await invoke('publishAuditArtifacts', { publication: JSON.stringify({ findings: [], coverage: [], requirements: [], history: [] }) });
+    completed.resolve();
+    const result = await running;
+    assert.equal(result.outcome.status, 'COMMITTED', JSON.stringify(result));
+    assert.equal(result.outcome.sessionId, sessionId);
+    assert.equal(result.delivery.state, 'delivered');
+    assert.match(runCommand('git', ['show', 'HEAD:' + result.outcome.reportPath], root).stdout, /确认走共享阶段/);
 });
 
 test('桌面审查取消跟踪保留会话和未决记录，恢复不重新创建会话', async t => {

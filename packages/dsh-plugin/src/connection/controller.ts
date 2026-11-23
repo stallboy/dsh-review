@@ -390,6 +390,10 @@ export class ConnectionController {
         } : undefined);
     }
 
+    auditStageApi(sessionId: string) {
+        return this.node?.auditStageApi(sessionId);
+    }
+
     private async connectNode(change?: { workspaceId: string; enabled: boolean }): Promise<void> {
         const config = this.config!;
         const credentials = this.secrets.nodes[config.centralId]!;

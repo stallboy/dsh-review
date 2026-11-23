@@ -78,6 +78,7 @@ export function internalRequest(method: string, url: string, body: Record<string
 }
 
 export interface ApiDeps {
+  auditSessionTools?: boolean;
   auditStageExecutor?: import('./audit-stage-runner.js').ExecuteAuditStage;
   auditStageGates?: typeof import('./validator.js').runGateChecks;
   settings: AppSettings;

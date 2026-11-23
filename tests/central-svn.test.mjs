@@ -61,7 +61,7 @@ test('SVN 子路径提交后固定远端版本读取，批准直接交付原远�
     assert.deepEqual(nested.registrations(), []);
     assert.match(nested.workspaceIssue('nested-wc'), /工作副本根目录/);
     nested.stop();
-    t.after(async () => { operations.stop(); journal.close(); await rm(base, { recursive: true, force: true }); });
+    t.after(async () => { await operations.stop(); journal.close(); await rm(base, { recursive: true, force: true }); });
     const project = { projectId: 'svn-project', nodeId: 'svn-node', name: 'SVN', workspaceId: 'svn-wc', bindingGeneration: 1, projectConfigRevision: 1, vcsType: 'svn', target: '^/', enabled: true };
     const snapshot = await operations.snapshot(project);
     assert.equal(snapshot.queue.length, 1, '不能因根 BASE 较旧而漏掉子路径新候选');

@@ -10,7 +10,7 @@ import type { ApiDeps } from './api-context.js';
 import { registerAuditStageTools, type AuditToolRegistry } from './audit-stage-tools.js';
 import { dshHome, loadSettings, saveSettings } from './settings.js';
 import { ApiError, type AppSettings } from './types.js';
-import { loadManagedNode, type ManagedHandle } from '../managed/managed-config.js';
+import { loadManagedNode, type ManagedAuditSessions, type ManagedHandle } from '../managed/managed-config.js';
 import { ConnectionController, CONNECTION_PREFIX } from '../connection/controller.js';
 import { discoverCandidates, resolveWorktree } from '../connection/config.js';
 import { CENTRAL_PREFIX } from '../connection/gateway.js';
@@ -295,7 +295,11 @@ export function apply(ctx: HostContext): void {
     }
   };
 
-  const auditSessions: Pick<ApiDeps, 'createAuditSession' | 'withAuditSessionIdle'> = {
+  const tools = ctx.get('tools') as AuditToolRegistry | undefined;
+  const stageCapabilities = { auditStageExecutor: executeAuditCli, auditStageGates: configuredAuditStageGates() };
+  const auditSessions: ManagedAuditSessions = {
+    ...stageCapabilities,
+    auditSessionTools: typeof tools?.register === 'function',
     createAuditSession: (input) => createDshAuditSession(ctx, input),
     withAuditSessionIdle: (sessionId, requestId, signal, finalize) => withDshAuditSessionIdle(
       ctx, sessionId, requestId, AbortSignal.any([signal, shutdown.signal]), finalize,
@@ -322,10 +326,14 @@ export function apply(ctx: HostContext): void {
   });
 
   const ready = (async () => {
+    if (typeof tools?.register === 'function') {
+      removeStageTools = registerAuditStageTools(tools, sessionId =>
+        connection.auditStageApi(sessionId) ?? (api?.hasAuditStageSession(sessionId) ? api : undefined));
+    }
     await connection.init();
     if (disposed) { await connection.stop(); return; }
     if (connection.configured) return;
-    managed = await loadManagedNode(resolveCredential, error => logger?.warn(`dsh-code-review: 中央连接异常：${error.message}`));
+    managed = await loadManagedNode(resolveCredential, error => logger?.warn(`dsh-code-review: 中央连接异常：${error.message}`), stageCapabilities);
     if (disposed) { await managed?.stop(); return; }
     if (managed) {
       logger?.info('dsh-code-review: 托管节点已启动');
@@ -339,10 +347,8 @@ export function apply(ctx: HostContext): void {
       const { DEFAULT_SETTINGS } = await import('./settings.js');
       settings = { ...DEFAULT_SETTINGS };
     }
-    const tools = ctx.get('tools') as AuditToolRegistry | undefined;
     const instance = new ReviewApi({
       settings,
-      ...(typeof tools?.register === 'function' ? { auditStageExecutor: executeAuditCli, auditStageGates: configuredAuditStageGates() } : {}),
       saveSettings: async (next) => {
         const saved = await saveSettings(next);
         logger?.info(`dsh-code-review: 设置已保存（repo=${saved.repoRoot || '未配置'}）`);
@@ -368,7 +374,6 @@ export function apply(ctx: HostContext): void {
     });
     await instance.init();
     if (disposed) return;
-    if (typeof tools?.register === 'function') removeStageTools = registerAuditStageTools(tools, instance);
     api = instance;
     logger?.info(`dsh-code-review host mounted（repo=${settings.repoRoot || '未配置'}）`);
   })().catch((error: unknown) => {
@@ -420,7 +425,7 @@ export function apply(ctx: HostContext): void {
       removeStageTools?.();
       offConnection();
       offCentral();
-      const results = await Promise.allSettled([connection.stop(), managed?.stop()]);
+      const results = await Promise.allSettled([connection.stop(), managed?.stop(), api?.closeAudit(), ready]);
       for (const result of results) if (result.status === 'rejected') logger?.error(`dsh-code-review: 节点停止失败：${String(result.reason)}`);
     },
     'dsh-code-review: http routes',

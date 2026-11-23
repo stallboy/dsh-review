@@ -3,12 +3,16 @@ import path from 'node:path';
 import type { ProjectRecord } from '@dsh-review/protocol';
 import type { ManagedWorkspace } from './managed-operations.js';
 import type { ApiDeps } from '../host/api-context.js';
+import type { ReviewApi } from '../host/api.js';
 import { dshHome } from '../host/settings.js';
+
+export type ManagedAuditSessions = Pick<ApiDeps, 'createAuditSession' | 'withAuditSessionIdle' | 'auditSessionTools' | 'auditStageExecutor' | 'auditStageGates'>;
 
 export interface ManagedHandle {
     centerUrl: string;
     nodeId: string;
     instanceId: string;
+    auditStageApi(sessionId: string): ReviewApi | undefined;
     hasUnsettled(): boolean;
     workspaceIssue(workspaceId: string): string | undefined;
     completeConfiguration(): void;
@@ -22,7 +26,7 @@ export interface ManagedConfiguration {
     workspaces: ManagedWorkspace[];
     pauseAdmission?: boolean;
     boundProjects?: ProjectRecord[];
-    auditSessions?: Pick<ApiDeps, 'createAuditSession' | 'withAuditSessionIdle'>;
+    auditSessions?: ManagedAuditSessions;
 }
 
 export async function startManagedNode(input: ManagedConfiguration, directory: string,
@@ -58,6 +62,7 @@ export async function startManagedNode(input: ManagedConfiguration, directory: s
         try { if (waitReady) await node.tick(); }
         catch (error) { await node.stop(); throw error; }
         return { centerUrl: input.centerUrl, nodeId: input.nodeId, instanceId: node.instanceId,
+            auditStageApi: sessionId => operations.auditStageApi(sessionId),
             hasUnsettled: () => journal.hasUnsettled(),
             workspaceIssue: workspaceId => operations.workspaceIssue(workspaceId),
             completeConfiguration: () => node.completeConfiguration(), stop: async (disconnect = true) => {
@@ -65,13 +70,14 @@ export async function startManagedNode(input: ManagedConfiguration, directory: s
                 if (disconnect) await fetch(new URL('node-api/v1/disconnect', input.centerUrl), { method: 'POST',
                     headers: { authorization: `Bearer ${input.token}`, 'content-type': 'application/json' },
                     body: JSON.stringify({ instanceId: node.instanceId }), signal: AbortSignal.timeout(2000) }).catch(() => {});
-                operations.stop();
+                await operations.stop();
                 journal.close();
             } };
-    } catch (error) { operations.stop(); journal.close(); throw error; }
+    } catch (error) { await operations.stop(); journal.close(); throw error; }
 }
 
-export async function loadManagedNode(resolveCredential: (reference: string) => Promise<string | undefined>, onError: (error: Error) => void): Promise<ManagedHandle | null> {
+export async function loadManagedNode(resolveCredential: (reference: string) => Promise<string | undefined>, onError: (error: Error) => void,
+    stageCapabilities?: Pick<ApiDeps, 'auditStageExecutor' | 'auditStageGates'>): Promise<ManagedHandle | null> {
     const directory = path.join(dshHome(), 'dsh-code-review');
     let input: Record<string, unknown>;
     try { input = JSON.parse(await readFile(path.join(directory, 'managed-node.json'), 'utf8')); }
@@ -83,6 +89,7 @@ export async function loadManagedNode(resolveCredential: (reference: string) => 
         || !Array.isArray(input.workspaces) || !input.workspaces.length) throw new Error('托管节点配置缺少中央地址、节点标识、凭据引用或工作副本');
     const token = process.env[input.tokenReference] ?? await resolveCredential(input.tokenReference);
     if (!token) throw new Error('托管节点凭据引用无法解析');
-    return startManagedNode({ centerUrl: input.centerUrl, nodeId: input.nodeId, token, workspaces: input.workspaces as ManagedWorkspace[] },
+    return startManagedNode({ centerUrl: input.centerUrl, nodeId: input.nodeId, token, workspaces: input.workspaces as ManagedWorkspace[],
+        ...(stageCapabilities ? { auditSessions: stageCapabilities } : {}) },
         path.join(directory, 'managed'), resolveCredential, onError, false);
 }

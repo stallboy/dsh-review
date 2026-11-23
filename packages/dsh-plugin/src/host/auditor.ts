@@ -1,4 +1,3 @@
-import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
@@ -345,22 +344,25 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
   });
 }
 
+function reviewScaffoldText(owner: string): string {
+  return [
+    '# dsh-code-review: 目录 / tag 与负责人路由。直接执行仓库审查时由插件初始化。',
+    `default_owner: ${JSON.stringify(owner || '')}`,
+    'rules: []',
+    '',
+  ].join('\n');
+}
+
 async function ensureReviewScaffold(store: ReviewStore, owner: string): Promise<boolean> {
   const aiRoot = path.join(store.repoRoot, '.ai-review');
   await mkdir(path.join(aiRoot, 'audits'), { recursive: true });
-  const file = reviewersPath(store.repoRoot);
-  if (existsSync(file)) return false;
-  await writeFile(
-    file,
-    [
-      '# dsh-code-review: 目录 / tag 与负责人路由。直接执行仓库审查时由插件初始化。',
-      `default_owner: ${JSON.stringify(owner || '')}`,
-      'rules: []',
-      '',
-    ].join('\n'),
-    'utf8',
-  );
-  return true;
+  try {
+    await writeFile(reviewersPath(store.repoRoot), reviewScaffoldText(owner), { encoding: 'utf8', flag: 'wx' });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw error;
+  }
 }
 
 function renderVerificationBlock(input: {
@@ -444,6 +446,7 @@ export interface AuditFinalizeInput {
   beforeIds: Set<string>;
   phasedItems?: AuditItem[];
   phasedSeal?: StageSeal;
+  svnUrl?: string;
   phasedGate?: (patch: string, commands: string[]) => ReturnType<typeof import('./validator.js').runGateChecks>;
   beforeCommit?: () => Promise<unknown>;
   baseRevision: string;
@@ -473,7 +476,7 @@ export interface AuditFinalizeResult {
   message: string;
 }
 
-function permittedScanOutputs(
+export function permittedScanOutputs(
     before: ReviewWorktreeState, after: ReviewWorktreeState, auditId: string, candidates: readonly string[],
 ): boolean {
     if (before.versionControl !== after.versionControl
@@ -493,7 +496,7 @@ function permittedScanOutputs(
             : fingerprint.startsWith('["file",') && files.has(entry)));
 }
 
-function sameReviewWorktree(before: ReviewWorktreeState, after: ReviewWorktreeState): boolean {
+export function sameReviewWorktree(before: ReviewWorktreeState, after: ReviewWorktreeState): boolean {
     return before.versionControl === after.versionControl && before.paths.size === after.paths.size
         && [...before.paths].every(([entry, fingerprint]) => after.paths.get(entry) === fingerprint);
 }
@@ -604,26 +607,33 @@ export function buildAuditItems(deferred: AuditDeferredItem[], warnings: string[
 
 /** 收尾不会提交无效候选，报告也不能留下指向这些未共享候选的引用。 */
 function filterAClassSection(body: string, validIds: string[], createdIds: string[]): string {
-  const invalid = createdIds.filter((id) => !validIds.includes(id));
-  if (invalid.length === 0) return body;
+  const invalid = new Set(createdIds.filter((id) => !validIds.includes(id)));
+  if (invalid.size === 0) return body;
   const lines = body.split('\n');
   const out: string[] = [];
   let inSection = false;
+  let inOverview = false;
   for (const line of lines) {
     if (/^##\s/.test(line)) {
       inSection = /^##\s*A\s*类/.test(line);
+      inOverview = line.trimEnd() === '## 优先级总览';
       out.push(line);
       continue;
     }
-    if (inSection && /^\s*[-*]\s/.test(line) && invalid.some((id) => line.includes(id))) continue;
-    const resolution = /^(\|.*\|) A · ([^ |]+) \|$/.exec(line);
-    if (resolution && invalid.includes(resolution[2] ?? '')) {
-      out.push(resolution[1] + ' 候选未通过收尾 |');
-      continue;
+    const candidate = /^\s*[-*]\s+`?\.ai-review\/([^\s`：:]+)\//.exec(line)?.[1];
+    if (inSection && candidate && invalid.has(candidate)) continue;
+    const resolution = inOverview && /^(\|.*\|) A · ([^|]+) \|$/.exec(line);
+    if (resolution) {
+      const ids = resolution[2]!.split('、');
+      const remaining = ids.filter(id => !invalid.has(id));
+      if (remaining.length !== ids.length) {
+        out.push(resolution[1] + (remaining.length ? ' A · ' + remaining.join('、') : ' 候选未通过收尾') + ' |');
+        continue;
+      }
     }
     out.push(line);
   }
-  return `${out.join('\n').replace(/\s+$/, '')}\n-（${String(invalid.length)} 个候选未通过收尾校验，未纳入共享提交；详见插件复核块。）\n`;
+  return `${out.join('\n').replace(/\s+$/, '')}\n-（${String(invalid.size)} 个候选未通过收尾校验，未纳入共享提交；详见插件复核块。）\n`;
 }
 
 export interface AuditDeps {
@@ -918,7 +928,8 @@ export class Auditor {
     const cancelled = () => input.scheduledScan ? recovery('SCHEDULE_SCAN_DIRTY', '全仓扫描收尾已取消，现场保留待核验') : aborted();
     const gateRecovery = (detail: string) => recovery(input.scheduledScan ? 'SCHEDULE_SCAN_DIRTY' : 'SYNC_STATE_UNKNOWN', detail);
     const baseSafe = async () => await this.scheduledBaseSafe(input.baseRevision)
-      && (input.scheduledScan !== undefined || await compatibleAuditBase(vcs, input.baseRevision).catch(() => false));
+      && ((input.scheduledScan !== undefined && !input.svnUrl)
+        || await compatibleAuditBase(vcs, input.baseRevision, input.svnUrl).catch(() => false));
     const businessClean = async () => (await vcs.ensureCleanWorkspace().catch(() => null))?.clean === true;
     if (this.deps.signal?.aborted) return cancelled();
     if (!await baseSafe() || !await businessClean()) {
@@ -1208,9 +1219,13 @@ export class Auditor {
       if (!snapshot?.entries) return rejected('无法安全读取收尾提交范围，未提交本轮产物');
       const { entries: commitEntries } = snapshot;
       if (input.phasedItems) {
-        const expectedReport = gitBlobHash(serializeAuditMarkdown(auditMeta, bodyWithGateNote));
+        const expectedFiles: Record<string, string | undefined> = {
+          ...input.phasedSeal,
+          [reportPath]: gitBlobHash(serializeAuditMarkdown(auditMeta, bodyWithGateNote)),
+          ...(reviewersCreated ? { '.ai-review/reviewers.yml': gitBlobHash(reviewScaffoldText(this.deps.owner)) } : {}),
+        };
         if (!input.phasedSeal || commitEntries.length !== commitPaths.length || commitEntries.some(entry =>
-          entry.blobHash !== (entry.path === reportPath ? expectedReport : input.phasedSeal![entry.path]))) {
+          entry.blobHash !== expectedFiles[entry.path])) {
           return recovery('SYNC_STATE_UNKNOWN', '收尾提交快照与本轮封存内容不符');
         }
       }
