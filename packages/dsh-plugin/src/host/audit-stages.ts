@@ -14,16 +14,27 @@ import {
 } from './audit-stage-runner.js';
 import type { ReviewersConfig } from './reviewers.js';
 import type { VcsAdapter } from './vcs.js';
+import { AUDIT_TYPES, type AuditType } from './types.js';
 import type { runGateChecks } from './validator.js';
 
 const strings = arraySchema(stringSchema);
 const navigation = { path: stringSchema, line: integerSchema };
 const evidence = objectSchema({ ...navigation, excerpt: stringSchema, reason: stringSchema });
+const neutralQuestions = {
+    retry_after_response_timeout: '首次写入成功但响应超时后，从导航处用同一请求 ID 重试时，实际会持久化写入几次？调用链上有哪些限制或保护？',
+    repeated_request: '从导航处重复提交同一请求时，会发生哪些状态变化或产生哪些副作用？在什么条件下会不同？',
+    concurrent_requests: '从导航处并发处理相关请求时，哪些操作可能交错？各自的状态与可观察结果是什么？',
+    state_transition: '从导航处触发状态转换时，满足哪些条件才允许变更？各分支最终会进入什么状态？',
+    error_path: '从导航处遇到异常或部分失败时，调用方会看到什么结果，已经产生的状态或副作用如何处理？',
+    reference_usage: '导航处的实现在哪些入口、配置、测试和动态调用中被引用？目前的视图能覆盖哪些引用类型？',
+    reachable_behavior: '导航处可从哪些实际入口到达，各自需要满足什么条件？实际行为和限制该行为的逻辑是什么？',
+} as const;
 const taskSchemas = {
     scan: objectSchema({ taskScope: strings, scenarios: strings, questions: strings, constraints: strings }),
-    verify: objectSchema({ subjectId: stringSchema, question: stringSchema, navigation: arraySchema(objectSchema(navigation)),
-        expectedBehavior: arraySchema(objectSchema({ text: stringSchema, source: stringSchema })) }),
-    patch: objectSchema({ subjectId: stringSchema, allowedPaths: strings, acceptance: strings, gateCommands: strings }),
+    verify: objectSchema({ subjectId: stringSchema, scenario: enumSchema(...Object.keys(neutralQuestions)),
+        navigation: arraySchema(objectSchema(navigation)), expectationIndexes: arraySchema(integerSchema) }),
+    patch: objectSchema({ subjectId: stringSchema, auditType: enumSchema(...AUDIT_TYPES),
+        allowedPaths: strings, acceptance: strings, gateCommands: strings }),
 };
 const resultSchemas = {
     scan: objectSchema({
@@ -180,7 +191,7 @@ export class AuditStages {
             throw new Error('备选补丁必须说明修复方法');
         }
         validateAuditValue(schema, stage === 'patch' ? patchTask : task, 'task');
-        const input = stage === 'patch' ? { ...patchTask } : { ...raw };
+        let input = stage === 'patch' ? patchTask : raw;
         const subject = String(input['subjectId'] ?? '');
         const existingCandidates = this.candidates.get(subject) ?? [];
         if (stage !== 'scan' && !this.leads.has(subject)) throw new Error('请使用本轮已登记的线索 ID');
@@ -192,24 +203,28 @@ export class AuditStages {
         if (stage === 'verify') {
             const registered = this.leads.get(subject)!;
             const requested = input['navigation'] as Array<{ path: string; line: number }>;
-            if (!requested.length || requested.some(item => !registered.navigation.some(anchor => anchor.path === item.path))) {
-                throw new Error('复核导航需要对应已登记线索');
+            if (!requested.length || requested.some(item => !registered.navigation.some(anchor => anchor.path === item.path && anchor.line === item.line))) {
+                throw new Error('复核导航需要对应已登记线索的路径和行号');
             }
-            const expectations = input['expectedBehavior'] as Array<{ text: string; source: string }>;
-            if (expectations.some(item => !this.userExpectations.includes(item.text))) throw new Error('业务预期需要引用本轮用户原文');
-            input['subjectId'] = registered.token;
-            input['navigation'] = registered.navigation;
-            input['question'] = '请独立检查导航处可达的行为，核对给定业务预期、实际触发条件和防护。可确认的问题及反证分别是什么？';
-            input['expectedBehavior'] = expectations.map(item => ({ text: item.text, source: '本轮用户附加要求' }));
+            const indexes = input['expectationIndexes'] as number[];
+            if (indexes.some(index => index < 0 || index >= this.userExpectations.length)) {
+                throw new Error('业务预期需要引用本轮额外要求');
+            }
+            const scenario = input['scenario'] as keyof typeof neutralQuestions;
+            input = {
+                subjectId: registered.token,
+                question: neutralQuestions[scenario],
+                navigation: registered.navigation.filter(anchor => requested.some(item => anchor.path === item.path && anchor.line === item.line)),
+                expectedBehavior: [...new Set(indexes)].map(index => ({
+                    text: this.userExpectations[index], source: '本轮用户附加要求',
+                })),
+            };
         }
         const preferred = stage === 'verify'
             ? (input['navigation'] as Array<{ path: string }>).map(item => item.path)
             : input[stage === 'scan' ? 'taskScope' : 'allowedPaths'] as string[];
         if (preferred.some(file => (file !== '.' && !validSourcePath(file)) || !withinScope(this.lease.targetPath, file))
             || (stage === 'patch' && (!preferred.length || preferred.includes('.')))) throw new Error('阶段路径超出审查范围');
-        if (stage === 'verify' && (!String(input['question']).trim() || /[\r\n]/.test(String(input['question']))
-            || !/[?？]$/.test(String(input['question']).trim()) || /初审结论|初审推理|上个模型|建议修复/.test(String(input['question']))
-            || String(input['question']).length > 800)) throw new Error('复核问题须为简短的单行中性问题');
         if (stage === 'patch' && !this.gate) return { status: 'blocked', reason: '未配置受限的 Host 门禁环境' };
         const commands = stage === 'patch' ? input['gateCommands'] as string[] : [];
         if (stage === 'patch' && (!commands.length || commands.some(command => !this.reviewers.allowedGateCommands.includes(command)))) {
@@ -238,6 +253,7 @@ export class AuditStages {
             const executionDir = await mkdtemp(path.join(tmpdir(), 'dsh-audit-cli-'));
             scratch = executionDir;
             const snapshot = await this.sources(preferred, signal);
+            if (snapshot.omittedCount) this.coverage.push(taskId + ' 有 ' + String(snapshot.omittedCount) + ' 个文件未进入基线视图');
             const visibleFiles = new Map(snapshot.files.map(file => [file.path, file.text.split(/\r?\n/).length]));
             const sourceView = stage === 'verify' ? {
                 ...snapshot,
@@ -269,20 +285,21 @@ export class AuditStages {
                     token: 'lead-' + String(this.leads.size + 1), navigation: lead.navigation,
                 });
                 this.scanned = true;
-                if (snapshot.omittedCount) this.coverage.push(taskId + ' 有 ' + String(snapshot.omittedCount) + ' 个文件未进入基线视图');
-                this.coverage.push(...value['limits'] as string[]);
+                this.coverage.push(...(value['coverage'] as string[]).map(line => taskId + ' 覆盖：' + line));
+                this.coverage.push(...(value['limits'] as string[]).map(line => taskId + ' 限制：' + line));
                 return value;
             }
             if (stage === 'verify') {
                 const checked = await this.verify(value, new Set(visibleFiles.keys()));
                 this.reviews.set(subject, checked);
+                this.coverage.push(...checked.limits.map(line => taskId + ' 限制：' + line));
                 return checked;
             }
             if (value['status'] === 'blocked') return { status: 'blocked', reason: value['reason'] };
             if (!String(value['summary']).trim()) throw new Error('候选方案缺少修复说明');
             const candidate = await prepareStageCandidate({
                 lease: this.lease, id, scratch, edits: value['edits'] as StageEdit[], allowedPaths: preferred, commands,
-                reviewers: this.reviewers, confirmed: oneLine(verification!.observedBehavior), summary: String(value['summary']),
+                reviewers: this.reviewers, auditType: input['auditType'] as AuditType, confirmed: oneLine(verification!.observedBehavior), summary: String(value['summary']),
                 evidence: verification!.evidence.map(item => '- ' + item.path + ':' + String(item.line) + ' ' + oneLine(item.reason)).join('\n'),
                 gateTimeoutMs: this.gateTimeoutMs, signal, gate: this.gate!,
             });

@@ -9,6 +9,7 @@ import { isRepoRelativePath } from './invariants.js';
 import { parsePatch } from './patch.js';
 import { resolveOwner, type ReviewersConfig } from './reviewers.js';
 import { runProcess } from './shell.js';
+import type { AuditType } from './types.js';
 import { runGateChecks } from './validator.js';
 import { AuditStopUnknown } from './audit-stage-runner.js';
 
@@ -85,7 +86,7 @@ export async function verifyStageGates(
 
 export async function prepareStageCandidate(input: {
     lease: AuditLeaseRecord; id: string; scratch: string; edits: StageEdit[]; allowedPaths: string[];
-    commands: string[]; reviewers: ReviewersConfig; confirmed: string; evidence: string; summary: string;
+    commands: string[]; reviewers: ReviewersConfig; auditType: AuditType; confirmed: string; evidence: string; summary: string;
     gateTimeoutMs: number; signal: AbortSignal; gate: typeof runGateChecks;
 }): Promise<StageCandidate> {
     const { lease, scratch, signal } = input;
@@ -139,7 +140,7 @@ export async function prepareStageCandidate(input: {
         '### 方案说明', oneLine(input.summary), '### 验证结果', gates, '### 人类总体意见', '待审核', '### 意见处理结果', '无',
     ].join('\n\n');
     const review = serializeReviewMarkdown({
-        schemaVersion: 1, module, title, auditType: 'bugfix', owner, tags: [], ticket: null, status: 'pending',
+        schemaVersion: 1, module, title, auditType: input.auditType, owner, tags: [], ticket: null, status: 'pending',
         createdAt: lease.createdAt, updatedAt: lease.createdAt, targetFiles: touched, currentRevision: 1,
         revisions: [{ id: 1, baseRevision: lease.baseRevision, patch: '001.patch', author: 'ai' }],
         gateChecks: input.commands, comments: [], humanDecisions: [], approval: null, rejection: null,
