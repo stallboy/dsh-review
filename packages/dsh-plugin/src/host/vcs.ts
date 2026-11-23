@@ -845,7 +845,7 @@ export class SvnAdapter implements VcsAdapter {
     if (!/^\d+$/.test(rev)) return null;
     const target = toRepoRelative(relPath);
     if (target.length === 0) return null;
-    const result = await svn(this.root, ['cat', '-r', rev, '--', target]);
+    const result = await svn(this.root, ['cat', '-r', rev, '--', target + '@' + rev]);
     return result.code === 0 ? result.stdout : null;
   }
 

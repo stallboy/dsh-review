@@ -97,13 +97,19 @@ export class ReviewApi implements ApiHost {
     return this.configErrors;
   }
 
+  closeAudit(): void { this.auditRuntime.close(); }
+
+  hasAuditStageSession(sessionId: string): boolean {
+    return this.auditRuntime.hasStageSession(sessionId);
+  }
+
   runAuditStage(sessionId: string, stage: import('./audit-prompts.js').AuditStage, runner: import('./audit-stage-runner.js').AuditExecutor,
     task: unknown, signal: AbortSignal): Promise<unknown> {
     return this.auditRuntime.runStage(sessionId, stage, runner, task, signal);
   }
 
-  publishAuditStages(sessionId: string, input: unknown): Promise<{ reportPath: string }> {
-    return this.auditRuntime.publishStages(sessionId, input);
+  publishAuditStages(sessionId: string, input: unknown, signal?: AbortSignal): ReturnType<AuditRuntime['publishStages']> {
+    return this.auditRuntime.publishStages(sessionId, input, signal);
   }
 
   queryAuditHistory(sessionId: string, disposition?: string): Promise<unknown> {

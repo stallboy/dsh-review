@@ -20,12 +20,17 @@ export interface AuditToolRegistry {
     register(definition: AuditTool): () => void;
 }
 
-export function registerAuditStageTools(registry: AuditToolRegistry, api: ReviewApi): () => void {
+export function registerAuditStageTools(registry: AuditToolRegistry, api: ReviewApi | ((sessionId: string) => ReviewApi | undefined)): () => void {
     const output = {
         schema: { type: 'object', properties: { json: { type: 'string' } }, required: ['json'], additionalProperties: false },
         render: (_args: unknown, value: { json: string }) => [{ type: 'text' as const, text: value.json }],
     };
-    const sessionId = (context: ToolContext) => context.agent?.session?.id ?? context.agent?.session?.header?.id ?? '';
+    const owner = (context: ToolContext) => {
+        const sessionId = context.agent?.session?.id ?? context.agent?.session?.header?.id ?? '';
+        const runtime = typeof api === 'function' ? api(sessionId) : api;
+        if (!runtime) throw new Error('阶段工具需要有效租约绑定的审查会话');
+        return { runtime, sessionId };
+    };
     const parse = (value: unknown): unknown => {
         if (typeof value !== 'string' || !value || value.length > 48 * 1024) throw new Error('阶段工具需要有效 JSON 参数');
         return JSON.parse(value);
@@ -41,7 +46,8 @@ export function registerAuditStageTools(registry: AuditToolRegistry, api: Review
         },
         output, timeoutMs: 3600_000,
         async execute(args, context) {
-            const result = await api.runAuditStage(sessionId(context), args['stage'] as AuditStage, args['runner'] as AuditExecutor,
+            const { runtime, sessionId } = owner(context);
+            const result = await runtime.runAuditStage(sessionId, args['stage'] as AuditStage, args['runner'] as AuditExecutor,
                 parse(args['task']), context.signal);
             return { json: JSON.stringify(result) };
         },
@@ -56,7 +62,8 @@ export function registerAuditStageTools(registry: AuditToolRegistry, api: Review
             output, timeoutMs: 60_000,
             async execute(args, context) {
                 context.signal.throwIfAborted();
-                const result = await api.publishAuditStages(sessionId(context), parse(args['publication']));
+                const { runtime, sessionId } = owner(context);
+                const result = await runtime.publishAuditStages(sessionId, parse(args['publication']), context.signal);
                 return { json: JSON.stringify(result) };
             },
         }));
@@ -68,7 +75,8 @@ export function registerAuditStageTools(registry: AuditToolRegistry, api: Review
             output, timeoutMs: 60_000,
             async execute(args, context) {
                 context.signal.throwIfAborted();
-                const result = await api.queryAuditHistory(sessionId(context), typeof args['disposition'] === 'string' ? args['disposition'] : undefined);
+                const { runtime, sessionId } = owner(context);
+                const result = await runtime.queryAuditHistory(sessionId, typeof args['disposition'] === 'string' ? args['disposition'] : undefined);
                 return { json: JSON.stringify(result) };
             },
         }));

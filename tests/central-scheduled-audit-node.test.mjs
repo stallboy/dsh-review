@@ -28,7 +28,7 @@ function commandFor(id, scheduled = true) {
     };
 }
 
-async function setup(t, runner = 'external', runnerArg = '') {
+async function setup(t, runner = 'external', runnerArg = '', auditSessions, runnerPath = fakeRunner) {
     const root = await createGitFixture();
     const directory = await mkdtemp(path.join(os.tmpdir(), 'central-scheduled-node-'));
     const journal = new ManagedJournal(path.join(directory, 'journal.sqlite'));
@@ -36,8 +36,8 @@ async function setup(t, runner = 'external', runnerArg = '') {
     const remote = path.join(directory, 'remote.git');
     const writer = path.join(directory, 'writer');
     const operations = new ManagedOperations({
-        dataDir: directory, journal,
-        workspaces: [{ workspaceId, label: '项目 A', root, target, settings: { runner, externalCommand: `"${process.execPath}" "${fakeRunner}" ${runnerArg}` } }],
+        dataDir: directory, journal, auditSessions,
+        workspaces: [{ workspaceId, label: '项目 A', root, target, settings: { runner, externalCommand: `"${process.execPath}" "${runnerPath}" ${runnerArg}` } }],
     });
     t.after(async () => {
         operations.stop();
@@ -59,6 +59,23 @@ async function setup(t, runner = 'external', runnerArg = '') {
     };
     return { root, writer, remote, target, operations, project, journal, directory, execute };
 }
+
+test('中央定时 Runner 使用阶段通道并交付 Host 生成的报告', async t => {
+    const runner = fileURLToPath(new URL('./fixtures/phased-audit-agent.mjs', import.meta.url));
+    const capabilities = { auditStageExecutor: async ({ prompt }) => {
+        assert.match(prompt, /固定基线只读视图/);
+        return { leads: [], coverage: ['中央定时共享阶段'], limits: [] };
+    } };
+    const { execute, root, remote, target } = await setup(t, 'external', 'empty', capabilities, runner);
+    const result = await execute(commandFor('schedule-phased'));
+    assert.equal(result.outcome.status, 'COMMITTED', JSON.stringify(result));
+    assert.equal(result.delivery.state, 'delivered', JSON.stringify(result));
+    assert.equal(result.outcome.report.path, result.outcome.reportPath);
+    const report = runCommand('git', ['show', 'refs/heads/' + target + ':' + result.outcome.reportPath], remote).stdout;
+    assert.match(report, /trigger: scheduled/);
+    assert.match(report, /中央定时共享阶段/);
+    assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), result.delivery.commitRevision);
+});
 
 async function writeArchive(root, id, base, scope, items = [], candidates = []) {
     const [, date, time] = /^(\d{8})-(\d{6})-/.exec(id);

@@ -3,7 +3,8 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { RETIRED_MANUAL_REVISION, retiredManualRevisionResult, type JsonRecord, type ManagedCommand, type ManagedOperation, type ManagedQuery, type ManagedQueryResult, type ManagedResult, type ProjectRecord, type WorkspaceRegistration } from '@dsh-review/protocol';
 import { ReviewApi } from '../host/api.js';
-import { withSharedView, type ApiDeps } from '../host/api-context.js';
+import { withSharedView } from '../host/api-context.js';
+import type { ManagedAuditSessions } from './managed-config.js';
 import { AuditArchive } from '../host/audit-archive.js';
 import { ManagedDelivery, decorateManagedVcs } from './managed-delivery.js';
 import { ManagedJournal } from './managed-journal.js';
@@ -72,7 +73,11 @@ export class ManagedOperations {
     private readonly issues = new Map<string, string>();
 
     constructor(private readonly options: { dataDir: string; journal: ManagedJournal; workspaces: ManagedWorkspace[]; resolveCredential?: (reference: string) => Promise<string | undefined>;
-        auditSessions?: Pick<ApiDeps, 'createAuditSession' | 'withAuditSessionIdle'> }) {}
+        auditSessions?: ManagedAuditSessions }) {}
+
+    auditStageApi(sessionId: string): ReviewApi | undefined {
+        return [...this.runtimes.values()].find(runtime => runtime.api.hasAuditStageSession(sessionId))?.api;
+    }
 
     async init(projects: ProjectRecord[] = []): Promise<void> {
         await mkdir(this.options.dataDir, { recursive: true, mode: 0o700 });
@@ -211,7 +216,7 @@ export class ManagedOperations {
             return { outcome: { status: 'ABORTED', reason: 'RUNNER_UNAVAILABLE', message: '此工作副本未配置进程型审查 Runner' }, delivery: { state: 'not_required' } };
         }
         this.options.journal.checkpoint(command.commandId, { phase: 'invoking', workspaceId: project.workspaceId });
-        const inSession = command.operation === 'audit' && !command.scheduledAudit && Boolean(this.options.auditSessions);
+        const inSession = command.operation === 'audit' && !command.scheduledAudit && Boolean(this.options.auditSessions?.createAuditSession);
         let session: { auditId: string; sessionId: string } | undefined;
         const response = await runtime.api.invoke({ method: 'POST', path: inSession ? '/audit/session' : routes[command.operation], body: { ...command.payload, ...command.guard,
             ...(command.operation === 'takeover' ? { owner: command.actor.reviewIdentity } : {}) },
@@ -406,5 +411,6 @@ export class ManagedOperations {
 
     stop(): void {
         this.stopped = true;
+        for (const { api } of this.runtimes.values()) api.closeAudit();
     }
 }
