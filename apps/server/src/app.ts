@@ -143,11 +143,22 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
     app.get('/api/v1/projects/:projectId', async req => {
         const projectId = params(req).projectId!;
         const view = snapshots.view(projectId);
-        return { ...view, snapshot: snapshots.get(projectId), auditSchedule: schedules.view(view.project) };
+        return { ...view, snapshot: snapshots.get(projectId), auditSchedule: schedules.view(view.project), auditPlans: schedules.list(view.project) };
     });
     app.put('/api/v1/projects/:projectId/audit-schedule', async req => ({
         auditSchedule: schedules.update(database.getProject(params(req).projectId!), body(req), (req as RequestContext).actor!),
     }));
+    app.post('/api/v1/projects/:projectId/audit-plans', async (req, reply) => {
+        const auditPlan = schedules.createPlan(database.getProject(params(req).projectId!), body(req), (req as RequestContext).actor!);
+        return reply.code(201).send({ auditPlan });
+    });
+    app.put('/api/v1/projects/:projectId/audit-plans/:planId', async req => ({
+        auditPlan: schedules.updatePlan(database.getProject(params(req).projectId!), params(req).planId!, body(req), (req as RequestContext).actor!),
+    }));
+    app.delete('/api/v1/projects/:projectId/audit-plans/:planId', async req => {
+        schedules.deletePlan(database.getProject(params(req).projectId!), params(req).planId!);
+        return { deleted: true };
+    });
     app.get('/api/v1/projects/:projectId/queue', async req => {
         const projectId = params(req).projectId!, snapshot = snapshots.get(projectId);
         return { ...snapshots.view(projectId), items: snapshot?.queue ?? [], errors: snapshot?.errors ?? [] };
@@ -236,7 +247,7 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
         const workspaces = new Set(capabilities.map(id => entityId(id, 'scheduledAuditWorkspaces')));
         const issues = readWorkspaceIssues(input.workspaceIssues);
         if (issues) database.setWorkspaceIssues(id, issues);
-        return { ...commands.poll(id, workspaces), projects: database.listProjects(id), queries: snapshots.pending(id) };
+        return { ...commands.poll(id, workspaces, input.supportsScheduledAuditNotes === true), projects: database.listProjects(id), queries: snapshots.pending(id) };
     });
     app.post('/node-api/v1/commands/:commandId/ack', async req => ({ command: commands.acknowledge(identify(req), params(req).commandId!) }));
     app.post('/node-api/v1/events', async req => {

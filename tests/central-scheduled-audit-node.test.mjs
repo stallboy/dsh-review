@@ -70,7 +70,7 @@ async function writeArchive(root, id, base, scope, items = [], candidates = []) 
 }
 
 test('托管定时审查同步绑定分支，在同一基线上先复查，再归档全仓结果和稳定 finding ID', async t => {
-    const { root, writer, remote, target, operations, journal, directory } = await setup(t);
+    const { root, writer, remote, target, operations, journal, directory } = await setup(t, 'external', 'require-plan-note');
     const original = runCommand('git', ['rev-parse', 'HEAD'], writer).stdout.trim();
     await writeCandidate(writer, 'approved-last-round', {
         review: {
@@ -119,9 +119,10 @@ test('托管定时审查同步绑定分支，在同一基线上先复查，再�
     t.after(() => { snapshotCanFinish.resolve(); return node.stop(); });
     await node.tick();
     const project = await bindProject(app, headers, { ...credential, workspaceId });
-    const schedule = await app.inject({ method: 'PUT', url: `/api/v1/projects/${project.projectId}/audit-schedule`, headers,
-        payload: { enabled: true, startTime: '08:00', timeZone: 'UTC' } });
-    assert.equal(schedule.statusCode, 200, schedule.body);
+    const schedule = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.projectId}/audit-plans`, headers,
+        payload: { name: '接口兼容性巡检', enabled: true, startTime: '08:00', timeZone: 'UTC',
+            recurrence: { kind: 'weekly', weekdays: [3] }, note: '重点检查新增接口的兼容行为' } });
+    assert.equal(schedule.statusCode, 201, schedule.body);
     await node.tick();
     await snapshotStarted.promise;
     now = new Date('2026-11-18T08:05:00Z');

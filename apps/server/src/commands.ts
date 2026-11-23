@@ -75,7 +75,7 @@ export class Commands {
         return this.get(command.commandId);
     }
 
-    poll(nodeId: string, scheduledAuditWorkspaces: ReadonlySet<string>): { commands: CommandRecord[]; cancellations: string[]; recoveries: string[] } {
+    poll(nodeId: string, scheduledAuditWorkspaces: ReadonlySet<string>, supportsScheduledAuditNotes: boolean): { commands: CommandRecord[]; cancellations: string[]; recoveries: string[] } {
         const db = this.database;
         return db.transaction(() => {
             const node = db.getNode(nodeId);
@@ -102,18 +102,19 @@ export class Commands {
             });
             if (!relevant.length && node.online) {
                 const ready = new Set([...scheduledAuditWorkspaces].filter(workspaceId => !Object.hasOwn(issues, workspaceId)));
-                const due = this.schedules.due(nodeId, ready)[0];
+                const due = this.schedules.due(nodeId, ready, supportsScheduledAuditNotes)[0];
                 if (due) {
                     const { key, ...schedule } = due.slot;
                     const input = { operation: 'audit', payload: {
-                        targetPath: '.', note: '', ...(this.supportsFindingWorkflow(due.project) ? { findingWorkflow: true } : {}),
+                        targetPath: '.', note: due.note, ...(this.supportsFindingWorkflow(due.project) ? { findingWorkflow: true } : {}),
                     } };
                     const actor = { userId: SCHEDULED_AUDIT_ACTOR, reviewIdentity: due.reviewIdentity };
                     relevant.push(this.insert(due.project, key, input, actor, digest(stableJson({ ...input, actor, schedule })), schedule));
                 }
             }
             const running = relevant.some(c => c.state === 'accepted' || c.state === 'executing' || c.state === 'recovery_required');
-            const dispatchable = relevant.filter(c => !c.scheduledAudit || scheduledAuditWorkspaces.has(db.getProject(c.projectId).workspaceId));
+            const dispatchable = relevant.filter(c => !c.scheduledAudit || (scheduledAuditWorkspaces.has(db.getProject(c.projectId).workspaceId)
+                && (supportsScheduledAuditNotes || !c.payload.note)));
             const accepted = dispatchable.filter(c => c.state === 'accepted');
             const waiting = dispatchable.filter(c => c.state === 'queued' || c.state === 'dispatched');
             const next = waiting.find(c => !c.scheduledAudit) ?? waiting[0];

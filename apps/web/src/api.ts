@@ -1,4 +1,4 @@
-import type { CommandRecord, ProjectRecord, ProjectSnapshot, NodeRecord } from '@dsh-review/protocol';
+import type { AuditPlanSettings, CommandRecord, ProjectRecord, ProjectSnapshot, NodeRecord } from '@dsh-review/protocol';
 import type { CandidateSummary } from '@dsh-review/protocol';
 import type { QueryClient } from '@tanstack/react-query';
 
@@ -9,7 +9,8 @@ export interface AuditSchedule extends AuditScheduleSettings {
     nextRunAt: string | null;
     lastRun: { scheduledAt: string; state: CommandRecord['state'] | 'waiting' | 'skipped'; reason: string | null; commandId: string | null } | null;
 }
-export interface ProjectDetail extends ProjectView { auditSchedule: AuditSchedule | null }
+export interface AuditPlan extends AuditPlanSettings, Pick<AuditSchedule, 'nextRunAt' | 'lastRun'> { planId: string }
+export interface ProjectDetail extends ProjectView { auditSchedule: AuditSchedule | null; auditPlans: AuditPlan[] }
 export type QueueItem = CandidateSummary & { projectId: string; projectName: string };
 export type { CommandRecord, NodeRecord };
 
@@ -44,6 +45,15 @@ export async function request<T>(path: string, method = 'GET', body?: unknown, s
 
 export function saveAuditSchedule(projectId: string, settings: AuditScheduleSettings) {
     return request<{ auditSchedule: AuditSchedule }>(`/projects/${projectId}/audit-schedule`, 'PUT', settings);
+}
+
+export function saveAuditPlan(projectId: string, settings: AuditPlanSettings, planId?: string) {
+    const base = `/projects/${projectId}/audit-plans`;
+    return request<{ auditPlan: AuditPlan }>(planId ? `${base}/${planId}` : base, planId ? 'PUT' : 'POST', settings);
+}
+
+export function deleteAuditPlan(projectId: string, planId: string) {
+    return request<{ deleted: true }>(`/projects/${projectId}/audit-plans/${planId}`, 'DELETE');
 }
 
 export async function detail<T>(projectId: string, kind: string, params: Record<string, string>, signal: AbortSignal): Promise<T> {

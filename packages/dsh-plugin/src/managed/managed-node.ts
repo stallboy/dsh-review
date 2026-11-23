@@ -188,6 +188,7 @@ export class ManagedNode {
         const scheduledAuditWorkspaces = this.active.size || this.background.size || config.pauseAdmission ? [] :
             workspaces.filter(workspace => workspace.supportsScheduledAudit && !unavailable.has(workspace.workspaceId)).map(workspace => workspace.workspaceId);
         const poll = await this.request<PollResult>('/node-api/v1/commands/poll', { instanceId: this.instanceId, scheduledAuditWorkspaces,
+            ...(scheduledAuditWorkspaces.length ? { supportsScheduledAuditNotes: true } : {}),
             ...(this.capabilities?.workspaceIssues ? { workspaceIssues } : {}) });
         if (this.stopping) return;
         if (this.options.refreshWorkspaceIssues && !this.workspaceCheck) {

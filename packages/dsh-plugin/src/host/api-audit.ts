@@ -495,7 +495,7 @@ export class AuditRuntime {
     const body = await readJson(req);
     const actor = currentTrustedActor();
     if (actor?.userId === SCHEDULED_AUDIT_ACTOR && actor.commandId && actor.scheduledAudit) {
-        const job = await this.startScheduledAudit(runtime, actor.scheduledAudit);
+        const job = await this.startScheduledAudit(runtime, actor.scheduledAudit, stringField(body, 'note'));
         sendJson(res, 202, { jobId: job.id, job });
         return;
     }
@@ -541,7 +541,7 @@ export class AuditRuntime {
     sendJson(res, 202, { jobId: job.id, job });
   }
 
-    private async startScheduledAudit(runtime: Runtime, scheduled: NonNullable<TrustedActor['scheduledAudit']>): Promise<JobRecord> {
+    private async startScheduledAudit(runtime: Runtime, scheduled: NonNullable<TrustedActor['scheduledAudit']>, note: string): Promise<JobRecord> {
         let admit!: (job: JobRecord) => void;
         let rejectAdmission!: (reason: unknown) => void;
         const admitted = new Promise<JobRecord>((resolve, reject) => {
@@ -606,7 +606,7 @@ export class AuditRuntime {
             const job = this.host.jobManager.start('audit', (log, jobId, signal) => {
                 this.host.auditJobLeases.set(jobId, auditId);
                 const auditor = new Auditor({
-                    store: runtime.store, vcs: runtime.vcs, settings, owner, targetPath: '', note: '', log,
+                    store: runtime.store, vcs: runtime.vcs, settings, owner, targetPath: '', note, log,
                     candidateSource, lease, signal: AbortSignal.any([scheduled.signal, signal]),
                     ...(this.host.deps.resolveCredential ? { resolveCredential: this.host.deps.resolveCredential } : {}),
                     scheduledBaseMatches: () => matchesAuditTarget(runtime, scheduled.target),

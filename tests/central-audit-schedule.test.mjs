@@ -17,9 +17,9 @@ async function scheduledProject(t, startTime = '02:00', initialTime = '2026-11-1
     const put = (payload) => setup.app.inject({ method: 'PUT', url: `${path}/audit-schedule`, headers: setup.headers, payload });
     const configured = await put({ enabled: true, startTime, timeZone });
     assert.equal(configured.statusCode, 200, configured.body);
-    const poll = async (app = setup.app, capable = true) => {
+    const poll = async (app = setup.app, capable = true, supportsNotes = true) => {
         const reply = await app.inject({ method: 'POST', url: '/node-api/v1/commands/poll', headers: node.headers,
-            payload: { instanceId: node.instanceId, ...(capable ? { scheduledAuditWorkspaces: [node.workspaceId] } : {}) } });
+            payload: { instanceId: node.instanceId, ...(capable ? { scheduledAuditWorkspaces: [node.workspaceId], ...(supportsNotes ? { supportsScheduledAuditNotes: true } : {}) } : {}) } });
         assert.equal(reply.statusCode, 200, reply.body);
         return reply.json().commands;
     };
@@ -35,6 +35,75 @@ async function scheduledProject(t, startTime = '02:00', initialTime = '2026-11-1
     return { ...setup, node, project, workspace, register, path, put, poll, view, ack, ackResponse, finish, clock, configured: configured.json().auditSchedule,
         moveClock: timestamp => { now = new Date(timestamp); } };
 }
+
+test('AC-CENTRAL-SCHEDULE-05：周计划可在同日分别派发，编辑另一条计划不撤回已派发任务', async t => {
+    const { app, headers, path, poll, moveClock, ack, finish } = await scheduledProject(t);
+    const url = `${path}/audit-plans`;
+    const settings = { name: '周三权限审查', enabled: true, startTime: '02:01', timeZone: 'Asia/Shanghai',
+        recurrence: { kind: 'weekly', weekdays: [7, 3] }, note: '重点检查权限回归' };
+    const created = await app.inject({ method: 'POST', url, headers, payload: settings });
+    assert.equal(created.statusCode, 201, created.body);
+    const { planId, recurrence, nextRunAt } = created.json().auditPlan;
+    assert.deepEqual(recurrence.weekdays, [3, 7]);
+    assert.equal(nextRunAt, '2026-11-17T18:01:00.000Z');
+
+    moveClock('2026-11-17T18:00:00Z');
+    const [daily] = await poll();
+    assert.equal(daily.payload.note, '');
+    const updated = await app.inject({ method: 'PUT', url: `${url}/${planId}`, headers,
+        payload: { ...settings, note: '重点检查角色权限变更' } });
+    assert.equal(updated.statusCode, 200, updated.body);
+    assert.equal((await poll())[0].commandId, daily.commandId);
+    assert.equal((await ack(daily.commandId)).state, 'accepted');
+    await finish(daily.commandId);
+
+    moveClock('2026-11-17T18:01:00Z');
+    assert.deepEqual(await poll(app, true, false), [], '旧节点不得执行带补充要求的计划');
+    const [weekly] = await poll();
+    assert.notEqual(weekly.commandId, daily.commandId);
+    assert.equal(weekly.payload.note, '重点检查角色权限变更');
+    const plans = (await app.inject({ url: path, headers })).json().auditPlans;
+    assert.equal(plans.find(plan => plan.planId === planId).lastRun.commandId, weekly.commandId);
+    assert.equal(plans.find(plan => plan.planId === planId).nextRunAt, '2026-11-21T18:01:00.000Z');
+    assert.equal(plans.find(plan => plan.planId !== planId).lastRun.commandId, daily.commandId);
+
+    const deletion = await app.inject({ method: 'DELETE', url: `${url}/${planId}`, headers });
+    assert.equal(deletion.statusCode, 200, deletion.body);
+    assert.equal((await ack(weekly.commandId)).result.outcome.reason, 'SCHEDULE_CHANGED');
+    assert.deepEqual(await poll(), []);
+    assert.equal((await app.inject({ url: path, headers })).json().auditPlans.length, 1);
+});
+
+test('AC-CENTRAL-SCHEDULE-05：周末和自然日间隔跨月，未来起始日和非法日期有明确结果', async t => {
+    const { app, headers, path, moveClock, poll } = await scheduledProject(t, '00:01', '2026-11-29T15:58:00Z');
+    const url = `${path}/audit-plans`;
+    const settings = { name: '定时复查', enabled: true, startTime: '00:02', timeZone: 'Asia/Shanghai', note: '' };
+    const add = recurrence => app.inject({ method: 'POST', url, headers, payload: { ...settings, recurrence } });
+    assert.equal((await add({ kind: 'weekly', weekdays: [6, 7] })).json().auditPlan.nextRunAt, '2026-12-04T16:02:00.000Z');
+    assert.equal((await add({ kind: 'interval', days: 3, startDate: '2026-11-28' })).json().auditPlan.nextRunAt, '2026-11-30T16:02:00.000Z');
+    assert.equal((await add({ kind: 'interval', days: 60, startDate: '2027-04-01' })).json().auditPlan.nextRunAt, '2027-03-31T16:02:00.000Z');
+    assert.equal((await add({ kind: 'interval', days: 3, startDate: '2026-02-30' })).statusCode, 422);
+    assert.equal((await add({ kind: 'weekly', weekdays: [] })).statusCode, 422);
+    moveClock('2026-11-29T16:02:00Z');
+    const [daily] = await poll();
+    assert.equal(daily.scheduledAudit.scheduledAt, '2026-11-29T16:01:00.000Z');
+});
+
+test('旧每日计划数据库迁移保留原计划和已派发轮次的幂等记录', async t => {
+    const { app, dataDir, headers, path, poll, moveClock, clock, createCentralApp } = await scheduledProject(t);
+    moveClock('2026-11-17T18:00:00Z');
+    const [command] = await poll();
+    app.database.sql.exec(`CREATE TABLE audit_schedules AS SELECT project_id,enabled,start_time,time_zone,effective_at,
+        review_identity,last_missed_at FROM audit_plans; DROP TABLE audit_plans;`);
+    await app.close();
+    const restarted = await createCentralApp({ dataDir, clock });
+    const view = (await restarted.inject({ url: path, headers })).json();
+    assert.equal(view.auditPlans.length, 1);
+    assert.deepEqual(view.auditPlans[0].recurrence, { kind: 'daily' });
+    assert.equal(view.auditSchedule.lastRun.commandId, command.commandId);
+    assert.equal((await poll(restarted))[0].commandId, command.commandId);
+    assert.equal(restarted.database.sql.prepare('SELECT COUNT(*) AS count FROM commands').get().count, 1);
+});
 
 test('AC-CENTRAL-SCHEDULE-01：手动任务优先，30 分钟内空闲可派发，重启不重复发起', async t => {
     const fixture = await scheduledProject(t);

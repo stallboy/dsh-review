@@ -27,6 +27,20 @@ export interface Guard {
     expectedUpdatedAt: string;
 }
 
+export type AuditRecurrence =
+    | { kind: 'daily' }
+    | { kind: 'weekly'; weekdays: number[] }
+    | { kind: 'interval'; days: number; startDate: string };
+
+export interface AuditPlanSettings {
+    name: string;
+    enabled: boolean;
+    startTime: string;
+    timeZone: string;
+    recurrence: AuditRecurrence;
+    note: string;
+}
+
 export interface ScheduledAudit {
     scheduledAt: string;
     expiresAt: string;
