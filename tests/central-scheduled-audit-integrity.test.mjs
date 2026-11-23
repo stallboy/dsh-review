@@ -89,6 +89,19 @@ async function setup(t, mode) {
         git('add', '.ai-review');
         git('commit', '-qm', '上轮共享档案');
     }
+    if (mode === 'legacy-central-with-v2-history') {
+        await new AuditArchive(root).write({ schemaVersion: 2, auditId: previous, scope: '.',
+            createdAt: '2026-11-17T09:00:00Z', baseRevision: git('rev-parse', 'HEAD'), trigger: 'manual',
+            previousAudit: null, candidates: [], items: [
+                { findingId: 'v2-takeover', kind: 'confirm', title: '已接手的计算问题', summary: '核验计算',
+                    targetFiles: ['src/math.js'], dependsOn: null, status: 'pending', candidate: null, repairPlan: '核对运算。' },
+            ] }, '# 新版历史档案');
+        await mkdir(path.join(root, '.ai-review/findings'), { recursive: true });
+        await writeFile(path.join(root, '.ai-review/findings/v2-takeover.yml'),
+            `schema_version: 1\nfinding_id: v2-takeover\nevents:\n- {revision: 1, audit_id: ${previous}, actor: tester, at: "2026-11-17T10:00:00Z", action: human_takeover}\n`);
+        git('add', '.ai-review');
+        git('commit', '-qm', '新版发现的接手状态');
+    }
     if (smokeMode) {
         const gate = path.join(directory, 'gate.mjs');
         await writeFile(gate, mode === 'smoke-gate-dirty'
@@ -122,6 +135,19 @@ async function setup(t, mode) {
     return { base, git, operations, command, project, result, root,
         remoteHead: () => runCommand('git', ['rev-parse', `refs/heads/${target}`], remote).stdout.trim() };
 }
+
+test('旧中央触发定时审查时不将已有新版发现复查写入旧档案', async t => {
+    const { result, root, remoteHead } = await setup(t, 'legacy-central-with-v2-history');
+    assert.equal(result.outcome.status, 'COMMITTED', JSON.stringify(result));
+    assert.equal(remoteHead(), result.outcome.commitRevision);
+    const archive = new AuditArchive(root);
+    const report = await archive.read(result.outcome.auditId);
+    assert.equal(report.parseError, undefined);
+    assert.equal(report.meta.schemaVersion, 1);
+    assert.equal(report.meta.previousAudit, null);
+    assert.deepEqual(report.meta.items, []);
+    assert.equal((await archive.read(previous)).meta.schemaVersion, 2);
+});
 
 test('定时全仓扫描改写已提交旧档案时保留现场并阻止提交，恢复原状后可核验结束', async t => {
     const { base, git, operations, command, project, result, root, remoteHead } = await setup(t, 'change-archive');

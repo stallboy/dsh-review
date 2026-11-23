@@ -1,7 +1,8 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 import os from 'node:os';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
@@ -17,8 +18,10 @@ import { Writers } from '../packages/dsh-plugin/dist/host/api-writers.js';
 import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
 import { GitHeadCandidateSource } from '../packages/dsh-plugin/dist/host/shared-facts.js';
 import { FindingApprovalState } from '../packages/dsh-plugin/dist/host/finding-approval-state.js';
+import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
+import { ManagedOperations } from '../packages/dsh-plugin/dist/managed/managed-operations.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
-import { commitCandidate, guardFixture, reviewFixture } from './fixtures/contract.mjs';
+import { commitCandidate, guardFixture, patchFixture, reviewFixture } from './fixtures/contract.mjs';
 
 const servers = [];
 after(async () => {
@@ -250,6 +253,22 @@ test('重启后发现的未决审批保留到探针和候选现场均可证明�
   await restarted.clear();
 });
 
+test('明确未提交但业务工作区无法恢复时保留发现的待核验标记', async () => {
+  const { root, findingId, options } = await prepareFindingOptions();
+  const { api, base } = await startApi(root);
+  const runtime = await api.runtimeFor(new URL(base));
+  runtime.vcs.atomicCommit = async () => ({
+    success: false, commitRevision: null, outOfDate: false, errorOutput: '测试拒绝提交',
+  });
+  runtime.vcs.revertBusinessWorkspace = async () => {};
+  const [finding] = (await (await fetch(`${base}/findings`)).json()).findings;
+  const response = await post(base, '/approve', guardFixture(options[0].candidateId, { expectedFindingVersion: finding.findingVersion }));
+  assert.equal(response.status, 202);
+  const job = await waitJob(base, (await response.json()).jobId);
+  assert.equal(job.result?.status, 'RECOVERY_REQUIRED', JSON.stringify(job));
+  assert.equal(await new FindingApprovalState(root, findingId, api.deps.statePath).pending(), true);
+});
+
 test('文字方案可人工接手并提交可选线索，旧发现版本不能覆盖新决定', async () => {
   const root = await createGitFixture();
   const findingId = 'complex-repair';
@@ -279,6 +298,108 @@ test('文字方案可人工接手并提交可选线索，旧发现版本不能�
   const updated = await hint.json();
   assert.equal(hint.status, 200, JSON.stringify(updated));
   assert.deepEqual(updated.finding.repairHints, ['PR 42']);
+  await writeFile(path.join(root, 'src/math.js'), 'export const add = (a, b) => a + b;\n');
+  runCommand('git', ['commit', '-qam', 'external repair'], root);
+  const started = await post(base, '/audit/manual', { targetPath: 'src' });
+  assert.equal(started.status, 202);
+  const { auditId, prompt, reportPath } = await started.json();
+  assert.match(prompt, /历史复查数据/);
+  assert.match(prompt, /complex-repair/);
+  await mkdir(path.dirname(path.resolve(root, reportPath)), { recursive: true });
+  const evidence = { file: 'src/math.js', line: 1, excerpt: 'a + b', reason: '已有的加法修复与验收一致' };
+  await writeFile(path.resolve(root, reportPath), [
+    '# 外部审查报告', '## 历史复查数据', '```json',
+    JSON.stringify([{ id: findingId, status: 'resolved', evidence }]), '```', '',
+  ].join('\n'));
+  const finalize = await post(base, '/audit/finalize', { auditId });
+  assert.equal(finalize.status, 202);
+  const job = await waitJob(base, (await finalize.json()).jobId);
+  assert.equal(job.result?.status, 'COMMITTED', JSON.stringify(job));
+  const [refreshed] = (await (await fetch(`${base}/findings`)).json()).findings;
+  assert.equal(refreshed.disposition, 'resolved');
+});
+
+test('SVN 拒绝提交后清除发现处置和批准的 SVN 调度，原发现可以重试', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'finding-svn-reject-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const repo = path.join(directory, 'repo');
+  const root = path.join(directory, 'wc');
+  await mkdir(repo);
+  await mkdir(root);
+  runCommand('svnadmin', ['create', 'repo'], directory);
+  runCommand('svn', ['checkout', '-q', pathToFileURL(repo).href, 'wc'], directory);
+  const svn = (...args) => runCommand('svn', args, root).stdout.trim();
+  await mkdir(path.join(root, 'src'));
+  await writeFile(path.join(root, 'src/math.js'), 'export const add = (a, b) => a - b;\n');
+  svn('add', 'src');
+  svn('commit', '-qm', 'business base');
+  svn('update', '-q');
+  const findingId = 'svn-repair';
+  const candidateId = '2026-11/svn-fix';
+  const candidateDir = path.join(root, '.ai-review', candidateId);
+  await mkdir(candidateDir, { recursive: true });
+  await writeFile(path.join(root, '.ai-review/reviewers.yml'), 'default_owner: tester\n');
+  const baseRevision = svn('info', '--show-item', 'revision');
+  const reviewPath = path.join(candidateDir, 'review.md');
+  const original = reviewFixture('svn-fix', {
+    schemaVersion: 2, extraLines: [`finding_id: ${findingId}`], baseRevision: JSON.stringify(baseRevision),
+    bodyLines: ['# 需人工判断项', '', '- 无'],
+  });
+  await writeFile(reviewPath, original);
+  await writeFile(path.join(candidateDir, '001.patch'), patchFixture());
+  await new AuditArchive(root).write({
+    schemaVersion: 2, auditId: '20261120-100300-src', createdAt: '2026-11-20T10:03:00Z', scope: 'src',
+    trigger: 'manual', previousAudit: null, baseRevision, candidates: [candidateId],
+    items: [{ findingId, kind: 'repair', title: '算术', summary: '加法错误', targetFiles: ['src/math.js'],
+      dependsOn: null, status: 'pending', candidate: null, repairPlan: '修复计算并验证',
+      options: [{ candidateId, tradeoff: '更正运算符' }] }],
+  }, '# 审查报告\n');
+  svn('add', '.ai-review');
+  svn('commit', '-qm', 'finding');
+  svn('update', '-q');
+  const windows = process.platform === 'win32';
+  const hook = path.join(repo, 'hooks', windows ? 'pre-commit.cmd' : 'pre-commit');
+  await writeFile(hook, windows ? '@exit /b 1\r\n' : '#!/bin/sh\nexit 1\n');
+  if (!windows) await chmod(hook, 0o755);
+  const { base } = await startApi(root, { vcsType: 'svn' });
+  const [finding] = (await (await fetch(`${base}/findings`)).json()).findings;
+  const action = { findingId, expectedFindingVersion: finding.findingVersion, action: 'human_takeover' };
+  const decline = await post(base, '/finding/decision', action);
+  assert.equal(decline.status, 409);
+  assert.equal((await decline.json()).error.details.reason, 'COMMIT_FAILED');
+  assert.equal(svn('status'), '');
+  const approval = await post(base, '/approve', guardFixture(candidateId, { expectedFindingVersion: finding.findingVersion }));
+  assert.equal(approval.status, 202);
+  const job = await waitJob(base, (await approval.json()).jobId);
+  assert.equal(job.result?.status, 'ABORTED', JSON.stringify(job));
+  assert.equal(job.result.reason, 'COMMIT_FAILED');
+  assert.equal(svn('status'), '');
+  assert.equal(await readFile(reviewPath, 'utf8'), original);
+  const journal = new ManagedJournal(path.join(directory, 'journal.sqlite'));
+  const operations = new ManagedOperations({ dataDir: path.join(directory, 'state'), journal, workspaces: [
+    { workspaceId: 'svn', label: 'SVN', root, target: '^/', settings: { runner: 'manual' } },
+  ] });
+  try {
+    await operations.init();
+    const project = { projectId: 'project', nodeId: 'node', workspaceId: 'svn', name: 'SVN', bindingGeneration: 1,
+      projectConfigRevision: 1, vcsType: 'svn', target: '^/', enabled: true };
+    const command = { commandId: 'svn-finding-decision', requestHash: 'b'.repeat(64), projectId: project.projectId,
+      nodeId: project.nodeId, bindingGeneration: 1, projectConfigRevision: 1, operation: 'finding-decision',
+      payload: { ...action, findingWorkflow: true }, actor: { userId: 'tester-id', reviewIdentity: 'tester' },
+      createdAt: new Date().toISOString() };
+    journal.accept(command);
+    const result = await operations.execute(command, new AbortController().signal, () => {}, project);
+    assert.equal(result.outcome.status, 'ABORTED', JSON.stringify(result));
+    assert.equal(result.outcome.reason, 'COMMIT_FAILED');
+    assert.equal(result.delivery.state, 'not_required');
+    assert.equal(svn('status'), '');
+  } finally {
+    operations.stop();
+    journal.close();
+  }
+  await rm(hook);
+  const retry = await post(base, '/finding/decision', action);
+  assert.equal(retry.status, 200, await retry.text());
 });
 
 for (const kind of ['tracked', 'untracked']) {

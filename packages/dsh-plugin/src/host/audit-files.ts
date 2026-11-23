@@ -10,6 +10,7 @@ export interface AuditFilesRequest {
     expectedText?: string | null;
     createOnly?: boolean;
     entries?: ExpectedCommitEntry[];
+    removeEmptyParent?: boolean;
 }
 
 export interface AuditFilesResult {

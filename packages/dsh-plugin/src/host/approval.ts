@@ -406,6 +406,7 @@ export class ApprovalOrchestrator {
           backup,
           outOfDate: commit.outOfDate,
           errorOutput: commit.errorOutput,
+          restorePreparation: commit.restorePreparation,
           canRetry: attempt < maxAttempts,
           jobId,
           log,
@@ -459,6 +460,7 @@ export class ApprovalOrchestrator {
     backup: Backup;
     outOfDate: boolean;
     errorOutput: string;
+    restorePreparation?: () => Promise<void>;
     canRetry: boolean;
     jobId: string;
     log: (line: string) => void;
@@ -503,8 +505,21 @@ export class ApprovalOrchestrator {
       };
     }
     input.log('已证明业务提交不存在，恢复操作前快照');
-    await this.restore(input.backup);
-    await vcs.revertBusinessWorkspace().catch(() => undefined);
+    try {
+      await input.restorePreparation?.();
+      await this.restore(input.backup);
+      await vcs.revertBusinessWorkspace();
+      const restored = await vcs.ensureCleanWorkspace();
+      if (!restored.clean) throw new Error(restored.message);
+    } catch (error) {
+      return {
+        status: 'RECOVERY_REQUIRED',
+        reason: 'COMMIT_OUTCOME_UNKNOWN',
+        message: '已确认未提交，但批准前状态未能完整恢复。',
+        detail: String(error),
+        jobId: input.jobId,
+      };
+    }
     if (input.outOfDate && input.canRetry) {
       input.log('远端基线前进（撞车），先同步最新基线后重试');
       return null;
@@ -684,7 +699,7 @@ export class ApprovalOrchestrator {
   private async restore(backup: Backup): Promise<void> {
     await writeFile(backup.reviewPath, backup.reviewText, 'utf8');
     for (const patch of backup.patches) {
-      await writeFile(patch.path, patch.text, 'utf8').catch(() => undefined);
+      await writeFile(patch.path, patch.text, 'utf8');
     }
   }
 

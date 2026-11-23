@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
     closeSync, constants, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync,
-    realpathSync, renameSync, statSync, unlinkSync, writeFileSync,
+    realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
 import type { AuditFilesRequest, AuditFilesResult } from './audit-files.js';
@@ -160,6 +160,15 @@ function run(request: AuditFilesRequest & { root: string }): AuditFilesResult {
             }
             unlinkSync(isolated);
             assertDirectory(directory);
+            if (request.removeEmptyParent) {
+                const parent = components.pop()!;
+                enter(root, components);
+                try {
+                    rmdirSync(parent);
+                } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== 'ENOTEMPTY') throw error;
+                }
+            }
         }
         return {};
     }

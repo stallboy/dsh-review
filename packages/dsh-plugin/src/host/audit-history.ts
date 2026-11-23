@@ -32,9 +32,10 @@ export interface AuditRecheck {
     reportLines: string[];
 }
 
-export async function loadAuditHistory(store: ReviewStore, source: SharedCandidateSource, scope = '.'): Promise<AuditHistory> {
+export async function loadAuditHistory(store: ReviewStore, source: SharedCandidateSource, scope = '.', includeVersioned = true): Promise<AuditHistory> {
     const archive = new AuditArchive(store.repoRoot);
-    const [records, queue] = await Promise.all([archive.list(source), store.list({}, null, undefined, undefined, source)]);
+    const [archives, queue] = await Promise.all([archive.list(source), store.list({}, null, undefined, undefined, source)]);
+    const records = includeVersioned ? archives : archives.filter(record => record.meta.schemaVersion !== 2);
     const byId = new Map(records.filter(record => !record.parseError).map(record => [record.meta.auditId, record]));
     const previous = [...byId.values()].filter(record => record.meta.scope === '.').sort((a, b) => {
         const timestamp = Date.parse(b.meta.createdAt) - Date.parse(a.meta.createdAt);

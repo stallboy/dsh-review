@@ -258,6 +258,15 @@ export class Writers {
         detail: `${commit.errorOutput}（提交探针已前进但提交内容与本次写入不一致，禁止恢复）`,
       };
     }
+    try {
+      await commit.restorePreparation?.();
+    } catch (error) {
+      return {
+        landed: false,
+        outcome: 'RECOVERY_REQUIRED',
+        detail: `${commit.errorOutput}（无法撤销本次提交准备：${String(error)}）`,
+      };
+    }
     return { landed: false, outcome: 'ABORTED', detail: commit.errorOutput };
   }
 
@@ -640,6 +649,8 @@ export class Writers {
     const local = (await auditFiles(runtime.root, { op: 'read', paths: [file] })).bytes?.toString('utf8') ?? null;
     if (local !== before) throw new ApiError(409, 'conflict', '处置记录存在本地修改');
     const events = before === null ? [] : parseFindingEvents(before, id);
+    const removeEmptyParent = before === null
+      && !(await auditFiles(runtime.root, { op: 'list', paths: ['.ai-review'] })).names?.includes('findings');
     const text = serializeFindingEvents(id, [...events, {
       ...decision, revision: events.length + 1, auditId: finding.lastObservedAudit, actor, at: new Date().toISOString(),
     }]);
@@ -649,12 +660,20 @@ export class Writers {
     });
     if (!commit.landed) {
       if (commit.outcome === 'RECOVERY_REQUIRED') {
-        throw new ApiError(409, 'conflict', '处置提交结果待核验', { status: commit.outcome, detail: commit.detail });
+        throw new ApiError(409, 'conflict', '处置提交结果待核验', {
+          status: commit.outcome, reason: 'COMMIT_OUTCOME_UNKNOWN', detail: commit.detail,
+        });
       }
-      await auditFiles(runtime.root, before === null
-        ? { op: 'remove', paths: [file], entries: [{ path: file, blobHash: gitBlobHash(text), mode: '100644' }] }
-        : { op: 'write', paths: [file], text: before, expectedText: text });
-      throw new ApiError(500, 'internal', commit.detail);
+      try {
+        await auditFiles(runtime.root, before === null
+          ? { op: 'remove', paths: [file], entries: [{ path: file, blobHash: gitBlobHash(text), mode: '100644' }], removeEmptyParent }
+          : { op: 'write', paths: [file], text: before, expectedText: text });
+      } catch (error) {
+        throw new ApiError(409, 'conflict', '处置未提交，但工作区未能完整恢复', {
+          status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN', detail: String(error),
+        });
+      }
+      throw new ApiError(409, 'conflict', '处置提交已失败并恢复', { reason: 'COMMIT_FAILED', detail: commit.detail });
     }
     const updated = await this.readModels.findingProjection(runtime);
     sendJson(res, 200, { finding: updated.findings.find((item) => item.findingId === id), commitRevision: commit.commitRevision });
