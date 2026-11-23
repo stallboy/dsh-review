@@ -277,6 +277,52 @@ test('切换已有中央后停止插件不停止已有服务，切回本机保�
     assert.equal((await fetch(new URL('/api/v1/info', centerUrl))).status, 200);
 });
 
+test('已有中央离线时可启动本机中央，保留原连接和项目绑定', async t => {
+    const { app, dataDir, createCentralApp } = await setupCentral(t);
+    const centerUrl = await app.listen({ host: '127.0.0.1', port: 0 });
+    const port = Number(new URL(centerUrl).port);
+    const node = app.database.createNode('离线切换节点');
+    const root = await createGitFixture();
+    const { discoverCandidates } = await import('../packages/dsh-plugin/dist/connection/config.js');
+    const candidates = () => discoverCandidates([{ root }]);
+    const { value, directory } = await controller(t, { candidates });
+    t.after(() => rm(root, { recursive: true, force: true }));
+    await value.apply({ mode: 'external', centerUrl, ...node });
+    await value.project({ candidateId: (await candidates())[0].id, enabled: true });
+    const original = await value.status();
+    const localInput = { mode: 'local', reviewIdentity: '本机审核者' };
+    await app.close();
+    const unavailable = createServer((_req, res) => res.writeHead(503).end());
+    await new Promise(resolve => unavailable.listen(port, '127.0.0.1', resolve));
+    try {
+        await assert.rejects(value.apply(localInput), { code: 'server_unavailable', detail: 'HTTP 503' });
+        assert.equal((await value.status()).centralId, original.centralId);
+    } finally { await new Promise(resolve => unavailable.close(resolve)); }
+
+    const journal = new DatabaseSync(path.join(directory, 'connections', original.centralId, 'journal.sqlite'));
+    try {
+        journal.exec("INSERT INTO outbox VALUES ('pending-event', 1, '{}')");
+        await assert.rejects(value.apply(localInput), { code: 'connection_busy' });
+        assert.equal((await value.status()).centralId, original.centralId);
+        journal.exec("DELETE FROM outbox WHERE command_id='pending-event'");
+    } finally { journal.close(); }
+
+    await value.apply(localInput);
+    const local = await value.status();
+    assert.equal(local.mode, 'local');
+    assert.equal(local.phase, 'ready');
+    assert.equal(local.nodeOnline, true);
+    assert.deepEqual(local.projects, []);
+    assert.deepEqual(local.savedConnections.map(connection => connection.centralId), [original.centralId]);
+
+    const restored = await createCentralApp({ dataDir, clock: () => new Date(Date.now() + 31_000) });
+    await restored.listen({ host: '127.0.0.1', port });
+    await value.apply({ savedCentralId: original.centralId });
+    const back = await value.status();
+    assert.equal(back.nodeId, node.nodeId);
+    assert.equal(back.projects[0].projectId, original.projects[0].projectId);
+});
+
 test('旧配置升级后可按中央切换并恢复已保存地址、节点和工作副本', async t => {
     const first = (await setupCentral(t)).app;
     const second = (await setupCentral(t)).app;

@@ -59,6 +59,19 @@ class CentralRequestError extends Error {
     constructor(readonly status: number, message: string) { super(message); }
 }
 
+class CentralOfflineError extends ConnectionIssueError {
+    constructor() { super('server', 'server_unavailable', '无法读取中央服务器信息'); }
+}
+
+const offlineCodes = new Set(['ECONNREFUSED', 'ENETUNREACH', 'EHOSTUNREACH', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
+
+function isCentralOffline(error: unknown): boolean {
+    if (error instanceof CentralOfflineError) return true;
+    if (!(error instanceof Error)) return false;
+    const cause = error.cause as { code?: string } | undefined;
+    return error.name === 'TimeoutError' || offlineCodes.has(cause?.code ?? '');
+}
+
 function registrationIssue(error: NodeRegistrationError): ConnectionIssueError {
     const message = error.code === 'workspace_rejected' ? '中央服务器拒绝了工作副本信息'
         : error.code === 'registration_field_invalid' ? '中央服务器拒绝了节点注册信息' : error.message;
@@ -190,6 +203,7 @@ export class ConnectionController {
 
     private async inspectCentral(centerUrl: string): Promise<CentralCheck> {
         const info = await this.request(centerUrl, 'api/v1/info').catch(error => {
+            if (isCentralOffline(error)) throw new CentralOfflineError();
             throw new ConnectionIssueError('server', 'server_unavailable', '无法读取中央服务器信息',
                 error instanceof CentralRequestError ? `HTTP ${error.status}` : undefined);
         });
@@ -415,16 +429,20 @@ export class ConnectionController {
         this.node.completeConfiguration();
     }
 
-    private async idle(): Promise<NodeStatus | null> {
-        if (this.legacy) throw new Error('检测到旧 managed-node.json；请先在原中央处理未决任务，停用旧托管配置并重启插件，再应用新连接。旧执行记录不会自动迁移');
-        if (!this.config?.centralId) return null;
-        const journalFile = path.join(this.options.directory, 'connections', this.config.centralId, 'journal.sqlite');
+    private assertSettled(centralId: string): void {
+        const journalFile = path.join(this.options.directory, 'connections', centralId, 'journal.sqlite');
         if (this.node?.hasUnsettled()) throw new ConnectionIssueError('startup', 'connection_busy', '节点存在未核验执行或未确认事件，请先处理原任务');
         if (!this.node && existsSync(journalFile)) {
             const journal = new ManagedJournal(journalFile);
             try { if (journal.hasUnsettled()) throw new ConnectionIssueError('startup', 'connection_busy', '节点存在未核验执行或未确认事件，请先恢复原连接'); }
             finally { journal.close(); }
         }
+    }
+
+    private async idle(): Promise<NodeStatus | null> {
+        if (this.legacy) throw new Error('检测到旧 managed-node.json；请先在原中央处理未决任务，停用旧托管配置并重启插件，再应用新连接。旧执行记录不会自动迁移');
+        if (!this.config?.centralId) return null;
+        this.assertSettled(this.config.centralId);
         if (!this.config.enabled) return null;
         const credentials = this.secrets.nodes[this.config.centralId];
         if (!credentials) throw new Error('无法核验原中央节点状态，请恢复原连接');
@@ -522,7 +540,20 @@ export class ConnectionController {
             progress => { this.runtimeProgress = progress; }) : undefined;
         if (this.disposed) throw new Error('插件正在停止');
         if (mode === 'local') this.runtimeProgress = { stage: 'switching' };
-        if (!same || this.phase === 'ready') await this.idle();
+        if (!same || this.phase === 'ready') {
+            try { await this.idle(); }
+            catch (error) {
+                if (mode !== 'local' || this.config?.mode !== 'external' || !isCentralOffline(error)) throw error;
+                await this.shutdown(false, false);
+                try { this.assertSettled(this.config.centralId); }
+                catch (journalError) {
+                    this.phase = 'error';
+                    this.fail(journalError, '无法核验原连接的本机执行记录');
+                    throw journalError;
+                }
+                this.record('原中央不可达，保留原连接配置和执行记录，继续启动本机中央');
+            }
+        }
         const profiles = this.config?.profiles ?? {};
         const prior = this.config;
         if (prior?.mode === 'external') {
@@ -739,13 +770,13 @@ export class ConnectionController {
         }
     }
 
-    private async shutdown(releaseLock = true): Promise<void> {
+    private async shutdown(releaseLock = true, disconnectNode = true): Promise<void> {
         this.phase = 'stopped';
         this.localAccess = false;
         this.gateway.close();
         const node = this.node;
         this.node = null;
-        try { await node?.stop(); }
+        try { await node?.stop(disconnectNode); }
         finally { await this.local.stop(); if (releaseLock) await this.release(); }
     }
 
