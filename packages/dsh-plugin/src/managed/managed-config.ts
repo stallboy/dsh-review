@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { ProjectRecord } from '@dsh-review/protocol';
 import type { ManagedWorkspace } from './managed-operations.js';
+import type { ApiDeps } from '../host/api-context.js';
 import { dshHome } from '../host/settings.js';
 
 export interface ManagedHandle {
@@ -21,6 +22,7 @@ export interface ManagedConfiguration {
     workspaces: ManagedWorkspace[];
     pauseAdmission?: boolean;
     boundProjects?: ProjectRecord[];
+    auditSessions?: Pick<ApiDeps, 'createAuditSession' | 'withAuditSessionIdle'>;
 }
 
 export async function startManagedNode(input: ManagedConfiguration, directory: string,
@@ -32,7 +34,8 @@ export async function startManagedNode(input: ManagedConfiguration, directory: s
     const centerUrl = managedCenterUrl(input.centerUrl);
     const { ManagedOperations } = await import('./managed-operations.js');
     const journal = new ManagedJournal(path.join(directory, 'journal.sqlite'));
-    const operations = new ManagedOperations({ dataDir: directory, journal, workspaces: input.workspaces, resolveCredential });
+    const operations = new ManagedOperations({ dataDir: directory, journal, workspaces: input.workspaces, resolveCredential,
+        ...(input.auditSessions ? { auditSessions: input.auditSessions } : {}) });
     try {
         const initializeWorkspaces = async () => {
             const projects = input.boundProjects ?? await fetch(new URL('node-api/v1/status', centerUrl), {

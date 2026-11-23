@@ -267,27 +267,46 @@ export class AuditRuntime {
     return job;
   }
 
-  private trackAuditSession(runtime: Runtime, auditId: string, sessionId: string, requestId: string): JobRecord {
+  private trackAuditSession(runtime: Runtime, auditId: string, sessionId: string, requestId: string, managedSignal?: AbortSignal): JobRecord {
     this.armAuditLeaseTimeout(auditId);
     const watch = this.host.deps.withAuditSessionIdle;
     return this.startAuditTrackingJob(auditId, !watch ? undefined : async (log, signal) => {
-      const finished = await watch(sessionId, requestId, signal, async maintenance => {
-        const lease = this.auditLifecycle.find(auditId);
-        if (!lease || lease.state !== 'active' || this.isFinalizing(auditId)) return;
-        if (lease.phased && (!lease.stageSeal || this.stages.get(auditId)?.busy)) return false;
-        this.clearAuditLeaseTimeout(auditId);
-        log('审查会话已空闲，开始自动收尾');
-        try {
-          await this.finalizeAudit(runtime, lease, log, maintenance, true);
-        } catch (error) {
-          await this.auditLifecycle.markReleasable(auditId).catch(() => false);
-          this.finishAuditTracking(auditId, {
-            status: 'RECOVERY_REQUIRED', auditId,
-            message: `自动收尾失败，保留租约供手动复核：${error instanceof Error ? error.message : String(error)}`,
-          });
-        }
+      const watching = managedSignal ? AbortSignal.any([signal, managedSignal]) : signal;
+      let finished: boolean;
+      try {
+        finished = await watch(sessionId, requestId, watching, async maintenance => {
+          const lease = this.auditLifecycle.find(auditId);
+          if (!lease || lease.state !== 'active' || this.isFinalizing(auditId)) return;
+          if (lease.phased && (!lease.stageSeal || this.stages.get(auditId)?.busy)) return false;
+          this.clearAuditLeaseTimeout(auditId);
+          log('审查会话已空闲，开始自动收尾');
+          try {
+            await this.finalizeAudit(runtime, lease, log, maintenance, true);
+          } catch (error) {
+            await this.auditLifecycle.markReleasable(auditId).catch(() => false);
+            this.finishAuditTracking(auditId, {
+              status: 'RECOVERY_REQUIRED', auditId,
+              message: `自动收尾失败，保留租约供手动复核：${error instanceof Error ? error.message : String(error)}`,
+            });
+          }
+        });
+      } catch (error) {
+        if (!managedSignal) throw error;
+        finished = false;
+        if (!watching.aborted) log(`跟踪 DSH 会话失败：${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (finished || signal.aborted) return;
+      if (!managedSignal) {
+        log('无法确认 DSH 会话结束，请在审查结束后手动收尾');
+        return;
+      }
+      await this.auditLifecycle.markReleasable(auditId);
+      this.clearAuditLeaseTimeout(auditId);
+      this.finishAuditTracking(auditId, {
+        status: 'RECOVERY_REQUIRED', auditId, sessionId, reason: 'SYNC_STATE_UNKNOWN',
+        message: managedSignal.aborted ? '已停止跟踪；请在 DSH 中确认审查会话已停止，再核验原任务。'
+          : '无法确认 DSH 会话已结束，请在 DSH 中核对会话状态及审查产物。',
       });
-      if (!finished && !signal.aborted) log('无法确认 DSH 会话结束，请在审查结束后手动收尾');
     });
   }
 
@@ -305,7 +324,7 @@ export class AuditRuntime {
   /** 调用方须持有仓库锁，避免并发请求在各自通过互斥检查后同时取得租约。 */
   async beginAuditLeaseUnderLock(
     runtime: Runtime,
-    input: { targetPath: string; baseRevision: string; owner: string; now: Date; trigger: 'manual' | 'scheduled'; phased?: boolean },
+    input: { targetPath: string; baseRevision: string; owner: string; now: Date; trigger: 'manual' | 'scheduled'; phased?: boolean; commandId?: string },
     clean: { clean: boolean; message: string },
   ): Promise<{ auditId: string; reportPath: string }> {
     this.assertAuditStartAllowed(runtime, clean);
@@ -321,6 +340,7 @@ export class AuditRuntime {
       createdAt: input.now.toISOString(),
       candidateIdsBefore,
       ...(input.phased ? { phased: true } : {}),
+      ...(input.commandId ? { commandId: input.commandId } : {}),
       state: 'active',
     });
     return { auditId, reportPath: `.ai-review/audits/${auditId}/audit.md` };
@@ -328,7 +348,7 @@ export class AuditRuntime {
 
   private async beginAuditLease(
     runtime: Runtime,
-    input: { targetPath: string; baseRevision: string; owner: string; now: Date; trigger: 'manual' | 'scheduled'; phased?: boolean },
+    input: { targetPath: string; baseRevision: string; owner: string; now: Date; trigger: 'manual' | 'scheduled'; phased?: boolean; commandId?: string },
     clean: { clean: boolean; message: string },
   ): Promise<{ auditId: string; reportPath: string }> {
     return this.host.withWriteLock(runtime.root, () => this.beginAuditLeaseUnderLock(runtime, input, clean));
@@ -416,6 +436,9 @@ export class AuditRuntime {
   async auditSession(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
     const runtime = await this.host.runtimeFor(url);
     const ownerSessionId = url.searchParams.get('sessionId') ?? '';
+    const actor = currentTrustedActor();
+    const managed = actor?.managedAuditSession;
+    if (managed?.signal.aborted) throw new ApiError(409, 'conflict', '审查会话创建前已取消', { reason: 'CANCELLED' });
     const body = await readJson(req);
     const targetPath = stringField(body, 'targetPath');
     const note = stringField(body, 'note');
@@ -425,6 +448,9 @@ export class AuditRuntime {
       throw new ApiError(412, 'not_configured', '当前仓库没有可用的基线提交（Git HEAD / SVN revision），无法开始仓库审查。');
     }
     const clean = await runtime.vcs.ensureCleanWorkspace();
+    if (managed && (!this.host.deps.createAuditSession || !this.host.deps.withAuditSessionIdle)) {
+      throw new ApiError(412, 'not_configured', '当前桌面节点缺少 DSH 审查会话执行能力');
+    }
     if (!this.host.deps.createAuditSession) {
       throw new ApiError(500, 'internal', '当前 Host 不支持创建 DSH 审查会话（sessionController 未挂载）。');
     }
@@ -436,7 +462,8 @@ export class AuditRuntime {
       try { fields = auditUserFields(body); } catch { throw new ApiError(400, 'bad_request', '审查附加字段非法'); }
     }
     const { auditId, reportPath } = await this.beginAuditLease(
-      runtime, { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'manual', phased }, clean,
+      runtime, { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'manual', phased,
+        ...(managed && actor?.commandId ? { commandId: actor.commandId } : {}) }, clean,
     );
     const lease = this.auditLifecycle.find(auditId)!;
     const title = ('仓库审查 · ' + (target.targetPath || '全仓库')).slice(0, 60);
@@ -455,13 +482,16 @@ export class AuditRuntime {
           repoRoot: runtime.root, vcsType: runtime.vcsType, owner, targetPath: target.targetPath,
           note, baseRevision, reportPath, mode: 'session', now, ...(source ? { source } : {}),
         });
-        prompt = composeSessionPrompt(await loadAuditSystemPrompt(), userPrompt + '\n\n' + await this.ownerRoutingBlock(runtime.root, source));
+        const workdir = managed ? `\n\n执行命令时请显式使用仓库根目录 ${runtime.root}。报告和补丁路径相对仓库根目录。` : '';
+        prompt = composeSessionPrompt(await loadAuditSystemPrompt(), userPrompt + workdir + '\n\n' + await this.ownerRoutingBlock(runtime.root, source));
       }
       created = await this.host.deps.createAuditSession({
         cwd: runtime.root, title, prompt, ownerSessionId, requestId,
-        ...(phased ? { onCreated: async (sessionId: string) => {
+        ...(managed ? { requireWorkspace: true, signal: managed.signal } : {}),
+        ...(phased || managed ? { onCreated: async (sessionId: string) => {
           lease.sessionId = sessionId;
           await this.upsertLease(lease);
+          managed?.onCreated(auditId, sessionId);
         } } : {}),
       });
       if (lease.sessionId !== created.sessionId) {
@@ -470,14 +500,20 @@ export class AuditRuntime {
       }
     } catch (error) {
       this.stopStages(auditId);
-      if (phased && lease.sessionId) await this.auditLifecycle.markReleasable(auditId);
-      else {
+      if ((phased || managed) && lease.sessionId) await this.auditLifecycle.markReleasable(auditId);
+      if (managed && lease.sessionId) {
+        throw new ApiError(500, 'internal', error instanceof Error ? error.message : String(error), {
+          status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', auditId, sessionId: lease.sessionId,
+        });
+      }
+      if (!(phased && lease.sessionId)) {
         this.stages.delete(auditId);
         await this.releaseLeaseById(auditId).catch(() => undefined);
       }
+      if (managed?.signal.aborted) throw new ApiError(409, 'conflict', '审查会话创建前已取消', { reason: 'CANCELLED' });
       throw error;
     }
-    const job = this.trackAuditSession(runtime, auditId, created.sessionId, requestId);
+    const job = this.trackAuditSession(runtime, auditId, created.sessionId, requestId, managed?.signal);
     sendJson(res, 202, {
       sessionId: created.sessionId,
       jobId: job.id,
