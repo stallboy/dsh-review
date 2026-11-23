@@ -385,7 +385,7 @@ test('SVN 拒绝提交后清除发现处置和批准的 SVN 调度，原发现�
       projectConfigRevision: 1, vcsType: 'svn', target: '^/', enabled: true };
     const command = { commandId: 'svn-finding-decision', requestHash: 'b'.repeat(64), projectId: project.projectId,
       nodeId: project.nodeId, bindingGeneration: 1, projectConfigRevision: 1, operation: 'finding-decision',
-      payload: { ...action, findingWorkflow: true }, actor: { userId: 'tester-id', reviewIdentity: 'tester' },
+      payload: action, actor: { userId: 'tester-id', reviewIdentity: 'tester' },
       createdAt: new Date().toISOString() };
     journal.accept(command);
     const result = await operations.execute(command, new AbortController().signal, () => {}, project);
