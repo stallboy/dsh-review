@@ -14,6 +14,7 @@ export interface AuditLeaseRecord {
   candidateIdsBefore: string[];
   state: AuditLeaseState;
   sessionId?: string;
+  commandId?: string;
   phased?: boolean;
   stageSeal?: Record<string, string>;
   stageItems?: import('./audit-archive.js').AuditItem[];

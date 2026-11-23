@@ -1,16 +1,18 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { realpath } from 'node:fs/promises';
 import { withDshAuditSessionIdle } from './audit-session-idle.js';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from './api.js';
 import { executeAuditCli } from './audit-stage-runner.js';
 import { configuredAuditStageGates } from './audit-stage-gates.js';
+import type { ApiDeps } from './api-context.js';
 import { registerAuditStageTools, type AuditToolRegistry } from './audit-stage-tools.js';
 import { dshHome, loadSettings, saveSettings } from './settings.js';
-import type { AppSettings } from './types.js';
+import { ApiError, type AppSettings } from './types.js';
 import { loadManagedNode, type ManagedHandle } from '../managed/managed-config.js';
 import { ConnectionController, CONNECTION_PREFIX } from '../connection/controller.js';
-import { discoverCandidates } from '../connection/config.js';
+import { discoverCandidates, resolveWorktree } from '../connection/config.js';
 import { CENTRAL_PREFIX } from '../connection/gateway.js';
 
 export interface HostLogger {
@@ -176,7 +178,7 @@ function inheritOwnerPolicy(
 
 export async function createDshAuditSession(
   host: AuditSessionHost,
-  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string; requestId?: string; onCreated?: (id: string) => Promise<void> },
+  input: Parameters<NonNullable<ApiDeps['createAuditSession']>>[0],
 ): Promise<{ sessionId: string }> {
   return createDshSession(host, input, '审查');
 }
@@ -192,12 +194,14 @@ export async function createDshFixSession(
 /** 将会话挂到 cwd 对应的工作区，才能让侧栏在正确的工作区展示它。 */
 async function createDshSession(
   host: AuditSessionHost,
-  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string; requestId?: string; onCreated?: (id: string) => Promise<void> },
+  input: Parameters<NonNullable<ApiDeps['createAuditSession']>>[0],
   label: string,
 ): Promise<{ sessionId: string }> {
   const controller = host.get('sessionController') as DshSessionController | undefined;
   if (!controller || typeof controller.create !== 'function' || typeof controller.prompt !== 'function') {
-    throw new Error(`当前 DSH Host 未挂载 sessionController，无法创建${label}会话（请确认 DSH 版本包含 API Session 控制服务）`);
+    const message = `当前 DSH Host 未挂载 sessionController，无法创建${label}会话（请确认 DSH 版本包含 API Session 控制服务）`;
+    if (input.requireWorkspace) throw new ApiError(412, 'not_configured', message);
+    throw new Error(message);
   }
   const registry = host.get('workspaceRegistry') as WorkspaceRegistryLike | undefined;
   let workspace: WorkspaceLike | undefined;
@@ -209,6 +213,26 @@ async function createDshSession(
   if (!workspace) {
     workspace = registry?.list?.().find((item) => samePath(item.path, input.cwd));
   }
+  if (input.requireWorkspace) {
+    const root = await realpath(input.cwd);
+    const candidates = new Map((registry?.list?.() ?? []).map(candidate => [candidate.id, candidate]));
+    if (workspace) candidates.set(workspace.id, workspace);
+    const paths = await Promise.all([...candidates.values()].map(async candidate => ({
+      candidate, directory: await realpath(candidate.path).catch(() => null),
+    })));
+    const exact = paths.filter(({ directory }) => directory === root);
+    const matches = exact.length ? exact : (await Promise.all(paths.map(async entry => {
+      if (!entry.directory || !entry.directory.startsWith(root.endsWith(path.sep) ? root : root + path.sep)) return null;
+      const worktree = await resolveWorktree(entry.directory).catch(() => null);
+      return worktree?.root === root ? entry : null;
+    }))).filter(entry => entry !== null);
+    if (matches.length !== 1) {
+      const detail = matches.length ? 'DSH 中有多个项目匹配同一审查工作副本' : 'DSH 中找不到审查工作副本所属的项目';
+      throw new ApiError(412, 'not_configured', `${detail}：${input.cwd}`);
+    }
+    workspace = matches[0]!.candidate;
+  }
+  input.signal?.throwIfAborted();
   let created: { sessionId?: unknown };
   try {
     created = workspace
@@ -236,7 +260,7 @@ async function createDshSession(
         mode: 'queue',
         content: [{ type: 'text', text: input.prompt }],
       },
-      AbortSignal.timeout(60_000),
+      AbortSignal.any([AbortSignal.timeout(60_000), ...(input.signal ? [input.signal] : [])]),
     );
     if (prompted?.accepted !== true) throw new Error(`DSH 未接受${label}提示词`);
   } catch (error) {
@@ -271,9 +295,16 @@ export function apply(ctx: HostContext): void {
     }
   };
 
+  const auditSessions: Pick<ApiDeps, 'createAuditSession' | 'withAuditSessionIdle'> = {
+    createAuditSession: (input) => createDshAuditSession(ctx, input),
+    withAuditSessionIdle: (sessionId, requestId, signal, finalize) => withDshAuditSessionIdle(
+      ctx, sessionId, requestId, AbortSignal.any([signal, shutdown.signal]), finalize,
+    ),
+  };
   const connection = new ConnectionController({
     directory: path.join(dshHome(), 'dsh-code-review'),
     resolveCredential,
+    auditSessions,
     beforeConfigure: () => {
       if (initError) throw new Error(`本地评审恢复状态无法核验：${initError.message}`);
       if (localWrites || api?.jobManager.list().some(job => job.status === 'running')) throw new Error('本地评审仍有操作执行中，请先处理后启用中央连接');
@@ -318,10 +349,7 @@ export function apply(ctx: HostContext): void {
         return saved;
       },
       resolveCredential,
-      createAuditSession: (input) => createDshAuditSession(ctx, input),
-      withAuditSessionIdle: (sessionId, requestId, signal, finalize) => withDshAuditSessionIdle(
-        ctx, sessionId, requestId, AbortSignal.any([signal, shutdown.signal]), finalize,
-      ),
+      ...auditSessions,
       createFixSession: (input) => createDshFixSession(ctx, input),
       resolveSessionCwd: (sessionId) => {
         const sessions = ctx.get('sessions') as {

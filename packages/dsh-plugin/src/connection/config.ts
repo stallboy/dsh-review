@@ -73,6 +73,14 @@ export async function saveJson(filename: string, value: unknown): Promise<void> 
     await rename(temporary, filename);
 }
 
+export async function resolveWorktree(directory: string): Promise<{ root: string; vcsType: 'git' | 'svn' }> {
+    const git = await runProcess('git', ['rev-parse', '--show-toplevel'], { cwd: directory, timeoutMs: 10000 });
+    if (git.code === 0) return { root: await realpath(git.stdout.trim()), vcsType: 'git' };
+    const svn = await runProcess('svn', ['info', '--show-item', 'wc-root', '.'], { cwd: directory, timeoutMs: 10000 });
+    if (svn.code !== 0) throw new Error('不是有效的 Git/SVN 工作副本，或所需工具不可用');
+    return { root: await realpath(svn.stdout.trim()), vcsType: 'svn' };
+}
+
 export async function discoverCandidates(inputs: Array<{ root: string; label?: string; current?: boolean }>): Promise<Candidate[]> {
     const candidates = new Map<string, Candidate>();
     for (const input of inputs) {
@@ -82,16 +90,9 @@ export async function discoverCandidates(inputs: Array<{ root: string; label?: s
         let error: string | undefined;
         try {
             root = await realpath(root);
-            const git = await runProcess('git', ['rev-parse', '--show-toplevel'], { cwd: root, timeoutMs: 10000 });
-            if (git.code === 0) {
-                root = await realpath(git.stdout.trim());
-                vcsType = 'git';
-            } else {
-                const svn = await runProcess('svn', ['info', '--show-item', 'wc-root', '.'], { cwd: root, timeoutMs: 10000 });
-                if (svn.code !== 0) throw new Error('不是有效的 Git/SVN 工作副本，或所需工具不可用');
-                root = await realpath(svn.stdout.trim());
-                vcsType = 'svn';
-            }
+            const worktree = await resolveWorktree(root);
+            root = worktree.root;
+            vcsType = worktree.vcsType;
             const branch = await runProcess(vcsType, vcsType === 'git' ? ['branch', '--show-current'] : ['info', '--show-item', 'relative-url', '.'], { cwd: root, timeoutMs: 10000 });
             target = branch.stdout.trim();
             if (branch.code !== 0 || !target) throw new Error('无法确定目标分支，请先检出明确的目标');
