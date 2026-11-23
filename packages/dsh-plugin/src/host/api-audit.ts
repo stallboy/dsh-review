@@ -645,20 +645,26 @@ export class AuditRuntime {
       { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'manual' },
       clean,
     );
-    const sharedSource = await sharedSourceFor(runtime);
-    const userPrompt = await buildAuditPrompt({
-      repoRoot: runtime.root,
-      vcsType: runtime.vcsType,
-      owner,
-      targetPath: target.targetPath,
-      note,
-      baseRevision,
-      reportPath,
-      mode: 'headless',
-      now,
-      ...(sharedSource ? { source: sharedSource } : {}),
-    });
-    const prompt = wrapAgentPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root, sharedSource)}`);
+    let prompt: string;
+    try {
+      const sharedSource = await sharedSourceFor(runtime);
+      const userPrompt = await buildAuditPrompt({
+        repoRoot: runtime.root,
+        vcsType: runtime.vcsType,
+        owner,
+        targetPath: target.targetPath,
+        note,
+        baseRevision,
+        reportPath,
+        mode: 'headless',
+        now,
+        ...(sharedSource ? { source: sharedSource } : {}),
+      });
+      prompt = wrapAgentPrompt(await loadAuditSystemPrompt(), `${userPrompt}\n\n${await this.ownerRoutingBlock(runtime.root, sharedSource)}`);
+    } catch (error) {
+      await this.releaseLeaseById(auditId);
+      throw error;
+    }
     const job = this.startAuditTrackingJob(auditId);
     this.armAuditLeaseTimeout(auditId);
     sendJson(res, 202, {

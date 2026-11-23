@@ -42,7 +42,8 @@ test('独立插件包离线安装后可加载宿主、界面和资源，不携�
     assert.match(help, /只读检查 Frontmatter/);
     run(process.execPath, ['--input-type=module', '-e', `
         import assert from 'node:assert/strict';
-        import { existsSync, readFileSync } from 'node:fs';
+        import { execFileSync } from 'node:child_process';
+        import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
         import { createRequire } from 'node:module';
         import path from 'node:path';
         const require = createRequire(import.meta.url);
@@ -51,9 +52,17 @@ test('独立插件包离线安装后可加载宿主、界面和资源，不携�
         const manifest = require('dsh-code-review/package.json');
         assert.equal(manifest.dsh.client.platform, 'web');
         const packageRoot = path.dirname(require.resolve('dsh-code-review/package.json'));
-        const { loadAuditSystemPrompt } = await import('./node_modules/dsh-code-review/dist/host/auditor.js');
+        const { buildAuditPrompt, loadAuditSystemPrompt } = await import('./node_modules/dsh-code-review/dist/host/auditor.js');
         const { loadSystemPrompt } = await import('./node_modules/dsh-code-review/dist/host/runner.js');
         assert.ok((await loadAuditSystemPrompt()).length > 100);
+        const directPrompt = await buildAuditPrompt({
+            repoRoot: process.cwd(), vcsType: 'git', owner: 'offline', targetPath: '',
+            note: '离线保留 {{baseRevision}}', baseRevision: 'offline-base',
+            reportPath: '.ai-review/audits/offline/audit.md', mode: 'session',
+        });
+        assert.match(directPrompt, /## 会话执行方式/);
+        assert.match(directPrompt, /^schema_version: 2$/m);
+        assert.ok(directPrompt.includes('离线保留 {{baseRevision}}'));
         assert.ok((await loadSystemPrompt()).length > 100);
         assert.match(readFileSync(require.resolve('dsh-code-review/client'), 'utf8'), /__ModuleLoader__/);
         assert.ok(existsSync(require.resolve('dsh-code-review/locale/zh.json')));
@@ -61,6 +70,29 @@ test('独立插件包离线安装后可加载宿主、界面和资源，不携�
         assert.ok(existsSync(path.join(packageRoot, manifest.dsh.bundle.patch)));
         assert.equal(existsSync(path.join(packageRoot, 'apps')), false);
         assert.equal(existsSync('./node_modules/fastify'), false);
+        const repo = path.resolve('manual-audit-repo');
+        mkdirSync(repo);
+        const git = (...args) => execFileSync('git', args, { cwd: repo, windowsHide: true });
+        git('init', '-q');
+        writeFileSync(path.join(repo, 'README.md'), '# 离线仓库');
+        git('add', 'README.md');
+        git('-c', 'user.name=offline', '-c', 'user.email=offline@example.com', 'commit', '-qm', 'baseline');
+        const host = './node_modules/dsh-code-review/dist/host/';
+        const { ReviewApi } = await import(host + 'api.js');
+        const { DEFAULT_SETTINGS } = await import(host + 'settings.js');
+        const api = new ReviewApi({
+            settings: { ...DEFAULT_SETTINGS, repoRoot: repo, vcsType: 'git', owner: 'offline' },
+            saveSettings: async next => next,
+            statePath: path.resolve('offline-state.json'),
+        });
+        await api.init();
+        const task = path.join(packageRoot, 'assets/audit/direct/task.md');
+        renameSync(task, task + '.missing');
+        const failure = await api.invoke({ method: 'POST', path: '/audit/manual', body: {} });
+        assert.equal(failure.status, 500);
+        const queue = await api.invoke({ method: 'GET', path: '/queue' });
+        assert.equal(queue.status, 200);
+        assert.equal(queue.body.auditLease, undefined);
     `], directory);
 });
 

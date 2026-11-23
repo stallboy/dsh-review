@@ -1,0 +1,2 @@
+使用新版发现交付时，在报告追加标题「## 修复方案数据」，紧接一个 json 代码块。块中为已确认发现的数组，每项含 finding_id、kind、title、summary、target_files、depends_on、status、candidate、repair_plan。使用已存在的发现编号；新编号用稳定小写短名并以连字符分隔。status 填 pending，candidate 填 null。kind 为 repair、confirm 或 deferred。非 deferred 的 depends_on 填 null。
+repair 另含 options 数组（按推荐顺序，最多三个），每项含 candidate_id 和 tradeoff。每个选项有独立候选目录和对应的 finding_id，从同一基线生成并验证。confirm 和 deferred 交付文字方案，repair_plan 必须包含证据、修复步骤和验收标准。问题已确认但没有可验证补丁时使用 confirm。

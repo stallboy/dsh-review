@@ -23,6 +23,23 @@ const CONTRACT: Record<AuditTemplate, string> = {
     patch: '候选独立以本轮基线为准。消除根因并保持公开 API、协议和持久化格式。Host 仅在专用副本应用文本编辑，按受信门禁白名单执行命令。Host 生成 UTF-8/LF 全量 001.patch 与 review.md，初始 pending/rev1/approval=null，归档时按发现格式关联，owner 按同一基线路由，门禁只写实际通过项。评审数据与暂存文件不得出现在业务补丁中。' + AUDIT_TYPE_GUIDE,
 };
 
+const PLACEHOLDER = /\{\{([^{}]+)\}\}/g;
+
+export function renderPromptText(
+    body: string,
+    fields: readonly string[],
+    values: Readonly<Record<string, string>>,
+): string {
+    if (Object.keys(values).length !== fields.length || fields.some(key => !Object.hasOwn(values, key) || typeof values[key] !== 'string')) {
+        throw new Error('审查模板收到缺失或越界的变量');
+    }
+    const tokens = new Set([...body.matchAll(PLACEHOLDER)].map(match => match[1]));
+    if (tokens.size !== fields.length || fields.some(key => !tokens.has(key))) {
+        throw new Error('审查模板的占位符与契约不符');
+    }
+    return body.replace(PLACEHOLDER, (_, name: string) => values[name]!);
+}
+
 export async function renderAuditTemplate(
     phase: AuditTemplate,
     input: Readonly<Record<string, unknown>>,
@@ -34,10 +51,55 @@ export async function renderAuditTemplate(
     const asset = phase === 'orchestrator' ? 'orchestrator.md' : phase + '/SKILL.md';
     const raw = await readFile(new URL('../../assets/audit/' + asset, import.meta.url), 'utf8');
     const body = phase === 'orchestrator' ? raw : raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
-    const tokens = [...body.matchAll(/\{\{([^{}]+)\}\}/g)].map(match => match[1]);
-    if (tokens.length !== 2 || !tokens.includes('contractText') || !tokens.includes('taskJson')) {
+    if ([...body.matchAll(PLACEHOLDER)].length !== 2) {
         throw new Error('审查模板的占位符与契约不符');
     }
-    const values: Record<string, string> = { contractText: CONTRACT[phase], taskJson: JSON.stringify(input, null, 2) };
-    return body.replace(/\{\{([^{}]+)\}\}/g, (_, name: string) => values[name] ?? '').trim();
+    return renderPromptText(body, ['contractText', 'taskJson'], {
+        contractText: CONTRACT[phase], taskJson: JSON.stringify(input, null, 2),
+    }).trim();
+}
+
+const DIRECT_FIELDS = [
+    'repoRoot', 'vcsType', 'owner', 'ownerFallback', 'scope', 'reportScope', 'baseRevision',
+    'month', 'reportPath', 'now', 'reviewersText', 'existing', 'negativeMemory', 'outline', 'note',
+] as const;
+
+type DirectAuditPromptInput = Record<typeof DIRECT_FIELDS[number], string> & {
+    findingWorkflow: boolean;
+    mode: 'session' | 'headless';
+    priorFindingsJson?: string;
+};
+
+async function directAsset(name: string): Promise<string> {
+    const text = await readFile(new URL('../../assets/audit/direct/' + name + '.md', import.meta.url), 'utf8');
+    return text.replaceAll('\r\n', '\n').replace(/\n$/, '');
+}
+
+export async function renderDirectAuditPrompt(input: DirectAuditPromptInput): Promise<string> {
+    const { findingWorkflow, mode, priorFindingsJson, ...facts } = input;
+    const schemaVersion = findingWorkflow ? '2' : '1';
+    const hasHistory = findingWorkflow && priorFindingsJson !== undefined;
+    const [body, delivery, history, session, completion] = await Promise.all([
+        directAsset('task'),
+        directAsset('delivery-v' + schemaVersion),
+        hasHistory ? directAsset('history') : '',
+        mode === 'session' ? directAsset('session') : '',
+        directAsset(mode === 'session' ? 'complete-session' : 'complete-headless'),
+    ]);
+    const fragments = {
+        delivery,
+        history: history ? '\n' + history : '',
+        session: session ? session + '\n\n' : '',
+        completion,
+    };
+    const template = body.replace(/<!-- (delivery|history|session|completion) -->/g,
+        (_, fragment: keyof typeof fragments) => fragments[fragment]);
+    return renderPromptText(template, [
+        ...DIRECT_FIELDS, 'schemaVersion', 'findingIdField', ...(hasHistory ? ['priorFindingsJson'] : []),
+    ], {
+        ...facts,
+        schemaVersion,
+        findingIdField: findingWorkflow ? '\nfinding_id: "<对应的稳定发现编号>"' : '',
+        ...(hasHistory ? { priorFindingsJson } : {}),
+    });
 }
