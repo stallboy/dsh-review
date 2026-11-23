@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import os from 'node:os';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { withTrustedActor } from '../packages/dsh-plugin/dist/host/api-context.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { parseReviewMarkdown, serializeReviewMarkdown } from '../packages/dsh-plugin/dist/host/frontmatter.js';
 import { quickReviewInvariants } from '../packages/dsh-plugin/dist/host/invariants.js';
@@ -858,6 +859,30 @@ test('§11/AC-PROMPT-01：系统提示词和 Host 展开包含完整 Schema、9 
     }
     assert.doesNotMatch(text, /§\s*\d/);
     assert.doesNotMatch(text, /唯一例外/);
+  }
+});
+
+test('直接执行的审查提示词按能力只给出一版交付规则，并区分证据不足和无法验证修复', async t => {
+  const root = await createGitFixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const input = {
+    repoRoot: root, vcsType: 'git', owner: 'tester', targetPath: '', note: '',
+    baseRevision: runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(),
+    reportPath: '.ai-review/audits/example/audit.md',
+  };
+  const system = await loadAuditSystemPrompt();
+  for (const enabled of [false, true]) {
+    const task = await withTrustedActor({ userId: 'tester', reviewIdentity: 'tester', findingWorkflow: enabled },
+      () => buildAuditPrompt(input));
+    const rendered = system + '\n' + task;
+    assert.deepEqual([...rendered.matchAll(/^schema_version: (\d)$/gm)].map(match => Number(match[1])), [enabled ? 2 : 1]);
+    assert.equal(rendered.includes('最多三个'), enabled);
+    assert.equal(rendered.includes('一个问题一个候选目录'), !enabled);
+    assert.equal(rendered.includes('## 修复方案数据'), enabled);
+    assert.equal(/^finding_id: /m.test(rendered), enabled);
+    assert.match(rendered, /问题本身证据不足时仅记入覆盖说明/);
+    assert.match(rendered, /问题已确认.*无法.*验证.*B 类/);
+    assert.doesNotMatch(rendered, /判定不确定时一律降级为 B 类|A 类（直接生成候选，占大多数）/);
   }
 });
 

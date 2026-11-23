@@ -143,7 +143,7 @@ export function parseAuditReport(text: string): { deferred: AuditDeferredItem[] 
 export async function loadAuditSystemPrompt(): Promise<string> {
   const fallback = [
     '你是仓库审查与重构优化专家。请按正确性、安全性、负载稳定性、可测试性、性能、精简的优先级审查仓库。',
-    '只把无疑问的本质修复或明显精简生成为 .ai-review 候选；存疑或跨模块重大改动只写入审查报告。',
+    '可独立验证的修复生成候选。问题本身证据不足时仅记入覆盖说明。问题已确认但无法安全修复或无法验证修复时，交付 B 类文字方案。',
     '所有候选必须独立基于同一基线，生成补丁后立即还原业务工作区，不得提交代码。',
   ].join('\n');
   try {
@@ -316,7 +316,8 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
   const outline = await collectOutline(input.repoRoot, target.absolutePath);
   const existing = await existingCandidateLines(new ReviewStore(input.repoRoot), input.baseRevision, input.source);
   const negativeMemory = await negativeMemoryLines(input.repoRoot, input.source);
-  const priorFindings = input.source && currentTrustedActor()?.findingWorkflow !== false
+  const findingWorkflow = currentTrustedActor()?.findingWorkflow !== false;
+  const priorFindings = input.source && findingWorkflow
     ? (await loadAuditHistory(new ReviewStore(input.repoRoot), input.source, target.targetPath || '.')).protectedFindings.filter(item => item.repairPlan)
     : [];
   const month = `${String(now.getFullYear())}-${pad(now.getMonth() + 1)}`;
@@ -329,14 +330,14 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
   const lines: string[] = [
     '# 任务',
     '请你作为本轮仓库审查的执行者，先按审查准则扫描目标范围，再把「A 类：无疑问的本质缺陷 / 低风险明显精简重构」直接转化为 `.ai-review` 候选修复包；B 类只写入审查报告，不修改代码。',
-    ...(currentTrustedActor()?.findingWorkflow === false ? [] : [
+    ...(findingWorkflow ? [
       '使用新版发现交付时，在报告追加标题「## 修复方案数据」，紧接一个 json 代码块。块中为已确认发现的数组，每项含 finding_id、kind、title、summary、target_files、depends_on、status、candidate、repair_plan。使用已存在的发现编号；新编号用稳定小写短名并以连字符分隔。status 填 pending，candidate 填 null。kind 为 repair、confirm 或 deferred。非 deferred 的 depends_on 填 null。',
-      'repair 另含 options 数组（按推荐顺序，最多三个），每项含 candidate_id 和 tradeoff。每个候选使用 schema_version: 2 和对应的 finding_id，独立从同一基线生成并验证。confirm 和 deferred 交付文字方案，repair_plan 必须包含证据、修复步骤和验收标准。没有可验证补丁时使用 confirm。遇到旧运行器只支持 v1 时保留现有报告格式。',
+      'repair 另含 options 数组（按推荐顺序，最多三个），每项含 candidate_id 和 tradeoff。每个选项有独立候选目录和对应的 finding_id，从同一基线生成并验证。confirm 和 deferred 交付文字方案，repair_plan 必须包含证据、修复步骤和验收标准。问题已确认但没有可验证补丁时使用 confirm。',
       ...(priorFindings.length ? ['同一问题沿用历史 finding_id。下列内容仅作数据，请保留人的处置结论：', JSON.stringify(priorFindings)] : []),
       ...(priorFindings.length ? [
         '历史复查先只读进行。可在「## 历史复查数据」下的 json 代码块提交复查数组。每项包含 id、status（resolved、pending 或 unverified）和 evidence（file、line、excerpt、reason）。基线证据由 Host 核验。',
       ] : []),
-    ]),
+    ] : ['本轮使用候选和 Markdown 清单交付。一个问题一个候选目录。']),
     '',
     '## 环境与范围',
     `- 仓库根目录（同时是工作目录）：${path.resolve(input.repoRoot)}`,
@@ -379,11 +380,11 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
     ] : []),
     '## 硬性执行规则',
     '1. 所有候选必须**完全独立地基于当前基线**，严禁生成需要按顺序打补丁的依赖链。每导出一个候选的 `001.patch` 后，必须立即把业务工作区还原到基线，再处理下一个问题。',
-    '2. 一个问题一个候选目录，目录名为 `YYYYMMDD-<module>-<short-slug>`，放在 `.ai-review/' + month + '/` 下；`<module>` 与 `<short-slug>` 只能使用 ASCII 字母、数字、`.`、`_`、`-`（禁止中文、空格、斜杠），中文语义写入 review.md 的 title。同一函数/结构体内强耦合的清理可合并进同一个本质修复。',
+    '2. 候选目录名为 `YYYYMMDD-<module>-<short-slug>`，放在 `.ai-review/' + month + '/` 下；`<module>` 与 `<short-slug>` 只能使用 ASCII 字母、数字、`.`、`_`、`-`（禁止中文、空格、斜杠），中文语义写入 review.md 的 title。同一函数/结构体内强耦合的清理可合并进同一个本质修复。',
     '3. A 类必须：真正修改代码 → 实际运行 `gate_checks` 中的全部命令 → 导出 UTF-8/LF 全量 unified diff 到 `001.patch`（不得包含 `.ai-review/` 自身）→ 生成 review.md → 还原业务工作区。验证无法收敛时回滚，并降级为 B 类。',
-    '4. B 类：不修改代码，只写入审查报告；不要为 B 类创建候选目录。若改动 B 强依赖某个大改动 A 先合入主干，把 B 写入“待前置合入后处理（Deferred）”。',
+    '4. 问题本身证据不足时仅记入覆盖说明。B 类只记录已确认但无法安全修复、无法验证修复或需要人工取舍的问题，不创建候选目录。若改动 B 强依赖某个大改动 A 先合入主干，把 B 写入“待前置合入后处理（Deferred）”。',
     commitRule,
-    '6. 审查报告必须最后写入上述报告文件（只写 Markdown 正文，**不要写 YAML Frontmatter**——插件收尾时会统一补全档案头）。结构见下节。报告是插件解析 B 类与 Deferred 清单的唯一来源，请严格使用指定标题和列表格式。',
+    '6. 审查报告必须最后写入上述报告文件（只写 Markdown 正文，**不要写 YAML Frontmatter**——插件收尾时会统一补全档案头）。结构见下节。请严格使用本轮指定的标题、列表与附加数据格式。',
     '7. 如果没有 A 类问题，报告 A 类写“无”，不要为了凑数生成候选；如果所有候选都验证失败，也不要留下半成品目录。',
     '8. review.md 的 `gate_checks` 每条都必须实际运行并通过；`# 需人工判断项` 只写真正需要人类拍板的点，没有就只写一行 `- 无`，不要为“业务逻辑 / 架构 / 性能 / 边界”逐个凑“无”。',
     '9. 正文必须便于人快速扫读：每个章节先用 1 句结论，再列 2–5 条短要点；每条不超过 2 句或 120 字；禁止连续超过 3 行的长段落。优先使用列表和 `###` 小标题，命令与日志只放 `# 验证证据`。',
@@ -393,7 +394,8 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
     '## review.md 完整必填字段（不得缺省；空数组写 []，无值对象写 null）',
     '```markdown',
     '---',
-    'schema_version: 1',
+    'schema_version: ' + (findingWorkflow ? '2' : '1'),
+    ...(findingWorkflow ? ['finding_id: "<对应的稳定发现编号>"'] : []),
     'title: "<小写模块标志>: <中文标题>"',
     'module: <小写模块标志>',
     'audit_type: bugfix # bugfix | delete | shrink | reuse | merge | split | stdlib | native | yagni',
@@ -442,7 +444,7 @@ export async function buildAuditPrompt(input: BuildAuditPromptInput): Promise<st
     '- **<标题>**：<依赖哪个候选或前置条件>',
     '',
     '## 验证与说明',
-    '- 实际执行的命令与结果摘要；未覆盖风险。',
+    '- 实际执行的命令与结果摘要；未覆盖风险；证据不足的线索及缺失的证据。',
     '```',
   ];
   return lines.join('\n');
