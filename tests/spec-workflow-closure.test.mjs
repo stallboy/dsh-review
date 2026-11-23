@@ -395,7 +395,7 @@ test('SVN 拒绝提交后清除发现处置和批准的 SVN 调度，原发现�
     assert.equal(result.delivery.state, 'not_required');
     assert.equal(svn('status'), '');
   } finally {
-    operations.stop();
+    await operations.stop();
     journal.close();
   }
   await rm(hook);

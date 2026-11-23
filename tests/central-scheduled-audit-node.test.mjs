@@ -40,9 +40,9 @@ async function setup(t, runner = 'external', runnerArg = '', auditSessions, runn
         workspaces: [{ workspaceId, label: '项目 A', root, target, settings: { runner, externalCommand: `"${process.execPath}" "${runnerPath}" ${runnerArg}` } }],
     });
     t.after(async () => {
-        operations.stop();
+        await operations.stop();
         journal.close();
-        await rm(root, { recursive: true, force: true });
+        await rm(root, { recursive: true, force: true, maxRetries: 3 });
         await rm(directory, { recursive: true, force: true });
     });
     runCommand('git', ['init', '--bare', '-q', remote], root);

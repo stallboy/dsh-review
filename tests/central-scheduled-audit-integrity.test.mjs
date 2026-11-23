@@ -77,7 +77,7 @@ async function setup(t, mode) {
         settings: { runner: 'external', externalCommand: `"${process.execPath}" "${commandPath}" ${mode}` },
     }] });
     t.after(async () => {
-        operations.stop();
+        await operations.stop();
         journal.close();
         await rm(root, { recursive: true, force: true });
         await rm(directory, { recursive: true, force: true });
