@@ -1,14 +1,16 @@
 # dsh-code-review 规格说明书（SPEC）
 
-> **任务来源**: 用户认可中央服务与多机器 DSH 节点方案，随后确认插件连接、项目接入、生命周期，以及本机中央和独立中央各自的监听与登录规则。
-> **任务内容**: 在既有审核不变量上定义中央托管、可靠指令、查询与交付，明确插件内中央连接、项目接入、监听地址与登录契约。
+> **任务来源**: 用户确认中央托管设计，随后确认以发现为中心的审查方案、多补丁审批和人工接手后的跨轮核验。
+> **任务内容**: 定义本地与中央托管的审查、审批、查询和交付契约，补充多方案与人类处置记录。
 > **参考文档**:
 > - `AGENTS.md` — 协作、审查和验证流程。
 > - `docs/superpowers/specs/2026-11-16-central-review-web-design.md` — 本次认可的设计来源；契约以本文为准。
 > - `docs/superpowers/specs/2026-11-17-plugin-central-design.md` — 插件连接、项目接入与本机中央生命周期。
-> **生成日期**: 2026-11-17
+> - `docs/plans/2026-11-20-finding-review-workflow-design.md` — 审查产物、三个审核动作和跨轮复查设计。
+> - `docs/plans/2026-11-20-human-takeover-follow-up-plan.md` — 可选修复线索与自动核验计划。
+> **生成日期**: 2026-11-20
 
-`dsh-code-review` 是 DeepSeek Harness（DSH）的代码审核插件，支持本地会话模式及中央托管模式。它让 AI 在仓库中生成候选修复，让人在 Web 面板中审阅、提意见并作出决定，最后由插件重新执行门禁并原子提交。中央托管模式的多节点、平台持久化与交付扩展由 §16 定义；其余章节的审核不变量仍须满足。
+`dsh-code-review` 是 DeepSeek Harness（DSH）的代码审核插件，支持本地工作台及中央托管模式。AI 提交带证据的发现及可选修复，人决定应用补丁、本次不修改或人工接手。获批补丁由插件重新执行门禁并原子提交。中央托管模式的多节点、平台持久化与交付扩展由 §16 定义。
 
 **本文是自包含的唯一权威规格，不需要配合其他文档阅读。** `assets/ai-fixer-system.md`、`assets/repo-audit-system.md` 等提示词文件是本文 §11 的下游实现产物，必须服从本文；其他设计草案、实施计划和源码注释均不具有规范力。
 
@@ -33,18 +35,18 @@
 ```mermaid
 flowchart TD
     AUDIT["AI 审查仓库或响应审核意见"] --> TRIAGE{"问题是否需要前置人工决策？"}
-    TRIAGE -->|"A 类：可直接修复"| CAND["生成候选<br/>review.md + NNN.patch"]
-    TRIAGE -->|"B 类：需要拍板"| REPORT["写入审查档案"]
+    TRIAGE -->|"A 类：可验证修复"| CAND["生成一个或多个互斥补丁"]
+    TRIAGE -->|"B 类：需要拍板"| REPORT["记录文字修复方案"]
     TRIAGE -->|"Deferred：等待前置合入"| REPORT
-    REPORT -->|"人工转换 / 依赖满足"| CAND
-    CAND --> QUEUE["人类审核队列"]
-    QUEUE --> DETAIL["查看方案、判断项、门禁与差异"]
+    REPORT --> QUEUE["人类审核发现"]
+    CAND --> QUEUE
+    QUEUE --> DETAIL["查看证据、方案、判断项与差异"]
     DETAIL -->|"按意见 AI 修复 / Rebase"| FIX["生成新的完整补丁版本"]
     FIX --> QUEUE
-    DETAIL -->|"批准"| GATE["在批准时基线上应用补丁<br/>重新执行全部门禁"]
+    DETAIL -->|"选择补丁并批准"| GATE["在批准时基线上应用补丁<br/>重新执行全部门禁"]
     GATE -->|"全部通过"| COMMIT["原子提交业务代码与批准记录<br/>业务提交由 VCS 历史派生"]
-    DETAIL -->|"拒绝 / 超时"| REJECT["保留 review.md<br/>清理过程补丁"]
-    REJECT -.->|"负向记忆"| AUDIT
+    DETAIL -->|"本次不修改 / 人工接手"| RECHECK["记录人的决定，供跨轮复查"]
+    RECHECK -.->|"历史发现与人的结论"| AUDIT
 ```
 
 ### 1.3 核心价值
@@ -105,13 +107,15 @@ flowchart TD
 
 每次审查必须有明确的目标范围、开始基线和触发方式。Agent 先阅读构建配置、入口、核心数据流和现有测试，再开始判断或修改代码。
 
+新版审查以已确认的发现为审核单位。每条发现使用跨轮稳定的 `finding_id`，按 §4.9 交付补丁选项或文字方案。问题证据不足时仅记录覆盖说明；修复复杂或难验证时，已确认的发现仍可交付文字方案。
+
 审查发现按下列规则分流：
 
 | 分类 | 判定标准 | 产物 |
 | --- | --- | --- |
-| **A 类** | 问题确定；能消除根因；影响面收敛；不破坏公开 API、协议或持久化格式；可通过自动化门禁自证 | 实际修改、运行门禁并生成候选 |
-| **B 类 / confirm** | 涉及业务取舍、跨模块重大调整、公开协议、数据迁移或无法本地验证 | 只在审查档案中记录，不直接改代码 |
-| **Deferred** | 明确依赖另一个 finding 先闭合；该 finding 可已通过 converted 候选合入 | 在审查档案中记录 finding 类型的 `depends_on`，本轮不生成依赖链补丁 |
+| **A 类** | 问题确定；能消除根因；影响面收敛；不破坏公开 API、协议或持久化格式；可通过自动化门禁自证 | 生成一个推荐补丁；有实质取舍时可给二至三个互斥选项 |
+| **B 类 / confirm** | 涉及业务取舍、跨模块重大调整、公开协议、数据迁移或无法本地验证 | 写入文字修复方案，供人工接手 |
+| **Deferred** | 明确依赖另一个 finding 先闭合；该 finding 可已通过候选合入 | 记录文字方案与 `depends_on`，本轮不生成依赖链补丁 |
 
 判定不确定时必须降级为 B 类。没有具体触发案例的“代码品味建议”不得生成候选；删除或精简必须有全仓引用搜索等具体证据。
 
@@ -127,7 +131,11 @@ flowchart TD
 2. **同处耦合则合并**：若根因修复必须同时清理同一函数或结构体内的冗余代码，且分开会产生直接冲突，应合并为一个候选。
 3. **跨阶段强依赖则 Deferred**：不得生成必须按顺序应用的候选链。
 
+同一发现的备选补丁是互斥选项，允许触及相同路径。各选项必须独立基于同一审查基线生成和验证，分别写为一个候选，每次导出后还原业务工作区。不同发现之间仍遵循上述正交性规则。
+
 ### 3.3 人工审核循环
+
+新版发现详情展示三项处置：有可审批补丁时可「接受并应用」，其余两项为「本次不修改」和「人工接手」。处置写在发现上，批准绑定选中的候选版本，详见 §4.9、§7.5 和 §10.2。以下候选操作仍可从对应详情或需要处理的情境进入：
 
 1. Owner 查看问题、根因、当前方案、人工判断项、门禁证据和代码差异。
 2. Owner 可添加总体或行内评论；新增未解决评论使 `pending` 变为 `changes_requested`。
@@ -170,9 +178,11 @@ flowchart TD
 │       ├── review.md
 │       ├── 001.patch
 │       └── 002.patch
-└── audits/
-    └── <YYYYMMDD>-<HHmmss>-<slug>/
-        └── audit.md
+├── audits/
+│   └── <YYYYMMDD>-<HHmmss>-<slug>/
+│       └── audit.md
+└── findings/
+    └── <finding_id>.yml
 ```
 
 候选 id 是 `YYYY-MM/<slug>`。月份必须为四位年、两位月；slug 必须匹配 `^[A-Za-z0-9][A-Za-z0-9._-]*$`，因此不能为空或以 `.` 开头，也不得包含中文、空格或斜杠。候选 id 创建后不得改名或移动；目标目录已存在时追加 `-2`、`-3` 等后缀。
@@ -224,7 +234,8 @@ audit_smoke_commands: []
 
 | 键 | 必填 | 类型 | 契约 |
 | --- | --- | --- | --- |
-| `schema_version` | 是 | `1` | 当前唯一支持版本。 |
+| `schema_version` | 是 | `1 \| 2` | 独立及历史候选为 v1；绑定新版发现的候选为 v2，见 §4.9。 |
+| `finding_id` | v2 必填 | string | 稳定发现编号，必须与档案的修复选项双向对应；v1 无此字段。 |
 | `title` | 是 | 非空 string | 格式为 `<小写模块标志>: <中文标题>`。 |
 | `module` | 是 | 非空 string | 小写模块标志，用于筛选、路由与负向记忆。 |
 | `audit_type` | 是 | enum | `bugfix / delete / shrink / reuse / merge / split / stdlib / native / yagni`。 |
@@ -428,25 +439,25 @@ Frontmatter 以下键均必填：
 
 | 键 | 契约 |
 | --- | --- |
-| `schema_version` | 固定为 `1`。 |
+| `schema_version` | 旧档案为 `1`；采用 §4.9 的发现记录为 `2`。 |
 | `audit_id` / `created_at` / `base_revision` | 分别为非空 string 档案 id、ISO-8601 string 开始时间和非空 string 开始基线；YAML 数字基线不得隐式转换为字符串。 |
 | `scope` | `.` 或合法仓库相对目录，不得有 `./` 前缀或尾斜杠。 |
 | `trigger` | `manual` 或 `scheduled`。 |
 | `previous_audit` | 直接前驱档案 id 或 `null`，仅作上下文提示。 |
 | `candidates[]` | 本轮直接生成的 A 类候选 id；无候选为 `[]`。 |
-| `items[]` | B 类、Deferred 与历史复查条目；无条目为 `[]`。 |
+| `items[]` | v1 含 B 类、Deferred 和历史复查条目；v2 另含 A 类发现，见 §4.9。无条目为 `[]`。 |
 
 每个 item 必含：
 
 - `finding_id`：匹配 `^[a-z0-9][a-z0-9-]{0,63}$`；同一档案内唯一，跨轮稳定，不得复用于不同问题。
-- `kind`：`confirm` 或 `deferred`。
-- `title`、`summary`：均非空 string；confirm 必须说明需要决定什么，deferred 必须说明等待什么，resolved 必须说明复核依据。
+- `kind`：v1 为 `confirm` 或 `deferred`；v2 另支持 §4.9 的 `repair`。
+- `title`、`summary`：均非空 string；repair 说明问题，confirm 说明需要决定什么，deferred 说明等待什么，resolved 说明复核依据。
 - `target_files[]`：string[]；只有真正全仓级问题才允许为空。
-- `depends_on`：deferred 为非空 finding_id，confirm 固定为 `null`；不得自依赖。若 pending 依赖形成环，相关 item 均不得转换，并在投影 errors 中报告。
+- `depends_on`：deferred 为非空 finding_id，其余固定为 `null`；不得自依赖。若 pending 依赖形成环，相关 item 均不得转换，并在投影 errors 中报告。
 - `status`：`pending / converted / dismissed / resolved`。
 - `candidate`：仅 converted 时为非空候选 id，其他状态固定为 `null`。
 
-除 `/convert` 与 `/dismiss-finding` 对指定 item 及处理记录的明确更新外，既有档案不得重写。
+除旧版 `/convert` 与 `/dismiss-finding` 对指定 item 及处理记录的明确更新外，既有档案不得重写。v2 的人类处置另外记入 §4.9 的发现记录。
 
 完整示例：
 
@@ -534,7 +545,7 @@ finding 的当前状态由历史档案和候选共享事实实时计算，不建
 
 1. **有效观察**：item 的 target_files 必须全部落在所属档案 scope 内；`.` 覆盖一切，空 target_files 仅被 `.` 覆盖。不满足覆盖的 item 不得成为最新观察。
 2. **最新观察**：同一 finding_id 在有效观察中取 created_at 时间点最新的 item；同刻按 audit_id 字典序决胜。某轮未写历史 finding 只表示没有新观察，不表示问题消失。
-3. **基础状态映射**：
+3. **基础状态映射**：v1 及不含新版修复选项的观察按下表；v2 修复选项与人的处置按 §4.9 叠加。
 
 | item.status | 关联候选状态 | 投影 state |
 | --- | --- | --- |
@@ -551,6 +562,30 @@ finding 的当前状态由历史档案和候选共享事实实时计算，不建
 无效档案不参与投影。输出按 finding_id 排序，并保留最近观察的 audit_id 与时间供 UI 展示。
 
 Host 可以在内存中缓存同一 VCS 快照的投影结果，但缓存不是共享索引：不得持久化，不得跨快照复用，不得读取本地视图；缓存命中必须能证明快照未变化。Git 以 HEAD commit 为快照标识，SVN 以 revision 与工作副本标识为准。缓存只保存解析后的元数据与投影，不保存补丁全文。
+
+### 4.9 修复选项、人的处置与复查
+
+**修复选项。** v2 档案把 A 类发现也写入 `items`，使用 `kind: repair`。其初始观察为 `status: pending`、`candidate: null`、`depends_on: null`。每个新版初始观察须有非空 `repair_plan`（Markdown，含问题证据、建议步骤与验收条件）；新发布的 `repair` 方案另含 `options`，为一至三项有序数组，每项含唯一 `candidate_id` 与非空 `tradeoff`，首项为推荐。新选项均在同一档案的 `candidates` 中，且一个候选只能归属一个发现。各候选仍各自维护补丁版本。新版文字方案使用 `confirm` 或 `deferred`，没有 `options`。前置依赖闭合后，可在新的有效观察中提供补丁。仅复查既有方案时不重新发表候选，按下文沿用前一有效方案。
+
+**兼容读取。** 绑定到新版发现的候选使用 `review.md` 的 `schema_version: 2`，增设必填 `finding_id`，其余字段及候选状态枚举沿用 v1。Host 收尾必须验证档案与候选双向对应；旧读端须依 §13.2 拒绝这些候选，避免绕过同组互斥。旧档案、旧独立候选仍按 v1 读取和操作。旧转换及忽略接口不得处置新版发现。
+
+**处置记录。** `.ai-review/findings/<finding_id>.yml` 由 Host 写入，从同一共享快照与档案一并读取。其必填字段为 `schema_version: 1`、`finding_id`、`events`。事件按写入顺序追加，每项含从 1 开始的连续整数 `revision`、`audit_id`、Host 确认的 `actor`、ISO-8601 `at`、`action`。动作定义如下：
+
+| action | 数据与结果 |
+| --- | --- |
+| `accept_as_is` | 必填非空 `reason`；接受现状，保留决定供后续审查参考。 |
+| `defer` | 必填非空 `reason`；可填日期 `review_after`（YYYY-MM-DD，UTC）和非空文本 `review_when`；保留在延期清单。 |
+| `human_takeover` | `reason` 可选；进入人工接手复查。 |
+| `add_repair_hint` | 必填非空 `hint`（PR、提交引用或验证说明）；只在人工接手期间接受，不切换处置状态。 |
+| `resume_review` | 必填非空 `reason`；撤回先前处置，使仍开放的发现重新可审核。 |
+
+同一发现的处置从最近有效事件计算，后续审查观察不得覆盖人的结论。人工接手与本次不修改期间阻止同组补丁审批；恢复审核后仍须满足候选和基线校验。已经确认解决或已有组内批准的发现不得通过处置接口重新开放。新版读模型优先显示已有证据的 `resolved`，其次显示由合法组内批准产生的 `applied`，再显示有效人工处置或 `undecided`。已有批准的提交版本仍依 §5.5 派生。无效或歧义的发现关联、处置记录及组内批准产生诊断并阻止相关写入。
+
+处置写入只允许 Host 按最新有效观察的 `target_files` 与空 tags、使用同一共享快照的 `reviewers.yml` 路由出的负责人执行。补丁审批继续检查选中候选的 Owner。读模型的 `findingVersion` 必须随有效观察、处置事件或组内审批事实的变化而变化，不因无关仓库提交而变化。
+
+投影取最新有效观察的方案。只报告「仍存在」的历史复查必须沿用上一观察的修复选项与关联；只有本轮新生成并校验的方案才可显式替代旧组选项。历史组选项均须保留在审批互斥查询的范围内；已经被替代的旧选项不可再批准。一条发现的任何组已有批准时，后续观察不得为它开放新的审批。组中每个候选的当前版本可按现有候选流程演进，组关系不得随 Rebase 或 AI 修复改变。
+
+**跨轮复查。** 用 §8.2 的查询从本轮绑定的共享快照获取有效历史发现及人的结论，按范围与处置选取复查输入。覆盖范围内的人工接手项无需人工线索；延期项按日期、可验证条件或人工恢复再次进入审核，条件无法核验时继续保留。接受现状项在具有实质变化的新证据时才重新提请判断，并带上之前的理由。审查工具核验当前代码，确认解决时在新档案写入同一 `finding_id` 的 `resolved` 观察和证据；有可靠差异与历史证据时可附 `repair_revisions`（非空且去重的 VCS 版本号数组）及归因说明。无法归因仍可确认解决。范围未覆盖或证据不足时保留原投影。人工线索与自动归因分别留存。
 
 ---
 
@@ -636,7 +671,7 @@ Git 在触及该候选目录 `review.md` 的提交历史中（如 `git log -- <c
 - 事实正文只能来自共享快照、只读 VCS 命令与 `reviewers.yml`：任一来源不可读时该小节写“不可用/未填写”，不得猜测或编造；`review.md` 不记录 `audit_id`，因此不得凭日期或范围推断审查档案路径。
 - 非法 `commitDetail` 取值返回 422 `bad_request`，不得静默降级为其中一种。
 
-其余评审元数据操作必须产生仅包含相关 `.ai-review/` 路径的独立提交，包括评论、评论状态、接管、人工转回、AI 修复、Rebase、拒绝、重开、转换和忽略 finding。批量评论在一次共享写入与一次提交中完成。每次共享写操作只有在对应提交成功后才算完成。任何提交失败或结果不明都统一按以下顺序处理：
+其余评审元数据操作必须产生仅包含相关 `.ai-review/` 路径的独立提交，包括评论、评论状态、接管、人工转回、AI 修复、Rebase、拒绝、重开、转换和发现处置。批量评论在一次共享写入与一次提交中完成。每次共享写操作只有在对应提交成功后才算完成。任何提交失败或结果不明都统一按以下顺序处理：
 
 1. 查询 VCS 并确认提交存在且内容匹配：按成功继续，不得恢复旧文件。
 2. 已证明提交不存在：恢复操作前文件并返回失败，不得保留本地写入或返回成功。
@@ -749,6 +784,8 @@ Runner 模式：
 
 ### 7.5 批准编排
 
+带 `finding_id` 的候选必须提供 §8.3 的 `expectedFindingVersion`。首次受理、任务持锁后、同步后和门禁后，从对应共享快照检查发现版本、处置、选项成员及组内批准。落后版本返回 409 stale 或 Job 的 `CONCURRENCY_MISMATCH`；非可审批发现返回 409 conflict 或 Job 的 `STATE_CONFLICT`。业务提交仍只写所选候选及其业务文件；其余选项的不可审批状态由共享事实派生。进入 VCS 提交前须持久化该工作副本和发现的待核验标记及提交探针所需信息。只有确定提交存在或不存在后才可清除标记；结果不明或进程重启时复用现有恢复语义，在核实前禁止批准同组其他候选。适用范围遵循 §12.1 及中央项目绑定。
+
 最多允许 3 次提交尝试，即 `MAX_COMMIT_RETRIES = 2`。每次尝试必须按序执行；若上一次尝试已证明业务提交不存在，必须先恢复业务工作区和 review.md 到尝试前快照，再开始下一次：
 
 1. **重读同一 VCS 快照中的共享事实与 guard**：候选必须为 pending；revision、owner、updated_at 任一不符，返回 `ABORTED / CONCURRENCY_MISMATCH`；非 pending 返回 `ABORTED / STATE_CONFLICT`。同时按 §6 检查重复候选；发现则返回 `ABORTED / DUPLICATE_CANDIDATE`，detail 携带 duplicateOf。
@@ -804,7 +841,7 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 
 提示词必须由 Host 展开 §1.5、§3、§4 与 §11 中所有适用规则的最终文本，并附加 owner 路由、负向记忆、目标范围、基线和输出路径；不得只复制带内部章节引用的 §11。提示词文件只能物化本文规则，不得成为规范上游。审查执行超时上限 1 小时。Agent 不负责提交，Host 统一在收尾提交。
 
-收尾前须复核业务基线和工作区；不可确认时保留现场。收尾时 Host 必须验证每个 A 类候选：Frontmatter 合法、status=pending、rev1、approval=null、基线与本轮一致、补丁可在基线干净应用且不越界，并通过全部适用不变量。owner 必须等于 Host 按同一共享快照中的 reviewers.yml、target_files 和 tags 计算的路由结果，否则不得提交。B/Deferred 解析为档案 items，并写入插件复核块。校验失败的候选不得提交，其错误必须写入本轮复核结果；合法候选与本轮 audit 目录仍可继续。
+收尾前须复核业务基线和工作区；不可确认时保留现场。收尾时 Host 必须验证每个 A 类候选：Frontmatter 合法、status=pending、rev1、approval=null、基线与本轮一致、补丁可在基线干净应用且不越界，并通过全部适用不变量。owner 必须等于 Host 按同一共享快照中的 reviewers.yml、target_files 和 tags 计算的路由结果，否则不得提交。新版的 A/B/Deferred 发现均写入档案 items 和插件复核块。校验失败的候选不得提交，其错误必须写入本轮复核结果。Host 从组中移除失败选项，零有效选项时仅发布文字方案；合法候选与本轮 audit 目录仍可继续。
 
 收尾必须对本轮新候选的 `review.md` 和 Host 生成的正式 `audit.md` 执行与只读校验命令相同的文件格式检查。Job 通过 `result.dataValidation` 按文件返回 `path` 和 `errors`，全局评审工作台按工作副本展示其中的格式错误。候选文件格式错误沿用候选排除规则。正式档案校验失败时阻止本轮收尾提交，会话和手动收尾保留现有租约。
 
@@ -899,7 +936,7 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 | GET | `/jobs/:id?since=` | Job 详情与增量日志。`since`、`logOffset` 和 `totalLogLines` 都是单调递增的绝对行序号：logOffset 返回下一读取位置，totalLogLines 返回累计产生数，另含 `earliestLogOffset` 与 `logResetRequired`。若 since 早于最早保留行，返回当前完整保留日志并置 logResetRequired=true；未知 id 返回 404。 |
 | GET | `/reviewers` | `{config}`。 |
 | GET | `/audits` | `{audits, errors}`，仅包含目录式共享档案。 |
-| GET | `/findings` | `{findings, errors}`。 |
+| GET | `/findings?scope=&dispositions=&findingId=` | `{findings, errors}`，省略过滤参数保留原列表语义。scope 按 §4.8 覆盖规则筛选；dispositions 为逗号分隔的 `undecided,accept_as_is,defer,human_takeover,applied,resolved`；findingId 精确匹配。新版条目附最新方案、选项、有效处置、理由、复查条件、人工线索及不透明的 `findingVersion`。Host 向审查 Runner 提供同一读模型的只读查询，其读取绑定本轮共享快照。 |
 | GET | `/client-entry` | `{entry}`。 |
 
 审查入口映射：`/audit/prompt?mode=session` 预览 DSH 会话提示词，`mode=headless` 预览 headless Runner 提示词；`POST /audit` 启动 headless Runner，`POST /audit/session` 创建真实会话和跟踪 Job，`POST /audit/manual` 启动带执行租约的外部审查。外部审查完成后调用 `/audit/finalize`，使用开始执行时返回的 auditId。
@@ -928,9 +965,10 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 | POST | `/reopen` | `{id, ...guard, from, reason}`；from 指向真实 rejected 候选，reason 非空 | 200 `{candidate, commit}`；只修改活跃候选；from 已有直接替代候选时返回 409。 |
 | POST | `/convert` | `{auditId, findingId, candidateId}`，均非空；不传候选 guard | 200 `{audit, candidateId, commitRevision}`；按 §7.6 校验并原子提交。 |
 | POST | `/dismiss-finding` | `{auditId, findingId, reason}`，均非空；不传候选 guard | 200 `{audit, commitRevision}`；按 §7.6 留痕并独立提交。 |
+| POST | `/finding/decision` | `{findingId, expectedFindingVersion, action, reason?, reviewAfter?, reviewWhen?, hint?}`，按 §4.9 校验动作及适用字段，`reviewAfter`、`reviewWhen` 分别写入 `review_after`、`review_when`；身份由 Host 或中央请求上下文确定 | 200 `{finding, commitRevision}`；锁内校验版本与动作资格，按 §5.6 仅提交该发现记录。旧版本返回 409 stale，不允许的处置返回 409 conflict。 |
 | POST | `/rebase` | `{id, ...guard}` | 202 `{jobId, job}`，Job 类型 ai_fix。 |
 | POST | `/fix-session` | `{id}`；候选须解析有效、非归档、Owner 匹配、有未 resolved 评论且工作区干净 | 202 `{sessionId, title, candidateId, revision, prompt}`；按 §7.4「新 DSH 会话」创建会话并投递修复提示词，不创建执行租约、不提交候选。 |
-| POST | `/approve` | `{id, ...guard, confirmedDecisions?: string[], waivedDecisions?: {id, reason}[], commitMessage?: string, commitDetail?: 'simple'\|'detailed'}`；缺省数组按 `[]`；`commitMessage` 可选，提供时非空且首行必须等于 title（否则按 §7.5 返回 `COMMIT_MESSAGE_MISMATCH`），批准原子提交中一并更新 `review.md` 的 `commit_message`；`commitDetail` 可选，按 §5.6「提交信息详略」决定业务提交说明的组成，非法取值 422，未提供时使用候选 `commit_message` 全文 | 202 `{jobId, job}`；最终结果读取 job.result。 |
+| POST | `/approve` | `{id, ...guard, expectedFindingVersion?, confirmedDecisions?: string[], waivedDecisions?: {id, reason}[], commitMessage?: string, commitDetail?: 'simple'\|'detailed'}`；v2 候选必须传非空 `expectedFindingVersion`，缺失或非法返回 422；缺省数组按 `[]`；`commitMessage` 可选，提供时非空且首行必须等于 title（否则按 §7.5 返回 `COMMIT_MESSAGE_MISMATCH`），批准原子提交中一并更新 `review.md` 的 `commit_message`；`commitDetail` 可选，按 §5.6「提交信息详略」决定业务提交说明的组成，非法取值 422，未提供时使用候选 `commit_message` 全文 | 202 `{jobId, job}`；最终结果读取 job.result。 |
 | POST | `/ai-fix` | `{id, ...guard}`；必须有未 resolved 评论 | 202 `{jobId, job}`；无 unresolved/partial 评论时在创建 Job 前返回 409。 |
 | POST | `/sync` | 空 object `{}` | 200 VCS 同步结果；在 repo 工作区锁内串行，不创建候选写入。 |
 
@@ -965,6 +1003,8 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 stale、duplicate、local 和基线冲突必须使用不同徽标；local 不计入共享 KPI。local 中的 local-only（候选目录整体未进入共享快照）条目不可进入详情，卡片需提示"审查收尾提交后才可查看详情与批准"；队列头部需汇总本地未提交条目数。`/queue` 返回 `auditLease` 时，队列页必须展示阻塞审查租约横幅：`active` 提示审查执行中并提供收尾入口；`releasable` 额外提供经两段式确认的释放入口，并说明释放不提交本地候选。基线落后时提示批准将在新基线重放（“落后”同样按 §7.7「有效业务基线」判定，排除 `.ai-review/` 评审元数据提交，避免每次评论后所有候选集体显示落后）；`patchCheck.state == conflicted` 时提示可先 Rebase，但不得单独阻止查看或批准；批准 Job 仍须重新严格应用，冲突时按 §7.5 回退。无批量批准，整卡点击进入详情（local-only 卡除外）。
 
 ### 10.2 详情页
+
+本地全局评审工作台与中央 Web 对新版发现使用同一交互规则。多补丁先选方案，再查看该版本的差异、判断项和门禁；单补丁可直接进入确认。没有可审批补丁时，只提供「本次不修改」与「人工接手」。交接内容可随时复制，包括发现编号、基线、相关文件、问题证据、方案和验收条件。修复线索可选；候选级评论、修复、Rebase 和恢复等留在相应的详情或需要处理的情境。
 
 按以下决策顺序展示：
 
@@ -1061,10 +1101,10 @@ Auditor 必须遵循 §1.5 的优先级和 §3.1 的分流规则，并执行以�
 
 1. **建立地图**：阅读构建配置、入口、核心数据流与现有测试，明确预期负载和运行环境。
 2. **收集证据**：为每个问题建立具体案例；没有证据的品味建议直接丢弃。
-3. **自动分流**：A 类直接修复；B 类只报告；Deferred 记录稳定 depends_on。不确定一律 B 类。
+3. **自动分流**：按 §3.1 交付一至三个可验证的补丁选项，或交付文字方案；Deferred 记录稳定 depends_on。
 4. **保持正交**：按 §3.2 拆分、合并或延迟；同轮 A 类候选独立基于同一基线。
-5. **生成候选**：每个 A 类问题修改代码、执行门禁、导出 001.patch、还原业务工作区并生成 review.md。
-6. **记录 finding**：B/Deferred 写入 items。历史 finding 能确认消失时写 resolved，仍存在时沿用 converted 及其候选关联或写 pending，未复查则不新增观察。人工 dismissed 的 finding 保留处置结果。
+5. **生成候选**：每个 A 类选项独立修改代码、执行门禁、导出 001.patch、还原业务工作区并生成 review.md。
+6. **记录 finding**：初始观察与历史复查按 §4.9 写入 items，未核实的发现保留既有投影。用户处置由 Host 管理。
 7. **生成报告**：正文包含 A/B/Deferred、历史复查、验证与说明；B 类必须有位置、风险和需要决定，Deferred 必须有依赖。
 8. **不得伪造插件结论**：插件复核块只能由 Host 写入。
 
@@ -1148,7 +1188,7 @@ Agent 结束任务前必须逐项确认：
 | # | 不变量 |
 | --- | --- |
 | I1 | 候选与审查目录命名合法，id 与路径一致；候选 id 创建后不变；同一档案内 finding_id 唯一。 |
-| I2 | review.md 与 audit.md 的 schema_version 均为 1。 |
+| I2 | review.md 与 audit.md 支持 v1 和 §4.9 定义的 v2。未知版本须拒绝。 |
 | I3 | revision id 从 1 连续递增且唯一，current_revision 等于最大 id，revision id 与补丁编号一致。 |
 | I4 | 活跃候选每个 revision 的补丁文件存在；归档候选豁免。新候选还必须在生产收尾验证补丁可干净应用。 |
 | I5 | 活跃候选 target_files 非空、唯一并与当前补丁实际路径一致；重命名同时含旧、新路径。 |
@@ -1156,7 +1196,7 @@ Agent 结束任务前必须逐项确认：
 | I7 | approval.gate_checks 等于批准时顶层门禁；gate_results 按顺序一一对应，exit_code 均为非负整数且批准时全为 0，duration_ms 为非负有限数。 |
 | I8 | human_decisions id 唯一且非空；批准时 confirmed/waived 仅含有效 id、各自无重复、彼此互斥、并集完整覆盖，waive 理由非空。 |
 | I9 | audit item 为 converted 当且仅当 candidate 非空；其他状态 candidate=null。 |
-| I10 | deferred 的 depends_on 为非空 finding_id 且不得自依赖；confirm 的 depends_on=null；pending 环依赖不得转换并必须报告。 |
+| I10 | deferred 的 depends_on 为非空 finding_id 且不得自依赖；其他类型的 depends_on=null；pending 环依赖不得转换并必须报告。 |
 | I11 | 评论 id 非空唯一并引用已有版本；行内评论 file 非空、line>0、side=LEFT/RIGHT，`anchor` 若存在则 `snippet` 非空；总体评论 file=""、line=0 且省略 side 与 `anchor`。 |
 | I12 | target_files、scope、patch 与**行内**评论 file 均为合法仓库相对路径；总体评论 file="" 是不参与路径校验的哨兵值；实际读写不得经符号链接逃逸。 |
 | I13 | 所有时间戳含时区偏移且可解析；audit_id 时间与 created_at 规范化后的 **UTC 日历时刻**精确到秒一致。 |
@@ -1174,7 +1214,7 @@ Agent 结束任务前必须逐项确认：
 - 删除或重命名字段、改变字段语义、将可选改为必填、改变路径/id 规则也必须升至 v2。
 - 正式使用后，v2 必须提供迁移规范和至少一个版本的旧数据读兼容；开发期数据可按 §4.1 不迁移。
 
-本版（v0.3.0，2026-11-09 修订）仍处于开发期，`schema_version` 保持 1；删除 `approval.commit_revision`、新增可选 `rejection.category` / `rejection.related_symbols` / `comments[].anchor` 属于预发布契约修订，按 §4.1 不迁移开发期数据。正式使用后，删除或重命名字段必须升至 v2。
+2026-11-09 的开发期修订沿用 v1。§4.9 使用 v2 表达新的发现与候选约束，旧数据双读、原地保留。已有 v1 档案和独立候选无需批量迁移；不根据旧数据猜测选项关系。旧客户端收到新版候选时须拒绝写入。
 
 ---
 
@@ -1200,6 +1240,9 @@ Agent 结束任务前必须逐项确认：
 | AC-LOCK-01 | 冻结时钟并连续两次评论，第二个旧 guard 必须 stale；时钟回拨也严格推进；revision、owner、updated_at 任一变化均可检测。 |
 | AC-DECISION-01 | 完整确认/waive 可批准；遗漏、未知 id、重复、交叉和空理由均拒绝；approval 只保存精确集合。 |
 | AC-APPROVE-01 | 同步后重建快照并重跑前置检查；门禁后工作区、Git 索引和提交树均等于已验证快照；单次原子提交；业务提交成功后从历史派生提交版本；后续修复提交不改变派生结果；ambiguous/unknown 只诊断。 |
+| AC-FINDING-OPTIONS-01 | 单补丁直达确认；多补丁独立验证并只能提交一个；纯文字方案只提供另外两个处理动作；坏选项排除后按剩余有效选项展示。 |
+| AC-FINDING-LOCK-01 | 同组并发审批至多一次业务提交；旧界面绕过、过期发现版本、非当前选项与已处置发现均被拒绝；重启后提交不明仍阻止审批同组其他选项。 |
+| AC-FINDING-HISTORY-01 | 人的结论跨轮保留；按范围和处置过滤；未给人工线索也能复查；能归因才补记提交；证据不足保持状态；旧数据仍可读取和按 v1 流转。 |
 | AC-RECOVERY-01 | 提交超时模拟已提交/未提交/无法确定；取消已提交 Job 返回实际业务结果，结果不明取消返回 RECOVERY_REQUIRED；派生定位在提交存在/不存在/不明三态下正确，浅克隆与 merge 歧义不阻塞。 |
 | AC-API-01 | 每个写端点覆盖 400/422 边界、非法状态和冲突；guard 例外仅限约定端点；Job 日志绝对偏移与截断重置；批量评论全有或全无；`patchCheck` 三态；手动释放租约。 |
 | AC-SECURITY-01 | 路径穿越、绝对路径、反斜杠、VCS 管理路径、二进制/重命名越界、禁止目录和符号链接逃逸均拒绝；非白名单门禁完整展示并二次确认。 |
@@ -1309,6 +1352,8 @@ projectId、nodeId、workspaceId 必须明确区分。节点本地配置 workspa
 
 相邻正式发布的 Central 与 Node 必须支持任一端先升级；同一 Central 可同时服务两个版本的节点。升级保留 Central 与节点身份、凭据、项目绑定、缓存和未决任务。双方共有的操作必须可用；新增协议字段、端点和指令以显式能力为准，缺失的扩展能力按未声明处理，支持窗口内仍使用对方可接受的基础协议。对端返回的身份、绑定、执行配置和并发守卫仍须验证。退役操作须可诊断并安全结清，执行结果不明时保留待核验，禁止重新执行业务操作。降级后读取由更新版本写入的数据须独立验证。
 
+新版发现的查询扩展、处置和带发现版本的审批必须由两端显式声明支持。托管项目只有在两端均支持时才发布新版审查产物和开放其写入口。混合版本保留 v1 操作，新读端不得把新版选项降级为可独立审批的候选；旧节点无法解析的已有数据须明确提示升级。
+
 节点在线与工作副本就绪分别表达。单个工作副本目标、路径或本地初始化异常仅阻止该副本的新任务和实时读取；其他工作副本、节点连接、任务结果上报和恢复证据保留不受影响。中央展示受影响副本的原因，已有缓存带同步时间继续可读。节点周期复检并在恢复后重新声明就绪，业务执行与交付继续核对固定目标。兼容旧中央时，节点仍必须拒绝在错误目标上执行。
 
 发布前使用上一正式发布的实际 Central 和 Node 包；直接部署源码的环境使用上一部署保留且可核验的实际包。保留同一工作目录及已接入数据，验证只升级任一端、混合节点共存、基础读写、未决任务回报与去重，并验证一个工作副本目标不匹配时其他项目可运行。
@@ -1379,6 +1424,8 @@ projectId、nodeId、workspaceId 必须明确区分。节点本地配置 workspa
 定时审查沿用中央任务占用，使用项目与本地计划日期生成唯一幂等键。中央使用仅限定时 `audit` 的系统身份构造 `scheduledAudit: {scheduledAt, expiresAt}` 信封。Owner 以共享快照的 `reviewers.yml` 解析，配置时的受信审核身份兜底。用户写指令不得供应定时信封。
 
 节点必须在工作副本锁内预检完整检出、干净的业务工作区和 `.ai-review/`、有效基线，并在同步前持久化执行租约。同步绑定目标后固定共享快照。首先只读复查上一份已提交全仓档案的已合入候选和有效的未闭合 finding，其后全量审查。同一轮的两阶段共用基线和 1 小时的 Agent 执行预算。没有历史输入时直接全量审查。有明确证据才可产生原 `finding_id` 的新观察，指定相关文件的 finding 须在其相关文件中核对证据。已解决记录为 `resolved`，未核实保留此前投影。收尾写入一份 `trigger: scheduled` 的档案，候选继续通过人工审批。复查阶段出现工作区改动、全量阶段越界修改已有评审文件，或同步、提交、远端交付存在不确定性时，保留现场进入恢复流程。
+
+新版发现的人工接手和延期复查沿用同一历史阶段与预算，按 §4.9 和 §8.2 提供范围内的历史决定与证据。复查记录供后续审查参考，已批准补丁的远端交付仍按 §16.7 执行。
 
 | 验收编号 | 要点 |
 | --- | --- |

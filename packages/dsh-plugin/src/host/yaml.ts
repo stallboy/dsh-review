@@ -2,18 +2,22 @@
 import { load } from './vendor/js-yaml.js';
 export { load, dump } from './vendor/js-yaml.js';
 
+export function readYamlDocument(text: string, lineOffset = 1): unknown {
+    return load(text, {
+        listener(event: string, state: { anchor: string | null; line: number }) {
+            if (event === 'close' && state.anchor !== null) {
+                throw new Error(`禁止使用 YAML 锚点或别名（约第 ${String(state.line + lineOffset)} 行）`);
+            }
+        },
+    });
+}
+
 export function readMarkdownFrontmatter(text: string, filename: string): { doc: unknown; body: string } {
     const normalized = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
     const match = /^---\n([\s\S]*?)\n---(?:\n|$)/.exec(normalized);
     if (!match) throw new Error(`${filename} 缺少 YAML Frontmatter，起止分隔符必须各自独占一行（---）`);
     try {
-        const doc: unknown = load(match[1] ?? '', {
-            listener(event: string, state: { anchor: string | null; line: number }) {
-                if (event === 'close' && state.anchor !== null) {
-                    throw new Error(`禁止使用 YAML 锚点或别名（约第 ${String(state.line + 2)} 行）`);
-                }
-            },
-        });
+        const doc = readYamlDocument(match[1] ?? '', 2);
         return { doc, body: normalized.slice(match[0].length) };
     } catch (error) {
         throw new Error(`YAML 解析失败：${error instanceof Error ? error.message : String(error)}`);

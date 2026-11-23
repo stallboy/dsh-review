@@ -3,12 +3,16 @@ import path from 'node:path';
 
 let prompt = '';
 for await (const chunk of process.stdin) prompt += chunk;
+const mode = process.argv[2];
 if (prompt.includes('DSH_AUDIT_RECHECK=')) {
-    console.log('DSH_AUDIT_RECHECK={"findings":[],"candidates":[]}');
+    const findings = mode === 'legacy-central-with-v2-history' ? [{
+        id: 'v2-takeover', status: 'resolved',
+        evidence: { file: 'src/math.js', line: 1, excerpt: 'a - b', reason: '核验回归夹具的基线' },
+    }] : [];
+    console.log(`DSH_AUDIT_RECHECK=${JSON.stringify({ findings, candidates: [] })}`);
     process.exit(0);
 }
 
-const mode = process.argv[2];
 if (mode === 'failed-without-output') process.exit(5);
 if (mode === 'change-archive') {
     appendFileSync('.ai-review/audits/20261117-090000-repo/audit.md', 'Runner 改写的历史内容\n');

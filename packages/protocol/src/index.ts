@@ -8,7 +8,7 @@ export const RETIRED_MANUAL_REVISION = 'manual-revision';
 export const OPERATIONS = [
     'approve', 'comments', 'comments-batch', 'comment-status', 'takeover', 'reject', 'resume', 'rebase',
     'ai-fix', 'reopen', 'archive-stale', 'audit', 'audit-finalize',
-    'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'sync',
+    'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'finding-decision', 'sync',
 ] as const;
 
 export type ManagedOperation = typeof OPERATIONS[number];
@@ -76,6 +76,7 @@ export interface WorkspaceRegistration {
     target: string;
     executionConfigHash?: string;
     supportsScheduledAudit?: true;
+    findingWorkflow?: true;
 }
 
 export interface NodeRegistration {
@@ -115,6 +116,7 @@ export interface ArtifactManifest {
 }
 
 export interface ProjectSnapshot {
+    findingWorkflow?: boolean;
     projectId: string;
     bindingGeneration: number;
     projectConfigRevision: number;
@@ -214,7 +216,7 @@ export function validateCommand(value: unknown, allowRetiredManualRevision = fal
         throw new ProtocolError('scheduledAudit');
     }
     timestamp(input.createdAt, 'createdAt');
-    const needsGuard = !['audit', 'audit-finalize', 'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'sync'].includes(String(input.operation));
+    const needsGuard = !['audit', 'audit-finalize', 'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'finding-decision', 'sync'].includes(String(input.operation));
     if (needsGuard || input.guard !== undefined) {
         const guard = record(input.guard, 'guard');
         positiveInteger(guard.expectedRevision, 'guard.expectedRevision');
@@ -226,26 +228,30 @@ export function validateCommand(value: unknown, allowRetiredManualRevision = fal
 
 function validatePayload(operation: ManagedOperation, payload: JsonRecord): void {
     const fields: Record<ManagedOperation, string[]> = {
-        approve: ['id', 'confirmedDecisions', 'waivedDecisions', 'commitMessage', 'commitDetail'], comments: ['id', 'content', 'revision', 'file', 'line', 'side', 'anchor'],
+        approve: ['id', 'confirmedDecisions', 'waivedDecisions', 'commitMessage', 'commitDetail', 'expectedFindingVersion'], comments: ['id', 'content', 'revision', 'file', 'line', 'side', 'anchor'],
         'comments-batch': ['id', 'comments'], 'comment-status': ['id', 'commentId', 'status'], takeover: ['id'], reject: ['id', 'reason', 'category'], resume: ['id'],
         rebase: ['id'], 'ai-fix': ['id'], reopen: ['id', 'from', 'reason'], 'archive-stale': ['id'],
-        audit: ['targetPath', 'note'], 'audit-finalize': ['auditId'], 'audit-release': ['auditId', 'confirmStopped'], 'candidate-finalize': ['id'],
+        audit: ['targetPath', 'note', 'findingWorkflow'], 'audit-finalize': ['auditId'], 'audit-release': ['auditId', 'confirmStopped'], 'candidate-finalize': ['id'],
         convert: ['auditId', 'findingId', 'candidateId'], 'dismiss-finding': ['auditId', 'findingId', 'reason'], sync: [],
+        'finding-decision': ['findingId', 'expectedFindingVersion', 'action', 'reason', 'reviewAfter', 'reviewWhen', 'hint'],
     };
     for (const key of Object.keys(payload)) if (!fields[operation].includes(key)) throw new ProtocolError(`payload.${key}`);
     for (const key of ['id', 'from', 'candidateId']) if (payload[key] !== undefined && (typeof payload[key] !== 'string' || !/^\d{4}-\d{2}\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(payload[key]))) throw new ProtocolError(`payload.${key}`);
     if (payload.auditId !== undefined && (typeof payload.auditId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(payload.auditId))) throw new ProtocolError('payload.auditId');
-    for (const key of ['content', 'file', 'side', 'commentId', 'status', 'reason', 'category', 'targetPath', 'note', 'findingId', 'commitMessage', 'commitDetail']) {
+    for (const key of ['content', 'file', 'side', 'commentId', 'status', 'reason', 'category', 'targetPath', 'note', 'findingId', 'commitMessage', 'commitDetail',
+        'expectedFindingVersion', 'action', 'reviewAfter', 'reviewWhen', 'hint']) {
         if (payload[key] !== undefined && typeof payload[key] !== 'string') throw new ProtocolError(`payload.${key}`);
     }
     if (payload.revision !== undefined) positiveInteger(payload.revision, 'payload.revision');
     if (payload.line !== undefined && (typeof payload.line !== 'number' || !Number.isSafeInteger(payload.line) || payload.line < 0 || (payload.file && payload.line === 0))) throw new ProtocolError('payload.line');
     for (const key of ['comments', 'confirmedDecisions', 'waivedDecisions']) if (payload[key] !== undefined && !Array.isArray(payload[key])) throw new ProtocolError(`payload.${key}`);
     if (payload.confirmStopped !== undefined && typeof payload.confirmStopped !== 'boolean') throw new ProtocolError('payload.confirmStopped');
+    if (payload.findingWorkflow !== undefined && payload.findingWorkflow !== true) throw new ProtocolError('payload.findingWorkflow');
 }
 
 export function validateSnapshot(value: unknown): ProjectSnapshot {
     const input = record(value, 'snapshot');
+    if (input.findingWorkflow !== undefined && typeof input.findingWorkflow !== 'boolean') throw new ProtocolError('findingWorkflow');
     entityId(input.projectId, 'projectId');
     positiveInteger(input.bindingGeneration, 'bindingGeneration');
     positiveInteger(input.projectConfigRevision, 'projectConfigRevision');
@@ -279,7 +285,7 @@ export function validateRegistration(value: unknown): NodeRegistration {
     const ids = new Set<string>();
     for (const item of input.workspaces) {
         const workspace = record(item, 'workspace');
-        if (Object.keys(workspace).some(key => !['workspaceId', 'label', 'vcsType', 'target', 'executionConfigHash', 'supportsScheduledAudit'].includes(key))) throw new ProtocolError('workspace');
+        if (Object.keys(workspace).some(key => !['workspaceId', 'label', 'vcsType', 'target', 'executionConfigHash', 'supportsScheduledAudit', 'findingWorkflow'].includes(key))) throw new ProtocolError('workspace');
         const id = entityId(workspace.workspaceId, 'workspaceId');
         if (ids.has(id)) throw new ProtocolError('重复 workspaceId');
         ids.add(id);
@@ -288,6 +294,7 @@ export function validateRegistration(value: unknown): NodeRegistration {
         textValue(workspace.target, 'workspace.target');
         if (workspace.executionConfigHash !== undefined && (typeof workspace.executionConfigHash !== 'string' || !/^[a-f0-9]{64}$/.test(workspace.executionConfigHash))) throw new ProtocolError('workspace.executionConfigHash');
         if (workspace.supportsScheduledAudit !== undefined && workspace.supportsScheduledAudit !== true) throw new ProtocolError('workspace.supportsScheduledAudit');
+        if (workspace.findingWorkflow !== undefined && workspace.findingWorkflow !== true) throw new ProtocolError('workspace.findingWorkflow');
     }
     return structuredClone(input) as unknown as NodeRegistration;
 }

@@ -24,9 +24,13 @@ import {createRoot} from 'react-dom/client';
 import {flushSync} from 'react-dom';
 import {MemoryRouter,Routes,Route} from 'react-router-dom';
 import {QueryClient,QueryClientProvider} from '@tanstack/react-query';
-import {CandidatePage,UserContext} from './apps/web/src/App.tsx';
+import {CandidatePage,FindingCard,UserContext} from './apps/web/src/App.tsx';
 const h=React.createElement;
 const patch=${JSON.stringify(patch)};
+const group={findingId:'fixture-finding',findingVersion:'stable-v2',title:'互斥方案',summary:'同一发现',disposition:'undecided',
+    targetFiles:['a.ts'],baseRevision:'v1',repairPlan:'验证相关用例',options:[
+        {candidateId:'2026-11/demo',tradeoff:'甲方案',status:'pending'},{candidateId:'2026-11/other',tradeoff:'乙方案',status:'pending'}]};
+const textPlan={...group,findingId:'text-finding',findingVersion:'text-v2',title:'纯文字方案',options:[]};
 const status={controlToken:'control',configured:false,enabled:false,mode:'local',reviewIdentity:'',centerUrl:'',centralId:'',nodeId:'',phase:'stopped',nodeOnline:false,generation:1,hasCredentials:false,localAvailable:true,candidates:[],projects:[],logs:[]};
 window.test={status,writes:0,cleanups:[],errors:[],root:createRoot(document.getElementById('review-mount'))};
 window.addEventListener('error',event=>test.errors.push(String(event.error||event.message)));
@@ -72,6 +76,8 @@ window.fetch=async(url,init={})=>{
         value={settings:{owner:'tester'},validation:{ok:true,errors:[]}};
     }else if(test.auditFixture && String(url).includes('/api/queue')){
         value={configured:true,items:[],errors:[],counts:{},currentBase:'commit',auditLease:{auditId:'20261119-120000-repo',state:'releasable',createdAt:'2026-11-19T12:00:00Z',baseRevision:'commit'}};
+    }else if(String(url).includes('/api/findings')){
+        value={findings:test.reviewFindings ? [textPlan] : [],errors:[]};
     }else if(test.auditFixture && String(url).includes('/api/audit/session')){
         value={sessionId:'audit-child',auditId:'20261119-120000-repo',job:{id:'auto-check',type:'audit',status:'running',startedAt:'2026-11-19T12:00:00Z',log:[]}};
     }else if(test.auditFixture && String(url).includes('/api/audit/finalize')){
@@ -87,9 +93,11 @@ window.fetch=async(url,init={})=>{
             ],
         }};
     }else if(String(url).includes('/candidate?')){
-        value={data:{candidate:{id:'2026-11/demo',meta:{title:'Demo',owner:'张三',status:'pending',currentRevision:2,updatedAt:'2026-11-17T00:00:00Z',humanDecisions:[],comments:[],revisions:[{id:1},{id:2}],gateChecks:[],approval:null},sections:{...${JSON.stringify(sections)},...(test.emptySolution ? {solution:""} : {})},humanJudgmentDeclared:true,humanJudgment:[]},patchText:patch,comments:[],validation:[],isBaseBehind:false}};
+        const id=new URL(String(url),location.href).searchParams.get('id')||'2026-11/demo';
+        value={data:{candidate:{id,meta:{title:id.endsWith('/other')?'乙方案候选':'Demo',owner:'张三',status:'pending',currentRevision:2,updatedAt:'2026-11-17T00:00:00Z',humanDecisions:[],comments:[],revisions:[{id:1},{id:2}],gateChecks:[],approval:null,...(test.reviewFindings?{findingId:group.findingId}:{})},sections:{...${JSON.stringify(sections)},...(test.emptySolution ? {solution:""} : {})},humanJudgmentDeclared:true,humanJudgment:[]},patchText:patch,comments:[],validation:[],isBaseBehind:false,...(test.reviewFindings?{finding:group}:{})}};
     }else if(String(url).includes('/diff?')) value={data:{unifiedDiff:patch}};
-    else value={project:{projectId:'project-a',name:'Demo',target:'main',vcsType:'git'},writable:true,vcsSnapshot:'v1',freshness:'synced',online:true};
+    else if(String(url).includes('/commands') && init.method==='POST'){test.approvalRequest=JSON.parse(init.body);value={command:{commandId:'new-approval'}};}
+    else value={project:{projectId:'project-a',name:'Demo',target:'main',vcsType:'git'},writable:true,vcsSnapshot:'v1',freshness:'synced',online:true,snapshot:{findingWorkflow:true}};
     return new Response(JSON.stringify(value),{status:200,headers:{'content-type':'application/json'}});
 };
 test.mountReview=()=>flushSync(()=>test.root.render(h(test.view)));
@@ -99,10 +107,12 @@ test.mountCandidate=()=>{
     test.candidateRoot=createRoot(document.getElementById('candidate-mount'));
     test.candidateRoot.render(h(QueryClientProvider,{client:test.queryClient},h(UserContext.Provider,{value:{userId:'user-a',username:'local',reviewIdentity:'张三'}},h(MemoryRouter,{initialEntries:['/projects/project-a/candidates/2026-11/demo']},h(Routes,null,h(Route,{path:'/projects/:projectId/candidates/*',element:h(CandidatePage)}))))));
 };
+test.mountTextPlan=()=>test.candidateRoot.render(h(QueryClientProvider,{client:test.queryClient},h(MemoryRouter,null,
+    h(FindingCard,{finding:textPlan,projectId:'project-a',writable:true}))));
 `;
 const bundled = await build({ stdin: { contents: bootstrap, resolveDir: root, loader: 'tsx' }, bundle: true, write: false,
     outfile: path.join(root, '.tmp/browser.js'), format: 'iife', jsx: 'automatic', plugins: [{ name: 'fixture-exports', setup(builder) {
-        builder.onLoad({ filter: /apps[\\/]web[\\/]src[\\/]App\.tsx$/ }, async args => ({ contents: `${await readFile(args.path, 'utf8')}\nexport {CandidatePage,UserContext};`, loader: 'tsx' }));
+        builder.onLoad({ filter: /apps[\\/]web[\\/]src[\\/]App\.tsx$/ }, async args => ({ contents: `${await readFile(args.path, 'utf8')}\nexport {CandidatePage,FindingCard,UserContext};`, loader: 'tsx' }));
     } }] });
 const js = bundled.outputFiles.find(file => file.path.endsWith('.js')).text;
 const css = bundled.outputFiles.find(file => file.path.endsWith('.css'))?.text ?? '';
@@ -167,6 +177,11 @@ try {
     await click('本地评审');
     await waitFor(`document.querySelector('.dcr-sub')?.textContent.includes('/test/other') && [...document.querySelectorAll('button')].some(button=>button.textContent==='审查仓库')`);
     await check('另一工作副本不恢复上一副本的任务', `document.querySelector('.dcr-job')===null`);
+    await evaluate('test.reviewFindings=true');
+    await click('刷新');
+    await waitFor(`document.body.textContent.includes('纯文字方案')`);
+    await check('本地纯文字方案只提供处置入口', `(()=>{const card=document.querySelector('[aria-label="纯文字方案"]');return card.textContent.includes('本次不修改')&&card.textContent.includes('人工接手')&&!card.textContent.includes('接受并应用')})()`);
+    await evaluate('test.reviewFindings=false');
     await click('中央连接');
     await evaluate('test.auditFixture=false');
     await evaluate(`test.hideReview();Object.assign(test.status,{localAvailable:false,localRuntimeDownload:{version:'0.1.0',size:1048576,url:'https://runtime.example.test/central.tgz',sha256:'a'.repeat(64)}});test.mountReview()`);
@@ -233,6 +248,19 @@ try {
     await check('批量收起全部文件', `[...document.querySelectorAll('#candidate-mount details:has(> summary > span)')].every(file=>!file.open)`);
     await click('全部展开'); await pause(150);
     await check('批量展开全部文件', `[...document.querySelectorAll('#candidate-mount details:has(> summary > span)')].every(file=>file.open)`);
+    await evaluate('test.reviewFindings=true;test.queryClient.invalidateQueries()');
+    await waitFor(`document.body.textContent.includes('方案 2 · 乙方案')`);
+    await evaluate(`[...document.querySelectorAll('#candidate-mount a')].find(link=>link.textContent.includes('方案 2 · 乙方案')).click()`);
+    await waitFor(`document.body.textContent.includes('乙方案候选')`);
+    await click('接受并应用 →');
+    await waitFor(`document.querySelector('[role="dialog"] input[type="checkbox"]')!==null`);
+    await evaluate(`document.querySelector('[role="dialog"] input[type="checkbox"]').click()`);
+    await click('确认批准并交付');
+    await waitFor('Boolean(test.approvalRequest)');
+    await check('中央批准绑定当前选项和发现版本', `test.approvalRequest.payload.id==='2026-11/other'&&test.approvalRequest.payload.expectedFindingVersion==='stable-v2'`);
+    await evaluate('test.mountTextPlan()');
+    await waitFor(`document.querySelector('#candidate-mount').textContent.includes('纯文字方案')`);
+    await check('中央纯文字方案没有审批入口', `(()=>{const text=document.querySelector('#candidate-mount').textContent;return text.includes('本次不修改')&&text.includes('人工接手')&&!text.includes('接受并应用')})()`);
     await check('浏览器无异常', `test.errors.length===0`);
     console.log(JSON.stringify(checks, null, 2));
     await writeFile(path.join(root, '.tmp/review-ui-browser-result.json'), JSON.stringify(checks, null, 2));

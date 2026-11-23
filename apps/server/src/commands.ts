@@ -25,6 +25,11 @@ export class Commands {
         return (rows as Row[]).map(row => this.get(row.command_id));
     }
 
+    private supportsFindingWorkflow(project: ProjectRecord): boolean {
+        return this.database.getNode(project.nodeId).workspaces.some(workspace =>
+            workspace.workspaceId === project.workspaceId && workspace.findingWorkflow === true);
+    }
+
     create(projectId: string, input: JsonRecord, user: User): CommandRecord {
         if (input.operation === RETIRED_MANUAL_REVISION) throw new ProtocolError('operation');
         const db = this.database;
@@ -43,10 +48,18 @@ export class Commands {
             if (this.schedules.blocksManual(projectId)) throw new CentralError(409, 'project_busy', '项目有未决操作');
             const node = db.getNode(project.nodeId);
             if (!project.enabled || !node.online || !node.compatible) throw new CentralError(503, 'node_unavailable', '执行节点离线、停用或协议不兼容');
+            const supportsFindings = this.supportsFindingWorkflow(project);
+            const payload = record(input.payload, 'payload');
+            if ('findingWorkflow' in payload) throw new ProtocolError('payload.findingWorkflow');
+            if ((input.operation === 'finding-decision' || (input.operation === 'approve' && 'expectedFindingVersion' in payload)) && !supportsFindings) {
+                throw new CentralError(409, 'conflict', '节点尚未声明新版发现能力');
+            }
             const issues = db.workspaceIssues(node.nodeId);
             if (Object.hasOwn(issues, project.workspaceId)) throw new CentralError(503, 'workspace_unavailable', issues[project.workspaceId]!);
             this.schedules.yieldToManual(projectId, now);
-            return this.insert(project, key, input, { userId: user.userId, reviewIdentity: user.reviewIdentity }, requestHash);
+            const command = input.operation === 'audit' && supportsFindings
+                ? { ...input, payload: { ...payload, findingWorkflow: true } } : input;
+            return this.insert(project, key, command, { userId: user.userId, reviewIdentity: user.reviewIdentity }, requestHash);
         });
     }
 
@@ -72,13 +85,29 @@ export class Commands {
             const unavailable = (command: CommandRecord) => Object.hasOwn(issues, db.getProject(command.projectId).workspaceId);
             const all = (db.sql.prepare("SELECT command_id FROM commands WHERE node_id=? AND state!='completed' ORDER BY created_at").all(nodeId) as Row[])
                 .map(row => this.get(row.command_id));
-            const relevant = all.filter(command => command.state === 'accepted' || command.state === 'executing' || !unavailable(command));
+            const supports = (command: CommandRecord) => !(
+                command.operation === 'finding-decision' || (command.operation === 'approve' && 'expectedFindingVersion' in command.payload)
+                || (command.operation === 'audit' && command.payload.findingWorkflow === true)
+            ) || this.supportsFindingWorkflow(db.getProject(command.projectId));
+            const relevant = all.filter(command => {
+                if (command.state !== 'queued' && command.state !== 'dispatched') {
+                    return command.state === 'accepted' || command.state === 'executing' || !unavailable(command);
+                }
+                if (supports(command)) return !unavailable(command);
+                const result: ManagedResult = { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '执行节点已不支持新版发现' },
+                    delivery: { state: 'not_required' } };
+                db.sql.prepare("UPDATE commands SET state='completed',result=?,updated_at=? WHERE command_id=?")
+                    .run(JSON.stringify(result), db.now(), command.commandId);
+                return false;
+            });
             if (!relevant.length && node.online) {
                 const ready = new Set([...scheduledAuditWorkspaces].filter(workspaceId => !Object.hasOwn(issues, workspaceId)));
                 const due = this.schedules.due(nodeId, ready)[0];
                 if (due) {
                     const { key, ...schedule } = due.slot;
-                    const input = { operation: 'audit', payload: { targetPath: '.', note: '' } };
+                    const input = { operation: 'audit', payload: {
+                        targetPath: '.', note: '', ...(this.supportsFindingWorkflow(due.project) ? { findingWorkflow: true } : {}),
+                    } };
                     const actor = { userId: SCHEDULED_AUDIT_ACTOR, reviewIdentity: due.reviewIdentity };
                     relevant.push(this.insert(due.project, key, input, actor, digest(stableJson({ ...input, actor, schedule })), schedule));
                 }

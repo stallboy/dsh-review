@@ -38,6 +38,7 @@ export interface TrustedActor {
     userId: string;
     reviewIdentity: string;
     commandId?: string;
+    findingWorkflow?: boolean;
     scheduledAudit?: NonNullable<ManagedCommand['scheduledAudit']> & { target: string; signal: AbortSignal };
 }
 

@@ -17,6 +17,7 @@ export interface AuditLeaseRecord {
   phased?: boolean;
   stageSeal?: Record<string, string>;
   stageItems?: import('./audit-archive.js').AuditItem[];
+  stageRecheck?: import('./audit-history.js').AuditRecheck;
   commitOutcomeUnknown?: true;
 }
 

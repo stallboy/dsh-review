@@ -73,7 +73,7 @@ export class ManagedNode {
     private timer: ReturnType<typeof setInterval> | null = null;
     private registered = false;
     private registrationKey = '';
-    private capabilities?: { executionConfigHash: boolean; workspaceIssues: boolean };
+    private capabilities?: { executionConfigHash: boolean; workspaceIssues: boolean; findingWorkflow: boolean };
     private nextCapabilityCheck = 0;
     private workspaceCheck: Promise<void> | undefined;
     private initialized = false;
@@ -136,7 +136,7 @@ export class ManagedNode {
         const info = await this.transport(url, { signal: AbortSignal.timeout(3000) }).then(async response => {
             if (!response.ok) throw new Error('无法读取中央服务器协议能力');
             const data = await response.json() as { protocolVersion?: number; registrationCapabilities?: {
-                executionConfigHash?: boolean; workspaceIssues?: boolean;
+                executionConfigHash?: boolean; workspaceIssues?: boolean; findingWorkflow?: boolean;
             } };
             if (typeof data?.protocolVersion !== 'number') throw new Error('中央服务器协议能力响应无效');
             return data;
@@ -151,7 +151,8 @@ export class ManagedNode {
             throw new Error('中央协议版本不兼容');
         }
         this.capabilities = { executionConfigHash: info.registrationCapabilities?.executionConfigHash === true,
-            workspaceIssues: info.registrationCapabilities?.workspaceIssues === true };
+            workspaceIssues: info.registrationCapabilities?.workspaceIssues === true,
+            findingWorkflow: info.registrationCapabilities?.findingWorkflow === true };
     }
 
     private async cycle(): Promise<void> {
@@ -172,7 +173,8 @@ export class ManagedNode {
         const unavailable = new Map(workspaceIssues.map(issue => [issue.workspaceId, issue.message]));
         const declaredWorkspaces = workspaces.filter(workspace => !unavailable.has(workspace.workspaceId))
             .map(({ supportsScheduledAudit: _scheduled, executionConfigHash, ...workspace }) =>
-            this.capabilities?.executionConfigHash === false ? workspace : { ...workspace, executionConfigHash });
+                ({ ...workspace, ...(this.capabilities?.executionConfigHash === false ? {} : { executionConfigHash }),
+                    ...(this.capabilities?.findingWorkflow ? { findingWorkflow: true } : {}) }));
         const registrationKey = JSON.stringify(declaredWorkspaces);
         if (!this.registered || this.registrationKey !== registrationKey) {
             await this.request('/node-api/v1/register', { protocolVersion: PROTOCOL_VERSION, instanceId: this.instanceId,
@@ -285,7 +287,9 @@ export class ManagedNode {
                     const content = await this.options.snapshot!(project);
                     const snapshot: ProjectSnapshot = { ...content, projectId: project.projectId, bindingGeneration: project.bindingGeneration,
                         projectConfigRevision: project.projectConfigRevision, snapshotSequence: journal.nextSnapshotSequence(project.projectId), collectedAt: this.clock().toISOString() };
-                    await this.request('/node-api/v1/snapshots', { instanceId: this.instanceId, snapshot });
+                    await this.request('/node-api/v1/snapshots', { instanceId: this.instanceId, snapshot: {
+                        ...snapshot, ...(this.capabilities?.findingWorkflow ? { findingWorkflow: true } : {}),
+                    } });
                     this.lastSync.set(project.projectId, this.clock().getTime());
                 });
             }

@@ -8,6 +8,7 @@ for await (const chunk of process.stdin) prompt += chunk;
 const reportMatch = /审查报告文件（相对仓库根目录）[:：]\s*(\S+)/.exec(prompt);
 const reportPath = reportMatch ? reportMatch[1] : '.ai-review/audits/fallback.md';
 const base = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+const findingWorkflow = process.argv.includes('--finding-workflow');
 
 const source = path.join(process.cwd(), 'src', 'math.js');
 writeFileSync(source, 'export const add = (a, b) => a + b;\n', 'utf8');
@@ -19,7 +20,7 @@ writeFileSync(path.join(candidateDir, '001.patch'), patch, 'utf8');
 writeFileSync(
   path.join(candidateDir, 'review.md'),
   `---
-schema_version: 1
+schema_version: ${findingWorkflow ? '2\nfinding_id: addition-operator' : 1}
 title: "math: 修复加法实现"
 module: math
 audit_type: bugfix
@@ -87,6 +88,13 @@ writeFileSync(
     '## 待前置合入后处理（Deferred）',
     '- **缓存层重构**：依赖 math 候选先合入。',
     '',
+    ...(findingWorkflow ? ['## 修复方案数据', '```json', JSON.stringify([
+      { finding_id: 'addition-operator', kind: 'repair', title: '加法错误', summary: '计算用了减号', target_files: ['src/math.js'],
+        depends_on: null, status: 'pending', candidate: null, repair_plan: '改为加法并验证结果。',
+        options: [{ candidate_id: '2026-10/20261031-math-fix', tradeoff: '最小改动' }] },
+      { finding_id: 'arithmetic-contract', kind: 'confirm', title: '异常输入约定', summary: '类型语义需人工确认', target_files: ['src/math.js'],
+        depends_on: null, status: 'pending', candidate: null, repair_plan: '核对既有接口约定并补充验收用例。' },
+    ]), '```', ''] : []),
   ].join('\n'),
   'utf8',
 );

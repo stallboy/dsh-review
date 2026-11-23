@@ -25,6 +25,7 @@ export interface ManagedWorkspace {
 
 const routes: Record<ManagedOperation, string> = {
     approve: '/approve', comments: '/comments', 'comments-batch': '/comments/batch', 'comment-status': '/comment-status', takeover: '/takeover', reject: '/reject', resume: '/resume',
+    'finding-decision': '/finding/decision',
     rebase: '/rebase', 'ai-fix': '/ai-fix', reopen: '/reopen', 'archive-stale': '/archive-stale', audit: '/audit',
     'audit-finalize': '/audit/finalize', 'audit-release': '/audit/release', 'candidate-finalize': '/candidate/finalize', convert: '/convert', 'dismiss-finding': '/dismiss-finding', sync: '/sync',
 };
@@ -210,7 +211,7 @@ export class ManagedOperations {
         this.options.journal.checkpoint(command.commandId, { phase: 'invoking', workspaceId: project.workspaceId });
         const response = await runtime.api.invoke({ method: 'POST', path: routes[command.operation], body: { ...command.payload, ...command.guard,
             ...(command.operation === 'takeover' ? { owner: command.actor.reviewIdentity } : {}) },
-        actor: { ...command.actor, commandId: command.commandId,
+        actor: { ...command.actor, commandId: command.commandId, findingWorkflow: command.payload.findingWorkflow === true,
             ...(command.scheduledAudit ? { scheduledAudit: { ...command.scheduledAudit, target: runtime.registration.target, signal } } : {}) } });
         const data = object(response.body);
         let outcome: ManagedResult['outcome'];

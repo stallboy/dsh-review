@@ -1,22 +1,23 @@
 # dsh-code-review
 
 > **任务来源**: 用户授权单仓拆分，并要求为中央服务和 DSH 节点提供三平台独立部署、启动脚本。
-> **任务内容**: 说明包边界及交付入口，补充可重复覆盖、Git 更新和独立启动的使用方式。
+> **任务内容**: 说明包边界、部署入口和当前的发现级审核流程。
 > **参考文档**:
 > - `SPEC.md` — 权威审核及中央模式契约。
 > - `docs/central-user-guide.md` — 面向使用者的 Web 操作手册。
+> - `SPEC_for_human.md`、`docs/dsh-code-review-guide.md` — 流程概览和本地操作指南。
 > - `docs/central-deployment.md` — 中央和节点的部署、配置与恢复。
 > - `docs/oneclick-deployment.md` — 三平台部署、重复升级与独立启动。
 > - `docs/superpowers/specs/2026-11-16-package-boundaries-design.md` — 包边界与交付设计。
-> **生成日期**: 2026-11-17
+> **生成日期**: 2026-11-23
 
 新增中央托管模式：一个 TypeScript / Node.js 24 服务统一管理多个 DSH 插件节点，React Web 提供项目、报告、候选、审核和任务管理。中央使用 SQLite 保存平台状态与查询缓存，Git/SVN 中的 `.ai-review/` 仍是评审事实源。日常操作见 [使用手册](docs/central-user-guide.md)，部署与节点配置见 [中央部署说明](docs/central-deployment.md)。
 
 DeepSeek Harness（DSH）桌面端的代码评审插件。它把产品仓库里的 `.ai-review/` 目录变成可操作的审核队列：浏览候选修复、阅读全量/增量差异、按行评论、执行合并门禁、批准并原子提交，或把意见退回给 AI 生成下一版。
 
-插件内置「仓库审查（Audit Repo）」作为候选生产者：AI 扫描当前仓库，按正确性/安全/稳定性/可测试性/性能/精简的优先级发现问题，把无疑问的 A 类修复直接生成为候选，把存疑的 B 类只写进审查报告，从而形成「审查 → 生成候选 → 人工审核 → 批准合入」的闭环。
+「仓库审查（Audit Repo）」为每个确认的发现提供一个补丁、最多三个互斥补丁，或一份带验收条件的文字方案。审核人可以选一个补丁批准应用、说明理由后选择「本次不修改」，或标记「人工接手」并复制交接内容。只有文字方案时可用后两项。后续审查会按范围核验接手项，证据足够时补记修复提交。
 
-本地模式直接由插件提供界面与 API；中央托管模式增加独立管理服务。两种模式都以 **`review.md` + `NNN.patch` 作为共享评审事实**。
+本地模式由插件提供界面和 API，中央托管模式由中央协调节点。两种模式的共享评审事实都在仓库的 `.ai-review/` 下，包括审查档案、候选和发现处置记录。操作说明见[本地插件指南](docs/dsh-code-review-guide.md)和[中央评审使用手册](docs/central-user-guide.md)，流程概览见[人工阅读版](SPEC_for_human.md)。
 
 ## 功能
 
@@ -176,30 +177,22 @@ Host 端在 `/dsh-code-review/api` 下注册：
 
 > 评审员提交意见，由 AI 生成修复版本。需要人工改代码时，直接按目标仓库的流程处理。历史人工修订仍可在候选中查看。
 
-## 已知边界 / 与设计文档的差异
+## 使用边界
 
-1. **只 commit 不 push**：按当前会话选择；如需自动推送，可扩展 `GitAdapter.atomicCommit`。
-2. **批准只需一次提交**：提交哈希无法写入自身，也不需要写入；Host 按 SPEC §5.5 从 VCS 历史派生业务提交版本。当前 demo 仍保留第二次回填提交，属实现差距，待切换。
-3. **SVN 增量 diff 为 hunk 级**：SVN 无三方合并能力，跨版本增量直接退化为 hunk 对比并显示警告。
-4. **契约数据模型已落地（schema_version 1）**：`review.md` 核心字段（module/audit_type 9 值/updated_at/target_files/human_decisions/rejection/commit_message/reopened_*）、固定键序、不变量校验（队列 broken 隔离）、负向记忆指纹与窗口阻止、批准留痕（门禁快照/逐条结果/判断项确认）、检出级写互斥均已实现并有测试（`tests/contract-*.test.mjs`）。新增的 `rejection.category` / `rejection.related_symbols`、`comments[].anchor`、`patchCheck`、`approvalCommitRevision`/`approvalCommitLookup` 与 `/comments/batch` 尚未实现（SPEC 附录 A G18、G37–G42）。
-5. **仓库审查写入端仍为旧扁平报告**：`audits/<时间戳>-<范围>.md`；新目录式档案（`audits/<audit_id>/audit.md` + items/finding）的读取、投影、转换（`/convert`）已就绪，审查会话提示词改写为新格式属下一步。审查提示词已注入负向记忆摘要（§7.5/7.6）。
-6. **UI 未覆盖新端点**：`/archive-stale`、`/reopen`、`/convert`、`/rebase`、`/audits`、`/findings` 目前仅 API + 测试，客户端面板待补；`/comments/batch` 与 `patchCheck` 仍是 SPEC 目标契约，尚未实现。
-7. **无批量批准、无真实鉴权**：owner 是本地约定，适合小团队试点；真正的权限需要仓库/服务端能力。检出级互斥为进程内实现，多克隆并发与"批准后跨实例重复 approved 检测"（§18.8 后半）不在保证范围。Jira 等外部 Ticket 自动抓取尚未接入（远期方向）。
-7a. **§14 共享事实过滤未实现**：队列/投影/负向记忆当前直接读工作区文件，未按 `git status` 排除未提交改动（本地视图）；提交失败回滚机制为主要缓解，完整实现待做。
-8. **UI 使用中文文案**（locale 命名空间已注册，便于后续补英文/日文）。
-9. 门禁命令由 AI 写入 `review.md`，批准时会以当前用户权限在本机执行；确认框会完整展示命令，请只批准可信候选。
-10. **审查使用新建 DSH 会话**。长时间审查会持续占用该会话，可以在聊天界面取消或追加意见。定时审查在[中央项目详情页](docs/central-user-guide.md#6-配置定时审查)配置，由执行节点先复查历史结果，再执行本轮全量审查。
-11. **UI 与 headless 双路径**：UI 的「审查仓库」走新 DSH 会话（侧边栏可见、可交互），不再使用后台 headless 模态；`POST /audit` 的 headless 审查仍保留给自动化/测试，由插件负责复核与提交。
+- 本地 Git 批准产生本地提交。中央 Git 还需推送到绑定目标，SVN 则直接提交到绑定的远端。业务提交版本由 Host 从 VCS 历史派生。
+- 中央与节点都支持新版时才发布新版发现。旧格式及历史独立候选继续按原流程使用。
+- SVN 的跨版本增量使用 hunk 比较。工作台逐项批准，并在确认前显示会以执行账号运行的门禁命令。
+- 插件界面的「审查仓库」使用新建 DSH 会话，自动化可以调用 `POST /audit`。定时审查在[中央项目详情页](docs/central-user-guide.md#6-配置定时审查)配置。
 
 ## 验证记录
 
-已在 Windows + DSH Desktop 实际验证：
+以下为早期 Windows + DSH Desktop 的验证记录，保留用于追溯：
 
 - 插件安装、激活（`client-entry` 可见 `dsh-code-review` 条目）。曾用旧会话入口验证 API 显式传入 `sessionId` 时可解析与设置不同的仓库目录。
-- Git：队列、详情、行内评论（中文 UTF-8）、接管、放弃、批准；批准提交包含业务代码 + `review.md` + 补丁删除，过程补丁清理；目标契约为单次提交 + 历史派生，当前 demo 仍为两次提交，待切换。
+- Git：验证队列、详情、行内评论（中文 UTF-8）、接管、放弃和批准，核对批准提交中的业务代码、`review.md` 和过程补丁清理。
 - Git 增量 diff：两个版本在同一基线上真实重建并 `git diff`（`same_base_direct`）。
 - 同基线/多版本候选完整走通：评论 → AI 修复（真实 `dsh headless`）→ 新版本 3 → 门禁 4/4 → 批准。
-- SVN：本地 `file://` 仓库，`svn patch`、门禁、原子提交 r2、补丁删除（目标契约为单次提交；当前 demo 仍多一次回填，待切换）。
+- SVN：用本地 `file://` 仓库验证 `svn patch`、门禁、批准提交和补丁删除。
 - 仓库审查（自动化夹具）：临时 Git 仓库 + 假执行器/假 `dsh` 命令完整走通「审查 → 生成 A 类候选 → 解析 B/Deferred → 复核补丁 → 还原工作区 → 提交 `.ai-review`」；仅 B 类时只提交报告；无效候选会回传校验错误；失败且无候选时不产生提交。`/audit/session` 使用假的 `createAuditSession` 验证了 sessionId、标题、owner 会话与 session 提示词；Host 侧 `createDshAuditSession` 用假 `sessionController` 覆盖了工作区挂载、cwd 回退、改名失败、错误码、提示词受理，以及权限预设/审批策略继承（含 `custom` 回退）；`/comments` 的 `autoFix` 链用 manual 执行器验证「保存意见 → 返回 ai_fix job → job 成功且 prompt 含该意见」。`npm test` 35 项通过（不含候选补丁里的 5 个 vcs 用例）。
 - 仓库审查（真实 DSH 会话，`scripts/verify-audit-session.mjs` 实跑）：`POST /audit/session` 创建会话 → 写入 `workspace.json` 挂到 `dsh-review` 工作区（侧边栏可见，标题「仓库审查 · src/host」）→ 继承 `danger-full-access` + `never` → 审查代理完成 132 次工具调用 / 104 步、基线 `npm test` 29/29 通过 → 在 `src/host` 生成 4 个独立候选与 `.ai-review/audits/20261031-230629-src-host.md` → 只提交 `.ai-review`（`audit(src/host): 仓库审查生成 4 个候选 [skip ci]`，commit `2bfbb86`），业务工作区保持干净。
 - 审批 UI：批准 / AI 修复 / 放弃改为页内面板与页内运行日志，不再使用全屏 modal 遮罩；人工判断项过滤“无 / 暂无 / 无：…”占位；正文按 Markdown-lite 渲染并限宽。用真实 `dist/client.js` + React 18 + 真实 `/queue`、`/candidate` 数据在无头 Chrome 中渲染详情、勾选人工项、打开内联审批面板并点击“确认批准并提交”（approve 用假 job 响应），确认 `.dcr-modal-mask` 数量为 0、页内 job 卡片出现，控制台 0 error。

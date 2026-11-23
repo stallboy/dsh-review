@@ -2,6 +2,33 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setupCentral, registerNode, bindProject, approvePayload } from './central-helpers.mjs';
 
+test('中央仅向声明新版发现能力的节点发出处置指令', async t => {
+    const { app, headers } = await setupCentral(t);
+    const node = await registerNode(app);
+    const project = await bindProject(app, headers, node);
+    const url = `/api/v1/projects/${project.projectId}/commands`;
+    const payload = { operation: 'finding-decision', idempotencyKey: 'new-finding', payload: {
+        findingId: 'arithmetic', expectedFindingVersion: 'a'.repeat(64), action: 'human_takeover',
+    } };
+    const submit = () => app.inject({ method: 'POST', url, headers, payload });
+    const register = findingWorkflow => app.inject({ method: 'POST', url: '/node-api/v1/register', headers: node.headers, payload: {
+        protocolVersion: 1, instanceId: node.instanceId, pluginVersion: '0.3.0', dshVersion: '0.2.1', platform: 'linux',
+        workspaces: [{ workspaceId: node.workspaceId, label: node.workspaceId, vcsType: 'git', target: 'main',
+            ...(findingWorkflow ? { findingWorkflow: true } : {}) }],
+    } });
+    assert.equal((await submit()).statusCode, 409);
+    assert.equal((await register(true)).statusCode, 200);
+    const queued = await submit();
+    assert.equal(queued.statusCode, 202, queued.body);
+    assert.equal((await register(false)).statusCode, 200);
+    const poll = await app.inject({ method: 'POST', url: '/node-api/v1/commands/poll', headers: node.headers,
+        payload: { instanceId: node.instanceId } });
+    assert.deepEqual(poll.json().commands, []);
+    const id = queued.json().command.commandId;
+    const result = await app.inject({ url: `/api/v1/commands/${id}`, headers });
+    assert.equal(result.json().command.result.outcome.status, 'ABORTED');
+});
+
 test('中央拒绝新建人工补丁任务，节点不收到指令', async t => {
     const { app, headers } = await setupCentral(t);
     const node = await registerNode(app);

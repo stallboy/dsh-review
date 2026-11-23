@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
     closeSync, constants, fstatSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync,
-    realpathSync, renameSync, statSync, unlinkSync, writeFileSync,
+    realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
 import type { AuditFilesRequest, AuditFilesResult } from './audit-files.js';
@@ -160,6 +160,15 @@ function run(request: AuditFilesRequest & { root: string }): AuditFilesResult {
             }
             unlinkSync(isolated);
             assertDirectory(directory);
+            if (request.removeEmptyParent) {
+                const parent = components.pop()!;
+                enter(root, components);
+                try {
+                    rmdirSync(parent);
+                } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== 'ENOTEMPTY') throw error;
+                }
+            }
         }
         return {};
     }
@@ -174,6 +183,10 @@ function run(request: AuditFilesRequest & { root: string }): AuditFilesResult {
         const leaf = components.pop()!;
         const directory = enter(root, components, request.op === 'write', request.createOnly);
         if (request.op === 'read') return { bytes: readLeaf(leaf, directory) };
+        if (request.expectedText !== undefined
+            && (readLeaf(leaf, directory)?.toString('utf8') ?? null) !== request.expectedText) {
+            throw new Error('评审产物在写入前已更新');
+        }
         writeLeaf(leaf, directory, request.text ?? '');
         return {};
     } catch (error) {

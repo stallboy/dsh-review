@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { GitHeadCandidateSource, SvnBaseCandidateSource, type SharedCandidateSource } from '../host/shared-facts.js';
 import { runProcess } from '../host/shell.js';
+import { findingRecordPath } from '../host/finding-decisions.js';
 
 export class SvnRevisionSource extends SvnBaseCandidateSource {
     constructor(private readonly cwd: string, private readonly url: string, private readonly revision: string) { super(cwd); }
@@ -33,6 +34,7 @@ export class SvnRevisionSource extends SvnBaseCandidateSource {
     override readPatchText(month: string, slug: string, name: string) { return this.remote('cat', `.ai-review/${month}/${slug}/${name}`); }
     override readReviewersText() { return this.remote('cat', '.ai-review/reviewers.yml'); }
     override readAuditText(name: string) { return this.remote('cat', `.ai-review/audits/${name}/audit.md`); }
+    override readFindingText(id: string) { return this.remote('cat', findingRecordPath(id)); }
     override async listAuditDirs(): Promise<string[]> {
         return (await this.remote('list', '.ai-review/audits') ?? '').split(/\r?\n/).map(line => line.trim().replace(/\/$/, '')).filter(Boolean);
     }

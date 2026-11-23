@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { findingRecordPath } from './finding-decisions.js';
 import { FilesystemCandidateSource, type CandidateSource } from './store.js';
 import { runProcess, type ProcessResult } from './shell.js';
 
@@ -32,6 +33,7 @@ export interface SharedCandidateSource extends CandidateSource, AuditSnapshotSou
   /** 无法证明版本时返回 null，调用方须跳过跨请求缓存。 */
   snapshotId(): Promise<string | null>;
   readReviewersText(): Promise<string | null>;
+  readFindingText(findingId: string): Promise<string | null>;
 }
 
 /** 创建时固定 HEAD，后续共享读取不受工作区改动或 HEAD 前进影响。 */
@@ -129,6 +131,10 @@ export class GitHeadCandidateSource implements SharedCandidateSource {
     return this.show('.ai-review/reviewers.yml');
   }
 
+  async readFindingText(findingId: string): Promise<string | null> {
+    return this.show(findingRecordPath(findingId));
+  }
+
   private async show(relPath: string): Promise<string | null> {
     const result = await git(this.root, ['show', `${this.snapshot}:${relPath}`]);
     if (result.code === 0) return result.stdout;
@@ -207,8 +213,12 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
     return this.readSharedFile('.ai-review/reviewers.yml');
   }
 
+  async readFindingText(findingId: string): Promise<string | null> {
+    return this.readSharedFile(findingRecordPath(findingId), true);
+  }
+
   /** 只有版本一致且无本地改动的路径可直接读工作副本，从而避免为每个文件访问远端。 */
-  private async readSharedFile(relPath: string): Promise<string | null> {
+  private async readSharedFile(relPath: string, strict = false): Promise<string | null> {
     const snapshot = await this.sharedSnapshot();
     if (!snapshot?.files.has(relPath.replace(/^\.ai-review\//, ''))) return null;
     const dir = relPath.includes('/') ? relPath.slice(0, relPath.lastIndexOf('/')) : '.';
@@ -220,6 +230,7 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
     }
     const url = `${snapshot.url}/${relPath.replace(/^\.ai-review\//, '').split('/').map(encodeURIComponent).join('/')}`;
     const result = await svn(this.root, ['cat', '-r', snapshot.revision, '--', `${url}@${snapshot.revision}`]);
+    if (strict && result.code !== 0) throw new Error(`无法读取共享文件 ${relPath}：${result.stderr.trim()}`);
     return result.code === 0 ? result.stdout : null;
   }
 

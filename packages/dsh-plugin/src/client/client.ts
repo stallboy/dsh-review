@@ -129,6 +129,7 @@
     anchor?: { snippet: string; before?: string; after?: string };
   }
   interface QueueItem {
+    findingId?: string;
     id: string; title: string; owner: string; status: string; tags: string[]; ticket: string | null;
     currentRevision: number; createdAt: string; patchStats: Stats; unresolvedComments: number;
     humanJudgmentCount: number; humanJudgmentDeclared: boolean; isBaseBehind: boolean; baseRevision: string; lastFeedback: string; parseError?: string;
@@ -149,6 +150,7 @@
     auditLease?: AuditLeaseInfo;
   }
   interface CandidateMeta {
+    findingId?: string;
     schemaVersion: number; title: string; createdAt: string; updatedAt: string; owner: string; tags: string[]; status: string;
     ticket: string | null; currentRevision: number;
     /** AC-UI-01：用 Frontmatter 的判断项 ID 收集确认与知悉，避免正文改写影响批准校验。 */
@@ -158,6 +160,7 @@
     approval: { approvedBy: string; approvedAt: string } | null;
   }
   interface Detail {
+    finding?: FindingView;
     candidate: {
       id: string; month: string; slug: string; dirPath: string; reviewPath: string; meta: CandidateMeta;
       sections: { problem: string; rootCause: string; solution: string; humanJudgment: string; evidence: string; history: string };
@@ -173,6 +176,13 @@
     /** G40：预检只用于提示冲突，批准时仍须重新验证补丁。 */
     patchCheck?: { state: 'clean' | 'conflicted' | 'unknown'; checkedBase: string; checkedAt: string };
     canAct: boolean; me: string;
+  }
+  interface FindingView {
+    findingId: string; findingVersion: string; title: string; summary: string; disposition: string;
+    baseRevision?: string; repairPlan?: string; targetFiles: string[];
+    options: { candidateId: string; tradeoff: string; status: string }[];
+    decision?: { reason?: string; reviewAfter?: string; reviewWhen?: string };
+    repairHints?: string[]; repairRevisions?: string[];
   }
   interface DiffResult {
     mode: 'full' | 'incremental'; unifiedDiff: string; fromRevision: number | null; toRevision: number;
@@ -688,6 +698,64 @@
         blocks.push(h('p', { key: nextKey() }, ...inlineNodes(paragraph.join(' '), nextKey())));
       }
       return h('div', { className: `dcr-rt ${props.className ?? ''}`.trim() }, ...blocks);
+    }
+
+    function FindingCard(props: { finding: FindingView; currentId?: string; busy: boolean; choose(id: string): void; save(body: Record<string, unknown>): void }) {
+      const { finding, currentId, busy, choose, save } = props;
+      const [form, setForm] = useState('');
+      const [reason, setReason] = useState('');
+      const [reviewAfter, setReviewAfter] = useState('');
+      const [reviewWhen, setReviewWhen] = useState('');
+      const [copy, setCopy] = useState('');
+      const closed = finding.disposition === 'applied' || finding.disposition === 'resolved';
+      const dispositionText: Record<string, string> = {
+        undecided: '待审核', accept_as_is: '接受现状', defer: '延期', human_takeover: '人工接手', applied: '已应用', resolved: '已解决',
+      };
+      const submit = (action: string, fields: Record<string, unknown> = {}): void => {
+        save({ findingId: finding.findingId, expectedFindingVersion: finding.findingVersion, action, ...fields });
+        setForm('');
+      };
+      return h('section', { className: 'dcr-card', 'aria-label': finding.title },
+        h('h2', null, finding.title),
+        h('p', null, finding.summary),
+        h('span', { className: 'dcr-chip' }, dispositionText[finding.disposition]),
+        finding.decision?.reason ? h('p', null, finding.decision.reason) : null,
+        finding.decision?.reviewAfter || finding.decision?.reviewWhen
+          ? h('p', null, [finding.decision.reviewAfter, finding.decision.reviewWhen].filter(Boolean).join(' · ')) : null,
+        finding.repairRevisions?.length ? h('p', null, `修复提交 ${finding.repairRevisions.join('、')}`) : null,
+        finding.repairPlan ? h('details', null, h('summary', null, '修复方案与验收'), h(RichText, { text: finding.repairPlan })) : null,
+        finding.options.length ? h('div', { className: 'dcr-row' }, ...finding.options.map((option, index) =>
+          h('button', { key: option.candidateId, className: 'dcr-btn', disabled: option.candidateId === currentId,
+            onClick: () => choose(option.candidateId) },
+          `${finding.options.length === 1 ? '查看补丁' : `方案 ${String(index + 1)}`} · ${option.tradeoff}`))) : null,
+        h('div', { className: 'dcr-row' },
+          !closed && finding.disposition === 'undecided' ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('accept_as_is') }, '本次不修改') : null,
+          !closed && finding.disposition !== 'human_takeover' ? h('button', { className: 'dcr-btn', disabled: busy,
+            onClick: () => submit('human_takeover') }, '人工接手') : null,
+          !closed && finding.disposition !== 'undecided' ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('resume_review') }, '重新审核') : null,
+          finding.disposition === 'human_takeover' ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('add_repair_hint') }, '提交修复线索') : null,
+          h('button', { className: 'dcr-btn', onClick: () => {
+            const text = [finding.title, finding.findingId, `基线 ${finding.baseRevision ?? ''}`, finding.targetFiles.join('\n'),
+              finding.summary, finding.repairPlan ?? ''].join('\n\n');
+            void navigator.clipboard.writeText(text).then(() => setCopy('已复制')).catch(() => setCopy('复制失败'));
+          } }, '复制交接内容'),
+          h('span', { role: 'status' }, copy),
+        ),
+        finding.repairHints?.length ? h('ul', null, ...finding.repairHints.map((hint, index) => h('li', { key: index }, hint))) : null,
+        form ? h('div', null,
+          form === 'accept_as_is' || form === 'defer' ? h('select', { 'aria-label': '处置', className: 'dcr-select', value: form,
+            onChange: (event: any) => setForm(event.target.value) },
+          h('option', { value: 'accept_as_is' }, '接受现状'), h('option', { value: 'defer' }, '延期')) : null,
+          h('textarea', { className: 'dcr-textarea', 'aria-label': form === 'add_repair_hint' ? '修复线索' : '处置理由',
+            value: reason, onChange: (event: any) => setReason(event.target.value) }),
+          form === 'defer' ? h('div', { className: 'dcr-row' },
+            h('input', { type: 'date', 'aria-label': '复查日期', value: reviewAfter, onChange: (event: any) => setReviewAfter(event.target.value) }),
+            h('input', { 'aria-label': '复查条件', value: reviewWhen, onChange: (event: any) => setReviewWhen(event.target.value) })) : null,
+          h('button', { className: 'dcr-btn p', disabled: busy || !reason.trim(), onClick: () => submit(form, form === 'add_repair_hint'
+            ? { hint: reason.trim() } : { reason: reason.trim(), ...(form === 'defer' && reviewAfter ? { reviewAfter } : {}),
+              ...(form === 'defer' && reviewWhen.trim() ? { reviewWhen: reviewWhen.trim() } : {}) }) }, '保存'),
+          h('button', { className: 'dcr-btn', onClick: () => setForm('') }, '取消'),
+        ) : null);
     }
 
     function ReviewPanel() {
@@ -1226,6 +1294,8 @@
       const [settings, setSettings] = useState<Settings | null>(null);
       const [screen, setScreen] = useState<'loading' | 'setup' | 'queue' | 'detail' | 'settings'>('loading');
       const [queue, setQueue] = useState<Queue | null>(null);
+      const [findings, setFindings] = useState<FindingView[]>([]);
+      const [findingErrors, setFindingErrors] = useState<string[]>([]);
       const [diff, setDiff] = useState<DiffResult | null>(null);
       const [diffMode, setDiffMode] = useState<'full' | 'incremental'>('full');
       const [diffFrom, setDiffFrom] = useState(1);
@@ -1242,6 +1312,7 @@
       const [allowedGates, setAllowedGates] = useState<string[] | null>(null);
       const [job, setJob] = useState<Job | null>(null);
       const [panel, setPanel] = useState<'' | 'approve' | 'reject'>('');
+      const [approvalFindingVersion, setApprovalFindingVersion] = useState<string | undefined>(undefined);
       const [ack, setAck] = useState<Record<string, boolean>>({});
       const [waiveReason, setWaiveReason] = useState<Record<string, string>>({});
       const jobLogOffsetRef = useRef<number | null>(null);
@@ -1322,6 +1393,11 @@
           if (filter.createdBefore) query.set('createdBefore', new Date(filter.createdBefore).toISOString());
           const value = await api.get<Queue>(`/queue${query.size > 0 ? `?${query.toString()}` : ''}`);
           setQueue(value);
+          if (value.configured) {
+            const { findings: latest, errors } = await api.get<{ findings: FindingView[]; errors: string[] }>('/findings');
+            setFindings(latest.filter(item => item.findingVersion));
+            setFindingErrors(errors);
+          } else { setFindings([]); setFindingErrors([]); }
           setError('');
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
         finally { setLoading(false); }
@@ -1590,6 +1666,10 @@
       /** G4：白名单仅影响确认交互；白名单不可用时仍须确认所有门禁命令。 */
       const approve = (): void => {
         if (!detail) return;
+        if (detail.candidate.meta.findingId && (!approvalFindingVersion || approvalFindingVersion !== detail.finding?.findingVersion)) {
+          setError('发现已更新，请重新确认所选补丁');
+          return;
+        }
         const gates = detail.candidate.meta.gateChecks.map((command) => command.trim()).filter(Boolean);
         const nonWhitelisted = allowedGates === null ? gates : gates.filter((command) => !allowedGates.includes(command));
         if (nonWhitelisted.length > 0
@@ -1604,6 +1684,7 @@
           .map((item) => ({ id: item.id, reason: (waiveReason[item.id] ?? '').trim() }));
         void startJob('/approve', {
           id: detail.candidate.id, ...guard(), confirmedDecisions, waivedDecisions,
+          ...(approvalFindingVersion ? { expectedFindingVersion: approvalFindingVersion } : {}),
           commitDetail,
         });
       };
@@ -1826,6 +1907,9 @@
       };
 
       const openCandidate = (id: string): void => {
+        setPanel('');
+        setAck({});
+        setWaiveReason({});
         dispatchDetail({ type: 'open', id });
         setDiff(null);
         setDiffMode('full'); setDiffFrom(1); setScreen('detail');
@@ -1880,7 +1964,7 @@
       };
 
       /** 复用 /queue 的筛选结果，避免面板重复维护共享与本地候选的筛选规则。 */
-      const filteredItems = useMemo(() => queue?.items ?? [], [queue]);
+      const filteredItems = useMemo(() => (queue?.items ?? []).filter(item => !item.findingId || item.localOnly), [queue]);
 
       const renderSettings = (): any => {
         if (!settings) return h('div', { className: 'dcr-empty' }, '加载设置…');
@@ -1937,6 +2021,8 @@
       };
 
       const renderQueue = (): any => {
+        const visibleFindings = findings.filter(finding => (!filter.dir || finding.targetFiles.some(file => file.includes(filter.dir)))
+          && (!filter.text || `${finding.title} ${finding.findingId}`.toLowerCase().includes(filter.text.toLowerCase())));
         const localTotal = queue?.items.filter((item) => item.local).length ?? 0;
         const hasActiveFilter = Boolean(filter.owner || filter.statuses || filter.text || filter.tag || filter.dir || filter.createdAfter || filter.createdBefore);
         return h('div', { className: 'dcr-body' },
@@ -2003,7 +2089,10 @@
             ) : null,
           ) : null,
           error ? h('div', { className: 'dcr-banner err' }, error) : null,
-          filteredItems.length === 0 ? h('div', { className: 'dcr-empty' },
+          ...findingErrors.map((message, index) => h('div', { key: index, className: 'dcr-banner err' }, message)),
+          ...visibleFindings.map(finding => h(FindingCard, { key: finding.findingVersion, finding, busy, choose: openCandidate,
+            save: (body: Record<string, unknown>) => { void runWrite('/finding/decision', body); } })),
+          filteredItems.length === 0 && visibleFindings.length === 0 ? h('div', { className: 'dcr-empty' },
             h('div', null, hasActiveFilter
               ? '当前筛选条件下没有候选；本地未提交候选同样受筛选影响，可调整或清空上方筛选。'
               : '队列为空：仓库 .ai-review 中还没有候选修复。'),
@@ -2055,6 +2144,8 @@
         if (!detail) return h('div', { className: 'dcr-body' }, error ? h('div', { className: 'dcr-banner err' }, error) : h('div', { className: 'dcr-empty' }, '加载候选…'));
         const candidate = detail.candidate;
         const canAct = detail.canAct && !stale && candidate.meta.status !== 'approved' && candidate.meta.status !== 'rejected';
+        const canApproveFinding = !candidate.meta.findingId || (detail.finding?.disposition === 'undecided'
+          && detail.finding.options.some(option => option.candidateId === candidate.id && option.status === 'pending'));
         const items = (candidate.meta.humanDecisions ?? []).map((decision) => ({ id: decision.id, label: decision.question }));
         const ackCount = items.filter((item) => ack[item.id]).length;
         const waivedCount = items.filter((item) => !ack[item.id] && (waiveReason[item.id] ?? '').trim().length > 0).length;
@@ -2155,7 +2246,7 @@
           ),
           commitMessagePanel(),
           h('div', { className: 'dcr-row', style: { marginTop: 12 } },
-            h('button', { className: 'dcr-btn p', disabled: busy || !allAck || candidate.meta.gateChecks.length === 0, onClick: approve }, busy ? '执行中…' : '确认批准并提交'),
+            h('button', { className: 'dcr-btn p', disabled: busy || !canApproveFinding || !allAck || candidate.meta.gateChecks.length === 0, onClick: approve }, busy ? '执行中…' : '确认批准并提交'),
             h('button', { className: 'dcr-btn', onClick: () => setPanel('') }, '再想想'),
             h('span', { className: 'dcr-grow' }),
             h('span', { className: 'dcr-small dcr-muted' }, settings?.syncBeforeApprove ? '批准前自动同步基线' : '不自动同步基线'),
@@ -2291,15 +2382,20 @@
                   !detail.canAct ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void takeover(); } }, '接管审核') : null,
                   canAct && candidate.meta.status === 'changes_requested'
                     ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void resumeCandidate(); } }, '转回待审核') : null,
-                  canAct ? h('button', { className: 'dcr-btn d', disabled: busy, onClick: () => setPanel(panel === 'reject' ? '' : 'reject') }, panel === 'reject' ? '收起放弃' : '放弃') : null,
-                  canAct ? h('button', {
+                  canAct && !candidate.meta.findingId ? h('button', { className: 'dcr-btn d', disabled: busy, onClick: () => setPanel(panel === 'reject' ? '' : 'reject') }, panel === 'reject' ? '收起放弃' : '放弃') : null,
+                  canAct && canApproveFinding ? h('button', {
                     className: 'dcr-btn p',
                     disabled: busy || detail.validation.length > 0,
                     title: detail.validation.length > 0 ? detail.validation.join('；') : !allAck ? '打开审批面板，逐项确认人工判断项' : '确认批准并提交',
-                    onClick: () => setPanel(panel === 'approve' ? '' : 'approve'),
-                  }, panel === 'approve' ? '收起审批' : '批准并提交') : null,
+                    onClick: () => {
+                      setApprovalFindingVersion(detail.finding?.findingVersion);
+                      setPanel(panel === 'approve' ? '' : 'approve');
+                    },
+                  }, panel === 'approve' ? '收起审批' : candidate.meta.findingId ? '接受并应用' : '批准并提交') : null,
                 ),
               ),
+              detail.finding ? h(FindingCard, { key: detail.finding.findingVersion, finding: detail.finding, currentId: candidate.id,
+                busy, choose: openCandidate, save: (body: Record<string, unknown>) => { void runWrite('/finding/decision', body); } }) : null,
               h('div', { className: 'dcr-kpis' },
                 h('div', { className: 'dcr-kpi' },
                   h('div', { className: 'dcr-kpi-label' }, '基线'),

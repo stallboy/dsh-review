@@ -1,4 +1,5 @@
 import { readMarkdownFrontmatter, dump } from './yaml.js';
+import { FINDING_ID_PATTERN } from './invariants.js';
 import type {
   ApprovalMeta,
   AuditType,
@@ -215,6 +216,7 @@ function parseApproval(value: unknown): ApprovalMeta | null {
 
 const KNOWN_KEYS = new Set([
   'schema_version',
+  'finding_id',
   'title',
   'module',
   'audit_type',
@@ -254,7 +256,14 @@ export function parseReviewMarkdown(text: string): ParsedReview {
 
   const field = (key: string): unknown => requiredField(doc, key);
   const schemaVersion = asNumber(field('schema_version'), 'schema_version');
-  if (schemaVersion !== 1) throw new ReviewFormatError(`不支持的 schema_version：${String(schemaVersion)}（当前仅支持 1）`);
+  if (schemaVersion !== 1 && schemaVersion !== 2) {
+    throw new ReviewFormatError(`不支持的 schema_version：${String(schemaVersion)}（当前支持 1 和 2）`);
+  }
+  const findingId = schemaVersion === 2 ? asString(field('finding_id'), 'finding_id') : undefined;
+  if ((findingId !== undefined && !FINDING_ID_PATTERN.test(findingId))
+    || (schemaVersion === 1 && Object.hasOwn(doc, 'finding_id'))) {
+    throw new ReviewFormatError('finding_id 只能作为 v2 候选的合法发现编号');
+  }
   const status = asString(field('status'), 'status');
   if (!STATUSES.includes(status as ReviewStatus)) {
     throw new ReviewFormatError(`status 只能是 ${STATUSES.join(' | ')}`);
@@ -300,6 +309,7 @@ export function parseReviewMarkdown(text: string): ParsedReview {
   return {
     meta: {
       schemaVersion,
+      ...(findingId !== undefined ? { findingId } : {}),
       title,
       module: moduleField,
       auditType: auditTypeRaw as AuditType | '',
@@ -330,6 +340,7 @@ export function parseReviewMarkdown(text: string): ParsedReview {
 export function serializeReviewMarkdown(meta: ReviewFrontmatter, body: string): string {
   const doc: Record<string, unknown> = {
     schema_version: meta.schemaVersion,
+    ...(meta.findingId !== undefined ? { finding_id: meta.findingId } : {}),
     title: meta.title,
     module: meta.module,
     audit_type: meta.auditType,

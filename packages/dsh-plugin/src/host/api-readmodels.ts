@@ -3,7 +3,9 @@ import path from 'node:path';
 import { isAiReviewPath, parsePatch } from './patch.js';
 import { loadReviewers } from './reviewers.js';
 import { Runner, loadSystemPrompt, toSessionFixPrompt } from './runner.js';
-import { AuditArchive, projectFindings } from './audit-archive.js';
+import { AuditArchive, projectFindings, scopeCovers, type CandidateChainInfo } from './audit-archive.js';
+import { loadFindingEvents, type FindingDisposition } from './finding-decisions.js';
+import { FINDING_ID_PATTERN, isRepoRelativePath } from './invariants.js';
 import { matchesReviewFilter } from './store.js';
 import type { ReviewStatus, ApprovalCommitLookup, PatchCheckDiagnostic } from './types.js';
 import { ApiError } from './types.js';
@@ -253,8 +255,11 @@ export class ReadModels {
       // 无法证明业务基线时保留落后提示，供人工确认。
       if (business.state === 'unchanged' || business.state === 'same') isBaseBehind = false;
     }
+    const finding = detail.candidate.meta.findingId && view ? (await this.findingProjection(runtime, view)).findings
+      .find(item => item.findingId === detail.candidate.meta.findingId) : undefined;
     sendJson(res, 200, {
       candidate: detail.candidate,
+      ...(finding ? { finding } : {}),
       currentBase: detail.currentBase,
       isBaseBehind,
       patchText,
@@ -387,12 +392,12 @@ export class ReadModels {
   }
 
   /** 转换与忽略操作也要使用这份投影，免得以被后来观察覆盖的档案作判断。 */
-  async findingProjection(runtime: Runtime): Promise<{
+  async findingProjection(runtime: Runtime, view?: Awaited<ReturnType<typeof sharedViewFor>>): Promise<{
     records: Awaited<ReturnType<AuditArchive['list']>>;
     findings: ReturnType<typeof projectFindings>['findings'];
     errors: string[];
   }> {
-    const view = await sharedViewFor(runtime);
+    view ??= await sharedViewFor(runtime);
     const snapshot = view?.snapshot ?? null;
     const archive = new AuditArchive(runtime.root);
     if (snapshot) {
@@ -405,21 +410,26 @@ export class ReadModels {
     const records = await archive.list(view?.source);
     const queue = await runtime.store.list({}, null, undefined, undefined, view?.source);
     const sharedItems = queue.items.filter((item) => !item.local);
-    const infoById = new Map(sharedItems.map((item) => [item.id, {
+    const toChainInfo = (items: typeof queue.items): Map<string, CandidateChainInfo> => new Map(items.map((item) => [item.id, {
       status: item.status,
       reopenedFrom: item.reopenedFrom ?? null,
       broken: item.parseError !== undefined,
-    } as import('./audit-archive.js').CandidateChainInfo]));
+      ...(item.findingId !== undefined ? { findingId: item.findingId } : {}),
+    }]));
+    const infoById = toChainInfo(sharedItems);
+    const v2Info = toChainInfo(queue.items.filter((item) => !item.localOnly));
+    const events = view?.source ? await loadFindingEvents(view.source, records) : new Map();
     const projected = projectFindings(
       records,
       (candidateId) => infoById.get(candidateId) ?? null,
       sharedItems.map((item) => item.id),
+      view?.source ? { candidateInfo: (id) => v2Info.get(id) ?? null, events } : undefined,
     );
     const errors = [
       ...records.filter((record) => record.parseError).map((record) => `${record.dirName}: ${record.parseError}`),
       ...projected.errors,
     ];
-    if (snapshot) {
+    if (snapshot && ![...events.values()].some(event => event instanceof Error)) {
       const cacheKey = `${runtime.root}|${snapshot}`;
       state.projectionCache.set(cacheKey, { findings: projected.findings, errors, snapshot });
       if (state.projectionCache.size > 32) {
@@ -431,9 +441,21 @@ export class ReadModels {
   }
 
   async findings(res: ApiResponse, url: URL): Promise<void> {
+    const scope = url.searchParams.get('scope');
+    const findingId = url.searchParams.get('findingId');
+    const dispositions = url.searchParams.get('dispositions')?.split(',').filter(Boolean) ?? [];
+    const valid: FindingDisposition[] = ['undecided', 'accept_as_is', 'defer', 'human_takeover', 'applied', 'resolved'];
+    if ((scope && scope !== '.' && (!isRepoRelativePath(scope) || path.win32.parse(scope).root))
+      || (findingId && !FINDING_ID_PATTERN.test(findingId))
+      || dispositions.some((disposition) => !valid.includes(disposition as FindingDisposition))) {
+      throw new ApiError(422, 'bad_request', '发现查询筛选参数无效');
+    }
     const runtime = await this.host.runtimeFor(url);
     const { findings, errors } = await this.findingProjection(runtime);
-    sendJson(res, 200, { findings, errors });
+    const filtered = findings.filter((finding) => (!scope || scopeCovers(scope, finding.targetFiles))
+      && (!findingId || finding.findingId === findingId)
+      && (dispositions.length === 0 || (finding.disposition !== undefined && dispositions.includes(finding.disposition))));
+    sendJson(res, 200, { findings: filtered, errors });
   }
 
   async fixPrompt(res: ApiResponse, url: URL): Promise<void> {

@@ -104,6 +104,7 @@ export interface GateCheckResult {
 
 export interface ReviewFrontmatter {
     schemaVersion: number;
+    findingId?: string;
     title: string;
 
     module: string;
@@ -185,6 +186,7 @@ export interface PatchCheckDiagnostic {
 }
 
 export interface CandidateSummary {
+    findingId?: string;
     id: string;
     title: string;
     owner: string;

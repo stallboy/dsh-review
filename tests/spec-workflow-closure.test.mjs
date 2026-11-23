@@ -1,14 +1,15 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 import os from 'node:os';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { parseReviewMarkdown, serializeReviewMarkdown } from '../packages/dsh-plugin/dist/host/frontmatter.js';
 import { quickReviewInvariants } from '../packages/dsh-plugin/dist/host/invariants.js';
-import { projectFindings } from '../packages/dsh-plugin/dist/host/audit-archive.js';
+import { AuditArchive, projectFindings } from '../packages/dsh-plugin/dist/host/audit-archive.js';
 import { AuditLifecycle } from '../packages/dsh-plugin/dist/host/audit-lifecycle.js';
 import { ReadModels } from '../packages/dsh-plugin/dist/host/api-readmodels.js';
 import { SvnAdapter, createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
@@ -16,8 +17,11 @@ import { Auditor, buildAuditPrompt, loadAuditSystemPrompt } from '../packages/ds
 import { Writers } from '../packages/dsh-plugin/dist/host/api-writers.js';
 import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
 import { GitHeadCandidateSource } from '../packages/dsh-plugin/dist/host/shared-facts.js';
+import { FindingApprovalState } from '../packages/dsh-plugin/dist/host/finding-approval-state.js';
+import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
+import { ManagedOperations } from '../packages/dsh-plugin/dist/managed/managed-operations.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
-import { commitCandidate, guardFixture, reviewFixture } from './fixtures/contract.mjs';
+import { commitCandidate, guardFixture, patchFixture, reviewFixture } from './fixtures/contract.mjs';
 
 const servers = [];
 after(async () => {
@@ -76,6 +80,327 @@ async function standaloneCandidate(root, slug) {
     commit: false,
   });
 }
+
+test('v2 发现从共享快照恢复选项和人工处置，筛选结果与无关提交无关', async () => {
+  const root = await createGitFixture();
+  const findingId = 'addition-result';
+  const options = [];
+  for (const name of ['first', 'second']) {
+    const item = await commitCandidate(root, name, {
+      commit: false,
+      review: { schemaVersion: 2, extraLines: [`finding_id: ${findingId}`] },
+    });
+    options.push({ candidateId: item.id, tradeoff: name });
+  }
+  const baseRevision = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const archive = new AuditArchive(root);
+  const item = {
+    findingId, kind: 'repair', title: '加法结果错误', summary: '正数相加的结果不正确',
+    targetFiles: ['src/math.js'], dependsOn: null, status: 'pending', candidate: null,
+  };
+  const firstAudit = {
+    schemaVersion: 2, auditId: '20261119-100000-src', createdAt: '2026-11-19T10:00:00Z',
+    baseRevision, scope: 'src', trigger: 'manual', previousAudit: null,
+    candidates: options.map(option => option.candidateId),
+    items: [{ ...item, repairPlan: '恢复正数相加逻辑', options }],
+  };
+  await archive.write(firstAudit, '# 审查报告\n');
+  await archive.write({
+    ...firstAudit, auditId: '20261120-100000-src', createdAt: '2026-11-20T10:00:00Z',
+    previousAudit: firstAudit.auditId, candidates: [], items: [item],
+  }, '# 审查报告\n');
+  const decisionDir = path.join(root, '.ai-review', 'findings');
+  await mkdir(decisionDir, { recursive: true });
+  const decisionPath = path.join(decisionDir, `${findingId}.yml`);
+  await writeFile(decisionPath, [
+    'schema_version: 1', `finding_id: ${findingId}`, 'events:',
+    `  - {revision: 1, audit_id: ${firstAudit.auditId}, actor: tester, at: "2026-11-19T11:00:00Z", action: human_takeover}`,
+    `  - {revision: 2, audit_id: ${firstAudit.auditId}, actor: tester, at: "2026-11-19T11:30:00Z", action: add_repair_hint, hint: "PR 42"}`,
+  ].join('\n'), 'utf8');
+  runCommand('git', ['add', '-A', '.ai-review'], root);
+  runCommand('git', ['commit', '-qm', 'v2 fixture'], root);
+  const { base } = await startApi(root);
+  const read = async query => {
+    const response = await fetch(`${base}/findings${query}`);
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const query = '?scope=src&dispositions=human_takeover';
+  const original = await read(query);
+  assert.deepEqual(original.errors, []);
+  assert.equal(original.findings.length, 1);
+  const [finding] = original.findings;
+  assert.equal(finding.lastObservedAudit, '20261120-100000-src');
+  assert.equal(finding.repairPlan, '恢复正数相加逻辑');
+  assert.deepEqual(finding.repairHints, ['PR 42']);
+  assert.deepEqual(finding.options, options.map(option => ({ ...option, status: 'pending' })));
+  assert.match(finding.findingVersion, /^[a-f\d]{64}$/);
+  assert.deepEqual((await read('?scope=docs')).findings, []);
+  assert.deepEqual((await read('?dispositions=applied')).findings, []);
+  assert.equal((await fetch(`${base}/findings?scope=../src`)).status, 422);
+
+  const approval = await post(base, '/approve', guardFixture(options[0].candidateId));
+  assert.equal(approval.status, 422);
+  assert.equal((await post(base, '/approve', guardFixture(options[0].candidateId, {
+    expectedFindingVersion: finding.findingVersion,
+  }))).status, 409);
+  const dismiss = await post(base, '/dismiss-finding', { findingId, auditId: firstAudit.auditId, reason: '旧入口' });
+  assert.equal(dismiss.status, 409);
+
+  runCommand('git', ['commit', '--allow-empty', '-qm', 'unrelated'], root);
+  await writeFile(decisionPath, '本地未提交草稿', 'utf8');
+  assert.deepEqual(await read(query), original);
+  runCommand('git', ['add', '.ai-review/findings'], root);
+  runCommand('git', ['commit', '-qm', 'invalid shared decision'], root);
+  const invalid = await read('');
+  assert.deepEqual(invalid.findings, []);
+  assert.match(invalid.errors.join(), /addition-result.*处置记录/);
+});
+
+async function prepareFindingOptions() {
+  const root = await createGitFixture();
+  const archive = new AuditArchive(root);
+  const findingId = 'parallel-options';
+  const revision = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const options = [];
+  for (const slug of ['option-a', 'option-b']) {
+    const candidate = await commitCandidate(root, slug, {
+      commit: false,
+      review: {
+        schemaVersion: 2, extraLines: [`finding_id: ${findingId}`], baseRevision: JSON.stringify(revision),
+        bodyLines: ['# 需人工判断项', '', '- 无'],
+      },
+    });
+    options.push({ candidateId: candidate.id, tradeoff: slug });
+  }
+  const published = {
+    schemaVersion: 2, auditId: '20261120-100100-src', createdAt: '2026-11-20T10:01:00Z', scope: 'src',
+    trigger: 'manual', previousAudit: null, baseRevision: revision, candidates: options.map(option => option.candidateId),
+    items: [{ findingId, kind: 'repair', title: '算术', summary: '加法错误', targetFiles: ['src/math.js'],
+      dependsOn: null, status: 'pending', candidate: null, repairPlan: '修复计算并验证', options }],
+  };
+  await archive.write(published, '# 审查报告\n');
+  runCommand('git', ['add', '-A', '.ai-review'], root);
+  runCommand('git', ['commit', '-qm', 'publish group'], root);
+  return { root, findingId, options };
+}
+
+test('同一发现的两个备选补丁并发审批只产生一次业务提交', async () => {
+  const { root, findingId, options } = await prepareFindingOptions();
+  const before = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const { base } = await startApi(root);
+  const [finding] = (await (await fetch(`${base}/findings`)).json()).findings;
+  const outcomes = await Promise.all(options.map(async ({ candidateId }) => {
+    const response = await post(base, '/approve', guardFixture(candidateId, { expectedFindingVersion: finding.findingVersion }));
+    if (response.status === 409) return 'ABORTED';
+    const body = await response.json();
+    assert.equal(response.status, 202, JSON.stringify(body));
+    const job = await waitJob(base, body.jobId);
+    assert.ok(job.result, JSON.stringify(job));
+    return job.result.status;
+  }));
+  assert.deepEqual(outcomes.sort(), ['ABORTED', 'COMMITTED']);
+  assert.equal(runCommand('git', ['rev-list', '--count', `${before}..HEAD`], root).stdout.trim(), '1');
+  const [applied] = (await (await fetch(`${base}/findings?dispositions=applied`)).json()).findings;
+  assert.equal(applied.findingId, findingId);
+  assert.equal(applied.options.filter(option => option.status === 'approved').length, 1);
+});
+
+test('发现的提交命令异常中断进入待核验，同组另一补丁仍受阻', async () => {
+  const { root, options } = await prepareFindingOptions();
+  const { api, base } = await startApi(root);
+  const runtime = await api.runtimeFor(new URL(base));
+  runtime.vcs.atomicCommit = async () => { throw new Error('测试中断提交响应'); };
+  const [finding] = (await (await fetch(`${base}/findings`)).json()).findings;
+  const original = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const approve = async id => {
+    const response = await post(base, '/approve', guardFixture(id, { expectedFindingVersion: finding.findingVersion }));
+    const body = await response.json();
+    assert.equal(response.status, 202, JSON.stringify(body));
+    return (await waitJob(base, body.jobId)).result;
+  };
+  const interrupted = await approve(options[0].candidateId);
+  assert.equal(interrupted.status, 'RECOVERY_REQUIRED');
+  assert.equal(interrupted.reason, 'COMMIT_OUTCOME_UNKNOWN');
+  assert.match(interrupted.detail, /测试中断提交响应/);
+  const sibling = await approve(options[1].candidateId);
+  assert.equal(sibling.status, 'ABORTED');
+  assert.match(sibling.message, /仍待核验/);
+  assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), original);
+});
+
+test('重启后发现的未决审批保留到探针和候选现场均可证明未提交', async () => {
+  const root = await createGitFixture();
+  const statePath = path.join(await mkdtemp(path.join(os.tmpdir(), 'finding-recovery-')), 'runtime-state.json');
+  const option = await commitCandidate(root, 'recovery-option');
+  const review = `.ai-review/${option.id}/review.md`;
+  const patch = `.ai-review/${option.id}/001.patch`;
+  const vcs = createVcs('git', root);
+  const probe = await vcs.getCommitProbe([review, patch]);
+  const state = new FindingApprovalState(root, 'retry-group', statePath);
+  await state.begin([review, patch], probe);
+  await assert.rejects(state.begin([review, patch], probe), /EEXIST/);
+  const file = path.join(root, review);
+  const before = await readFile(file, 'utf8');
+  await writeFile(file, before + '\n提交结果待核验的工作区内容', 'utf8');
+  const restarted = new FindingApprovalState(root, 'retry-group', statePath);
+  assert.equal(await restarted.canRetry(vcs), false);
+  await writeFile(file, before, 'utf8');
+  assert.equal(await restarted.canRetry(vcs), true);
+  await restarted.begin([review, patch], probe);
+  runCommand('git', ['commit', '--allow-empty', '-qm', 'probe moved'], root);
+  assert.equal(await new FindingApprovalState(root, 'retry-group', statePath).canRetry(vcs), false);
+  await restarted.clear();
+});
+
+test('明确未提交但业务工作区无法恢复时保留发现的待核验标记', async () => {
+  const { root, findingId, options } = await prepareFindingOptions();
+  const { api, base } = await startApi(root);
+  const runtime = await api.runtimeFor(new URL(base));
+  runtime.vcs.atomicCommit = async () => ({
+    success: false, commitRevision: null, outOfDate: false, errorOutput: '测试拒绝提交',
+  });
+  runtime.vcs.revertBusinessWorkspace = async () => {};
+  const [finding] = (await (await fetch(`${base}/findings`)).json()).findings;
+  const response = await post(base, '/approve', guardFixture(options[0].candidateId, { expectedFindingVersion: finding.findingVersion }));
+  assert.equal(response.status, 202);
+  const job = await waitJob(base, (await response.json()).jobId);
+  assert.equal(job.result?.status, 'RECOVERY_REQUIRED', JSON.stringify(job));
+  assert.equal(await new FindingApprovalState(root, findingId, api.deps.statePath).pending(), true);
+});
+
+test('文字方案可人工接手并提交可选线索，旧发现版本不能覆盖新决定', async () => {
+  const root = await createGitFixture();
+  const findingId = 'complex-repair';
+  const revision = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  await mkdir(path.join(root, '.ai-review'), { recursive: true });
+  await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\n', 'utf8');
+  await new AuditArchive(root).write({
+    schemaVersion: 2, auditId: '20261120-100200-src', createdAt: '2026-11-20T10:02:00Z', scope: 'src',
+    trigger: 'manual', previousAudit: null, baseRevision: revision, candidates: [],
+    items: [{ findingId, kind: 'confirm', title: '复杂修复', summary: '需要人工接手', targetFiles: ['src/math.js'],
+      dependsOn: null, status: 'pending', candidate: null, repairPlan: '验证边界后改动 API' }],
+  }, '# 审查报告\n');
+  runCommand('git', ['add', '-A', '.ai-review'], root);
+  runCommand('git', ['commit', '-qm', 'publish text plan'], root);
+  const { base } = await startApi(root);
+  const [finding] = (await (await fetch(`${base}/findings`)).json()).findings;
+  assert.deepEqual(finding.options, []);
+  const action = { findingId, expectedFindingVersion: finding.findingVersion, action: 'human_takeover' };
+  const received = await post(base, '/finding/decision', action);
+  const body = await received.json();
+  assert.equal(received.status, 200, JSON.stringify(body));
+  assert.equal(body.finding.disposition, 'human_takeover');
+  assert.equal((await post(base, '/finding/decision', action)).status, 409);
+  const hint = await post(base, '/finding/decision', {
+    findingId, expectedFindingVersion: body.finding.findingVersion, action: 'add_repair_hint', hint: 'PR 42',
+  });
+  const updated = await hint.json();
+  assert.equal(hint.status, 200, JSON.stringify(updated));
+  assert.deepEqual(updated.finding.repairHints, ['PR 42']);
+  await writeFile(path.join(root, 'src/math.js'), 'export const add = (a, b) => a + b;\n');
+  runCommand('git', ['commit', '-qam', 'external repair'], root);
+  const started = await post(base, '/audit/manual', { targetPath: 'src' });
+  assert.equal(started.status, 202);
+  const { auditId, prompt, reportPath } = await started.json();
+  assert.match(prompt, /历史复查数据/);
+  assert.match(prompt, /complex-repair/);
+  await mkdir(path.dirname(path.resolve(root, reportPath)), { recursive: true });
+  const evidence = { file: 'src/math.js', line: 1, excerpt: 'a + b', reason: '已有的加法修复与验收一致' };
+  await writeFile(path.resolve(root, reportPath), [
+    '# 外部审查报告', '## 历史复查数据', '```json',
+    JSON.stringify([{ id: findingId, status: 'resolved', evidence }]), '```', '',
+  ].join('\n'));
+  const finalize = await post(base, '/audit/finalize', { auditId });
+  assert.equal(finalize.status, 202);
+  const job = await waitJob(base, (await finalize.json()).jobId);
+  assert.equal(job.result?.status, 'COMMITTED', JSON.stringify(job));
+  const [refreshed] = (await (await fetch(`${base}/findings`)).json()).findings;
+  assert.equal(refreshed.disposition, 'resolved');
+});
+
+test('SVN 拒绝提交后清除发现处置和批准的 SVN 调度，原发现可以重试', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'finding-svn-reject-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const repo = path.join(directory, 'repo');
+  const root = path.join(directory, 'wc');
+  await mkdir(repo);
+  await mkdir(root);
+  runCommand('svnadmin', ['create', 'repo'], directory);
+  runCommand('svn', ['checkout', '-q', pathToFileURL(repo).href, 'wc'], directory);
+  const svn = (...args) => runCommand('svn', args, root).stdout.trim();
+  await mkdir(path.join(root, 'src'));
+  await writeFile(path.join(root, 'src/math.js'), 'export const add = (a, b) => a - b;\n');
+  svn('add', 'src');
+  svn('commit', '-qm', 'business base');
+  svn('update', '-q');
+  const findingId = 'svn-repair';
+  const candidateId = '2026-11/svn-fix';
+  const candidateDir = path.join(root, '.ai-review', candidateId);
+  await mkdir(candidateDir, { recursive: true });
+  await writeFile(path.join(root, '.ai-review/reviewers.yml'), 'default_owner: tester\n');
+  const baseRevision = svn('info', '--show-item', 'revision');
+  const reviewPath = path.join(candidateDir, 'review.md');
+  const original = reviewFixture('svn-fix', {
+    schemaVersion: 2, extraLines: [`finding_id: ${findingId}`], baseRevision: JSON.stringify(baseRevision),
+    bodyLines: ['# 需人工判断项', '', '- 无'],
+  });
+  await writeFile(reviewPath, original);
+  await writeFile(path.join(candidateDir, '001.patch'), patchFixture());
+  await new AuditArchive(root).write({
+    schemaVersion: 2, auditId: '20261120-100300-src', createdAt: '2026-11-20T10:03:00Z', scope: 'src',
+    trigger: 'manual', previousAudit: null, baseRevision, candidates: [candidateId],
+    items: [{ findingId, kind: 'repair', title: '算术', summary: '加法错误', targetFiles: ['src/math.js'],
+      dependsOn: null, status: 'pending', candidate: null, repairPlan: '修复计算并验证',
+      options: [{ candidateId, tradeoff: '更正运算符' }] }],
+  }, '# 审查报告\n');
+  svn('add', '.ai-review');
+  svn('commit', '-qm', 'finding');
+  svn('update', '-q');
+  const windows = process.platform === 'win32';
+  const hook = path.join(repo, 'hooks', windows ? 'pre-commit.cmd' : 'pre-commit');
+  await writeFile(hook, windows ? '@exit /b 1\r\n' : '#!/bin/sh\nexit 1\n');
+  if (!windows) await chmod(hook, 0o755);
+  const { base } = await startApi(root, { vcsType: 'svn' });
+  const [finding] = (await (await fetch(`${base}/findings`)).json()).findings;
+  const action = { findingId, expectedFindingVersion: finding.findingVersion, action: 'human_takeover' };
+  const decline = await post(base, '/finding/decision', action);
+  assert.equal(decline.status, 409);
+  assert.equal((await decline.json()).error.details.reason, 'COMMIT_FAILED');
+  assert.equal(svn('status'), '');
+  const approval = await post(base, '/approve', guardFixture(candidateId, { expectedFindingVersion: finding.findingVersion }));
+  assert.equal(approval.status, 202);
+  const job = await waitJob(base, (await approval.json()).jobId);
+  assert.equal(job.result?.status, 'ABORTED', JSON.stringify(job));
+  assert.equal(job.result.reason, 'COMMIT_FAILED');
+  assert.equal(svn('status'), '');
+  assert.equal(await readFile(reviewPath, 'utf8'), original);
+  const journal = new ManagedJournal(path.join(directory, 'journal.sqlite'));
+  const operations = new ManagedOperations({ dataDir: path.join(directory, 'state'), journal, workspaces: [
+    { workspaceId: 'svn', label: 'SVN', root, target: '^/', settings: { runner: 'manual' } },
+  ] });
+  try {
+    await operations.init();
+    const project = { projectId: 'project', nodeId: 'node', workspaceId: 'svn', name: 'SVN', bindingGeneration: 1,
+      projectConfigRevision: 1, vcsType: 'svn', target: '^/', enabled: true };
+    const command = { commandId: 'svn-finding-decision', requestHash: 'b'.repeat(64), projectId: project.projectId,
+      nodeId: project.nodeId, bindingGeneration: 1, projectConfigRevision: 1, operation: 'finding-decision',
+      payload: action, actor: { userId: 'tester-id', reviewIdentity: 'tester' },
+      createdAt: new Date().toISOString() };
+    journal.accept(command);
+    const result = await operations.execute(command, new AbortController().signal, () => {}, project);
+    assert.equal(result.outcome.status, 'ABORTED', JSON.stringify(result));
+    assert.equal(result.outcome.reason, 'COMMIT_FAILED');
+    assert.equal(result.delivery.state, 'not_required');
+    assert.equal(svn('status'), '');
+  } finally {
+    operations.stop();
+    journal.close();
+  }
+  await rm(hook);
+  const retry = await post(base, '/finding/decision', action);
+  assert.equal(retry.status, 200, await retry.text());
+});
 
 for (const kind of ['tracked', 'untracked']) {
   test(`§7.6：独立候选收尾遇到 ${kind} 业务修改时中止且完整保留用户内容`, async () => {

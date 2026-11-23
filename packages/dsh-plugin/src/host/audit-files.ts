@@ -7,8 +7,10 @@ export interface AuditFilesRequest {
     op: 'read' | 'list' | 'write' | 'snapshot' | 'remove';
     paths: string[];
     text?: string;
+    expectedText?: string | null;
     createOnly?: boolean;
     entries?: ExpectedCommitEntry[];
+    removeEmptyParent?: boolean;
 }
 
 export interface AuditFilesResult {

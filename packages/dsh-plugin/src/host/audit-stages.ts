@@ -4,6 +4,8 @@ import path from 'node:path';
 import type { AuditLeaseRecord } from './audit-lifecycle.js';
 import type { AuditItem } from './audit-archive.js';
 import { findingIdOf } from './auditor.js';
+import { parseReviewMarkdown, serializeReviewMarkdown } from './frontmatter.js';
+import { FINDING_ID_PATTERN } from './invariants.js';
 import { renderAuditTemplate, type AuditStage } from './audit-prompts.js';
 import { auditGit, compatibleAuditBase, oneLine, prepareStageCandidate, validSourcePath, withinScope, type StageCandidate, type StageEdit } from './audit-stage-artifacts.js';
 import {
@@ -66,6 +68,8 @@ interface Finding {
     title: string;
     decision: string;
     dependsOn: string;
+    repairPlan?: string;
+    findingId?: string;
 }
 
 const SUBJECT = /^[a-z0-9][a-z0-9-]{0,47}$/;
@@ -107,7 +111,7 @@ export class AuditStages {
     private readonly abort = new AbortController();
     private readonly leads = new Map<string, { token: string; navigation: Array<{ path: string; line: number }> }>();
     private readonly reviews = new Map<string, Verification>();
-    private readonly candidates = new Map<string, StageCandidate>();
+    private readonly candidates = new Map<string, StageCandidate[]>();
     private readonly coverage: string[] = [];
     private taskCounter = 0;
     private scanned = false;
@@ -170,10 +174,20 @@ export class AuditStages {
         if (this.busy || this.uncertain || this.lease.stageSeal || this.lease.state !== 'active') throw new Error('此轮不能启动阶段任务');
         const schema = taskSchemas[stage];
         if (!schema || !AUDIT_EXECUTORS.includes(executor)) throw new Error('未知审查阶段或执行器');
-        validateAuditValue(schema, task, 'task');
-        const input = { ...auditObject(task) };
+        const raw = auditObject(task);
+        const { approach, ...patchTask } = raw;
+        if (stage === 'patch' && approach !== undefined && (typeof approach !== 'string' || !approach.trim())) {
+            throw new Error('备选补丁必须说明修复方法');
+        }
+        validateAuditValue(schema, stage === 'patch' ? patchTask : task, 'task');
+        const input = stage === 'patch' ? { ...patchTask } : { ...raw };
         const subject = String(input['subjectId'] ?? '');
-        if (stage !== 'scan' && (!this.leads.has(subject) || this.candidates.has(subject))) throw new Error('请使用本轮未生成候选的线索 ID');
+        const existingCandidates = this.candidates.get(subject) ?? [];
+        if (stage !== 'scan' && !this.leads.has(subject)) throw new Error('请使用本轮已登记的线索 ID');
+        if ((stage === 'verify' && existingCandidates.length > 0)
+            || (stage === 'patch' && (existingCandidates.length >= 3 || (existingCandidates.length > 0 && !approach)))) {
+            throw new Error('同一发现最多生成三个独立补丁；备选补丁需要说明方法');
+        }
         if (stage === 'patch' && this.reviews.get(subject)?.verdict !== 'confirmed') throw new Error('候选需要 Host 核验通过的复核');
         if (stage === 'verify') {
             const registered = this.leads.get(subject)!;
@@ -210,13 +224,14 @@ export class AuditStages {
         try {
             if (!await compatibleAuditBase(this.vcs, this.lease.baseRevision)) throw new AuditStopUnknown('阶段执行前业务基线已变化');
             const verification = this.reviews.get(subject);
-            const id = this.lease.createdAt.slice(0, 7) + '/' + this.lease.auditId.slice(0, 15) + '-' + subject;
+            const id = this.lease.createdAt.slice(0, 7) + '/' + this.lease.auditId.slice(0, 15) + '-' + subject
+                + (existingCandidates.length > 0 ? '-option-' + String(existingCandidates.length + 1) : '');
             const stageData = {
                 ...common(this.lease), taskId, ...input,
                 ...(stage === 'patch' ? {
                     confirmedFact: verification!.observedBehavior, evidence: verification!.evidence,
                     ownerRouting: { rules: this.reviewers.rules, defaultOwner: this.reviewers.defaultOwner },
-                    candidate: { id, createdAt: this.lease.createdAt },
+                    candidate: { id, createdAt: this.lease.createdAt, ...(typeof approach === 'string' ? { approach } : {}) },
                 } : {}),
             };
             const template = await renderAuditTemplate(stage, stageData);
@@ -271,7 +286,8 @@ export class AuditStages {
                 evidence: verification!.evidence.map(item => '- ' + item.path + ':' + String(item.line) + ' ' + oneLine(item.reason)).join('\n'),
                 gateTimeoutMs: this.gateTimeoutMs, signal, gate: this.gate!,
             });
-            this.candidates.set(subject, candidate);
+            if (existingCandidates.some(option => option.patch === candidate.patch)) throw new Error('备选补丁与先前方案相同');
+            this.candidates.set(subject, [...existingCandidates, candidate]);
             return { status: 'ready', candidateId: candidate.id };
         } catch (error) {
             this.coverage.push(taskId + ' 未完成');
@@ -287,9 +303,12 @@ export class AuditStages {
         if (this.busy || this.uncertain || this.lease.state !== 'active' || this.lease.stageSeal || !this.scanned) {
             throw new Error('发布需要完成初审、停止阶段执行并且没有恢复事项');
         }
-        validateAuditValue(publicationSchema, input, 'publication');
         const value = auditObject(input);
+        if (!Array.isArray(value['findings'])) throw new Error('findings 必须为数组');
+        const rawFindings = value['findings'].map(auditObject);
+        validateAuditValue(publicationSchema, { ...value, findings: rawFindings.map(({ repairPlan, findingId, ...item }) => item) }, 'publication');
         const findings = value['findings'] as Finding[];
+        const versioned = findings.some(item => item.repairPlan !== undefined || (this.candidates.get(item.subjectId)?.length ?? 0) > 1);
         const selected = new Set<string>();
         for (const finding of findings) {
             if (selected.has(finding.subjectId) || this.reviews.get(finding.subjectId)?.verdict !== 'confirmed' || !finding.title.trim()) {
@@ -297,6 +316,12 @@ export class AuditStages {
             }
             selected.add(finding.subjectId);
             if (finding.kind === 'A' && !this.candidates.has(finding.subjectId)) throw new Error('A 类必须绑定本轮合格候选');
+            if (versioned && (typeof finding.repairPlan !== 'string' || !finding.repairPlan.trim())) {
+                throw new Error('新版发现需要包含证据、步骤和验收条件的修复方案');
+            }
+            if (finding.findingId !== undefined && (!versioned || typeof finding.findingId !== 'string' || !FINDING_ID_PATTERN.test(finding.findingId))) {
+                throw new Error('发现编号无效');
+            }
             if (finding.kind === 'B' && !finding.decision.trim()) throw new Error('B 类缺少待决定事项');
             if (finding.kind === 'Deferred' && (!SUBJECT.test(finding.dependsOn) || finding.dependsOn === finding.subjectId)) {
                 throw new Error('Deferred 缺少有效的前置问题 ID');
@@ -308,7 +333,14 @@ export class AuditStages {
         const sorted = findings.map((finding, index) => ({ finding, index })).sort((left, right) =>
             priorityValues.indexOf(left.finding.priority) - priorityValues.indexOf(right.finding.priority)
             || left.index - right.index || left.finding.subjectId.localeCompare(right.finding.subjectId)).map(item => item.finding);
-        const a = sorted.filter(item => item.kind === 'A').map(item => this.candidates.get(item.subjectId)!);
+        const findingId = (item: Finding): string => item.findingId
+            ?? findingIdOf(versioned ? 'confirm' : item.kind === 'Deferred' ? 'deferred' : 'confirm', oneLine(item.title));
+        const a = sorted.filter(item => item.kind === 'A').flatMap(item =>
+            (this.candidates.get(item.subjectId) ?? []).map(option => {
+                if (!versioned) return option;
+                const { meta, body } = parseReviewMarkdown(option.review);
+                return { ...option, review: serializeReviewMarkdown({ ...meta, schemaVersion: 2, findingId: findingId(item) }, body) };
+            }));
         const b = sorted.filter(item => item.kind === 'B');
         const deferred = sorted.filter(item => item.kind === 'Deferred');
         const list = (items: string[]) => items.length ? items.map(item => '- ' + oneLine(item)) : ['- 无'];
@@ -324,7 +356,7 @@ export class AuditStages {
             '# 仓库审查报告', '', '- 基线：' + this.lease.baseRevision, '- 范围：' + (this.lease.targetPath || '.'),
             '', '## 优先级总览', '', '| 优先级 | 问题 | 处置 |', '| --- | --- | --- |',
             ...sorted.map(item => '| ' + item.priority + ' | ' + tableCell(item.title) + ' | '
-                + (item.kind === 'A' ? 'A · ' + this.candidates.get(item.subjectId)!.id : item.kind) + ' |'),
+                + (item.kind === 'A' ? 'A · ' + (this.candidates.get(item.subjectId) ?? []).map(option => option.id).join('、') : item.kind) + ' |'),
             '', '## A 类：已生成候选', '', ...list(a.map(item => '.ai-review/' + item.id + '/：' + item.title)),
             '', '## B 类：需人工确认', '', ...(b.length ? b.flatMap(item => {
                 const review = this.reviews.get(item.subjectId)!;
@@ -338,16 +370,20 @@ export class AuditStages {
             ]) : ['- 无']), '', '## 历史问题复查', '', ...list(value['history'] as string[]),
             '', '## 验证证据与未覆盖风险', '', ...list(coverage), '',
         ].join('\n');
-        const items = [...b, ...deferred].map((item): AuditItem => {
+        const items = (versioned ? sorted : [...b, ...deferred]).map((item): AuditItem => {
             const review = this.reviews.get(item.subjectId)!;
-            const kind = item.kind === 'B' ? 'confirm' : 'deferred';
-            const target = [...b, ...deferred].find(candidate => candidate.subjectId === item.dependsOn);
-            const dependsOn = target ? findingIdOf(target.kind === 'B' ? 'confirm' : 'deferred', oneLine(target.title)) : item.dependsOn;
+            const kind = item.kind === 'A' ? 'repair' : item.kind === 'B' ? 'confirm' : 'deferred';
+            const target = (versioned ? sorted : [...b, ...deferred]).find(candidate => candidate.subjectId === item.dependsOn);
+            const dependsOn = target ? findingId(target) : item.dependsOn;
             return {
-                kind, findingId: findingIdOf(kind, oneLine(item.title)), title: oneLine(item.title),
-                summary: oneLine(review.observedBehavior) + '。' + (kind === 'confirm' ? oneLine(item.decision) : '等待 ' + dependsOn),
+                kind, findingId: findingId(item), title: oneLine(item.title),
+                summary: oneLine(review.observedBehavior) + '。' + (kind === 'deferred' ? '等待 ' + dependsOn : oneLine(item.decision)),
                 targetFiles: [...new Set(review.evidence.map(anchor => anchor.path))],
                 dependsOn: kind === 'deferred' ? dependsOn : null, status: 'pending', candidate: null,
+                ...(item.repairPlan !== undefined ? { repairPlan: item.repairPlan } : {}),
+                ...(kind === 'repair' ? { options: (this.candidates.get(item.subjectId) ?? []).map(option => ({
+                    candidateId: option.id, tradeoff: option.title,
+                })) } : {}),
             };
         });
         if (new Set(items.map(item => item.findingId)).size !== items.length) throw new Error('重复的正式问题标识');
