@@ -51,7 +51,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     let prompt = '';
     process.stdin.setEncoding('utf8');
     for await (const chunk of process.stdin) prompt += chunk;
-    const result = await runAuditChannel(prompt, { empty: process.argv.includes('empty') });
-    process.stdout.write(JSON.stringify(result) + '\n');
-    if (process.argv.includes('hold')) await new Promise(resolve => setTimeout(resolve, 800));
+    if (process.argv.includes('cancel-before-publication')) {
+        process.stdout.write('Runner 已开始等待取消\n');
+        await new Promise(resolve => setTimeout(resolve, 60_000));
+    } else {
+        const result = await runAuditChannel(prompt, { empty: process.argv.includes('empty') });
+        process.stdout.write(JSON.stringify(result) + '\n');
+        if (process.argv.includes('hold')) await new Promise(resolve => setTimeout(resolve, 800));
+    }
 }

@@ -65,8 +65,9 @@ export class AuditRuntime {
   private lifecycle: AuditLifecycle | null = null;
   private readonly stages = new Map<string, AuditStages>();
   private closed = false;
+  private leaseWrites: Promise<void> = Promise.resolve();
 
-  close(): void {
+  close(): Promise<void> {
     this.closed = true;
     for (const [jobId] of this.host.auditJobLeases) this.host.jobManager.abort(jobId);
     for (const auditId of new Set([...this.leaseTimeouts.keys(), ...this.stages.keys()])) {
@@ -74,6 +75,7 @@ export class AuditRuntime {
       this.stopStages(auditId);
       this.finishAuditTracking(auditId, { status: 'RECOVERY_REQUIRED', auditId, message: 'Host 已停止，请核验审查租约' });
     }
+    return this.leaseWrites;
   }
 
   private readonly channels = new Map<string, Awaited<ReturnType<typeof openAuditStageChannel>>>();
@@ -266,13 +268,19 @@ export class AuditRuntime {
         if (!Array.isArray(parsed.leases)) throw new Error('审查租约文件缺少 leases 数组，互斥状态不可证明');
         return parsed.leases;
       },
-      save: async (leases) => {
+      save: (leases) => {
+        if (this.closed) return Promise.reject(new Error('审查 Host 已停止'));
         const file = this.leaseStatePath;
-        await mkdir(path.dirname(file), { recursive: true }).catch(() => undefined);
-        const temp = `${file}.tmp-${String(process.pid)}-${String(Math.random()).slice(2, 8)}`;
-        const { writeFile: writeState, rename: renameState } = await import('node:fs/promises');
-        await writeState(temp, JSON.stringify({ leases }, null, 2), 'utf8');
-        await renameState(temp, file);
+        const state = JSON.stringify({ leases }, null, 2);
+        const write = this.leaseWrites.then(async () => {
+          await mkdir(path.dirname(file), { recursive: true }).catch(() => undefined);
+          const temp = `${file}.tmp-${String(process.pid)}-${String(Math.random()).slice(2, 8)}`;
+          const { writeFile: writeState, rename: renameState } = await import('node:fs/promises');
+          await writeState(temp, state, 'utf8');
+          await renameState(temp, file);
+        });
+        this.leaseWrites = write.catch(() => undefined);
+        return write;
       },
     });
     await this.lifecycle.load();
@@ -645,7 +653,8 @@ export class AuditRuntime {
     const fields = phased ? this.readStageFields(body) : { focus: [], extraRequirements: [] };
     const { auditId } = await this.beginAuditLease(
       runtime,
-      { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'manual', phased },
+      { targetPath: target.targetPath, baseRevision, owner, now, trigger: 'manual', phased,
+        ...(phased && actor?.commandId ? { commandId: actor.commandId } : {}) },
       clean,
     );
     if (phased) {
@@ -681,6 +690,7 @@ export class AuditRuntime {
   }
 
     private async startScheduledAudit(runtime: Runtime, scheduled: NonNullable<TrustedActor['scheduledAudit']>): Promise<JobRecord> {
+        const commandId = currentTrustedActor()?.commandId;
         let admit!: (job: JobRecord) => void;
         let rejectAdmission!: (reason: unknown) => void;
         const admitted = new Promise<JobRecord>((resolve, reject) => {
@@ -709,7 +719,8 @@ export class AuditRuntime {
             const owner = await this.host.ownerFor(runtime.root);
             const now = new Date();
             const { auditId: reservedId } = await this.beginAuditLeaseUnderLock(
-                runtime, { targetPath: '', baseRevision: before, owner, now, trigger: 'scheduled', phased: this.usesStages() }, clean,
+                runtime, { targetPath: '', baseRevision: before, owner, now, trigger: 'scheduled', phased: this.usesStages(),
+                    ...(this.usesStages() && commandId ? { commandId } : {}) }, clean,
             );
             let activeId = reservedId;
             const { candidateSource, lease } = await (async () => {
@@ -795,9 +806,10 @@ export class AuditRuntime {
         const run = (prompt: string, label: string) => {
           signal.throwIfAborted();
           startedRunner = true;
+          const redact = this.channels.get(auditId)?.redact;
           return runAgent({
             kind: settings.runner === 'dsh' ? 'dsh' : 'external', settings, cwd: runtime.root,
-            prompt: wrapAgentPrompt('', prompt), log: line => log(this.channels.get(auditId)?.redact(line) ?? line), signal,
+            prompt: wrapAgentPrompt('', prompt), log: line => log(redact?.(line) ?? line), signal,
             timeoutMs: Math.max(1, Date.parse(lease.createdAt) + AUDIT_TIMEOUT_MS - Date.now()), label,
             ...(this.host.deps.resolveCredential ? { resolveCredential: this.host.deps.resolveCredential } : {}),
           });

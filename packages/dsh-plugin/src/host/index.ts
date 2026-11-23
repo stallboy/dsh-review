@@ -421,12 +421,11 @@ export function apply(ctx: HostContext): void {
     () => async () => {
       disposed = true;
       shutdown.abort();
-      api?.closeAudit();
       off();
       removeStageTools?.();
       offConnection();
       offCentral();
-      const results = await Promise.allSettled([connection.stop(), managed?.stop()]);
+      const results = await Promise.allSettled([connection.stop(), managed?.stop(), api?.closeAudit(), ready]);
       for (const result of results) if (result.status === 'rejected') logger?.error(`dsh-code-review: 节点停止失败：${String(result.reason)}`);
     },
     'dsh-code-review: http routes',

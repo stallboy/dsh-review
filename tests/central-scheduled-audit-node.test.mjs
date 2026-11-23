@@ -77,6 +77,33 @@ test('中央定时 Runner 使用阶段通道并交付 Host 生成的报告', asy
     assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), result.delivery.commitRevision);
 });
 
+for (const scheduled of [false, true]) {
+    test(`中央${scheduled ? '定时' : '后台手动'} Runner 取消后可以核验并释放原租约`, { timeout: 35_000 }, async t => {
+        const runner = fileURLToPath(new URL('./fixtures/phased-audit-agent.mjs', import.meta.url));
+        const capabilities = { auditStageExecutor: async () => { throw new Error('此用例在派发阶段之前取消'); } };
+        const { operations, project, journal, root } = await setup(t, 'external', 'cancel-before-publication', capabilities, runner);
+        const command = commandFor('phased-cancel', scheduled);
+        const controller = new AbortController();
+        journal.accept(command);
+        const result = await operations.execute(command, controller.signal, message => {
+            if (message.includes('Runner 已开始等待取消')) controller.abort();
+        }, project);
+        assert.equal(result.outcome.status, 'RECOVERY_REQUIRED', JSON.stringify(result));
+        assert.equal(result.delivery.state, 'unknown');
+        const scratch = path.join(root, 'src/math.js');
+        const original = await readFile(scratch, 'utf8');
+        await writeFile(scratch, original + '// 临时改动\n');
+        const blocked = await operations.recover(command, result, project);
+        assert.equal(blocked.outcome.status, 'RECOVERY_REQUIRED', JSON.stringify(blocked));
+        await writeFile(scratch, original);
+        const recovered = await operations.recover(command, result, project);
+        assert.equal(recovered.outcome.status, 'ABORTED', JSON.stringify(recovered));
+        assert.equal(recovered.outcome.auditId, result.outcome.auditId);
+        assert.equal(recovered.delivery.state, 'not_required');
+        assert.deepEqual(await operations.recover(command, result, project), recovered);
+    });
+}
+
 async function writeArchive(root, id, base, scope, items = [], candidates = []) {
     const [, date, time] = /^(\d{8})-(\d{6})-/.exec(id);
     const createdAt = `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6)}T${time.slice(0, 2)}:${time.slice(2, 4)}:${time.slice(4)}Z`;

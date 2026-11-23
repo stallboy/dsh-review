@@ -70,10 +70,10 @@ export async function startManagedNode(input: ManagedConfiguration, directory: s
                 if (disconnect) await fetch(new URL('node-api/v1/disconnect', input.centerUrl), { method: 'POST',
                     headers: { authorization: `Bearer ${input.token}`, 'content-type': 'application/json' },
                     body: JSON.stringify({ instanceId: node.instanceId }), signal: AbortSignal.timeout(2000) }).catch(() => {});
-                operations.stop();
+                await operations.stop();
                 journal.close();
             } };
-    } catch (error) { operations.stop(); journal.close(); throw error; }
+    } catch (error) { await operations.stop(); journal.close(); throw error; }
 }
 
 export async function loadManagedNode(resolveCredential: (reference: string) => Promise<string | undefined>, onError: (error: Error) => void,

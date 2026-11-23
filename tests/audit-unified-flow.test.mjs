@@ -65,12 +65,18 @@ test('外部通道随 Host 关闭撤销，重启后的未封存租约仍可核�
     const { auditId, prompt } = start.body;
     const address = /http:\/\/127\.0\.0\.1:\d+\//.exec(prompt)?.[0];
     assert.ok(address);
-    api.closeAudit();
+    await api.closeAudit();
     await assert.rejects(fetch(address, { method: 'POST' }));
     const restarted = new ReviewApi(deps);
     await restarted.init();
     assert.equal((await request(restarted, '/audit/finalize', { auditId })).status, 409);
     assert.equal((await request(restarted, '/audit/release', { auditId, confirmStopped: true })).status, 200);
+    const next = await request(restarted, '/audit/manual', { targetPath: 'src' });
+    assert.equal(next.status, 202);
+    await assert.rejects(api.leaseTransition(auditId, 'released'), /Host 已停止/);
+    assert.equal(JSON.parse(await readFile(deps.statePath, 'utf8')).leases.some(
+        lease => lease.auditId === next.body.auditId && lease.state === 'active'), true);
+    await restarted.closeAudit();
 });
 
 async function waitForJob(api, id) {

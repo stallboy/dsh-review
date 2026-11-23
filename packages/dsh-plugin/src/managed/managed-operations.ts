@@ -11,6 +11,7 @@ import { ManagedJournal } from './managed-journal.js';
 import { managedSource } from './managed-source.js';
 import { DEFAULT_SETTINGS } from '../host/settings.js';
 import { scheduledReviewDataClean } from '../host/scheduled-audit-vcs.js';
+import { readSvnAuditUrl } from '../host/audit-stage-artifacts.js';
 import { runProcess } from '../host/shell.js';
 import type { AppSettings } from '../host/types.js';
 
@@ -263,7 +264,7 @@ export class ManagedOperations {
         if (session) outcome = { ...outcome, ...session };
         let commit = typeof outcome.commitRevision === 'string' ? outcome.commitRevision : null;
         if (!commit) commit = await runtime.delivery.findCommandCommit(command.commandId);
-        const unverifiedAudit = (command.scheduledAudit || inSession) && outcome.status === 'RECOVERY_REQUIRED';
+        const unverifiedAudit = command.operation === 'audit' && outcome.status === 'RECOVERY_REQUIRED';
         const result: ManagedResult = { outcome, delivery: unverifiedAudit
             ? { state: 'unknown', ...(commit ? { commitRevision: commit } : {}) }
             : commit ? { state: 'pending', commitRevision: commit } : { state: outcome.status === 'RECOVERY_REQUIRED' ? 'unknown' : 'not_required' } };
@@ -290,8 +291,34 @@ export class ManagedOperations {
             const sessionId = result?.outcome.sessionId ?? checkpoint?.sessionId ?? previous?.outcome.sessionId ?? originalLease?.sessionId;
             const auditId = result?.outcome.auditId ?? checkpoint?.auditId ?? previous?.outcome.auditId ?? originalLease?.auditId;
             const session = typeof sessionId === 'string' && typeof auditId === 'string' ? { auditId, sessionId } : undefined;
+            const lease = typeof auditId === 'string' ? runtime.api.leaseLookup(auditId) : undefined;
+            const phasedRunner = command.operation === 'audit' && lease?.phased && !lease.sessionId
+                && lease.commandId === command.commandId && lease.root === runtime.root
+                && lease.trigger === (command.scheduledAudit ? 'scheduled' : 'manual') ? lease : undefined;
             if (!commit) {
+                if (checkpoint?.phase === 'finished' && result?.delivery.state === 'not_required') return result;
                 let diagnostic = '没有足够证据证明原执行结果；请保留现场并人工核验，不会重跑业务操作';
+                if (phasedRunner) {
+                    const releaseStarted = checkpoint?.phase === 'runner_releasing';
+                    const current = await runtime.api.runtimeFor(new URL('http://managed/'));
+                    if (!phasedRunner.commitOutcomeUnknown
+                        && (phasedRunner.state === 'releasable' || (phasedRunner.state === 'released' && releaseStarted))
+                        && await current.vcs.getCurrentBase() === phasedRunner.baseRevision
+                        && (current.vcsType !== 'svn' || (phasedRunner.svnUrl && await readSvnAuditUrl(current.root) === phasedRunner.svnUrl
+                            && (await (await managedSource(current.root, current.vcsType)).source.snapshotId())?.endsWith(`@${phasedRunner.baseRevision}`)))
+                        && (await current.vcs.ensureCleanWorkspace()).clean && await scheduledReviewDataClean(current)) {
+                        this.options.journal.checkpoint(command.commandId, { phase: 'runner_releasing', auditId: phasedRunner.auditId });
+                        if (phasedRunner.state !== 'released') await runtime.api.leaseTransition(phasedRunner.auditId, 'released');
+                        const recovered: ManagedResult = {
+                            outcome: { status: 'ABORTED', reason: 'CANCELLED', auditId: phasedRunner.auditId,
+                                baseRevision: phasedRunner.baseRevision, message: '已核验原 Runner 的工作副本安全并释放租约' },
+                            delivery: { state: 'not_required' },
+                        };
+                        this.options.journal.checkpoint(command.commandId, { phase: 'finished', result: recovered });
+                        return recovered;
+                    }
+                    return { outcome: { ...unknownResult(diagnostic).outcome, auditId: phasedRunner.auditId }, delivery: { state: 'unknown' } };
+                }
                 if (session && !command.scheduledAudit && command.operation === 'audit') {
                     const lease = runtime.api.leaseLookup(session.auditId);
                     const releaseStarted = checkpoint?.phase === 'session_releasing';
@@ -321,7 +348,7 @@ export class ManagedOperations {
                     const { auditId, baseRevision } = result.outcome;
                     const lease = typeof auditId === 'string' ? runtime.api.leaseLookup(auditId) : undefined;
                     const releaseStarted = checkpoint?.phase === 'recheck_releasing';
-                    if (!lease || lease.root !== runtime.root || lease.trigger !== 'scheduled' || lease.baseRevision !== baseRevision
+                    if (!lease || lease.commitOutcomeUnknown || lease.root !== runtime.root || lease.trigger !== 'scheduled' || lease.baseRevision !== baseRevision
                         || (lease.state !== 'releasable' && !(lease.state === 'released' && releaseStarted))) return result;
                     const current = await runtime.api.runtimeFor(new URL('http://managed/'));
                     if (await current.vcs.getCurrentBase() !== lease.baseRevision || !(await current.vcs.ensureCleanWorkspace()).clean
@@ -355,7 +382,7 @@ export class ManagedOperations {
             const restored = result ?? { outcome: { status: 'RECOVERY_REQUIRED', reason: 'EXECUTION_OUTCOME_UNKNOWN', commitRevision: commit,
                 detail: '已找到原指令的提交，但缺少完整业务结果，不能仅据提交标记推断执行成功' }, delivery: { state: 'pending' as const, commitRevision: commit } };
             if (session) restored.outcome = { ...restored.outcome, ...session };
-            if ((command.scheduledAudit || session) && restored.outcome.status === 'RECOVERY_REQUIRED') {
+            if (command.operation === 'audit' && restored.outcome.status === 'RECOVERY_REQUIRED') {
                 return { ...restored, delivery: { state: 'unknown', commitRevision: commit } };
             }
             restored.delivery = await runtime.delivery.deliver(commit);
@@ -409,8 +436,8 @@ export class ManagedOperations {
         return { queryId: query.queryId, vcsSnapshot: pinned.identity, status: 'ready', data };
     }
 
-    stop(): void {
+    async stop(): Promise<void> {
         this.stopped = true;
-        for (const { api } of this.runtimes.values()) api.closeAudit();
+        await Promise.all([...this.runtimes.values()].map(({ api }) => api.closeAudit()));
     }
 }

@@ -97,7 +97,7 @@ export class ReviewApi implements ApiHost {
     return this.configErrors;
   }
 
-  closeAudit(): void { this.auditRuntime.close(); }
+  closeAudit(): Promise<void> { return this.auditRuntime.close(); }
 
   hasAuditStageSession(sessionId: string): boolean {
     return this.auditRuntime.hasStageSession(sessionId);
