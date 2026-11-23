@@ -2,7 +2,9 @@ name: 三平台部署与启动
 
 on:
     push:
-    pull_request:
+        tags:
+            - 'v[0-9]+.[0-9]+.[0-9]+'
+            - 'v[0-9]+.[0-9]+.[0-9]+-[0-9A-Za-z]*'
     workflow_dispatch:
 
 permissions:

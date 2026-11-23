@@ -336,7 +336,7 @@ export class ManagedNode {
         await Promise.all([this.workspaceCheck, ...[...this.active.values(), ...this.background.values()].map(value => value.promise)]);
     }
 
-    async stop(): Promise<void> {
+    async stop(flushPending = true): Promise<void> {
         this.stopping = true;
         if (this.timer) clearInterval(this.timer);
         this.timer = null;
@@ -344,6 +344,6 @@ export class ManagedNode {
         await this.ticking?.catch(() => {});
         for (const value of this.active.values()) value.controller.abort();
         await this.drain();
-        await this.flush().catch(() => {});
+        if (flushPending) await this.flush().catch(() => {});
     }
 }

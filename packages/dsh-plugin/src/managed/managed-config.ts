@@ -11,7 +11,7 @@ export interface ManagedHandle {
     hasUnsettled(): boolean;
     workspaceIssue(workspaceId: string): string | undefined;
     completeConfiguration(): void;
-    stop(): Promise<void>;
+    stop(disconnect?: boolean): Promise<void>;
 }
 
 export interface ManagedConfiguration {
@@ -57,9 +57,9 @@ export async function startManagedNode(input: ManagedConfiguration, directory: s
         return { centerUrl: input.centerUrl, nodeId: input.nodeId, instanceId: node.instanceId,
             hasUnsettled: () => journal.hasUnsettled(),
             workspaceIssue: workspaceId => operations.workspaceIssue(workspaceId),
-            completeConfiguration: () => node.completeConfiguration(), stop: async () => {
-                await node.stop();
-                await fetch(new URL('node-api/v1/disconnect', input.centerUrl), { method: 'POST',
+            completeConfiguration: () => node.completeConfiguration(), stop: async (disconnect = true) => {
+                await node.stop(disconnect);
+                if (disconnect) await fetch(new URL('node-api/v1/disconnect', input.centerUrl), { method: 'POST',
                     headers: { authorization: `Bearer ${input.token}`, 'content-type': 'application/json' },
                     body: JSON.stringify({ instanceId: node.instanceId }), signal: AbortSignal.timeout(2000) }).catch(() => {});
                 operations.stop();
