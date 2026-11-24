@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -126,7 +126,7 @@ test('桌面托管手动审查使用绑定工作副本的 DSH 会话并自动收
     await started.promise;
     assert.equal(calls.length, 1);
     assert.equal(calls[0].requireWorkspace, true);
-    assert.equal(path.resolve(calls[0].cwd).toLowerCase(), path.resolve(root).toLowerCase());
+    assert.equal(calls[0].cwd, await realpath(root));
     assert.match(calls[0].prompt, /复核绑定项目/);
     assert.equal(journal.recoveryData(command.commandId).sessionId, 'desktop-audit');
     completedTurn.resolve();

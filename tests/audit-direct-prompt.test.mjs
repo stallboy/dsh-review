@@ -74,3 +74,10 @@ test('提示词渲染拒绝越界占位符和变量，并且只替换一遍', ()
     assert.throws(() => renderPromptText('{{baseRevision}} {{extra}}', fields, values), /占位符/);
     assert.throws(() => renderPromptText('{{baseRevision}}', fields, values), /占位符/);
 });
+
+test('提示词模板的 CRLF 换行统一为 LF，保留输入值中的换行', () => {
+    const template = '## 任务数据\r\n{{taskJson}}\r\n\r\n从实际入口';
+    const taskJson = '{\r\n  "question": "复核问题"\r\n}';
+    assert.equal(renderPromptText(template, ['taskJson'], { taskJson }),
+        '## 任务数据\n' + taskJson + '\n\n从实际入口');
+});
