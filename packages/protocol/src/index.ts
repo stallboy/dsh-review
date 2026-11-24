@@ -27,6 +27,20 @@ export interface Guard {
     expectedUpdatedAt: string;
 }
 
+export type AuditRecurrence =
+    | { kind: 'daily' }
+    | { kind: 'weekly'; weekdays: number[] }
+    | { kind: 'interval'; days: number; startDate: string };
+
+export interface AuditPlanSettings {
+    name: string;
+    enabled: boolean;
+    startTime: string;
+    timeZone: string;
+    recurrence: AuditRecurrence;
+    note: string;
+}
+
 export interface ScheduledAudit {
     scheduledAt: string;
     expiresAt: string;
@@ -60,6 +74,14 @@ export interface ManagedResult {
 
 export function retiredManualRevisionResult(): ManagedResult {
     return { outcome: { status: 'ABORTED', reason: 'CANCELLED', message: '人工补丁提交已撤除' }, delivery: { state: 'not_required' } };
+}
+
+export interface PendingCommandSummary {
+    commandId: string;
+    projectId: string;
+    operation: string;
+    state: CommandState;
+    detail?: string;
 }
 
 export interface CommandRecord extends ManagedCommand {

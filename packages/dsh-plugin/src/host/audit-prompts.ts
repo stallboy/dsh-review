@@ -37,7 +37,7 @@ export function renderPromptText(
     if (tokens.size !== fields.length || fields.some(key => !tokens.has(key))) {
         throw new Error('审查模板的占位符与契约不符');
     }
-    return body.replace(PLACEHOLDER, (_, name: string) => values[name]!);
+    return body.replaceAll('\r\n', '\n').replace(PLACEHOLDER, (_, name: string) => values[name]!);
 }
 
 export async function renderAuditTemplate(

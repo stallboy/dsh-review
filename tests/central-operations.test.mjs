@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -126,7 +126,7 @@ test('桌面托管手动审查使用绑定工作副本的 DSH 会话并自动收
     await started.promise;
     assert.equal(calls.length, 1);
     assert.equal(calls[0].requireWorkspace, true);
-    assert.equal(path.resolve(calls[0].cwd).toLowerCase(), path.resolve(root).toLowerCase());
+    assert.equal(calls[0].cwd, await realpath(root));
     assert.match(calls[0].prompt, /复核绑定项目/);
     assert.equal(journal.recoveryData(command.commandId).sessionId, 'desktop-audit');
     completedTurn.resolve();
@@ -211,6 +211,7 @@ test('桌面审查取消跟踪保留会话和未决记录，恢复不重新创�
     const blocked = await operations.recover(command, result, project);
     assert.equal(blocked.outcome.status, 'RECOVERY_REQUIRED');
     assert.equal(blocked.outcome.sessionId, 'desktop-audit-cancelled');
+    assert.match(blocked.outcome.detail, /\.ai-review\/unfinished\.md/);
     await rm(draft);
     const recovered = await operations.recover(command, blocked, project);
     assert.equal(recovered.outcome.status, 'ABORTED');
