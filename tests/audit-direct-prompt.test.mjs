@@ -10,17 +10,17 @@ import { buildAuditPrompt } from '../packages/dsh-plugin/dist/host/auditor.js';
 import { GitHeadCandidateSource } from '../packages/dsh-plugin/dist/host/shared-facts.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
-// 迁移前由原 buildAuditPrompt 采集，用于校验包括空行在内的完整输出。
+// 固定包含优先级要求的模板输出，覆盖两种交付格式、两种启动方式及历史数据。
 const baselineHashes = {
-    'v1-headless': '9de1ae0fa30838d4c1ef2cefce92e5f94c9f534ed00d0e7b3097376cc69aa405',
-    'v1-session': '6a0ba1fc268e24cb446680ba951f8ebaecb1139960ad445e0f4cd8216ef6fcbd',
-    'v2-headless': '00b48abba904b0fd1984f40919e25c74e9eb44dbdbf4eac8731e3fe3e1854a7a',
-    'v2-session': '8698d2c137e7440ec7f5a2a355f9be0888b2a94e7453a5b68ac1e165ae378a16',
-    'v2-headless-history': 'd1d2e16aabed4c66e32d895ac51021f2c500628f8b8698313e8e4bcbd592fc93',
-    'v2-session-history': '8637460852cddaf7cab84dfbfc2c86353a0360faf78e373ed86c78d31a67bb3e',
+    'v1-headless': 'eed2fb1e54164cc5672360d8594032943f3135f6dd55b3fbaa668f7363110a73',
+    'v1-session': '5b902108f7b85903a07656b5304cd7a3ea9a55ff379ec9d99942b1bdd54736bc',
+    'v2-headless': '2b78b3e814bb39ecddfa705e1d437376644033b43c84e2be48ee7e594697517b',
+    'v2-session': 'ec86482e55d8688a76271d2d43d0d1597b99d1c418da8d92d25b06d22f604f79',
+    'v2-headless-history': 'e397c11073eb6c3887d84143a47de19c3608747262cd019ac05ef25a6fa1a076',
+    'v2-session-history': 'f7c12a305d7edc5ac96e0ebaeba5e99b2b2220bc8d1c2c0a5cd807fe6b66deab',
 };
 
-test('直接执行提示词迁移前后逐字等价，并保留作为数据输入的模板语法', async t => {
+test('直接执行提示词包含优先级规则，并保留作为数据输入的模板语法', async t => {
     const root = await createGitFixture();
     t.after(() => rm(root, { recursive: true, force: true }));
     const baseRevision = 'a'.repeat(40);
@@ -33,6 +33,8 @@ test('直接执行提示词迁移前后逐字等价，并保留作为数据输�
         const actual = await withTrustedActor({ userId: 'tester', reviewIdentity: 'tester', findingWorkflow },
             () => buildAuditPrompt({ ...input, mode, source }));
         assert.ok(actual.includes(note));
+        assert.match(actual, /跨 A\/B\/Deferred 按 P0 → P1 → P2 → P3 排序/);
+        assert.match(actual, /## 优先级总览\n\| 优先级 \| 问题 \| 处置 \|/);
         if (source) assert.ok(actual.includes('历史方案中的 {{taskJson}}'));
         const label = (findingWorkflow ? 'v2' : 'v1') + '-' + mode + (source ? '-history' : '');
         const normalized = actual.replaceAll('\r\n', '\n').replaceAll(path.resolve(root), '<仓库根目录>');

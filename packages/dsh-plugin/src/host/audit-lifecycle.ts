@@ -8,13 +8,16 @@ export interface AuditLeaseRecord {
   targetPath: string;
   trigger: 'manual' | 'scheduled';
   baseRevision: string;
+  svnUrl?: string;
   owner: string;
   createdAt: string;
   /** 开审时已存在的候选不属于本轮新增产物，收尾须排除。 */
   candidateIdsBefore: string[];
   state: AuditLeaseState;
   sessionId?: string;
+  commandId?: string;
   phased?: boolean;
+  stageProcessActive?: true;
   stageSeal?: Record<string, string>;
   stageItems?: import('./audit-archive.js').AuditItem[];
   stageRecheck?: import('./audit-history.js').AuditRecheck;

@@ -238,3 +238,29 @@ test('audit session still starts when permission inheritance is unavailable', as
   assert.equal(result.sessionId, 'session-audit');
   assert.equal(calls.prompt.length, 1);
 });
+
+test('桌面审查选择精确匹配的工作区，避免在上层项目创建会话', async () => {
+    const owner = { id: 'workspace-owner', path: '..' };
+    const exact = { id: 'workspace-exact', path: CWD };
+    const { host, calls } = createHost({
+        registry: { resolveByPath: async () => owner, list: () => [owner, exact] },
+    });
+    await createDshAuditSession(host, { cwd: CWD, title: '仓库审查', prompt: '任务', requireWorkspace: true });
+    assert.deepEqual(calls.create, [{ workspaceId: 'workspace-exact' }]);
+});
+
+test('桌面审查缺少绑定工作区时报错并保持会话列表不变', async () => {
+    const { host, calls } = createHost({ registry: registryWith(undefined) });
+    await assert.rejects(
+        createDshAuditSession(host, { cwd: CWD, title: '仓库审查', prompt: '任务', requireWorkspace: true }),
+        /找不到审查工作副本所属的项目/,
+    );
+    assert.equal(calls.create.length, 0);
+});
+
+test('桌面审查支持登记在同一工作副本子目录的 DSH 项目', async () => {
+    const workspace = { id: 'workspace-nested', path: `${CWD}/packages/dsh-plugin` };
+    const { host, calls } = createHost({ registry: registryWith(workspace) });
+    await createDshAuditSession(host, { cwd: CWD, title: '仓库审查', prompt: '任务', requireWorkspace: true });
+    assert.deepEqual(calls.create, [{ workspaceId: 'workspace-nested' }]);
+});

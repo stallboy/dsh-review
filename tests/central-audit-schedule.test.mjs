@@ -305,14 +305,30 @@ test('启停只变更启用状态，基于旧版本的全量编辑被拒绝', as
     assert.equal(stale.statusCode, 409, stale.body);
 });
 
-test('四位年份最大日期可保存和计算下次计划', async t => {
+test('四位年份最大日期可保存和计算协议能派发的下次计划', async t => {
     const { app, headers, path } = await scheduledProject(t);
     const response = await app.inject({ method: 'POST', url: `${path}/audit-plans`, headers, payload: {
-        ...dailyPlan, timeZone: 'America/Los_Angeles', startTime: '23:30',
+        ...dailyPlan, timeZone: 'America/Los_Angeles', startTime: '14:00',
         recurrence: { kind: 'interval', days: 3, startDate: '9999-12-31' },
     } });
     assert.equal(response.statusCode, 201, response.body);
-    assert.equal(response.json().auditPlan.nextRunAt, '+010000-01-01T07:30:00.000Z');
+    assert.equal(response.json().auditPlan.nextRunAt, '9999-12-31T22:00:00.000Z');
+});
+
+test('四位年份边界校验同时覆盖计划时刻及等待截止时间', async t => {
+    const { app, headers, path, project } = await scheduledProject(t);
+    const add = settings => app.inject({ method: 'POST', url: `${path}/audit-plans`, headers, payload: { ...dailyPlan, ...settings } });
+    const recurrence = { kind: 'interval', days: 3, startDate: '9999-12-31' };
+    for (const settings of [{ timeZone: 'America/Los_Angeles', startTime: '23:30' }, { timeZone: 'UTC', startTime: '23:30' }]) {
+        const response = await add({ ...settings, recurrence });
+        assert.equal(response.statusCode, 422, response.body);
+    }
+    const daily = await add({ timeZone: 'UTC', startTime: '23:30' });
+    assert.equal(daily.statusCode, 201, daily.body);
+    const { AuditSchedules } = await import('../apps/server/dist/audit-schedule.js');
+    const [plan] = new AuditSchedules(app.database).list(project, '9999-12-31T23:00:00.000Z')
+        .filter(item => item.planId === daily.json().auditPlan.planId);
+    assert.equal(plan.nextRunAt, null);
 });
 
 test('AC-CENTRAL-SCHEDULE-01：手动任务优先，30 分钟内空闲可派发，重启不重复发起', async t => {

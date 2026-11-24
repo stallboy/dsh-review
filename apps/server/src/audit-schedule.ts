@@ -6,6 +6,7 @@ import { assignCommandState, CentralDatabase, CentralError, type Row, type User 
 
 const DAY_MS = 24 * 60 * 60_000;
 const MAX_INTERVAL_DAYS = 365;
+const END_OF_PROTOCOL_TIME = Date.parse('+010000-01-01T00:00:00Z');
 const LEGACY_PLAN_ID = 'legacy';
 const LEGACY_PLAN_NAME = '每日全量审查';
 const EXPIRED_REASON = 'SCHEDULE_WINDOW_EXPIRED';
@@ -43,6 +44,11 @@ function localMinute(formatter: Intl.DateTimeFormat, date: Date): number {
     return Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute));
 }
 
+function scheduleFormatter(timeZone: string): Intl.DateTimeFormat {
+    return new Intl.DateTimeFormat('en-GB', { timeZone, year: 'numeric', month: '2-digit',
+        day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+}
+
 function matchesDay(recurrence: AuditRecurrence, day: number): boolean {
     switch (recurrence.kind) {
         case 'daily': return true;
@@ -54,26 +60,28 @@ function matchesDay(recurrence: AuditRecurrence, day: number): boolean {
     }
 }
 
-function slotAt(formatter: Intl.DateTimeFormat, policy: SchedulePolicy, day: number): Slot | null {
-    if (!matchesDay(policy.recurrence, day)) return null;
-    const date = new Date(day).toISOString().slice(0, 10);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
-    const wallTime = Date.parse(`${date}T${policy.startTime}:00Z`);
+function scheduledMinute(formatter: Intl.DateTimeFormat, date: string, startTime: string): number | null {
+    const wallTime = Date.parse(`${date}T${startTime}:00Z`);
     const candidates = [-1, 0, 1].map(offsetDay => {
         const sample = wallTime + offsetDay * DAY_MS;
         const offset = localMinute(formatter, new Date(sample)) - sample;
         return wallTime - offset;
     }).filter(candidate => localMinute(formatter, new Date(candidate)) === wallTime);
-    if (!candidates.length) return null;
-    const start = Math.min(...candidates);
-    const scheduledAt = new Date(start).toISOString();
-    if (start < Date.parse(policy.effectiveAt)) return null;
-    return { key: `${keyPrefix(policy.planId)}${date}`, scheduledAt, expiresAt: new Date(start + SCHEDULED_AUDIT_WAIT_MS).toISOString() };
+    return candidates.length ? Math.min(...candidates) : null;
+}
+
+function slotAt(formatter: Intl.DateTimeFormat, policy: SchedulePolicy, day: number): Slot | null {
+    if (!matchesDay(policy.recurrence, day)) return null;
+    const date = new Date(day).toISOString().slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+    const start = scheduledMinute(formatter, date, policy.startTime);
+    if (start === null || start < Date.parse(policy.effectiveAt) || start + SCHEDULED_AUDIT_WAIT_MS >= END_OF_PROTOCOL_TIME) return null;
+    return { key: `${keyPrefix(policy.planId)}${date}`, scheduledAt: new Date(start).toISOString(),
+        expiresAt: new Date(start + SCHEDULED_AUDIT_WAIT_MS).toISOString() };
 }
 
 function localCalendar(policy: SchedulePolicy, now: string) {
-    const formatter = new Intl.DateTimeFormat('en-GB', { timeZone: policy.timeZone, year: 'numeric', month: '2-digit',
-        day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+    const formatter = scheduleFormatter(policy.timeZone);
     const today = Math.floor(localMinute(formatter, new Date(now)) / DAY_MS) * DAY_MS;
     return { today, slot: (day: number) => slotAt(formatter, policy, day) };
 }
@@ -93,7 +101,14 @@ function planSettings(input: JsonRecord): AuditPlanSettings {
     let zone: string;
     try { zone = new Intl.DateTimeFormat('en', { timeZone }).resolvedOptions().timeZone; }
     catch { throw new CentralError(422, 'bad_request', '请填写有效的 IANA 时区'); }
-    return { name: name.trim(), enabled, startTime, timeZone: zone, recurrence: readRecurrence(recurrence), note: note.trim() };
+    const rule = readRecurrence(recurrence);
+    if (rule.kind === 'interval' && rule.startDate === '9999-12-31') {
+        const first = scheduledMinute(scheduleFormatter(zone), rule.startDate, startTime);
+        if (first !== null && first + SCHEDULED_AUDIT_WAIT_MS >= END_OF_PROTOCOL_TIME) {
+            throw new CentralError(422, 'bad_request', '计划时刻及等待截止时间须落在四位年份的 UTC 范围内');
+        }
+    }
+    return { name: name.trim(), enabled, startTime, timeZone: zone, recurrence: rule, note: note.trim() };
 }
 
 function readRecurrence(value: unknown): AuditRecurrence {

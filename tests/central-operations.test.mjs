@@ -5,9 +5,10 @@ import path from 'node:path';
 import test from 'node:test';
 import { createGitFixture, runCommand } from './helpers.mjs';
 import { reviewFixture, patchFixture } from './fixtures/contract.mjs';
+import { registerAuditStageTools } from '../packages/dsh-plugin/dist/host/audit-stage-tools.js';
 import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
 
-async function fixture(t) {
+async function fixture(t, auditSessions) {
     const root = await createGitFixture();
     const state = await mkdtemp(path.join(os.tmpdir(), 'central-operations-'));
     const remote = path.join(state, 'remote.git');
@@ -27,7 +28,7 @@ async function fixture(t) {
     const journal = new ManagedJournal(path.join(state, 'journal.sqlite'));
     t.after(async () => { journal.close(); await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }); });
     const { ManagedOperations } = await import('../packages/dsh-plugin/dist/managed/managed-operations.js');
-    const operations = new ManagedOperations({ dataDir: state, journal, workspaces: [{ workspaceId: 'workspace-a', label: '项目 A', root, target, settings: { runner: 'manual', syncBeforeApprove: false } }] });
+    const operations = new ManagedOperations({ dataDir: state, journal, auditSessions, workspaces: [{ workspaceId: 'workspace-a', label: '项目 A', root, target, settings: { runner: 'manual', syncBeforeApprove: false } }] });
     await operations.init();
     t.after(() => operations.stop());
     const project = { projectId: 'project-a', name: '项目 A', nodeId: 'node-a', workspaceId: 'workspace-a', bindingGeneration: 1, projectConfigRevision: 1, vcsType: 'git', target, enabled: true };
@@ -85,4 +86,145 @@ test('仅有指令提交标记不能推断批准成功，原业务结果丢失�
     const result = await operations.recover(command, undefined, project);
     assert.equal(result.outcome.status, 'RECOVERY_REQUIRED');
     assert.equal(result.delivery.state, 'delivered');
+});
+
+function auditCommand(project) {
+    return {
+        commandId: 'audit-desktop', requestHash: 'b'.repeat(64), projectId: project.projectId, nodeId: project.nodeId,
+        bindingGeneration: 1, projectConfigRevision: 1, operation: 'audit',
+        actor: { userId: 'user-a', reviewIdentity: 'tester' }, payload: { targetPath: '.', note: '复核绑定项目' },
+        createdAt: new Date().toISOString(),
+    };
+}
+
+test('桌面托管手动审查使用绑定工作副本的 DSH 会话并自动收尾交付', async t => {
+    const completedTurn = Promise.withResolvers();
+    const calls = [];
+    const auditSessions = {
+        async createAuditSession(input) {
+            calls.push(input);
+            await input.onCreated('desktop-audit');
+            return { sessionId: 'desktop-audit' };
+        },
+        async withAuditSessionIdle(sessionId, requestId, signal, finalize) {
+            assert.equal(sessionId, 'desktop-audit');
+            assert.equal(requestId, calls[0].requestId);
+            await completedTurn.promise;
+            await finalize(signal);
+            return true;
+        },
+    };
+    const { operations, project, journal, root, remote, target } = await fixture(t, auditSessions);
+    const command = auditCommand(project);
+    journal.accept(command);
+    const started = Promise.withResolvers();
+    const logs = [];
+    const running = operations.execute(command, new AbortController().signal, line => {
+        logs.push(line);
+        started.resolve();
+    }, project);
+    await started.promise;
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].requireWorkspace, true);
+    assert.equal(path.resolve(calls[0].cwd).toLowerCase(), path.resolve(root).toLowerCase());
+    assert.match(calls[0].prompt, /复核绑定项目/);
+    assert.equal(journal.recoveryData(command.commandId).sessionId, 'desktop-audit');
+    completedTurn.resolve();
+    const result = await running;
+    assert.equal(result.outcome.status, 'COMMITTED', JSON.stringify(result));
+    assert.equal(result.outcome.sessionId, 'desktop-audit');
+    assert.equal(result.delivery.state, 'delivered');
+    assert.match(logs[0], /desktop-audit/);
+    assert.equal(runCommand('git', ['rev-parse', `refs/heads/${target}`], remote).stdout.trim(), result.delivery.commitRevision);
+    assert.match(runCommand('git', ['log', '-1', '--format=%B'], root).stdout, /Dsh-Command: audit-desktop/);
+});
+
+test('中央桌面节点使用绑定会话访问共享阶段工具', async t => {
+    const created = Promise.withResolvers();
+    const completed = Promise.withResolvers();
+    const sessionId = 'desktop-phased';
+    const capabilities = {
+        auditStageExecutor: async ({ prompt }) => {
+            assert.match(prompt, /固定基线只读视图/);
+            return { leads: [], coverage: ['确认走共享阶段'], limits: [] };
+        },
+        async createAuditSession(input) {
+            assert.match(input.prompt, /仓库审查总调度/);
+            await input.onCreated(sessionId);
+            created.resolve();
+            return { sessionId };
+        },
+        async withAuditSessionIdle(_sessionId, _requestId, signal, finalize) {
+            await completed.promise;
+            return (await finalize(signal)) !== false;
+        },
+    };
+    const { operations, project, journal, root } = await fixture(t, capabilities);
+    const command = auditCommand(project);
+    journal.accept(command);
+    const running = operations.execute(command, new AbortController().signal, () => {}, project);
+    await created.promise;
+    const tools = new Map();
+    t.after(registerAuditStageTools({ register: item => { tools.set(item.name, item); return () => tools.delete(item.name); } },
+        id => operations.auditStageApi(id)));
+    const invoke = (name, args, id = sessionId) => tools.get(name).execute(args, {
+        agent: { session: { id } }, signal: new AbortController().signal,
+    });
+    const scan = { stage: 'scan', runner: 'codex', task: JSON.stringify({ taskScope: ['src'], scenarios: [], questions: [], constraints: [] }) };
+    await assert.rejects(invoke('runAuditStage', scan, 'other-session'), /有效租约/);
+    await invoke('runAuditStage', scan);
+    await invoke('publishAuditArtifacts', { publication: JSON.stringify({ findings: [], coverage: [], requirements: [], history: [] }) });
+    completed.resolve();
+    const result = await running;
+    assert.equal(result.outcome.status, 'COMMITTED', JSON.stringify(result));
+    assert.equal(result.outcome.sessionId, sessionId);
+    assert.equal(result.delivery.state, 'delivered');
+    assert.match(runCommand('git', ['show', 'HEAD:' + result.outcome.reportPath], root).stdout, /确认走共享阶段/);
+});
+
+test('桌面审查取消跟踪保留会话和未决记录，恢复不重新创建会话', async t => {
+    const watching = Promise.withResolvers();
+    let created = 0;
+    const { operations, project, journal, root } = await fixture(t, {
+        async createAuditSession(input) {
+            created++;
+            await input.onCreated('desktop-audit-cancelled');
+            return { sessionId: 'desktop-audit-cancelled' };
+        },
+        withAuditSessionIdle(_sessionId, _requestId, signal) {
+            watching.resolve();
+            return new Promise(resolve => signal.addEventListener('abort', () => resolve(false), { once: true }));
+        },
+    });
+    const command = auditCommand(project);
+    journal.accept(command);
+    const abort = new AbortController();
+    const running = operations.execute(command, abort.signal, () => {}, project);
+    await watching.promise;
+    abort.abort();
+    const result = await running;
+    assert.equal(result.outcome.status, 'RECOVERY_REQUIRED');
+    assert.equal(result.outcome.sessionId, 'desktop-audit-cancelled');
+    assert.equal(result.delivery.state, 'unknown');
+    const draft = path.join(root, '.ai-review', 'unfinished.md');
+    await writeFile(draft, '# 草稿');
+    const blocked = await operations.recover(command, result, project);
+    assert.equal(blocked.outcome.status, 'RECOVERY_REQUIRED');
+    assert.equal(blocked.outcome.sessionId, 'desktop-audit-cancelled');
+    await rm(draft);
+    const recovered = await operations.recover(command, blocked, project);
+    assert.equal(recovered.outcome.status, 'ABORTED');
+    assert.equal(recovered.outcome.sessionId, 'desktop-audit-cancelled');
+    assert.equal(recovered.delivery.state, 'not_required');
+    assert.deepEqual(await operations.recover(command, recovered, project), recovered);
+    assert.equal(created, 1);
+});
+
+test('后台托管节点仍通过进程审查入口处理手动指令', async t => {
+    const { operations, project, journal } = await fixture(t);
+    const command = auditCommand(project);
+    journal.accept(command);
+    const result = await operations.execute(command, new AbortController().signal, () => {}, project);
+    assert.equal(result.outcome.status, 'MANUAL_REQUIRED');
+    assert.equal(result.outcome.sessionId, undefined);
 });

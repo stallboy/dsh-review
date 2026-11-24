@@ -4,12 +4,14 @@ import { createHash } from 'node:crypto';
 import { RETIRED_MANUAL_REVISION, retiredManualRevisionResult, type JsonRecord, type ManagedCommand, type ManagedOperation, type ManagedQuery, type ManagedQueryResult, type ManagedResult, type ProjectRecord, type WorkspaceRegistration } from '@dsh-review/protocol';
 import { ReviewApi } from '../host/api.js';
 import { withSharedView } from '../host/api-context.js';
+import type { ManagedAuditSessions } from './managed-config.js';
 import { AuditArchive } from '../host/audit-archive.js';
 import { ManagedDelivery, decorateManagedVcs } from './managed-delivery.js';
 import { ManagedJournal } from './managed-journal.js';
 import { managedSource } from './managed-source.js';
 import { DEFAULT_SETTINGS } from '../host/settings.js';
 import { scheduledReviewDataClean } from '../host/scheduled-audit-vcs.js';
+import { readSvnAuditUrl } from '../host/audit-stage-artifacts.js';
 import { runProcess } from '../host/shell.js';
 import type { AppSettings } from '../host/types.js';
 
@@ -71,7 +73,12 @@ export class ManagedOperations {
     private stopped = false;
     private readonly issues = new Map<string, string>();
 
-    constructor(private readonly options: { dataDir: string; journal: ManagedJournal; workspaces: ManagedWorkspace[]; resolveCredential?: (reference: string) => Promise<string | undefined> }) {}
+    constructor(private readonly options: { dataDir: string; journal: ManagedJournal; workspaces: ManagedWorkspace[]; resolveCredential?: (reference: string) => Promise<string | undefined>;
+        auditSessions?: ManagedAuditSessions }) {}
+
+    auditStageApi(sessionId: string): ReviewApi | undefined {
+        return [...this.runtimes.values()].find(runtime => runtime.api.hasAuditStageSession(sessionId))?.api;
+    }
 
     async init(projects: ProjectRecord[] = []): Promise<void> {
         await mkdir(this.options.dataDir, { recursive: true, mode: 0o700 });
@@ -150,6 +157,7 @@ export class ManagedOperations {
                 owner: 'managed-node' };
             api = new ReviewApi({ settings, saveSettings: async () => { throw new Error('托管配置仅由节点本地文件管理'); },
                 statePath: path.join(this.options.dataDir, `${config.workspaceId}-runtime.json`), decorateVcs: decorateManagedVcs,
+                ...this.options.auditSessions,
                 ...(this.options.resolveCredential ? { resolveCredential: this.options.resolveCredential } : {}) });
             await api.init();
             if (api.lastConfigErrors.length) throw new Error(api.lastConfigErrors.join('；'));
@@ -209,9 +217,16 @@ export class ManagedOperations {
             return { outcome: { status: 'ABORTED', reason: 'RUNNER_UNAVAILABLE', message: '此工作副本未配置进程型审查 Runner' }, delivery: { state: 'not_required' } };
         }
         this.options.journal.checkpoint(command.commandId, { phase: 'invoking', workspaceId: project.workspaceId });
-        const response = await runtime.api.invoke({ method: 'POST', path: routes[command.operation], body: { ...command.payload, ...command.guard,
+        const inSession = command.operation === 'audit' && !command.scheduledAudit && Boolean(this.options.auditSessions?.createAuditSession);
+        let session: { auditId: string; sessionId: string } | undefined;
+        const response = await runtime.api.invoke({ method: 'POST', path: inSession ? '/audit/session' : routes[command.operation], body: { ...command.payload, ...command.guard,
             ...(command.operation === 'takeover' ? { owner: command.actor.reviewIdentity } : {}) },
         actor: { ...command.actor, commandId: command.commandId, findingWorkflow: command.payload.findingWorkflow === true,
+            ...(inSession ? { managedAuditSession: { signal, onCreated: (auditId: string, sessionId: string) => {
+                session = { auditId, sessionId };
+                this.options.journal.checkpoint(command.commandId, { phase: 'session', workspaceId: project.workspaceId, ...session });
+                emit(`已在 DSH 项目中创建审查会话：${sessionId}`);
+            } } } : {}),
             ...(command.scheduledAudit ? { scheduledAudit: { ...command.scheduledAudit, target: runtime.registration.target, signal } } : {}) } });
         const data = object(response.body);
         let outcome: ManagedResult['outcome'];
@@ -221,11 +236,13 @@ export class ManagedOperations {
                 status: response.status < 500 ? 'ABORTED' : 'RECOVERY_REQUIRED', reason: details.reason ?? error.code ?? 'EXECUTION_EXCEPTION', message: error.message, httpStatus: response.status,
             };
         } else if (typeof data.jobId === 'string') {
-            this.options.journal.checkpoint(command.commandId, { phase: 'job', workspaceId: project.workspaceId, jobId: data.jobId });
+            this.options.journal.checkpoint(command.commandId, { phase: 'job', workspaceId: project.workspaceId, jobId: data.jobId, ...session });
             let offset = 0;
             const cancel = () => runtime.api.jobManager.abort(String(data.jobId));
-            signal.addEventListener('abort', cancel, { once: true });
-            if (signal.aborted) cancel();
+            if (!inSession) {
+                signal.addEventListener('abort', cancel, { once: true });
+                if (signal.aborted) cancel();
+            }
             try {
                 for (;;) {
                     const job = runtime.api.jobManager.get(data.jobId);
@@ -244,15 +261,16 @@ export class ManagedOperations {
             const commitRevision = data.commitRevision ?? object(data.commit).commitRevision;
             outcome = { ...data, status: typeof commitRevision === 'string' ? 'COMMITTED' : 'SUCCEEDED', ...(typeof commitRevision === 'string' ? { commitRevision } : {}) };
         }
+        if (session) outcome = { ...outcome, ...session };
         let commit = typeof outcome.commitRevision === 'string' ? outcome.commitRevision : null;
         if (!commit) commit = await runtime.delivery.findCommandCommit(command.commandId);
-        const unverifiedSchedule = command.scheduledAudit && outcome.status === 'RECOVERY_REQUIRED';
-        const result: ManagedResult = { outcome, delivery: unverifiedSchedule
+        const unverifiedAudit = command.operation === 'audit' && outcome.status === 'RECOVERY_REQUIRED';
+        const result: ManagedResult = { outcome, delivery: unverifiedAudit
             ? { state: 'unknown', ...(commit ? { commitRevision: commit } : {}) }
             : commit ? { state: 'pending', commitRevision: commit } : { state: outcome.status === 'RECOVERY_REQUIRED' ? 'unknown' : 'not_required' } };
-        this.options.journal.checkpoint(command.commandId, { phase: 'business_finished', result });
-        if (commit && !unverifiedSchedule) result.delivery = await runtime.api.withWriteLock(runtime.root, () => runtime.delivery.deliver(commit!));
-        this.options.journal.checkpoint(command.commandId, { phase: 'finished', result });
+        this.options.journal.checkpoint(command.commandId, { phase: 'business_finished', result, ...session });
+        if (commit && !unverifiedAudit) result.delivery = await runtime.api.withWriteLock(runtime.root, () => runtime.delivery.deliver(commit!));
+        this.options.journal.checkpoint(command.commandId, { phase: 'finished', result, ...session });
         return result;
     }
 
@@ -268,12 +286,69 @@ export class ManagedOperations {
             const saved = object(checkpoint?.result) as unknown as ManagedResult;
             const result = saved?.outcome ? structuredClone(saved) : previous?.outcome.status !== 'RECOVERY_REQUIRED' ? structuredClone(previous) : undefined;
             const commit = result?.delivery.commitRevision ?? await runtime.delivery.findCommandCommit(command.commandId);
+            const blocking = runtime.api.auditLifecycle.blockingLeaseFor(runtime.root);
+            const originalLease = blocking?.commandId === command.commandId ? blocking : undefined;
+            const sessionId = result?.outcome.sessionId ?? checkpoint?.sessionId ?? previous?.outcome.sessionId ?? originalLease?.sessionId;
+            const auditId = result?.outcome.auditId ?? checkpoint?.auditId ?? previous?.outcome.auditId ?? originalLease?.auditId;
+            const session = typeof sessionId === 'string' && typeof auditId === 'string' ? { auditId, sessionId } : undefined;
+            const lease = typeof auditId === 'string' ? runtime.api.leaseLookup(auditId) : undefined;
+            const phasedRunner = command.operation === 'audit' && lease?.phased && !lease.sessionId
+                && lease.commandId === command.commandId && lease.root === runtime.root
+                && lease.trigger === (command.scheduledAudit ? 'scheduled' : 'manual') ? lease : undefined;
             if (!commit) {
+                if (checkpoint?.phase === 'finished' && result?.delivery.state === 'not_required') return result;
+                let diagnostic = '没有足够证据证明原执行结果；请保留现场并人工核验，不会重跑业务操作';
+                if (phasedRunner) {
+                    const releaseStarted = checkpoint?.phase === 'runner_releasing';
+                    const current = await runtime.api.runtimeFor(new URL('http://managed/'));
+                    if (!phasedRunner.commitOutcomeUnknown
+                        && (phasedRunner.state === 'releasable' || (phasedRunner.state === 'released' && releaseStarted))
+                        && await current.vcs.getCurrentBase() === phasedRunner.baseRevision
+                        && (current.vcsType !== 'svn' || (phasedRunner.svnUrl && await readSvnAuditUrl(current.root) === phasedRunner.svnUrl
+                            && (await (await managedSource(current.root, current.vcsType)).source.snapshotId())?.endsWith(`@${phasedRunner.baseRevision}`)))
+                        && (await current.vcs.ensureCleanWorkspace()).clean && await scheduledReviewDataClean(current)) {
+                        this.options.journal.checkpoint(command.commandId, { phase: 'runner_releasing', auditId: phasedRunner.auditId });
+                        if (phasedRunner.state !== 'released') await runtime.api.leaseTransition(phasedRunner.auditId, 'released');
+                        const recovered: ManagedResult = {
+                            outcome: { status: 'ABORTED', reason: 'CANCELLED', auditId: phasedRunner.auditId,
+                                baseRevision: phasedRunner.baseRevision, message: '已核验原 Runner 的工作副本安全并释放租约' },
+                            delivery: { state: 'not_required' },
+                        };
+                        this.options.journal.checkpoint(command.commandId, { phase: 'finished', result: recovered });
+                        return recovered;
+                    }
+                    return { outcome: { ...unknownResult(diagnostic).outcome, auditId: phasedRunner.auditId }, delivery: { state: 'unknown' } };
+                }
+                if (session && !command.scheduledAudit && command.operation === 'audit') {
+                    const lease = runtime.api.leaseLookup(session.auditId);
+                    const releaseStarted = checkpoint?.phase === 'session_releasing';
+                    if (lease && lease.root === runtime.root && lease.trigger === 'manual' && lease.sessionId === session.sessionId
+                        && !lease.commitOutcomeUnknown && (lease.state !== 'released' || releaseStarted)) {
+                        const current = await runtime.api.runtimeFor(new URL('http://managed/'));
+                        const revision = await current.vcs.getCurrentBase();
+                        const shared = current.vcsType === 'svn' ? await (await managedSource(current.root, current.vcsType)).source.snapshotId() : null;
+                        if (revision !== lease.baseRevision || (current.vcsType === 'svn' && !shared?.endsWith(`@${revision}`))) {
+                            diagnostic = '工作副本的版本与原审查基线不一致，请核验变更后重试恢复。';
+                        } else if (!(await current.vcs.ensureCleanWorkspace()).clean || !await scheduledReviewDataClean(current)) {
+                            diagnostic = '工作副本仍有业务改动或 .ai-review 草稿。请在执行节点保留并处理这些改动，再重试恢复。';
+                        } else {
+                            this.options.journal.checkpoint(command.commandId, { phase: 'session_releasing', ...session });
+                            if (lease.state !== 'released') await runtime.api.leaseTransition(lease.auditId, 'released');
+                            const recovered: ManagedResult = {
+                                outcome: { status: 'ABORTED', reason: 'CANCELLED', ...session,
+                                    message: '已确认会话停止且工作副本无本轮遗留改动，审查占用已释放' },
+                                delivery: { state: 'not_required' },
+                            };
+                            this.options.journal.checkpoint(command.commandId, { phase: 'finished', result: recovered });
+                            return recovered;
+                        }
+                    }
+                }
                 if (command.scheduledAudit && (result?.outcome.reason === 'SCHEDULE_RECHECK_DIRTY' || result?.outcome.reason === 'SCHEDULE_SCAN_DIRTY')) {
                     const { auditId, baseRevision } = result.outcome;
                     const lease = typeof auditId === 'string' ? runtime.api.leaseLookup(auditId) : undefined;
                     const releaseStarted = checkpoint?.phase === 'recheck_releasing';
-                    if (!lease || lease.root !== runtime.root || lease.trigger !== 'scheduled' || lease.baseRevision !== baseRevision
+                    if (!lease || lease.commitOutcomeUnknown || lease.root !== runtime.root || lease.trigger !== 'scheduled' || lease.baseRevision !== baseRevision
                         || (lease.state !== 'releasable' && !(lease.state === 'released' && releaseStarted))) return result;
                     const current = await runtime.api.runtimeFor(new URL('http://managed/'));
                     if (await current.vcs.getCurrentBase() !== lease.baseRevision || !(await current.vcs.ensureCleanWorkspace()).clean
@@ -300,11 +375,14 @@ export class ManagedOperations {
                     if (clean.clean) return { outcome: { status: 'ABORTED', reason: command.operation === 'approve' ? 'COMMIT_FAILED' : 'CANCELLED',
                         message: '原指令未进入业务执行，已核验工作副本安全；不会重跑业务操作' }, delivery: { state: 'not_required' } };
                 }
-                return unknownResult('没有足够证据证明原执行结果；请保留现场并人工核验，不会重跑业务操作');
+                const unresolved = unknownResult(diagnostic);
+                if (session) unresolved.outcome = { ...unresolved.outcome, ...session };
+                return unresolved;
             }
             const restored = result ?? { outcome: { status: 'RECOVERY_REQUIRED', reason: 'EXECUTION_OUTCOME_UNKNOWN', commitRevision: commit,
                 detail: '已找到原指令的提交，但缺少完整业务结果，不能仅据提交标记推断执行成功' }, delivery: { state: 'pending' as const, commitRevision: commit } };
-            if (command.scheduledAudit && restored.outcome.status === 'RECOVERY_REQUIRED') {
+            if (session) restored.outcome = { ...restored.outcome, ...session };
+            if (command.operation === 'audit' && restored.outcome.status === 'RECOVERY_REQUIRED') {
                 return { ...restored, delivery: { state: 'unknown', commitRevision: commit } };
             }
             restored.delivery = await runtime.delivery.deliver(commit);
@@ -358,7 +436,8 @@ export class ManagedOperations {
         return { queryId: query.queryId, vcsSnapshot: pinned.identity, status: 'ready', data };
     }
 
-    stop(): void {
+    async stop(): Promise<void> {
         this.stopped = true;
+        await Promise.all([...this.runtimes.values()].map(({ api }) => api.closeAudit()));
     }
 }

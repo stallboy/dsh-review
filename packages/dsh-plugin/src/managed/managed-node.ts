@@ -160,8 +160,11 @@ export class ManagedNode {
         if (!this.initialized) {
             await this.options.initializeWorkspaces?.();
             for (const saved of journal.interrupted()) {
+                const checkpoint = journal.recoveryData(saved.command.commandId);
+                const { sessionId, auditId } = checkpoint ?? {};
                 journal.emit(saved.command.commandId, 'recovery_required', undefined, {
-                    outcome: { status: 'RECOVERY_REQUIRED', reason: 'NODE_RESTARTED', detail: '节点中断过执行，必须核验 VCS 与工作副本，不能直接重跑' },
+                    outcome: { status: 'RECOVERY_REQUIRED', reason: 'NODE_RESTARTED', detail: '节点中断过执行，必须核验 VCS 与工作副本，不能直接重跑',
+                        ...(typeof sessionId === 'string' && typeof auditId === 'string' ? { sessionId, auditId } : {}) },
                     delivery: { state: 'unknown' },
                 });
             }

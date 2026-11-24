@@ -28,7 +28,7 @@ function commandFor(id, scheduled = true) {
     };
 }
 
-async function setup(t, runner = 'external', runnerArg = '') {
+async function setup(t, runner = 'external', runnerArg = '', auditSessions, runnerPath = fakeRunner) {
     const root = await createGitFixture();
     const directory = await mkdtemp(path.join(os.tmpdir(), 'central-scheduled-node-'));
     const journal = new ManagedJournal(path.join(directory, 'journal.sqlite'));
@@ -36,13 +36,13 @@ async function setup(t, runner = 'external', runnerArg = '') {
     const remote = path.join(directory, 'remote.git');
     const writer = path.join(directory, 'writer');
     const operations = new ManagedOperations({
-        dataDir: directory, journal,
-        workspaces: [{ workspaceId, label: '项目 A', root, target, settings: { runner, externalCommand: `"${process.execPath}" "${fakeRunner}" ${runnerArg}` } }],
+        dataDir: directory, journal, auditSessions,
+        workspaces: [{ workspaceId, label: '项目 A', root, target, settings: { runner, externalCommand: `"${process.execPath}" "${runnerPath}" ${runnerArg}` } }],
     });
     t.after(async () => {
-        operations.stop();
+        await operations.stop();
         journal.close();
-        await rm(root, { recursive: true, force: true });
+        await rm(root, { recursive: true, force: true, maxRetries: 3 });
         await rm(directory, { recursive: true, force: true });
     });
     runCommand('git', ['init', '--bare', '-q', remote], root);
@@ -53,11 +53,68 @@ async function setup(t, runner = 'external', runnerArg = '') {
     runCommand('git', ['config', 'user.email', 'review@example.com'], root);
     await operations.init();
     const project = { projectId, nodeId, workspaceId, name: '项目 A', bindingGeneration: 1, projectConfigRevision: 1, vcsType: 'git', target, enabled: true };
-    const execute = async command => {
+    const execute = async (command, log = () => {}) => {
         journal.accept(command);
-        return operations.execute(command, new AbortController().signal, () => {}, project);
+        return operations.execute(command, new AbortController().signal, log, project);
     };
     return { root, writer, remote, target, operations, project, journal, directory, execute };
+}
+
+test('中央定时 Runner 使用阶段通道并交付 Host 生成的报告', async t => {
+    const runner = fileURLToPath(new URL('./fixtures/phased-audit-agent.mjs', import.meta.url));
+    const capabilities = { auditStageExecutor: async ({ prompt }) => {
+        assert.match(prompt, /固定基线只读视图/);
+        return { leads: [], coverage: ['中央定时共享阶段'], limits: [] };
+    } };
+    const { execute, root, writer, remote, target } = await setup(t, 'external', 'empty check-scheduled-note', capabilities, runner);
+    const previousId = '20261117-090000-repo';
+    const base = runCommand('git', ['rev-parse', 'HEAD'], writer).stdout.trim();
+    await writeArchive(writer, previousId, base, '.', [{
+        findingId: 'historical-phased', kind: 'confirm', title: '旧档案的问题', summary: '核对旧问题',
+        targetFiles: ['src/math.js'], dependsOn: null, status: 'pending', candidate: null,
+    }]);
+    runCommand('git', ['add', '--', '.ai-review'], writer);
+    runCommand('git', ['commit', '-qm', '补充定时历史档案'], writer);
+    runCommand('git', ['push', '-q', 'origin', target], writer);
+    const command = commandFor('schedule-phased');
+    command.payload.note = '重点核对阶段审查的权限边界';
+    const logs = [];
+    const result = await execute(command, entry => logs.push(entry));
+    assert.equal(result.outcome.status, 'COMMITTED', JSON.stringify(result));
+    assert.ok(logs.some(entry => entry.includes('已验证历史提示范围')), logs.join('\n'));
+    assert.equal(result.delivery.state, 'delivered', JSON.stringify(result));
+    assert.equal(result.outcome.report.path, result.outcome.reportPath);
+    const report = runCommand('git', ['show', 'refs/heads/' + target + ':' + result.outcome.reportPath], remote).stdout;
+    assert.match(report, /trigger: scheduled/);
+    assert.match(report, /中央定时共享阶段/);
+    assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), result.delivery.commitRevision);
+});
+
+for (const scheduled of [false, true]) {
+    test(`中央${scheduled ? '定时' : '后台手动'} Runner 取消后可以核验并释放原租约`, { timeout: 35_000 }, async t => {
+        const runner = fileURLToPath(new URL('./fixtures/phased-audit-agent.mjs', import.meta.url));
+        const capabilities = { auditStageExecutor: async () => { throw new Error('此用例在派发阶段之前取消'); } };
+        const { operations, project, journal, root } = await setup(t, 'external', 'cancel-before-publication', capabilities, runner);
+        const command = commandFor('phased-cancel', scheduled);
+        const controller = new AbortController();
+        journal.accept(command);
+        const result = await operations.execute(command, controller.signal, message => {
+            if (message.includes('Runner 已开始等待取消')) controller.abort();
+        }, project);
+        assert.equal(result.outcome.status, 'RECOVERY_REQUIRED', JSON.stringify(result));
+        assert.equal(result.delivery.state, 'unknown');
+        const scratch = path.join(root, 'src/math.js');
+        const original = await readFile(scratch, 'utf8');
+        await writeFile(scratch, original + '// 临时改动\n');
+        const blocked = await operations.recover(command, result, project);
+        assert.equal(blocked.outcome.status, 'RECOVERY_REQUIRED', JSON.stringify(blocked));
+        await writeFile(scratch, original);
+        const recovered = await operations.recover(command, result, project);
+        assert.equal(recovered.outcome.status, 'ABORTED', JSON.stringify(recovered));
+        assert.equal(recovered.outcome.auditId, result.outcome.auditId);
+        assert.equal(recovered.delivery.state, 'not_required');
+        assert.deepEqual(await operations.recover(command, result, project), recovered);
+    });
 }
 
 async function writeArchive(root, id, base, scope, items = [], candidates = []) {

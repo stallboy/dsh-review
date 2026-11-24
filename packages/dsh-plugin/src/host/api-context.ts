@@ -39,6 +39,10 @@ export interface TrustedActor {
     reviewIdentity: string;
     commandId?: string;
     findingWorkflow?: boolean;
+    managedAuditSession?: {
+        signal: AbortSignal;
+        onCreated(auditId: string, sessionId: string): void;
+    };
     scheduledAudit?: NonNullable<ManagedCommand['scheduledAudit']> & { target: string; signal: AbortSignal };
 }
 
@@ -74,6 +78,7 @@ export function internalRequest(method: string, url: string, body: Record<string
 }
 
 export interface ApiDeps {
+  auditSessionTools?: boolean;
   auditStageExecutor?: import('./audit-stage-runner.js').ExecuteAuditStage;
   auditStageGates?: typeof import('./validator.js').runGateChecks;
   settings: AppSettings;
@@ -86,6 +91,8 @@ export interface ApiDeps {
     title: string;
     prompt: string;
     requestId?: string;
+    requireWorkspace?: boolean;
+    signal?: AbortSignal;
     /** 新会话继承面板所属会话的权限预设与审批策略。 */
     ownerSessionId?: string;
     onCreated?: (sessionId: string) => Promise<void>;

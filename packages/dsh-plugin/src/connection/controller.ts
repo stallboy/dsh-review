@@ -5,7 +5,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { PROTOCOL_VERSION, type ProjectRecord } from '@dsh-review/protocol';
-import { startManagedNode, type ManagedHandle } from '../managed/managed-config.js';
+import { startManagedNode, type ManagedHandle, type ManagedConfiguration } from '../managed/managed-config.js';
 import { ManagedJournal } from '../managed/managed-journal.js';
 import { NodeRegistrationError } from '../managed/managed-node.js';
 import { normalizeCenterUrl, readJson, saveJson, type Candidate, type ConnectionConfig, type ConnectionSecrets } from './config.js';
@@ -19,6 +19,7 @@ interface ControllerOptions {
     directory: string;
     candidates(sessionId?: string): Promise<Candidate[]>;
     resolveCredential?: (reference: string) => Promise<string | undefined>;
+    auditSessions?: ManagedConfiguration['auditSessions'];
     localEntry?: URL;
     beforeConfigure?: () => void;
 }
@@ -389,6 +390,10 @@ export class ConnectionController {
         } : undefined);
     }
 
+    auditStageApi(sessionId: string) {
+        return this.node?.auditStageApi(sessionId);
+    }
+
     private async connectNode(change?: { workspaceId: string; enabled: boolean }): Promise<void> {
         const config = this.config!;
         const credentials = this.secrets.nodes[config.centralId]!;
@@ -405,7 +410,8 @@ export class ConnectionController {
         }
         const active = profile.workspaces.filter(workspace => workspace.enabled);
         this.node = await startManagedNode({ centerUrl: config.centerUrl, ...credentials, pauseAdmission: true,
-            workspaces: profile.workspaces.map(workspace => ({ ...workspace })), boundProjects: state.projects }, path.join(this.options.directory, 'connections', config.centralId),
+            workspaces: profile.workspaces.map(workspace => ({ ...workspace })), boundProjects: state.projects,
+            ...(this.options.auditSessions ? { auditSessions: this.options.auditSessions } : {}) }, path.join(this.options.directory, 'connections', config.centralId),
             this.options.resolveCredential ?? (async () => undefined), error => {
                 if (this.phase === 'starting') return;
                 const failure = this.describe(error, '节点连接异常');
