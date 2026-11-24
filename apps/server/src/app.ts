@@ -149,11 +149,14 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
         auditSchedule: schedules.update(database.getProject(params(req).projectId!), body(req), (req as RequestContext).actor!),
     }));
     app.post('/api/v1/projects/:projectId/audit-plans', async (req, reply) => {
-        const auditPlan = schedules.createPlan(database.getProject(params(req).projectId!), body(req), (req as RequestContext).actor!);
+        const auditPlan = schedules.createPlan(database.getProject(params(req).projectId!), body(req), (req as RequestContext).actor!, req.headers['idempotency-key']);
         return reply.code(201).send({ auditPlan });
     });
     app.put('/api/v1/projects/:projectId/audit-plans/:planId', async req => ({
         auditPlan: schedules.updatePlan(database.getProject(params(req).projectId!), params(req).planId!, body(req), (req as RequestContext).actor!),
+    }));
+    app.patch('/api/v1/projects/:projectId/audit-plans/:planId', async req => ({
+        auditPlan: schedules.setPlanEnabled(database.getProject(params(req).projectId!), params(req).planId!, body(req), (req as RequestContext).actor!),
     }));
     app.delete('/api/v1/projects/:projectId/audit-plans/:planId', async req => {
         schedules.deletePlan(database.getProject(params(req).projectId!), params(req).planId!);
@@ -249,7 +252,9 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
         if (issues) database.setWorkspaceIssues(id, issues);
         return { ...commands.poll(id, workspaces, input.supportsScheduledAuditNotes === true), projects: database.listProjects(id), queries: snapshots.pending(id) };
     });
-    app.post('/node-api/v1/commands/:commandId/ack', async req => ({ command: commands.acknowledge(identify(req), params(req).commandId!) }));
+    app.post('/node-api/v1/commands/:commandId/ack', async req => ({
+        command: commands.acknowledge(identify(req), params(req).commandId!, body(req).supportsScheduledAuditNotes === true),
+    }));
     app.post('/node-api/v1/events', async req => {
         const id = identify(req), input = body(req);
         if (!Array.isArray(input.events) || input.events.length > 100) throw new CentralError(422, 'bad_request', '事件批次无效');

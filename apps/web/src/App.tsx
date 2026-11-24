@@ -3,7 +3,7 @@ import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate, usePa
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import Markdown from 'react-markdown';
 import { entityId, type AuditPlanSettings, type AuditRecurrence, type ReviewCandidate, type ReviewComment } from '@dsh-review/protocol';
-import { ApiError, clearSession, command, deleteAuditPlan, detail, request, saveAuditPlan, setSession, type AuditPlan, type CommandRecord, type NodeRecord, type ProjectDetail, type ProjectView, type QueueItem, type Session } from './api.js';
+import { ApiError, clearSession, command, deleteAuditPlan, detail, request, saveAuditPlan, setAuditPlanEnabled, setSession, type AuditPlan, type CommandRecord, type NodeRecord, type ProjectDetail, type ProjectView, type QueueItem, type Session } from './api.js';
 import { Diff, type Anchor } from './Diff.js';
 import s from './App.module.css';
 
@@ -187,15 +187,17 @@ function settingsForPlan({ name, enabled, startTime, timeZone, recurrence, note 
 
 function AuditPlansPanel({ projectId, plans }: { projectId: string; plans: AuditPlan[] }) {
     const client = useQueryClient();
-    const [editing, setEditing] = useState<{ planId?: string; settings: AuditPlanSettings } | null>(null);
+    const [editing, setEditing] = useState<{ plan?: Pick<AuditPlan, 'planId' | 'version'>; settings: AuditPlanSettings } | null>(null);
     const [status, setStatus] = useState('');
     const mutate = useMutation({
-        mutationFn: async (action: { settings: AuditPlanSettings; planId?: string } | { deleteId: string }) => {
+        mutationFn: async (action: { settings: AuditPlanSettings; plan?: Pick<AuditPlan, 'planId' | 'version'> }
+            | { planId: string; enabled: boolean } | { deleteId: string }) => {
             if ('deleteId' in action) {
                 await deleteAuditPlan(projectId, action.deleteId);
                 return { deleteId: action.deleteId };
             }
-            return saveAuditPlan(projectId, action.settings, action.planId);
+            if ('enabled' in action) return setAuditPlanEnabled(projectId, action.planId, action.enabled);
+            return saveAuditPlan(projectId, action.settings, action.plan);
         },
         onSuccess: async result => {
             const queryKey = ['project', projectId];
@@ -240,9 +242,9 @@ function AuditPlansPanel({ projectId, plans }: { projectId: string; plans: Audit
         {editing && draft && <form className={`${s.form} ${s.scheduleEditor}`} onSubmit={event => {
             event.preventDefault();
             setStatus('');
-            if (!busy) mutate.mutate({ planId: editing.planId, settings: { ...draft, timeZone: draft.timeZone.trim() } });
+            if (!busy) mutate.mutate({ plan: editing.plan, settings: { ...draft, timeZone: draft.timeZone.trim() } });
         }}>
-            <h3>{editing.planId ? '编辑计划' : '新增定时计划'}</h3>
+            <h3>{editing.plan ? '编辑计划' : '新增定时计划'}</h3>
             <fieldset className={s.scheduleEditorFields} disabled={busy}>
                 <div className={s.scheduleFields}>
                     <label>计划名称<input required autoFocus maxLength={80} value={draft.name}
@@ -318,11 +320,11 @@ function AuditPlansPanel({ projectId, plans }: { projectId: string; plans: Audit
                             <button type="button" disabled={actionsDisabled} onClick={() => {
                                 mutate.reset();
                                 setStatus('');
-                                setEditing({ planId: plan.planId, settings: settingsForPlan(plan) });
+                                setEditing({ plan: { planId: plan.planId, version: plan.version }, settings: settingsForPlan(plan) });
                             }}>编辑</button>
                             <button type="button" disabled={actionsDisabled} onClick={() => {
                                 setStatus('');
-                                mutate.mutate({ planId: plan.planId, settings: { ...settingsForPlan(plan), enabled: !plan.enabled } });
+                                mutate.mutate({ planId: plan.planId, enabled: !plan.enabled });
                             }}>{plan.enabled ? '暂停' : '恢复'}</button>
                             <button type="button" disabled={actionsDisabled} onClick={() => {
                                 if (window.confirm(`删除「${plan.name}」？已受理的审查会继续执行。`)) {

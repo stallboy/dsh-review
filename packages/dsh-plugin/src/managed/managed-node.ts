@@ -188,7 +188,7 @@ export class ManagedNode {
         const scheduledAuditWorkspaces = this.active.size || this.background.size || config.pauseAdmission ? [] :
             workspaces.filter(workspace => workspace.supportsScheduledAudit && !unavailable.has(workspace.workspaceId)).map(workspace => workspace.workspaceId);
         const poll = await this.request<PollResult>('/node-api/v1/commands/poll', { instanceId: this.instanceId, scheduledAuditWorkspaces,
-            ...(scheduledAuditWorkspaces.length ? { supportsScheduledAuditNotes: true } : {}),
+            supportsScheduledAuditNotes: true,
             ...(this.capabilities?.workspaceIssues ? { workspaceIssues } : {}) });
         if (this.stopping) return;
         if (this.options.refreshWorkspaceIssues && !this.workspaceCheck) {
@@ -210,7 +210,7 @@ export class ManagedNode {
                 && project.projectConfigRevision === command.projectConfigRevision && workspace.vcsType === project.vcsType && workspace.target === project.target
                 && (!command.scheduledAudit || workspace.supportsScheduledAudit);
             const { command: acknowledged } = await this.request<{ command?: CommandRecord }>(
-                `/node-api/v1/commands/${command.commandId}/ack`, { instanceId: this.instanceId });
+                `/node-api/v1/commands/${command.commandId}/ack`, { instanceId: this.instanceId, ...(command.scheduledAudit && { supportsScheduledAuditNotes: true }) });
             if (acknowledged?.state === 'completed' && acknowledged.result) {
                 journal.settleBeforeExecution(command.commandId, acknowledged.result);
                 continue;

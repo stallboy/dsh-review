@@ -5,6 +5,10 @@ import { digest, stableJson } from './auth.js';
 import { CentralDatabase, CentralError, type Row, type User } from './database.js';
 import { AuditSchedules } from './audit-schedule.js';
 
+function requiresAuditNotes(command: CommandRecord): boolean {
+    return Boolean(command.scheduledAudit && command.payload.note);
+}
+
 export class Commands {
     constructor(private readonly database: CentralDatabase, private readonly schedules: AuditSchedules) {
         database.sql.prepare(`UPDATE commands SET state='completed',result=?,updated_at=?
@@ -93,6 +97,10 @@ export class Commands {
                 if (command.state !== 'queued' && command.state !== 'dispatched') {
                     return command.state === 'accepted' || command.state === 'executing' || !unavailable(command);
                 }
+                if (!supportsScheduledAuditNotes && requiresAuditNotes(command)) {
+                    this.schedules.skipUnsupportedNotes(command.commandId);
+                    return false;
+                }
                 if (supports(command)) return !unavailable(command);
                 const result: ManagedResult = { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '执行节点已不支持新版发现' },
                     delivery: { state: 'not_required' } };
@@ -114,7 +122,7 @@ export class Commands {
             }
             const running = relevant.some(c => c.state === 'accepted' || c.state === 'executing' || c.state === 'recovery_required');
             const dispatchable = relevant.filter(c => !c.scheduledAudit || (scheduledAuditWorkspaces.has(db.getProject(c.projectId).workspaceId)
-                && (supportsScheduledAuditNotes || !c.payload.note)));
+                && (supportsScheduledAuditNotes || !requiresAuditNotes(c))));
             const accepted = dispatchable.filter(c => c.state === 'accepted');
             const waiting = dispatchable.filter(c => c.state === 'queued' || c.state === 'dispatched');
             const next = waiting.find(c => !c.scheduledAudit) ?? waiting[0];
@@ -130,13 +138,22 @@ export class Commands {
         });
     }
 
-    acknowledge(nodeId: string, commandId: string): CommandRecord {
+    acknowledge(nodeId: string, commandId: string, supportsScheduledAuditNotes: boolean): CommandRecord {
         const db = this.database;
         return db.transaction(() => {
             const now = db.now();
             this.schedules.expire(now);
             const command = this.get(commandId);
             this.authorize(nodeId, command, !(command.state === 'completed' && (command.scheduledAudit || command.operation === RETIRED_MANUAL_REVISION)));
+            if (!supportsScheduledAuditNotes && requiresAuditNotes(command)) {
+                if (command.state === 'accepted') {
+                    throw new CentralError(409, 'audit_notes_unsupported', '此任务已受理，请使用支持定时审查要求的节点继续处理');
+                }
+                if (command.state === 'queued' || command.state === 'dispatched') {
+                    this.schedules.skipUnsupportedNotes(commandId);
+                    return this.get(commandId);
+                }
+            }
             if (command.state === 'queued' || command.state === 'dispatched') {
                 if (!db.getNode(nodeId).compatible) throw new CentralError(409, 'protocol_incompatible', '节点协议不兼容，不能受理写指令');
                 const issues = db.workspaceIssues(nodeId);

@@ -47,10 +47,15 @@ export class CentralDatabase {
                 last_event INTEGER NOT NULL DEFAULT 0, logs_total INTEGER NOT NULL DEFAULT 0,
                 recovery_requested INTEGER NOT NULL DEFAULT 0, UNIQUE(project_id,idempotency_key));
             CREATE UNIQUE INDEX IF NOT EXISTS one_project_writer ON commands(project_id) WHERE state!='completed';
+            CREATE TABLE IF NOT EXISTS audit_schedules (project_id TEXT PRIMARY KEY REFERENCES projects,
+                enabled INTEGER NOT NULL, start_time TEXT NOT NULL, time_zone TEXT NOT NULL,
+                effective_at TEXT NOT NULL, review_identity TEXT NOT NULL, last_missed_at TEXT);
             CREATE TABLE IF NOT EXISTS audit_plans (project_id TEXT NOT NULL REFERENCES projects, plan_id TEXT NOT NULL,
                 name TEXT NOT NULL, enabled INTEGER NOT NULL, start_time TEXT NOT NULL, time_zone TEXT NOT NULL,
                 recurrence TEXT NOT NULL, note TEXT NOT NULL, effective_at TEXT NOT NULL,
-                review_identity TEXT NOT NULL, last_missed_at TEXT, PRIMARY KEY (project_id,plan_id));
+                review_identity TEXT NOT NULL, last_missed_at TEXT, version INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (project_id,plan_id));
+            CREATE TABLE IF NOT EXISTS audit_plan_creations (project_id TEXT NOT NULL REFERENCES projects,
+                request_key TEXT NOT NULL, request_hash TEXT NOT NULL, plan_id TEXT NOT NULL, PRIMARY KEY (project_id,request_key));
             CREATE TABLE IF NOT EXISTS events (command_id TEXT NOT NULL REFERENCES commands, sequence INTEGER NOT NULL,
                 payload TEXT NOT NULL, PRIMARY KEY(command_id,sequence));
             CREATE TABLE IF NOT EXISTS logs (command_id TEXT NOT NULL REFERENCES commands, offset INTEGER NOT NULL,
@@ -78,17 +83,40 @@ export class CentralDatabase {
             this.sql.exec('ALTER TABLE projects ADD COLUMN execution_config_hash TEXT');
         }
         this.transaction(() => {
-            if (!this.sql.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='audit_schedules'").get()) return;
-            this.sql.exec(`INSERT INTO audit_plans
-                SELECT project_id, 'legacy', '每日全量审查', enabled, start_time, time_zone, '{"kind":"daily"}', '',
-                    effective_at, review_identity, last_missed_at FROM audit_schedules;
-                DROP TABLE audit_schedules;`);
+            if (!this.sql.prepare('PRAGMA table_info(audit_plans)').all().some(column => column.name === 'version')) {
+                this.sql.exec('ALTER TABLE audit_plans ADD COLUMN version INTEGER NOT NULL DEFAULT 1');
+            }
+            this.sql.exec(`INSERT INTO audit_plans (project_id,plan_id,name,enabled,start_time,time_zone,recurrence,note,
+                effective_at,review_identity,last_missed_at)
+                SELECT project_id,'legacy','每日全量审查',enabled,start_time,time_zone,'{"kind":"daily"}','',
+                    effective_at,review_identity,last_missed_at FROM audit_schedules WHERE 1
+                ON CONFLICT(project_id,plan_id) DO UPDATE SET
+                    enabled=CASE WHEN excluded.enabled=1 OR (json_extract(audit_plans.recurrence,'$.kind')='daily' AND audit_plans.note='')
+                        THEN excluded.enabled ELSE audit_plans.enabled END,
+                    start_time=excluded.start_time,time_zone=excluded.time_zone,effective_at=excluded.effective_at,
+                    review_identity=excluded.review_identity,last_missed_at=excluded.last_missed_at,version=audit_plans.version+1
+                WHERE excluded.enabled!=(audit_plans.enabled AND json_extract(audit_plans.recurrence,'$.kind')='daily' AND audit_plans.note='')
+                    OR excluded.start_time!=audit_plans.start_time OR excluded.time_zone!=audit_plans.time_zone
+                    OR excluded.effective_at!=audit_plans.effective_at OR excluded.review_identity!=audit_plans.review_identity
+                    OR excluded.last_missed_at IS NOT audit_plans.last_missed_at;`);
+            for (const row of this.sql.prepare("SELECT project_id FROM audit_plans WHERE plan_id='legacy'").all()) {
+                this.syncLegacyAuditSchedule(String(row.project_id));
+            }
         });
         this.sql.prepare("INSERT OR IGNORE INTO metadata(key,value) VALUES ('central_id',?)").run(randomUUID());
         this.centralId = (this.sql.prepare("SELECT value FROM metadata WHERE key='central_id'").get() as Row).value;
     }
 
     now(): string { return this.clock().toISOString(); }
+
+    syncLegacyAuditSchedule(projectId: string): void {
+        // 旧中央只理解每日全仓计划，扩展计划回退期间须保持停用。
+        this.sql.prepare(`INSERT INTO audit_schedules (project_id,enabled,start_time,time_zone,effective_at,review_identity,last_missed_at)
+            SELECT project_id,(enabled AND json_extract(recurrence,'$.kind')='daily' AND note=''),start_time,time_zone,
+                effective_at,review_identity,last_missed_at FROM audit_plans WHERE plan_id='legacy' AND project_id=?
+            ON CONFLICT(project_id) DO UPDATE SET enabled=excluded.enabled,start_time=excluded.start_time,time_zone=excluded.time_zone,
+                effective_at=excluded.effective_at,review_identity=excluded.review_identity,last_missed_at=excluded.last_missed_at`).run(projectId);
+    }
 
     transaction<T>(task: () => T): T {
         this.sql.exec('BEGIN IMMEDIATE');

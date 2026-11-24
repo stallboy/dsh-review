@@ -1441,12 +1441,13 @@ projectId、nodeId、workspaceId 必须明确区分。节点本地配置 workspa
 
 中央按项目持久化多条独立审查计划，项目无计划时不调度。每条包含名称、启用状态、开始时间（`HH:mm`）、IANA 时区、执行频率及可选审查要求。执行频率可以是每天 `{kind:"daily"}`、每周指定日期 `{kind:"weekly", weekdays:[1,6,7]}`（1 为周一，7 为周日），或每隔 N 个本地自然日 `{kind:"interval", days:3, startDate:"2026-11-23"}`（间隔 2 至 365 天，起始日计为第一次）。时间计算由中央完成，项目详情的 `auditPlans` 给出各条计划的设置、最近一轮状态和原因、下次计划时刻。
 
-`POST /api/v1/projects/:projectId/audit-plans` 新建计划，`PUT /api/v1/projects/:projectId/audit-plans/:planId` 更新计划。两者接收 `{name, enabled, startTime, timeZone, recurrence, note}` 并返回 `{auditPlan}`。同路径 `DELETE` 删除指定计划并返回 `{deleted:true}`。原项目级每日计划迁移为独立计划，保留执行记录和幂等键；旧 `PUT /api/v1/projects/:projectId/audit-schedule` 和详情的 `auditSchedule` 继续访问这条兼容计划，旧本地间隔配置不参与调度。计划从生效后的适用时刻开始。
+`POST /api/v1/projects/:projectId/audit-plans` 新建计划，接收 `{name, enabled, startTime, timeZone, recurrence, note}`。同一项目以相同 `Idempotency-Key`、登录身份及配置重试，返回原计划；复用键提交其他设置时返回 409，原计划已删除时返回 410。`PUT /api/v1/projects/:projectId/audit-plans/:planId` 接收完整设置和 `expectedVersion`，版本冲突返回 409。同路径 `PATCH` 只接收 `{enabled}`，启停时保留服务端当前的其他设置。新建、编辑和启停返回带 `version` 的 `{auditPlan}`。`DELETE` 删除指定计划并返回 `{deleted:true}`。
 
+原项目级每日计划迁移为独立计划，保留执行记录、幂等键和旧中央可读取的每日配置。旧 `PUT /api/v1/projects/:projectId/audit-schedule` 和详情的 `auditSchedule` 继续访问这条兼容计划。切回旧中央修改兼容配置后，重新升级时吸收这些修改并保留其他计划。使用扩展频率或审查要求的兼容计划在旧中央默认停用。旧本地间隔配置不参与调度。计划从生效后的适用时刻开始。
 
 从计划时刻起等待最多 30 分钟，手动任务优先于尚未受理的定时任务。中央在兼容执行节点轮询且能受理时派发，节点声明可运行的工作副本。到截止时尚未受理的指令结束并记为跳过；已受理的任务沿用取消、执行超时、收尾和交付规则。更改计划的执行设置、暂停或删除时，仅撤回该计划尚未受理的定时任务。多条计划有重叠的执行窗口时，沿用同一工作副本的串行受理及各轮独立截止时间。窗口跨午夜时使用开始的本地日期作为归属；夏令时重复时刻采用首次，不存在的本地时刻当日跳过。
 
-定时审查沿用中央任务占用，使用项目、计划与该计划的本地日期生成唯一幂等键，兼容计划保留原项目和日期键。计划的审查要求随既有审查指令的 `note` 参数传给执行节点，用于全仓审查阶段的补充关注点。带审查要求的计划只向在轮询中声明 `supportsScheduledAuditNotes: true` 的执行节点派发，旧节点仍可执行没有补充要求的计划。中央使用仅限定时 `audit` 的系统身份构造 `scheduledAudit: {scheduledAt, expiresAt}` 信封。Owner 以共享快照的 `reviewers.yml` 解析，配置时的受信审核身份兜底。用户写指令不得供应定时信封。
+定时审查沿用中央任务占用，使用项目、计划与该计划的本地日期生成唯一幂等键，兼容计划保留原项目和日期键。计划的审查要求随既有审查指令的 `note` 参数传给执行节点，用于全仓审查阶段的补充关注点。带审查要求的计划在派发和受理时均要求执行节点在对应请求中声明 `supportsScheduledAuditNotes: true`。节点失去该能力时跳过已派发但尚未受理的带要求任务，释放任务占用。已经受理的指令保留其状态，重放受理时仍校验能力。旧节点仍可执行没有补充要求的计划。中央使用仅限定时 `audit` 的系统身份构造 `scheduledAudit: {scheduledAt, expiresAt}` 信封。Owner 以共享快照的 `reviewers.yml` 解析，配置时的受信审核身份兜底。用户写指令不得供应定时信封。
 
 节点必须在工作副本锁内预检完整检出、干净的业务工作区和 `.ai-review/`、有效基线，并在同步前持久化执行租约。同步绑定目标后固定共享快照。首先只读复查上一份已提交全仓档案的已合入候选和有效的未闭合 finding，其后全量审查。同一轮的两阶段共用基线和 1 小时的 Agent 执行预算。没有历史输入时直接全量审查。有明确证据才可产生原 `finding_id` 的新观察，指定相关文件的 finding 须在其相关文件中核对证据。已解决记录为 `resolved`，未核实保留此前投影。收尾写入一份 `trigger: scheduled` 的档案，候选继续通过人工审批。复查阶段出现工作区改动、全量阶段越界修改已有评审文件，或同步、提交、远端交付存在不确定性时，保留现场进入恢复流程。
 
