@@ -314,9 +314,9 @@ export class CentralDatabase {
     }
 
     pendingNodeCommandDetails(nodeId: string): PendingCommandSummary[] {
-        const rows = this.sql.prepare(`SELECT command_id, project_id, state, json_extract(envelope,'$.operation') AS operation,
+        const rows = this.sql.prepare(`SELECT command_id, project_id, active_state AS state, json_extract(envelope,'$.operation') AS operation,
             COALESCE(json_extract(result,'$.outcome.detail'),json_extract(result,'$.outcome.message'),json_extract(result,'$.delivery.reason')) AS detail
-            FROM commands WHERE node_id=? AND state!='completed' ORDER BY updated_at DESC, command_id LIMIT 30`).all(nodeId);
+            FROM commands WHERE node_id=? AND active_state!='completed' ORDER BY updated_at DESC, command_id LIMIT 30`).all(nodeId);
         return rows.map(row => ({ commandId: String(row.command_id), projectId: String(row.project_id),
             operation: String(row.operation), state: row.state as PendingCommandSummary['state'],
             ...(typeof row.detail === 'string' ? { detail: row.detail.slice(0, 600) } : {}) }));

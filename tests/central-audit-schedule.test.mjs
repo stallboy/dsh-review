@@ -122,6 +122,10 @@ for (const phase of ['dispatched', 'accepted']) {
         if (phase === 'accepted') {
             assert.equal((await ackResponse(original.commandId, node, true)).json().command.state, 'accepted');
         }
+        const status = await app.inject({ method: 'POST', url: '/node-api/v1/status', headers: node.headers, payload: {} });
+        assert.equal(status.statusCode, 200, status.body);
+        assert.equal(status.json().pending, 1);
+        assert.deepEqual(status.json().pendingCommands, [{ commandId: original.commandId, projectId: original.projectId, operation: 'audit', state: phase }]);
         await app.close();
 
         const previous = new DatabaseSync(path.join(dataDir, 'central.sqlite'));
