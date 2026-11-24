@@ -55,23 +55,59 @@ export interface AuditExecution {
     schema: Schema;
     timeoutMs: number;
     signal: AbortSignal;
+    logProcessExit?: (line: string) => void;
 }
 
 export type ExecuteAuditStage = (input: AuditExecution) => Promise<unknown>;
 
 export class AuditStopUnknown extends Error {}
 
+export class AuditExecutorAuthenticationError extends Error {
+    constructor(executor: AuditExecutor, code?: number | null) {
+        super(executor + ' 执行器报告认证失败' + (code == null ? '' : '（退出码 ' + String(code) + '）'));
+    }
+}
+
 const MAX_OUTPUT = 1024 * 1024;
 
-export function auditCliDiagnostic(output: string): string {
+const AUTHENTICATION_FAILURE = /unauthorized|not logged in|invalid api key|authentication failed/i;
+
+const AUTHENTICATION_MESSAGE = /^(?:Error:\s*)?(?:Not logged in\b|Unauthorized\b|Invalid API key\b|Authentication failed\b|(?:unexpected status |API Error:\s*)?401\b)/i;
+
+function diagnosticObject(text: string): Record<string, unknown> | undefined {
+    try { return auditObject(JSON.parse(text)); } catch { return undefined; }
+}
+
+function isAuthenticationMessage(message: unknown): boolean {
+    return typeof message === 'string' && AUTHENTICATION_MESSAGE.test(message.trim());
+}
+
+export function isAuditAuthenticationFailure(executor: AuditExecutor, stdout: string, stderr: string): boolean {
+    if (stderr.split(/\r?\n/).some(isAuthenticationMessage)) return true;
+    if (executor === 'claude-code') {
+        const result = diagnosticObject(stdout);
+        return result?.['type'] === 'result' && result['is_error'] === true
+            && (result['api_error_status'] === 401 || isAuthenticationMessage(result['result']));
+    }
+    return stdout.split(/\r?\n/).some(line => {
+        const event = diagnosticObject(line);
+        if (event?.['type'] === 'error') return isAuthenticationMessage(event['message']);
+        if (event?.['type'] === 'turn.failed' && typeof event['error'] === 'object' && event['error'] !== null) {
+            return isAuthenticationMessage((event['error'] as Record<string, unknown>)['message']);
+        }
+        return false;
+    });
+}
+
+export function auditCliDiagnostic(output: string, includeAuthentication = true): string {
     if (/sandbox|沙箱/i.test(output) && /denied|failed|requires|blocked|error|拒绝|失败|阻止/i.test(output)) return '执行器报告沙箱错误';
     if (/EACCES|EPERM|permission denied|access is denied|operation not permitted|权限不足|拒绝访问/i.test(output)) return '执行器报告权限不足';
     if (/ENOENT|command not found|找不到命令/i.test(output)) return '找不到执行命令或所需文件';
-    if (/unauthorized|not logged in|invalid api key|authentication failed/i.test(output)) return '执行器报告认证失败';
+    if (includeAuthentication && AUTHENTICATION_FAILURE.test(output)) return '执行器报告认证失败';
     return '';
 }
 
-export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, prompt, schema, timeoutMs, signal }) => {
+export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, prompt, schema, timeoutMs, signal, logProcessExit }) => {
     const resultPath = path.join(location, 'result.json');
     const schemaPath = path.join(location, 'schema.json');
     const schemaText = JSON.stringify(schema);
@@ -96,10 +132,22 @@ export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, p
         cwd: location, timeoutMs, signal, input: prompt, killTreeOnExit: true, maxBytes: MAX_OUTPUT,
         env: { CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1' },
     });
+    logProcessExit?.([
+        '执行器进程结束', '退出码=' + String(result.code),
+        ...(result.signal ? ['信号=' + result.signal] : []),
+        ...(result.stdinError ? ['输入管道=' + result.stdinError] : []),
+        ...(result.error ? ['启动失败'] : []),
+        ...(result.timedOut ? ['超时'] : []),
+        ...(result.aborted ? ['已取消'] : []),
+    ].join(' '));
     if (result.timedOut || result.aborted) throw new AuditStopUnknown(executor + (result.timedOut ? ' 执行器超时' : ' 执行器已取消') + '，需确认子进程已经停止');
-    const diagnostic = auditCliDiagnostic([result.error, result.stderr, result.stdout].filter(Boolean).join('\n'));
+    const diagnostic = auditCliDiagnostic([result.error, result.stderr, result.stdout].filter(Boolean).join('\n'), false);
     if (result.error) throw new Error(executor + ' 无法启动' + (diagnostic ? '：' + diagnostic : ''));
-    if (result.code !== 0) throw new Error(executor + ' 阶段执行失败（退出码 ' + String(result.code) + '）' + (diagnostic ? '：' + diagnostic : ''));
+    if (result.code !== 0) {
+        if (isAuditAuthenticationFailure(executor, result.stdout, result.stderr)) throw new AuditExecutorAuthenticationError(executor, result.code);
+        throw new Error(executor + ' 阶段执行失败（退出码 ' + String(result.code) + '）' + (diagnostic ? '：' + diagnostic : ''));
+    }
+    if (result.stdinError) throw new Error(executor + ' 执行器未接收完整提示词（' + result.stdinError + '）');
     if (Buffer.byteLength(result.stdout) >= MAX_OUTPUT) throw new Error(executor + ' 阶段输出过长');
     let value: unknown;
     if (codex) {

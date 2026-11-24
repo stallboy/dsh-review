@@ -256,6 +256,9 @@ async function runDshAgent(options: AgentRunOptions, timeoutMs: number): Promise
   if (result.code !== 0) {
     return { ok: false, errorMessage: `DSH 退出码 ${String(result.code ?? 'null')}`, outputTail: tail, code: result.code, timedOut: false };
   }
+  if (result.stdinError) {
+    return { ok: false, errorMessage: `DSH 未接收完整提示词（${result.stdinError}）`, outputTail: tail, code: 0, timedOut: false };
+  }
   return { ok: true, outputTail: tail, code: 0, timedOut: false };
 }
 
@@ -292,6 +295,9 @@ async function runExternalAgent(options: AgentRunOptions, timeoutMs: number): Pr
   }
   if (result.code !== 0) {
     return { ok: false, errorMessage: `外部命令退出码 ${String(result.code ?? 'null')}`, outputTail: tail, code: result.code, timedOut: false };
+  }
+  if (result.stdinError) {
+    return { ok: false, errorMessage: `外部命令未接收完整提示词（${result.stdinError}）`, outputTail: tail, code: 0, timedOut: false };
   }
   return { ok: true, outputTail: tail, code: 0, timedOut: false };
 }

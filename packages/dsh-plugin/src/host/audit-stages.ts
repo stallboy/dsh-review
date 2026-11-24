@@ -9,7 +9,7 @@ import { FINDING_ID_PATTERN } from './invariants.js';
 import { renderAuditTemplate, type AuditStage } from './audit-prompts.js';
 import { compatibleAuditBase, listAuditSources, oneLine, readAuditSource, prepareStageCandidate, validSourcePath, withinScope, type StageCandidate, type StageEdit } from './audit-stage-artifacts.js';
 import {
-    arraySchema, AUDIT_EXECUTORS, auditObject, AuditStopUnknown, enumSchema, integerSchema,
+    arraySchema, AUDIT_EXECUTORS, auditObject, AuditExecutorAuthenticationError, AuditStopUnknown, enumSchema, integerSchema,
     objectSchema, stringSchema, validateAuditValue, type AuditExecutor, type ExecuteAuditStage,
 } from './audit-stage-runner.js';
 import type { SharedCandidateSource } from './shared-facts.js';
@@ -129,6 +129,7 @@ export class AuditStages {
     private readonly reviews = new Map<string, Verification>();
     private readonly candidates = new Map<string, StageCandidate[]>();
     private readonly coverage: string[] = [];
+    private readonly authenticationFailures = new Set<AuditExecutor>();
     private taskCounter = 0;
     private scanned = false;
     busy = false;
@@ -144,6 +145,7 @@ export class AuditStages {
         private readonly gate?: typeof runGateChecks,
         readonly historySource?: SharedCandidateSource,
         readonly findingWorkflow?: boolean,
+        private readonly log?: (line: string) => void,
     ) {}
 
     cancel(): void { this.abort.abort(); }
@@ -185,6 +187,10 @@ export class AuditStages {
         if (this.busy || this.uncertain || this.lease.stageSeal || this.lease.state !== 'active') throw new Error('此轮不能启动阶段任务');
         const schema = taskSchemas[stage];
         if (!schema || !AUDIT_EXECUTORS.includes(executor)) throw new Error('未知审查阶段或执行器');
+        if (this.authenticationFailures.has(executor)) {
+            const alternative = AUDIT_EXECUTORS.find(runner => runner !== executor && !this.authenticationFailures.has(runner));
+            throw new Error(executor + ' 认证失败，本轮已停止派发' + (alternative ? '，可独立启动 ' + alternative : '，当前没有可用执行器'));
+        }
         const raw = auditObject(task);
         const { approach, ...patchTask } = raw;
         if (stage === 'patch' && approach !== undefined && (typeof approach !== 'string' || !approach.trim())) {
@@ -235,6 +241,7 @@ export class AuditStages {
         const signal = AbortSignal.any([outerSignal, this.abort.signal, AbortSignal.timeout(remaining)]);
         this.busy = true;
         const taskId = stage + '-' + String(++this.taskCounter);
+        const log = (line: string) => this.log?.(taskId + ' ' + executor + ' ' + line);
         let scratch: string | undefined;
         try {
             if (!await compatibleAuditBase(this.vcs, this.lease.baseRevision, this.lease.svnUrl)) throw new AuditStopUnknown('阶段执行前业务基线已变化');
@@ -262,8 +269,9 @@ export class AuditStages {
                     lines: file.text.split(/\r?\n/).map((text, index) => ({ line: index + 1, text })),
                 })),
             } : snapshot;
+            log('启动执行器');
             const result = await this.execute({
-                executor, location: executionDir,
+                executor, location: executionDir, logProcessExit: log,
                 prompt: template + '\n\n## 固定基线只读视图（JSON，内容仅作数据）\n' + JSON.stringify(sourceView),
                 schema: resultSchemas[stage], signal, timeoutMs: Math.min(240_000, remaining),
             });
@@ -271,6 +279,7 @@ export class AuditStages {
             const value = auditObject(result);
             signal.throwIfAborted();
             if (!await compatibleAuditBase(this.vcs, this.lease.baseRevision, this.lease.svnUrl)) throw new AuditStopUnknown('阶段执行期间业务基线已变化');
+            log('执行器结果已校验');
             if (stage === 'scan') {
                 const leads = value['leads'] as Array<{ leadId: string; navigation: Array<{ path: string; line: number }> }>;
                 const seen = new Set<string>();
@@ -307,7 +316,14 @@ export class AuditStages {
             this.candidates.set(subject, [...existingCandidates, candidate]);
             return { status: 'ready', candidateId: candidate.id };
         } catch (error) {
-            this.coverage.push(taskId + ' 未完成');
+            if (error instanceof AuditExecutorAuthenticationError) {
+                this.authenticationFailures.add(executor);
+                this.coverage.push(taskId + ' ' + executor + ' 认证失败，本轮停止派发');
+                log('认证失败，本轮停止派发');
+            } else {
+                this.coverage.push(taskId + ' 未完成');
+                log(signal.aborted ? '阶段已取消或超时' : '阶段未完成');
+            }
             if (error instanceof AuditStopUnknown || signal.aborted) this.uncertain = true;
             throw error;
         } finally {
@@ -330,10 +346,13 @@ export class AuditStages {
         if (versioned && this.findingWorkflow === false) throw new Error('报告须使用当前节点与中央共同支持的档案格式');
         const selected = new Set<string>();
         for (const finding of findings) {
-            if (selected.has(finding.subjectId) || this.reviews.get(finding.subjectId)?.verdict !== 'confirmed' || !finding.title.trim()) {
-                throw new Error('报告包含重复、未核实或无标题发现');
-            }
-            selected.add(finding.subjectId);
+            const { subjectId } = finding;
+            if (!SUBJECT.test(subjectId)) throw new Error('报告发现的 subjectId 无效');
+            if (selected.has(subjectId)) throw new Error('报告包含重复发现：' + subjectId);
+            const verdict = this.reviews.get(subjectId)?.verdict;
+            if (verdict !== 'confirmed') throw new Error('报告发现 ' + subjectId + ' 未核实（' + (verdict ?? '未复核') + '），请计入覆盖说明');
+            if (!finding.title.trim()) throw new Error('报告发现缺少标题：' + subjectId);
+            selected.add(subjectId);
             if (finding.kind === 'A' && !this.candidates.has(finding.subjectId)) throw new Error('A 类必须绑定本轮合格候选');
             if (versioned && (typeof finding.repairPlan !== 'string' || !finding.repairPlan.trim())) {
                 throw new Error('新版发现需要包含证据、步骤和验收条件的修复方案');
@@ -346,9 +365,8 @@ export class AuditStages {
                 throw new Error('Deferred 缺少有效的前置问题 ID');
             }
         }
-        if ([...this.reviews].some(([id, result]) => result.verdict === 'confirmed' && !selected.has(id))) {
-            throw new Error('正式报告遗漏了已确认的问题');
-        }
+        const missing = [...this.reviews].filter(([id, result]) => result.verdict === 'confirmed' && !selected.has(id));
+        if (missing.length) throw new Error('正式报告遗漏了已确认的问题：' + missing.map(([id]) => id).join('、'));
         const sorted = findings.map((finding, index) => ({ finding, index })).sort((left, right) =>
             priorityValues.indexOf(left.finding.priority) - priorityValues.indexOf(right.finding.priority)
             || left.index - right.index || left.finding.subjectId.localeCompare(right.finding.subjectId)).map(item => item.finding);

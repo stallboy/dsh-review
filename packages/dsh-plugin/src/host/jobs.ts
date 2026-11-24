@@ -22,16 +22,7 @@ export class JobManager {
     };
     this.jobs.set(id, record);
     this.prune();
-    const log = (line: string): void => {
-      record.log.push(line);
-      record.logStartOffset ??= 0;
-      if (record.log.length > MAX_LOG_LINES) {
-        const dropped = record.log.length - MAX_LOG_LINES;
-        record.log.splice(0, dropped);
-        // G36：截断只移动日志窗口，绝对偏移保持递增以免轮询漏行。
-        record.logStartOffset += dropped;
-      }
-    };
+    const log = (line: string): void => this.appendLog(id, line);
     void (async () => {
       try {
         record.result = await task(log, id, controller.signal);
@@ -46,6 +37,19 @@ export class JobManager {
       }
     })();
     return record;
+  }
+
+  appendLog(id: string, line: string): void {
+    const record = this.jobs.get(id);
+    if (!record) return;
+    record.log.push(line);
+    record.logStartOffset ??= 0;
+    if (record.log.length > MAX_LOG_LINES) {
+      const dropped = record.log.length - MAX_LOG_LINES;
+      record.log.splice(0, dropped);
+      // G36：截断只移动日志窗口，绝对偏移保持递增以免轮询漏行。
+      record.logStartOffset += dropped;
+    }
   }
 
   abort(id: string): boolean {

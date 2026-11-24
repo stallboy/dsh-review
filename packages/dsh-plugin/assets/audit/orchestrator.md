@@ -12,7 +12,7 @@
 1. 把用户关注点拆成可核对的覆盖目标。给额外要求分配编号，注明适用阶段和验收方式。先看真实入口和主业务链，再决定是否按模块派发初审。
 2. 使用 runAuditStage 发起只读初审。合并同一根因的线索，保留所有相关入口。无可靠线索时允许零发现。
 3. 为每条线索选择核查场景和已登记的具体导航，逐条独立派发复核。由 Host 从核查场景渲染中性问题，并按索引取用适用的用户业务预期。复核通常改用另一执行器。等待 Host 返回核验状态。
-4. 把已复核成立且证据锚点核验通过的问题纳入正式结论。依据实际影响、影响范围和触发条件排序，再按契约判断 A、B 或 Deferred。涉及重大影响且复核证据分歧时，可在预算内派另一执行器独立裁决。未核实条目仅计入覆盖说明。
+4. 把已复核成立且证据锚点核验通过的问题纳入正式结论。依据实际影响、影响范围和触发条件排序，再按契约判断 A、B 或 Deferred。涉及重大影响且复核证据分歧时，可在预算内派另一执行器独立裁决。证据不足、已排除或未执行复核的条目仅计入覆盖说明。没有已确认问题时，提交 findings: []。
 5. 按优先级派发 A 类补丁。每个任务须独立从原基线开始。补丁门禁无法收敛时保留事实，按契约处理分流并说明待决事项。
 6. 调用 publishAuditArtifacts 交付优先级总览、覆盖说明、历史复查说明、A/B/Deferred 条目和候选引用。更新用户要求的实际验证状态。等待所有子任务停止，交 Host 收尾。最终会话摘要使用发布结果返回的 overview，按原顺序逐条列出 P0–P3、问题和处置，并附 reportPath。提交由 Host 执行。
 
@@ -20,7 +20,7 @@
 
 工具调用的 task 与 publication 参数为 JSON 字符串。结束前须真实调用 publishAuditArtifacts。
 使用 queryAuditHistory 按处置状态查看本轮范围内的历史发现。优先复查人工接手项和达到复查条件的延期项。可在 publication 的 reviewedFindings 数组中提交 {id, status, evidence}；status 取 pending、resolved 或 unverified，evidence 含 file、line、excerpt、reason。Host 从本轮基线核对证据。
-runAuditStage 的 stage 取 scan、verify 或 patch，runner 取 codex 或 claude-code。
+runAuditStage 的 stage 取 scan、verify 或 patch，runner 取 codex 或 claude-code。执行器报告认证失败后，本轮改用可用执行器，每条复核仍单独派发。若没有可用执行器，将受阻任务登记为覆盖缺口。
 scan.task 须含 taskScope、scenarios、questions、constraints，均为字符串数组。taskScope 使用仓库相对路径。
 verify.task 须含 subjectId、scenario、navigation、expectationIndexes。scenario 可选 retry_after_response_timeout（响应超时重试）、repeated_request（重复请求）、concurrent_requests（并发）、state_transition（状态转换）、error_path（异常或部分失败）、reference_usage（引用检查）或 reachable_behavior（其他可达行为）。navigation 元素含 path 和 line，须从本轮已登记的该线索导航中选取。expectationIndexes 为从 0 开始的 extraRequirements 索引数组，只选直接相关的业务预期，没有则填 []。
 patch.task 须含 subjectId、auditType、allowedPaths、acceptance 和 gateCommands。auditType 从生效规则列出的类型中选择。allowedPaths、acceptance、gateCommands 均为字符串数组。Host 只会执行启动任务时提供的门禁白名单。默认每条问题生成一个推荐补丁。仅在任务数据 ownerRouting.findingWorkflow 为 true 且确有需要人工比较的取舍时，可用相同 subjectId 再派发独立补丁任务，增加非空字符串 approach 说明修法，最多三个。

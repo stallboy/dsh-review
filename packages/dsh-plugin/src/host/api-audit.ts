@@ -147,6 +147,12 @@ export class AuditRuntime {
     });
   }
 
+  private logAuditStage(auditId: string, line: string): void {
+    for (const [jobId, leaseId] of this.host.auditJobLeases) {
+      if (leaseId === auditId) this.host.jobManager.appendLog(jobId, line);
+    }
+  }
+
   private async publishStage(stage: AuditStages, input: unknown, signal?: AbortSignal, recheck?: AuditRecheck): Promise<{ reportPath: string; overview: AuditPriorityEntry[] }> {
     const lease = stage.lease;
     return this.host.withWriteLock(lease.root, async () => {
@@ -194,6 +200,7 @@ export class AuditRuntime {
       } finally {
         stage.busy = false;
       }
+      this.logAuditStage(lease.auditId, '已封存审查档案，' + String(output.overview.length) + ' 个正式发现');
       return { reportPath: output.path, overview: output.overview };
     });
   }
@@ -223,7 +230,8 @@ export class AuditRuntime {
     const source = await sharedSourceFor(runtime);
     const reviewers = await loadReviewers(runtime.root, source);
     const stage = new AuditStages(lease, runtime.vcs, reviewers, this.host.deps.auditStageExecutor!,
-      this.host.currentSettings().gateTimeoutMs, fields.extraRequirements, this.host.deps.auditStageGates, source, currentTrustedActor()?.findingWorkflow);
+      this.host.currentSettings().gateTimeoutMs, fields.extraRequirements, this.host.deps.auditStageGates, source,
+      currentTrustedActor()?.findingWorkflow, line => this.logAuditStage(lease.auditId, line));
     this.stages.set(lease.auditId, stage);
     return stage;
   }

@@ -1,10 +1,11 @@
 import test from 'node:test';
+import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { registerAuditStageTools } from '../packages/dsh-plugin/dist/host/audit-stage-tools.js';
-import { executeAuditCli } from '../packages/dsh-plugin/dist/host/audit-stage-runner.js';
+import { AuditExecutorAuthenticationError, executeAuditCli, isAuditAuthenticationFailure } from '../packages/dsh-plugin/dist/host/audit-stage-runner.js';
 import { compatibleAuditBase } from '../packages/dsh-plugin/dist/host/audit-stage-artifacts.js';
 import { GitAdapter } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { runGateChecks } from '../packages/dsh-plugin/dist/host/validator.js';
@@ -278,4 +279,106 @@ test('阶段业务基线允许仅评审元数据推进，拒绝业务文件推�
     runCommand('git', ['add', sourcePath], root);
     runCommand('git', ['commit', '-qm', 'business content update'], root);
     assert.equal(await compatibleAuditBase(vcs, base), false);
+});
+
+test('执行器提前退出、取消或超时时，输入管道错误不会终止宿主', () => {
+    const shell = new URL('../packages/dsh-plugin/dist/host/shell.js', import.meta.url).href;
+    const script = [
+        "import { runProcess } from " + JSON.stringify(shell),
+        "const options = { cwd: process.cwd(), input: 'x'.repeat(1024 * 1024) };",
+        "const run = (program, extra) => runProcess(process.execPath, ['-e', program], { ...options, ...extra });",
+        "const exit = await run('process.exit(17)', { timeoutMs: 5000 });",
+        "const timeout = await run('setInterval(() => {}, 1000)', { timeoutMs: 100 });",
+        "const abort = await run('setInterval(() => {}, 1000)', { signal: AbortSignal.timeout(100) });",
+        "const missing = await runProcess('dsh-test-missing-executable', [], options);",
+        "console.log(JSON.stringify({ exit, timeout, abort, missing }));",
+    ].join('\n');
+    const host = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 20_000 });
+    assert.equal(host.status, 0, host.stderr || String(host.error));
+    const { exit, timeout, abort, missing } = JSON.parse(host.stdout);
+    assert.equal(exit.code, 17);
+    assert.match(exit.stdinError, /^(EOF|EPIPE|ECONNRESET|ECANCELED|ERR_STREAM_DESTROYED)$/);
+    assert.equal(timeout.timedOut, true);
+    assert.equal(abort.aborted, true);
+    assert.match(missing.error, /ENOENT/);
+});
+
+test('认证失败只派发一次，复核证据不足可以通过阶段工具发布空报告', async t => {
+    const root = await retryFixture(t);
+    const sessionId = 'dsh-audit-executor-failure';
+    const executions = [];
+    let finishTurn;
+    const turn = new Promise(resolve => { finishTurn = resolve; });
+    const api = new ReviewApi({
+        settings: { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType: 'git' },
+        saveSettings: async next => next,
+        statePath: path.join(root, '.tmp', 'audit-state.json'),
+        createAuditSession: async input => {
+            await input.onCreated(sessionId);
+            return { sessionId };
+        },
+        withAuditSessionIdle: async (_id, _requestId, signal, finalize) => {
+            await turn;
+            return await finalize(signal) !== false;
+        },
+        auditStageExecutor: async request => {
+            executions.push([request.executor, request.location]);
+            if (request.executor === 'claude-code') throw new AuditExecutorAuthenticationError('claude-code');
+            if (request.prompt.startsWith('# 初审')) {
+                return { leads: [lead('first', 4), lead('second', 10)], coverage: [], limits: [] };
+            }
+            return { verdict: 'insufficient_evidence', reason: '基线视图缺少调用链',
+                preconditions: [], observedBehavior: '', impact: '', evidence: [], limits: [] };
+        },
+    });
+    await api.init();
+    const tools = new Map();
+    t.after(registerAuditStageTools({ register: tool => { tools.set(tool.name, tool); return () => tools.delete(tool.name); } }, api));
+    const post = (pathname, body) => api.invoke({ method: 'POST', path: pathname, body });
+    const invoke = (name, args) => tools.get(name).execute(args, { agent: { session: { id: sessionId } }, signal: new AbortController().signal });
+    const stage = (name, runner, task) => invoke('runAuditStage', { stage: name, runner, task: JSON.stringify(task) });
+    const { status, body } = await post('/audit/session', { targetPath: '' });
+    assert.equal(status, 202, JSON.stringify(body));
+    await stage('scan', 'codex', { taskScope: ['src'], scenarios: [], questions: [], constraints: [] });
+    const verify = (runner, id, line) => stage('verify', runner, {
+        subjectId: id, scenario: 'reachable_behavior', navigation: navigation(line), expectationIndexes: [],
+    });
+    await assert.rejects(verify('claude-code', 'first', 4), /认证失败/);
+    await assert.rejects(verify('claude-code', 'second', 10), /本轮.*停止派发/);
+    await verify('codex', 'first', 4);
+    await verify('codex', 'second', 10);
+    assert.deepEqual(executions.map(([runner]) => runner), ['codex', 'claude-code', 'codex', 'codex']);
+    assert.equal(new Set(executions.map(([, directory]) => directory)).size, executions.length);
+    const publish = findings => invoke('publishAuditArtifacts', {
+        publication: JSON.stringify({ findings, coverage: [], requirements: [], history: [] }),
+    });
+    await assert.rejects(publish([{ subjectId: 'first', title: '未核实', kind: 'B', priority: 'P2', decision: '复核', dependsOn: '' }]),
+        /first.*insufficient_evidence/);
+    const publication = JSON.parse((await publish([])).json);
+    assert.deepEqual(publication.overview, []);
+    finishTurn();
+    const job = api.jobManager.get(body.jobId);
+    for (let attempt = 0; attempt < 150 && job.status === 'running'; attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.equal(job.result?.status, 'COMMITTED', JSON.stringify(job));
+    assert.deepEqual(job.result.created, []);
+    assert.equal(api.leaseLookup(body.auditId).state, 'released');
+    const report = await readFile(path.join(root, publication.reportPath), 'utf8');
+    assert.match(report, /first：证据不足/);
+    assert.match(report, /插件复核/);
+    const jobLog = job.log.join('\n');
+    assert.match(jobLog, /verify-2 claude-code.*认证失败/);
+    assert.match(jobLog, /已封存.*0 个正式发现/);
+});
+
+test('认证熔断依据执行器错误事件，忽略模型结果中提到的认证字样', () => {
+    const claude = (error, result) => JSON.stringify({ type: 'result', is_error: error, result });
+    assert.equal(isAuditAuthenticationFailure('claude-code', claude(true, 'Not logged in · Please run /login'), ''), true);
+    assert.equal(isAuditAuthenticationFailure('claude-code', claude(false, 'Not logged in'), ''), false);
+    const codex = JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'Unauthorized when the app session expires' } });
+    const timeout = JSON.stringify({ type: 'turn.failed', error: { message: 'Request timeout' } });
+    const unauthorized = JSON.stringify({ type: 'turn.failed', error: { message: 'unexpected status 401 Unauthorized' } });
+    assert.equal(isAuditAuthenticationFailure('codex', codex + '\n' + timeout, 'request timed out'), false);
+    assert.equal(isAuditAuthenticationFailure('codex', unauthorized, ''), true);
 });

@@ -13,6 +13,7 @@ export interface ProcessResult {
   stdout: string;
   stderr: string;
   error?: string;
+  stdinError?: string;
 }
 
 export interface ProcessOptions {
@@ -103,7 +104,10 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
     let pendingStderr = '';
     let timedOut = false;
     let aborted = false;
-    let killPromise: Promise<void> = Promise.resolve();
+    let stdinError: string | undefined;
+    let termination: Promise<void> | undefined;
+    let settled = false;
+    const terminate = () => (termination ??= killTree(child.pid));
 
     const emit = (stream: 'stdout' | 'stderr', chunk: string): void => {
       if (!options.onLine) return;
@@ -134,13 +138,14 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
 
     const timer = setTimeout(() => {
       timedOut = true;
-      killPromise = killTree(child.pid);
+      void terminate();
     }, options.timeoutMs ?? 120_000);
     timer.unref?.();
 
     const onAbort = (): void => {
       aborted = true;
-      killPromise = Promise.all([killPromise, killTree(child.pid)]).then(() => undefined);
+      clearTimeout(timer);
+      void terminate();
     };
     if (options.signal) {
       if (options.signal.aborted) onAbort();
@@ -149,26 +154,26 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
 
     // 即使主进程正常退出，POSIX 同组子进程也可能仍在运行。
     const finish = (code: number | null, signal: NodeJS.Signals | null, error?: string): void => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       options.signal?.removeEventListener('abort', onAbort);
       const shouldKill = timedOut || aborted || process.platform !== 'win32' || options.killTreeOnExit === true;
-      const cleanup = shouldKill
-        ? Promise.all([killPromise, killTree(child.pid)]).then(() => undefined)
-        : killPromise;
+      const cleanup = shouldKill ? terminate() : Promise.resolve();
       void cleanup.then(() => {
         if (pendingStdout) options.onLine?.(pendingStdout, 'stdout');
         if (pendingStderr) options.onLine?.(pendingStderr, 'stderr');
-        resolve({ code, signal, timedOut, aborted, stdout, stderr, ...(error ? { error } : {}) });
+        resolve({ code, signal, timedOut, aborted, stdout, stderr, ...(error ? { error } : {}),
+          ...(stdinError ? { stdinError } : {}) });
       });
     };
 
     child.on('error', (error) => finish(null, null, error.message));
     child.on('close', (code, signal) => finish(code, signal));
-    if (options.input !== undefined) {
-      child.stdin?.end(options.input);
-    } else {
-      child.stdin?.end();
-    }
+    child.stdin?.on('error', (error: NodeJS.ErrnoException) => {
+      stdinError = error.code ?? 'UNKNOWN';
+    });
+    child.stdin?.end(options.input);
   });
 }
 

@@ -67,3 +67,49 @@ test('首次配置完成后自动重注册不再暂停中央指令受理', async
     assert.equal(registrations[1], undefined);
     await node.stop();
 });
+
+test('节点重启上报中断的 DSH 审查，保留定位信息且拒绝重跑', async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'plugin-audit-restart-'));
+    const journal = new ManagedJournal(path.join(directory, 'journal.sqlite'));
+    const command = { commandId: 'audit-interrupted', requestHash: 'b'.repeat(64), projectId: 'project-a', nodeId: 'node-a',
+        bindingGeneration: 1, projectConfigRevision: 1, operation: 'audit', payload: {},
+        actor: { userId: 'user-a', reviewIdentity: '审核者' }, createdAt: new Date().toISOString() };
+    journal.accept(command);
+    journal.markExecuting(command.commandId);
+    journal.checkpoint(command.commandId, { phase: 'job', auditId: 'audit-original', sessionId: 'session-original' });
+    const workspace = { workspaceId: 'workspace-a', label: '项目', vcsType: 'git', target: 'main' };
+    const project = { projectId: command.projectId, nodeId: command.nodeId, workspaceId: workspace.workspaceId,
+        bindingGeneration: 1, projectConfigRevision: 1, vcsType: workspace.vcsType, target: workspace.target, enabled: true };
+    const reported = [];
+    let executions = 0;
+    const node = new ManagedNode({
+        config: { centerUrl: 'http://127.0.0.1:3081/', nodeId: 'node-a', token: 'test-token', workspaces: [workspace] },
+        journal,
+        execute: async () => { executions++; throw new Error('不应重复启动审查'); },
+        read: async () => { throw new Error('不应读取项目'); },
+        fetch: async (url, init) => {
+            const pathname = new URL(url).pathname;
+            if (pathname.endsWith('/commands/poll')) {
+                return Response.json({ commands: [command], projects: [project], cancellations: [], queries: [], recoveries: [] });
+            }
+            if (pathname.endsWith('/events')) {
+                const { events } = JSON.parse(init.body);
+                reported.push(...events);
+                return Response.json({ acks: Object.fromEntries(events.map(event => [event.commandId, event.sequence])) });
+            }
+            return Response.json({});
+        },
+    });
+    t.after(async () => { await node.stop(); journal.close(); await rm(directory, { recursive: true, force: true }); });
+    await node.tick();
+    await node.tick();
+    assert.equal(executions, 0);
+    assert.equal(journal.hasUnsettled(), true);
+    assert.equal(journal.get(command.commandId).phase, 'recovery_required');
+    assert.equal(reported.length, 1);
+    const [event] = reported;
+    assert.equal(event.type, 'recovery_required');
+    assert.equal(event.result.outcome.reason, 'NODE_RESTARTED');
+    assert.equal(event.result.outcome.auditId, 'audit-original');
+    assert.equal(event.result.outcome.sessionId, 'session-original');
+});
