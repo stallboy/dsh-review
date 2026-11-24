@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { PROTOCOL_VERSION, type NodeRecord, type NodeRegistration, type ProjectRecord, textValue, entityId } from '@dsh-review/protocol';
+import { PROTOCOL_VERSION, type CommandRecord, type NodeRecord, type NodeRegistration, type ProjectRecord, textValue, entityId } from '@dsh-review/protocol';
 import { digest, passwordHash, passwordMatches, secret } from './auth.js';
 
 export class CentralError extends Error {
@@ -16,6 +16,15 @@ export interface User {
 }
 
 export type Row = Record<string, any>;
+
+function rollbackState(state: CommandRecord['state']): CommandRecord['state'] {
+    return state === 'queued' || state === 'dispatched' || state === 'completed' ? 'completed' : 'recovery_required';
+}
+
+export function assignCommandState(state: CommandRecord['state']): string {
+    return `state=CASE WHEN protected_state IS NULL THEN '${state}' ELSE '${rollbackState(state)}' END,
+        protected_state=${state === 'completed' ? 'NULL' : `CASE WHEN protected_state IS NOT NULL THEN '${state}' END`}`;
+}
 
 export class CentralDatabase {
     readonly sql: DatabaseSync;
@@ -50,6 +59,12 @@ export class CentralDatabase {
             CREATE TABLE IF NOT EXISTS audit_schedules (project_id TEXT PRIMARY KEY REFERENCES projects,
                 enabled INTEGER NOT NULL, start_time TEXT NOT NULL, time_zone TEXT NOT NULL,
                 effective_at TEXT NOT NULL, review_identity TEXT NOT NULL, last_missed_at TEXT);
+            CREATE TABLE IF NOT EXISTS audit_plans (project_id TEXT NOT NULL REFERENCES projects, plan_id TEXT NOT NULL,
+                name TEXT NOT NULL, enabled INTEGER NOT NULL, start_time TEXT NOT NULL, time_zone TEXT NOT NULL,
+                recurrence TEXT NOT NULL, note TEXT NOT NULL, effective_at TEXT NOT NULL,
+                review_identity TEXT NOT NULL, last_missed_at TEXT, version INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (project_id,plan_id));
+            CREATE TABLE IF NOT EXISTS audit_plan_creations (project_id TEXT NOT NULL REFERENCES projects,
+                request_key TEXT NOT NULL, request_hash TEXT NOT NULL, plan_id TEXT NOT NULL, PRIMARY KEY (project_id,request_key));
             CREATE TABLE IF NOT EXISTS events (command_id TEXT NOT NULL REFERENCES commands, sequence INTEGER NOT NULL,
                 payload TEXT NOT NULL, PRIMARY KEY(command_id,sequence));
             CREATE TABLE IF NOT EXISTS logs (command_id TEXT NOT NULL REFERENCES commands, offset INTEGER NOT NULL,
@@ -76,11 +91,75 @@ export class CentralDatabase {
         if (!this.sql.prepare('PRAGMA table_info(projects)').all().some(column => column.name === 'execution_config_hash')) {
             this.sql.exec('ALTER TABLE projects ADD COLUMN execution_config_hash TEXT');
         }
+        this.transaction(() => {
+            if (!this.sql.prepare('PRAGMA table_info(audit_plans)').all().some(column => column.name === 'version')) {
+                this.sql.exec('ALTER TABLE audit_plans ADD COLUMN version INTEGER NOT NULL DEFAULT 1');
+            }
+            this.prepareCommandRollback();
+            this.sql.exec(`INSERT INTO audit_plans (project_id,plan_id,name,enabled,start_time,time_zone,recurrence,note,
+                effective_at,review_identity,last_missed_at)
+                SELECT project_id,'legacy','每日全量审查',enabled,start_time,time_zone,'{"kind":"daily"}','',
+                    effective_at,review_identity,last_missed_at FROM audit_schedules WHERE 1
+                ON CONFLICT(project_id,plan_id) DO UPDATE SET
+                    enabled=CASE WHEN excluded.enabled=1 OR (json_extract(audit_plans.recurrence,'$.kind')='daily' AND audit_plans.note='')
+                        THEN excluded.enabled ELSE audit_plans.enabled END,
+                    start_time=excluded.start_time,time_zone=excluded.time_zone,effective_at=excluded.effective_at,
+                    review_identity=excluded.review_identity,last_missed_at=excluded.last_missed_at,version=audit_plans.version+1
+                WHERE excluded.enabled!=(audit_plans.enabled AND json_extract(audit_plans.recurrence,'$.kind')='daily' AND audit_plans.note='')
+                    OR excluded.start_time!=audit_plans.start_time OR excluded.time_zone!=audit_plans.time_zone
+                    OR excluded.effective_at!=audit_plans.effective_at OR excluded.review_identity!=audit_plans.review_identity
+                    OR excluded.last_missed_at IS NOT audit_plans.last_missed_at;`);
+            for (const row of this.sql.prepare("SELECT project_id FROM audit_plans WHERE plan_id='legacy'").all()) {
+                this.syncLegacyAuditSchedule(String(row.project_id));
+            }
+        });
         this.sql.prepare("INSERT OR IGNORE INTO metadata(key,value) VALUES ('central_id',?)").run(randomUUID());
         this.centralId = (this.sql.prepare("SELECT value FROM metadata WHERE key='central_id'").get() as Row).value;
     }
 
     now(): string { return this.clock().toISOString(); }
+
+    private prepareCommandRollback(): void {
+        if (!this.sql.prepare('PRAGMA table_info(commands)').all().some(column => column.name === 'protected_state')) {
+            this.sql.exec("ALTER TABLE commands ADD COLUMN protected_state TEXT; ALTER TABLE commands ADD COLUMN active_state TEXT AS (COALESCE(protected_state,state));");
+        }
+        // 有补充要求的指令只能由理解能力守卫的中央重新派发。
+        this.sql.exec(`UPDATE commands SET protected_state=state,
+            state=CASE WHEN state IN ('queued','dispatched') THEN 'completed' ELSE 'recovery_required' END
+            WHERE protected_state IS NULL AND state!='completed'
+                AND json_extract(envelope,'$.scheduledAudit') IS NOT NULL AND json_extract(envelope,'$.payload.note')!='';
+            UPDATE commands SET protected_state=NULL
+                WHERE protected_state IS NOT NULL AND state='completed' AND result IS NOT NULL;
+            UPDATE commands SET protected_state='recovery_required'
+                WHERE protected_state IN ('accepted','executing') AND state='recovery_required' AND result IS NOT NULL;`);
+        // 旧中央可在未受理指令暂不可见时合法接管同项目，重新升级不得抢占。
+        this.sql.prepare(`UPDATE commands AS protected SET protected_state=NULL,updated_at=?,result=?
+            WHERE protected_state IN ('queued','dispatched') AND (EXISTS (
+                SELECT 1 FROM commands AS other WHERE other.project_id=protected.project_id AND other.state!='completed'
+            ) OR NOT EXISTS (
+                SELECT 1 FROM projects WHERE project_id=protected.project_id AND enabled=1
+                    AND binding_generation=json_extract(protected.envelope,'$.bindingGeneration')
+                    AND config_revision=json_extract(protected.envelope,'$.projectConfigRevision')
+            ) OR (protected.idempotency_key GLOB 'scheduled-audit:????-??-??' AND EXISTS (
+                SELECT 1 FROM audit_schedules AS legacy JOIN audit_plans AS plan USING(project_id)
+                WHERE legacy.project_id=protected.project_id AND plan.plan_id='legacy'
+                    AND (legacy.enabled!=(plan.enabled AND json_extract(plan.recurrence,'$.kind')='daily' AND plan.note='')
+                        OR legacy.start_time!=plan.start_time OR legacy.time_zone!=plan.time_zone
+                        OR legacy.effective_at!=plan.effective_at OR legacy.review_identity!=plan.review_identity)
+            )))`).run(this.now(), JSON.stringify({
+            outcome: { status: 'ABORTED', reason: 'SCHEDULE_ROLLBACK_CONFLICT', message: '回退期间项目配置已变化或已有任务，本轮未启动' },
+            delivery: { state: 'not_required' },
+        }));
+    }
+
+    syncLegacyAuditSchedule(projectId: string): void {
+        // 旧中央只理解每日全仓计划，扩展计划回退期间须保持停用。
+        this.sql.prepare(`INSERT INTO audit_schedules (project_id,enabled,start_time,time_zone,effective_at,review_identity,last_missed_at)
+            SELECT project_id,(enabled AND json_extract(recurrence,'$.kind')='daily' AND note=''),start_time,time_zone,
+                effective_at,review_identity,last_missed_at FROM audit_plans WHERE plan_id='legacy' AND project_id=?
+            ON CONFLICT(project_id) DO UPDATE SET enabled=excluded.enabled,start_time=excluded.start_time,time_zone=excluded.time_zone,
+                effective_at=excluded.effective_at,review_identity=excluded.review_identity,last_missed_at=excluded.last_missed_at`).run(projectId);
+    }
 
     transaction<T>(task: () => T): T {
         this.sql.exec('BEGIN IMMEDIATE');
@@ -196,18 +275,18 @@ export class CentralDatabase {
                 if (workspace.executionConfigHash === project.executionConfigHash) continue;
                 if (!workspace.executionConfigHash) throw new CentralError(409, 'configuration_required', '节点必须继续提供已登记的执行配置摘要');
                 if (!project.executionConfigHash) {
-                    this.sql.prepare("UPDATE commands SET cancel_requested=1,updated_at=? WHERE project_id=? AND state IN ('queued','dispatched')").run(this.now(), project.projectId);
-                    this.sql.prepare("UPDATE commands SET state='recovery_required',updated_at=? WHERE project_id=? AND state IN ('accepted','executing')").run(this.now(), project.projectId);
+                    this.sql.prepare("UPDATE commands SET cancel_requested=1,updated_at=? WHERE project_id=? AND active_state IN ('queued','dispatched')").run(this.now(), project.projectId);
+                    this.sql.prepare(`UPDATE commands SET ${assignCommandState('recovery_required')},updated_at=? WHERE project_id=? AND active_state IN ('accepted','executing')`).run(this.now(), project.projectId);
                     this.sql.prepare('UPDATE projects SET execution_config_hash=? WHERE project_id=?').run(workspace.executionConfigHash, project.projectId);
                     continue;
                 }
-                if (this.sql.prepare("SELECT 1 FROM commands WHERE project_id=? AND state!='completed'").get(project.projectId)) throw new CentralError(409, 'project_busy', '项目有未决操作，不能更改执行配置');
+                if (this.sql.prepare("SELECT 1 FROM commands WHERE project_id=? AND active_state!='completed'").get(project.projectId)) throw new CentralError(409, 'project_busy', '项目有未决操作，不能更改执行配置');
                 this.sql.prepare('UPDATE projects SET execution_config_hash=?,config_revision=config_revision+1 WHERE project_id=?')
                     .run(workspace.executionConfigHash ?? null, project.projectId);
             }
             if (workspaceIssues || node.instanceId !== registration.instanceId) this.setWorkspaceIssues(nodeId, workspaceIssues ?? {});
             if (node.instanceId && node.instanceId !== registration.instanceId) {
-                this.sql.prepare("UPDATE commands SET state='recovery_required',updated_at=? WHERE node_id=? AND state IN ('accepted','executing')").run(this.now(), nodeId);
+                this.sql.prepare(`UPDATE commands SET ${assignCommandState('recovery_required')},updated_at=? WHERE node_id=? AND active_state IN ('accepted','executing')`).run(this.now(), nodeId);
             }
             const paused = node.instanceId === registration.instanceId
                 ? Number((this.sql.prepare('SELECT admission_paused FROM nodes WHERE node_id=?').get(nodeId) as Row).admission_paused)
@@ -231,7 +310,7 @@ export class CentralDatabase {
     }
 
     pendingNodeCommands(nodeId: string): number {
-        return Number((this.sql.prepare("SELECT COUNT(*) AS count FROM commands WHERE node_id=? AND state!='completed'").get(nodeId) as Row).count);
+        return Number((this.sql.prepare("SELECT COUNT(*) AS count FROM commands WHERE node_id=? AND active_state!='completed'").get(nodeId) as Row).count);
     }
 
     quiesceNode(nodeId: string, instanceId: string): void {
@@ -255,7 +334,7 @@ export class CentralDatabase {
             const node = this.getNode(nodeId);
             if (!node.enabled || !instanceId || node.instanceId !== instanceId) throw new CentralError(409, 'instance_conflict', '节点实例已失效，请重新核验');
             this.sql.prepare('UPDATE nodes SET last_seen_at=NULL,admission_paused=1 WHERE node_id=?').run(nodeId);
-            this.sql.prepare("UPDATE commands SET state='recovery_required',updated_at=? WHERE node_id=? AND state IN ('accepted','executing')").run(this.now(), nodeId);
+            this.sql.prepare(`UPDATE commands SET ${assignCommandState('recovery_required')},updated_at=? WHERE node_id=? AND active_state IN ('accepted','executing')`).run(this.now(), nodeId);
         });
     }
 
@@ -307,7 +386,7 @@ export class CentralDatabase {
 
     updateProject(projectId: string, input: { name?: string; enabled?: boolean }): ProjectRecord {
         this.getProject(projectId);
-        if (this.sql.prepare("SELECT 1 FROM commands WHERE project_id=? AND state!='completed'").get(projectId)) throw new CentralError(409, 'project_busy', '项目有未决操作，不能更改配置');
+        if (this.sql.prepare("SELECT 1 FROM commands WHERE project_id=? AND active_state!='completed'").get(projectId)) throw new CentralError(409, 'project_busy', '项目有未决操作，不能更改配置');
         if (input.name !== undefined) this.sql.prepare('UPDATE projects SET name=? WHERE project_id=?').run(textValue(input.name, 'name', 160), projectId);
         if (input.enabled !== undefined) this.sql.prepare('UPDATE projects SET enabled=? WHERE project_id=?').run(input.enabled ? 1 : 0, projectId);
         return this.getProject(projectId);

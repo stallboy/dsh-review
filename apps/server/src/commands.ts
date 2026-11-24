@@ -2,20 +2,24 @@ import { randomUUID } from 'node:crypto';
 import { entityId, positiveInteger, ProtocolError, record, RETIRED_MANUAL_REVISION, retiredManualRevisionResult, SCHEDULED_AUDIT_ACTOR, textValue, validateCommand, type Actor, type CommandRecord,
     type JsonRecord, type ManagedResult, type NodeEvent, type ProjectRecord, type ScheduledAudit } from '@dsh-review/protocol';
 import { digest, stableJson } from './auth.js';
-import { CentralDatabase, CentralError, type Row, type User } from './database.js';
+import { assignCommandState, CentralDatabase, CentralError, type Row, type User } from './database.js';
 import { AuditSchedules } from './audit-schedule.js';
+
+function requiresAuditNotes(command: CommandRecord): boolean {
+    return Boolean(command.scheduledAudit && command.payload.note);
+}
 
 export class Commands {
     constructor(private readonly database: CentralDatabase, private readonly schedules: AuditSchedules) {
-        database.sql.prepare(`UPDATE commands SET state='completed',result=?,updated_at=?
-            WHERE state IN ('queued','dispatched') AND json_extract(envelope,'$.operation')=?`)
+        database.sql.prepare(`UPDATE commands SET ${assignCommandState('completed')},result=?,updated_at=?
+            WHERE active_state IN ('queued','dispatched') AND json_extract(envelope,'$.operation')=?`)
             .run(JSON.stringify(retiredManualRevisionResult()), database.now(), RETIRED_MANUAL_REVISION);
     }
 
     get(commandId: string): CommandRecord {
         const row = this.database.sql.prepare('SELECT * FROM commands WHERE command_id=?').get(commandId) as Row | undefined;
         if (!row) throw new CentralError(404, 'not_found', '任务不存在');
-        return { ...JSON.parse(row.envelope), state: row.state, cancelRequested: Boolean(row.cancel_requested),
+        return { ...JSON.parse(row.envelope), state: row.active_state, cancelRequested: Boolean(row.cancel_requested),
             updatedAt: row.updated_at, ...(row.result ? { result: JSON.parse(row.result) } : {}) };
     }
 
@@ -70,12 +74,14 @@ export class Commands {
             bindingGeneration: project.bindingGeneration, projectConfigRevision: project.projectConfigRevision,
             operation: input.operation, payload: input.payload, actor, ...(input.guard !== undefined ? { guard: input.guard } : {}),
             ...(scheduledAudit ? { scheduledAudit } : {}), createdAt });
-        db.sql.prepare(`INSERT INTO commands(command_id,project_id,node_id,idempotency_key,request_hash,envelope,state,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,'queued',?,?)`).run(command.commandId, project.projectId, project.nodeId, key, requestHash, JSON.stringify(command), createdAt, createdAt);
+        const protectedNotes = Boolean(scheduledAudit && command.payload.note);
+        db.sql.prepare(`INSERT INTO commands(command_id,project_id,node_id,idempotency_key,request_hash,envelope,state,protected_state,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)`).run(command.commandId, project.projectId, project.nodeId, key, requestHash, JSON.stringify(command),
+                protectedNotes ? 'completed' : 'queued', protectedNotes ? 'queued' : null, createdAt, createdAt);
         return this.get(command.commandId);
     }
 
-    poll(nodeId: string, scheduledAuditWorkspaces: ReadonlySet<string>): { commands: CommandRecord[]; cancellations: string[]; recoveries: string[] } {
+    poll(nodeId: string, scheduledAuditWorkspaces: ReadonlySet<string>, supportsScheduledAuditNotes: boolean): { commands: CommandRecord[]; cancellations: string[]; recoveries: string[] } {
         const db = this.database;
         return db.transaction(() => {
             const node = db.getNode(nodeId);
@@ -83,7 +89,7 @@ export class Commands {
             this.schedules.expire();
             const issues = db.workspaceIssues(nodeId);
             const unavailable = (command: CommandRecord) => Object.hasOwn(issues, db.getProject(command.projectId).workspaceId);
-            const all = (db.sql.prepare("SELECT command_id FROM commands WHERE node_id=? AND state!='completed' ORDER BY created_at").all(nodeId) as Row[])
+            const all = (db.sql.prepare("SELECT command_id FROM commands WHERE node_id=? AND active_state!='completed' ORDER BY created_at").all(nodeId) as Row[])
                 .map(row => this.get(row.command_id));
             const supports = (command: CommandRecord) => !(
                 command.operation === 'finding-decision' || (command.operation === 'approve' && 'expectedFindingVersion' in command.payload)
@@ -93,58 +99,72 @@ export class Commands {
                 if (command.state !== 'queued' && command.state !== 'dispatched') {
                     return command.state === 'accepted' || command.state === 'executing' || !unavailable(command);
                 }
+                if (!supportsScheduledAuditNotes && requiresAuditNotes(command)) {
+                    this.schedules.skipUnsupportedNotes(command.commandId);
+                    return false;
+                }
                 if (supports(command)) return !unavailable(command);
                 const result: ManagedResult = { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '执行节点已不支持新版发现' },
                     delivery: { state: 'not_required' } };
-                db.sql.prepare("UPDATE commands SET state='completed',result=?,updated_at=? WHERE command_id=?")
+                db.sql.prepare(`UPDATE commands SET ${assignCommandState('completed')},result=?,updated_at=? WHERE command_id=?`)
                     .run(JSON.stringify(result), db.now(), command.commandId);
                 return false;
             });
             if (!relevant.length && node.online) {
                 const ready = new Set([...scheduledAuditWorkspaces].filter(workspaceId => !Object.hasOwn(issues, workspaceId)));
-                const due = this.schedules.due(nodeId, ready)[0];
+                const due = this.schedules.due(nodeId, ready, supportsScheduledAuditNotes)[0];
                 if (due) {
                     const { key, ...schedule } = due.slot;
                     const input = { operation: 'audit', payload: {
-                        targetPath: '.', note: '', ...(this.supportsFindingWorkflow(due.project) ? { findingWorkflow: true } : {}),
+                        targetPath: '.', note: due.note, ...(this.supportsFindingWorkflow(due.project) ? { findingWorkflow: true } : {}),
                     } };
                     const actor = { userId: SCHEDULED_AUDIT_ACTOR, reviewIdentity: due.reviewIdentity };
                     relevant.push(this.insert(due.project, key, input, actor, digest(stableJson({ ...input, actor, schedule })), schedule));
                 }
             }
             const running = relevant.some(c => c.state === 'accepted' || c.state === 'executing' || c.state === 'recovery_required');
-            const dispatchable = relevant.filter(c => !c.scheduledAudit || scheduledAuditWorkspaces.has(db.getProject(c.projectId).workspaceId));
+            const dispatchable = relevant.filter(c => !c.scheduledAudit || (scheduledAuditWorkspaces.has(db.getProject(c.projectId).workspaceId)
+                && (supportsScheduledAuditNotes || !requiresAuditNotes(c))));
             const accepted = dispatchable.filter(c => c.state === 'accepted');
             const waiting = dispatchable.filter(c => c.state === 'queued' || c.state === 'dispatched');
             const next = waiting.find(c => !c.scheduledAudit) ?? waiting[0];
             const commands = accepted.length ? accepted : !running && next ? [next] : [];
             for (const command of commands) {
                 if (command.state === 'accepted') continue;
-                db.sql.prepare("UPDATE commands SET state='dispatched',updated_at=? WHERE command_id=?").run(db.now(), command.commandId);
+                db.sql.prepare(`UPDATE commands SET ${assignCommandState('dispatched')},updated_at=? WHERE command_id=?`).run(db.now(), command.commandId);
                 command.state = 'dispatched';
             }
-            const recoveries = db.sql.prepare("SELECT command_id FROM commands WHERE node_id=? AND state='recovery_required' AND recovery_requested=1").all(nodeId) as Row[];
+            const recoveries = db.sql.prepare("SELECT command_id FROM commands WHERE node_id=? AND active_state='recovery_required' AND recovery_requested=1").all(nodeId) as Row[];
             return { commands, cancellations: all.filter(c => c.cancelRequested).map(c => c.commandId),
                 recoveries: recoveries.map(row => row.command_id) };
         });
     }
 
-    acknowledge(nodeId: string, commandId: string): CommandRecord {
+    acknowledge(nodeId: string, commandId: string, supportsScheduledAuditNotes: boolean): CommandRecord {
         const db = this.database;
         return db.transaction(() => {
             const now = db.now();
             this.schedules.expire(now);
             const command = this.get(commandId);
             this.authorize(nodeId, command, !(command.state === 'completed' && (command.scheduledAudit || command.operation === RETIRED_MANUAL_REVISION)));
+            if (!supportsScheduledAuditNotes && requiresAuditNotes(command)) {
+                if (command.state === 'accepted') {
+                    throw new CentralError(409, 'audit_notes_unsupported', '此任务已受理，请使用支持定时审查要求的节点继续处理');
+                }
+                if (command.state === 'queued' || command.state === 'dispatched') {
+                    this.schedules.skipUnsupportedNotes(commandId);
+                    return this.get(commandId);
+                }
+            }
             if (command.state === 'queued' || command.state === 'dispatched') {
                 if (!db.getNode(nodeId).compatible) throw new CentralError(409, 'protocol_incompatible', '节点协议不兼容，不能受理写指令');
                 const issues = db.workspaceIssues(nodeId);
                 if (Object.hasOwn(issues, db.getProject(command.projectId).workspaceId)) return command;
-                if (command.scheduledAudit && db.sql.prepare(`SELECT projects.workspace_id,commands.state FROM commands JOIN projects USING(project_id)
-                    WHERE commands.node_id=? AND commands.state!='completed'
+                if (command.scheduledAudit && db.sql.prepare(`SELECT projects.workspace_id,commands.active_state AS state FROM commands JOIN projects USING(project_id)
+                    WHERE commands.node_id=? AND commands.active_state!='completed'
                     AND json_extract(envelope,'$.scheduledAudit') IS NULL`).all(nodeId)
                     .some(row => row.state === 'accepted' || row.state === 'executing' || !Object.hasOwn(issues, String(row.workspace_id)))) return command;
-                db.sql.prepare("UPDATE commands SET state='accepted',updated_at=? WHERE command_id=?").run(now, commandId);
+                db.sql.prepare(`UPDATE commands SET ${assignCommandState('accepted')},updated_at=? WHERE command_id=?`).run(now, commandId);
             }
             const acknowledged = this.get(commandId);
             return acknowledged.operation === RETIRED_MANUAL_REVISION && acknowledged.state === 'accepted'
@@ -236,11 +256,12 @@ export class Commands {
                 throw new CentralError(409, 'delivery_mismatch', '已提交内容的远端交付义务不能被清除');
             }
             const unresolved = event.result.outcome.status === 'RECOVERY_REQUIRED' || ['pending', 'conflict', 'unknown'].includes(event.result.delivery.state);
-            db.sql.prepare('UPDATE commands SET state=?,result=?,updated_at=?,recovery_requested=0 WHERE command_id=?').run(unresolved ? 'recovery_required' : 'completed', JSON.stringify(event.result), db.now(), commandId);
+            db.sql.prepare(`UPDATE commands SET ${assignCommandState(unresolved ? 'recovery_required' : 'completed')},result=?,updated_at=?,recovery_requested=0 WHERE command_id=?`)
+                .run(JSON.stringify(event.result), db.now(), commandId);
         } else {
             const state = event.type === 'recovery_required' ? 'recovery_required' : event.type === 'accepted' ? 'accepted' : 'executing';
             if (command.state === 'recovery_required') return;
-            db.sql.prepare('UPDATE commands SET state=?,updated_at=? WHERE command_id=?').run(state, db.now(), commandId);
+            db.sql.prepare(`UPDATE commands SET ${assignCommandState(state)},updated_at=? WHERE command_id=?`).run(db.now(), commandId);
         }
     }
 

@@ -68,3 +68,31 @@ test('定时审查设置通过项目接口提交本地时刻、时区和 CSRF �
     assert.equal(options.headers['x-csrf-token'], 'audit-csrf');
     assert.deepEqual(JSON.parse(options.body), settings);
 });
+
+test('定时计划保存重试复用键，编辑提交版本，启停只发送状态', async t => {
+    const { saveAuditPlan, setAuditPlanEnabled } = await import('../apps/web/src/api.ts');
+    const settings = { name: '定时复查', enabled: true, startTime: '08:45', timeZone: 'Asia/Shanghai', recurrence: { kind: 'daily' }, note: '' };
+    const auditPlan = { ...settings, planId: 'plan-a', version: 4 };
+    let fail = true;
+    const fetch = t.mock.method(globalThis, 'fetch', async () => {
+        if (fail) {
+            fail = false;
+            throw new TypeError('response lost');
+        }
+        return Response.json({ auditPlan });
+    });
+
+    await assert.rejects(saveAuditPlan('project-a', settings), /response lost/);
+    await saveAuditPlan('project-a', settings);
+    await saveAuditPlan('project-a', settings);
+    await saveAuditPlan('project-a', settings, auditPlan);
+    await setAuditPlanEnabled('project-a', auditPlan.planId, false);
+    const options = fetch.mock.calls.map(call => call.arguments[1]);
+    assert.match(options[0].headers['idempotency-key'], /^[a-f0-9]{32}$/);
+    assert.equal(options[1].headers['idempotency-key'], options[0].headers['idempotency-key']);
+    assert.notEqual(options[2].headers['idempotency-key'], options[0].headers['idempotency-key']);
+    assert.equal(options[3].method, 'PUT');
+    assert.deepEqual(JSON.parse(options[3].body), { ...settings, expectedVersion: auditPlan.version });
+    assert.equal(options[4].method, 'PATCH');
+    assert.deepEqual(JSON.parse(options[4].body), { enabled: false });
+});

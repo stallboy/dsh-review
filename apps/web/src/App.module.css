@@ -75,6 +75,19 @@ a.projectCard:hover { text-decoration: none; border-color: #8fc4c5; }
 .form { display: flex; flex-direction: column; gap: 16px; padding: 22px; line-height: 1.7; align-items: stretch; }
 .form > button { align-self: flex-start; }
 .form p { color: #596a7a; font-size: 13px; }
+.scheduleEditor { background: #f5faf9; border-bottom: 1px solid #d8ece8; }
+.scheduleEditorFields, .scheduleWeekdays { border: 0; margin: 0; padding: 0; min-inline-size: 0; display: grid; gap: 12px; }
+.scheduleWeekdays legend { color: #455665; margin-bottom: 6px; font-size: 12px; }
+.scheduleWeekdays button[aria-pressed="true"] { border-color: #087e83; background: #e7f3f1; color: #086466; font-weight: 600; }
+.schedulePreview { border-left: 3px solid #087e83; padding-left: 12px; }
+.scheduleStatus { color: #596a7a; font-size: 12px; padding: 12px 22px; }
+.scheduleList { list-style: none; margin: 0; padding: 0; }
+.schedulePlan { display: grid; gap: 12px; padding: 18px 22px; border-bottom: 1px solid #edf0f3; }
+.schedulePlanHead { display: flex; justify-content: space-between; align-items: start; gap: 12px; }
+.schedulePlanHead > small { white-space: nowrap; }
+.schedulePlan p, .scheduleRequirements { color: #596a7a; font-size: 13px; overflow-wrap: anywhere; }
+.scheduleRequirements summary { cursor: pointer; color: #086466; }
+.scheduleRequirements p { white-space: pre-wrap; margin-top: 5px; }
 .scheduleFields { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%,160px),1fr)); gap: 15px; max-width: 32rem; }
 .scheduleSummary { display: grid; gap: 7px; border-top: 1px solid #edf0f3; padding-top: 14px; }
 .inlineForm { display: flex; align-items: end; gap: 15px; padding: 22px; }

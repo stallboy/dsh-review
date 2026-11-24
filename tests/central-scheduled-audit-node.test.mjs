@@ -53,9 +53,9 @@ async function setup(t, runner = 'external', runnerArg = '', auditSessions, runn
     runCommand('git', ['config', 'user.email', 'review@example.com'], root);
     await operations.init();
     const project = { projectId, nodeId, workspaceId, name: '项目 A', bindingGeneration: 1, projectConfigRevision: 1, vcsType: 'git', target, enabled: true };
-    const execute = async command => {
+    const execute = async (command, log = () => {}) => {
         journal.accept(command);
-        return operations.execute(command, new AbortController().signal, () => {}, project);
+        return operations.execute(command, new AbortController().signal, log, project);
     };
     return { root, writer, remote, target, operations, project, journal, directory, execute };
 }
@@ -66,9 +66,22 @@ test('中央定时 Runner 使用阶段通道并交付 Host 生成的报告', asy
         assert.match(prompt, /固定基线只读视图/);
         return { leads: [], coverage: ['中央定时共享阶段'], limits: [] };
     } };
-    const { execute, root, remote, target } = await setup(t, 'external', 'empty', capabilities, runner);
-    const result = await execute(commandFor('schedule-phased'));
+    const { execute, root, writer, remote, target } = await setup(t, 'external', 'empty check-scheduled-note', capabilities, runner);
+    const previousId = '20261117-090000-repo';
+    const base = runCommand('git', ['rev-parse', 'HEAD'], writer).stdout.trim();
+    await writeArchive(writer, previousId, base, '.', [{
+        findingId: 'historical-phased', kind: 'confirm', title: '旧档案的问题', summary: '核对旧问题',
+        targetFiles: ['src/math.js'], dependsOn: null, status: 'pending', candidate: null,
+    }]);
+    runCommand('git', ['add', '--', '.ai-review'], writer);
+    runCommand('git', ['commit', '-qm', '补充定时历史档案'], writer);
+    runCommand('git', ['push', '-q', 'origin', target], writer);
+    const command = commandFor('schedule-phased');
+    command.payload.note = '重点核对阶段审查的权限边界';
+    const logs = [];
+    const result = await execute(command, entry => logs.push(entry));
     assert.equal(result.outcome.status, 'COMMITTED', JSON.stringify(result));
+    assert.ok(logs.some(entry => entry.includes('已验证历史提示范围')), logs.join('\n'));
     assert.equal(result.delivery.state, 'delivered', JSON.stringify(result));
     assert.equal(result.outcome.report.path, result.outcome.reportPath);
     const report = runCommand('git', ['show', 'refs/heads/' + target + ':' + result.outcome.reportPath], remote).stdout;
@@ -114,7 +127,7 @@ async function writeArchive(root, id, base, scope, items = [], candidates = []) 
 }
 
 test('托管定时审查同步绑定分支，在同一基线上先复查，再归档全仓结果和稳定 finding ID', async t => {
-    const { root, writer, remote, target, operations, journal, directory } = await setup(t);
+    const { root, writer, remote, target, operations, journal, directory } = await setup(t, 'external', 'require-plan-note');
     const original = runCommand('git', ['rev-parse', 'HEAD'], writer).stdout.trim();
     await writeCandidate(writer, 'approved-last-round', {
         review: {
@@ -163,9 +176,10 @@ test('托管定时审查同步绑定分支，在同一基线上先复查，再�
     t.after(() => { snapshotCanFinish.resolve(); return node.stop(); });
     await node.tick();
     const project = await bindProject(app, headers, { ...credential, workspaceId });
-    const schedule = await app.inject({ method: 'PUT', url: `/api/v1/projects/${project.projectId}/audit-schedule`, headers,
-        payload: { enabled: true, startTime: '08:00', timeZone: 'UTC' } });
-    assert.equal(schedule.statusCode, 200, schedule.body);
+    const schedule = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.projectId}/audit-plans`, headers,
+        payload: { name: '接口兼容性巡检', enabled: true, startTime: '08:00', timeZone: 'UTC',
+            recurrence: { kind: 'weekly', weekdays: [3] }, note: '重点检查新增接口的兼容行为' } });
+    assert.equal(schedule.statusCode, 201, schedule.body);
     await node.tick();
     await snapshotStarted.promise;
     now = new Date('2026-11-18T08:05:00Z');

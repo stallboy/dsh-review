@@ -1,4 +1,4 @@
-import type { CommandRecord, ProjectRecord, ProjectSnapshot, NodeRecord } from '@dsh-review/protocol';
+import type { AuditPlanSettings, CommandRecord, ProjectRecord, ProjectSnapshot, NodeRecord } from '@dsh-review/protocol';
 import type { CandidateSummary } from '@dsh-review/protocol';
 import type { QueryClient } from '@tanstack/react-query';
 
@@ -9,7 +9,8 @@ export interface AuditSchedule extends AuditScheduleSettings {
     nextRunAt: string | null;
     lastRun: { scheduledAt: string; state: CommandRecord['state'] | 'waiting' | 'skipped'; reason: string | null; commandId: string | null } | null;
 }
-export interface ProjectDetail extends ProjectView { auditSchedule: AuditSchedule | null }
+export interface AuditPlan extends AuditPlanSettings, Pick<AuditSchedule, 'nextRunAt' | 'lastRun'> { planId: string; version: number }
+export interface ProjectDetail extends ProjectView { auditSchedule: AuditSchedule | null; auditPlans: AuditPlan[] }
 export type QueueItem = CandidateSummary & { projectId: string; projectName: string };
 export type { CommandRecord, NodeRecord };
 
@@ -32,10 +33,10 @@ export class ApiError extends Error {
     constructor(status: number, code: string, message: string) { super(message); this.status = status; this.code = code; }
 }
 
-export async function request<T>(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<T> {
+export async function request<T>(path: string, method = 'GET', body?: unknown, signal?: AbortSignal, headers?: Record<string, string>): Promise<T> {
     const basePath = typeof document === 'undefined' ? '' : new URL(document.baseURI).pathname.replace(/\/$/, '');
     const response = await fetch(`${basePath}/api/v1${path}`, { method, credentials: 'same-origin', signal,
-        headers: { ...(body !== undefined ? { 'content-type': 'application/json' } : {}), ...(method !== 'GET' ? { 'x-csrf-token': csrfToken } : {}) },
+        headers: { ...(body !== undefined ? { 'content-type': 'application/json' } : {}), ...(method !== 'GET' ? { 'x-csrf-token': csrfToken } : {}), ...headers },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
     const value = await response.json();
     if (!response.ok) throw new ApiError(response.status, value.error?.code ?? 'http_error', value.error?.message ?? `请求失败（${response.status}）`);
@@ -44,6 +45,30 @@ export async function request<T>(path: string, method = 'GET', body?: unknown, s
 
 export function saveAuditSchedule(projectId: string, settings: AuditScheduleSettings) {
     return request<{ auditSchedule: AuditSchedule }>(`/projects/${projectId}/audit-schedule`, 'PUT', settings);
+}
+
+export async function saveAuditPlan(projectId: string, settings: AuditPlanSettings, plan?: Pick<AuditPlan, 'planId' | 'version'>) {
+    const base = `/projects/${projectId}/audit-plans`;
+    if (plan) return request<{ auditPlan: AuditPlan }>(`${base}/${plan.planId}`, 'PUT', { ...settings, expectedVersion: plan.version });
+    const intent = JSON.stringify(['audit-plan', projectId, settings]);
+    const key = intents.get(intent) ?? Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+    intents.set(intent, key);
+    try {
+        const result = await request<{ auditPlan: AuditPlan }>(base, 'POST', settings, undefined, { 'idempotency-key': key });
+        intents.delete(intent);
+        return result;
+    } catch (error) {
+        if (error instanceof ApiError && error.status < 500) intents.delete(intent);
+        throw error;
+    }
+}
+
+export function setAuditPlanEnabled(projectId: string, planId: string, enabled: boolean) {
+    return request<{ auditPlan: AuditPlan }>(`/projects/${projectId}/audit-plans/${planId}`, 'PATCH', { enabled });
+}
+
+export function deleteAuditPlan(projectId: string, planId: string) {
+    return request<{ deleted: true }>(`/projects/${projectId}/audit-plans/${planId}`, 'DELETE');
 }
 
 export async function detail<T>(projectId: string, kind: string, params: Record<string, string>, signal: AbortSignal): Promise<T> {

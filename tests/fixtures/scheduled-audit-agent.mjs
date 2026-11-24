@@ -7,6 +7,7 @@ let prompt = '';
 for await (const chunk of process.stdin) prompt += chunk;
 
 if (prompt.includes('DSH_AUDIT_RECHECK=')) {
+    if (process.argv.includes('require-plan-note')) assert.doesNotMatch(prompt, /重点检查新增接口的兼容行为/);
     if (process.argv.includes('write-business-during-recheck')) {
         writeFileSync('src/math.js', '// 复查期间出现的业务改动\n');
         writeFileSync('local-note.txt', '复查期间出现的未跟踪文件\n');
@@ -43,6 +44,7 @@ if (prompt.includes('DSH_AUDIT_RECHECK=')) {
     process.exit(0);
 }
 
+if (process.argv.includes('require-plan-note')) assert.match(prompt, /重点检查新增接口的兼容行为/);
 const reportPath = /审查报告文件（相对仓库根目录）[:：]\s*(\S+)/.exec(prompt)?.[1];
 assert.ok(reportPath);
 if (prompt.includes('本轮定时审查') && !process.argv.includes('write-during-recheck') && !process.argv.includes('write-business-during-recheck')) {
