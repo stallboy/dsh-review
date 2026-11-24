@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { SCHEDULED_AUDIT_WAIT_MS, entityId, positiveInteger, type AuditPlanSettings, type AuditRecurrence, type CommandRecord,
     type JsonRecord, type ProjectRecord, type ScheduledAudit } from '@dsh-review/protocol';
 import { digest, stableJson } from './auth.js';
-import { CentralDatabase, CentralError, type Row, type User } from './database.js';
+import { assignCommandState, CentralDatabase, CentralError, type Row, type User } from './database.js';
 
 const DAY_MS = 24 * 60 * 60_000;
 const MAX_INTERVAL_DAYS = 365;
@@ -14,7 +14,7 @@ const CHANGED_REASON = 'SCHEDULE_CHANGED';
 const CHANGED_MESSAGE = '定时设置已修改，本轮未启动';
 const NOTES_UNSUPPORTED = 'SCHEDULE_NOTES_UNSUPPORTED';
 const SCHEDULE_KEY_PREFIX = 'scheduled-audit:';
-const UNACCEPTED_SCHEDULED = "state IN ('queued','dispatched') AND json_extract(envelope,'$.scheduledAudit') IS NOT NULL";
+const UNACCEPTED_SCHEDULED = "active_state IN ('queued','dispatched') AND json_extract(envelope,'$.scheduledAudit') IS NOT NULL";
 
 interface SchedulePolicy extends AuditPlanSettings {
     planId: string;
@@ -231,7 +231,7 @@ export class AuditSchedules {
     }
 
     private withdraw(projectId: string, planId: string, now: string): void {
-        this.database.sql.prepare(`UPDATE commands SET state='completed',updated_at=?,result=?
+        this.database.sql.prepare(`UPDATE commands SET ${assignCommandState('completed')},updated_at=?,result=?
             WHERE project_id=? AND idempotency_key GLOB ? AND ${UNACCEPTED_SCHEDULED}`)
             .run(now, this.skipped(CHANGED_REASON, CHANGED_MESSAGE), projectId, keysFor(planId));
     }
@@ -241,15 +241,15 @@ export class AuditSchedules {
     }
 
     skipUnsupportedNotes(commandId: string): void {
-        this.database.sql.prepare(`UPDATE commands SET state='completed',updated_at=?,result=?
+        this.database.sql.prepare(`UPDATE commands SET ${assignCommandState('completed')},updated_at=?,result=?
             WHERE command_id=? AND ${UNACCEPTED_SCHEDULED}`).run(this.database.now(),
             this.skipped(NOTES_UNSUPPORTED, '执行节点不支持定时审查要求，本轮未启动'), commandId);
     }
 
     expire(now = this.database.now()): void {
-        const expired = `state!='completed' AND state IN ('queued','dispatched') AND json_extract(envelope,'$.scheduledAudit.expiresAt')<=?`;
+        const expired = `${UNACCEPTED_SCHEDULED} AND json_extract(envelope,'$.scheduledAudit.expiresAt')<=?`;
         if (!this.database.sql.prepare(`SELECT 1 FROM commands WHERE ${expired} LIMIT 1`).get(now)) return;
-        this.database.sql.prepare(`UPDATE commands SET state='completed',updated_at=?,result=? WHERE ${expired}`)
+        this.database.sql.prepare(`UPDATE commands SET ${assignCommandState('completed')},updated_at=?,result=? WHERE ${expired}`)
             .run(now, this.skipped(EXPIRED_REASON, EXPIRED_MESSAGE), now);
     }
 
@@ -265,13 +265,13 @@ export class AuditSchedules {
     }
 
     blocksManual(projectId: string): boolean {
-        return Boolean(this.database.sql.prepare(`SELECT 1 FROM commands WHERE project_id=? AND state!='completed'
+        return Boolean(this.database.sql.prepare(`SELECT 1 FROM commands WHERE project_id=? AND active_state!='completed'
             AND NOT (${UNACCEPTED_SCHEDULED})`).get(projectId));
     }
 
     /** 改写未取消指令的幂等键使本轮可以重新派发，并保留原指令供节点确认。 */
     yieldToManual(projectId: string, now: string): void {
-        this.database.sql.prepare(`UPDATE commands SET state='completed',updated_at=?,
+        this.database.sql.prepare(`UPDATE commands SET ${assignCommandState('completed')},updated_at=?,
             idempotency_key=CASE WHEN cancel_requested=1 THEN idempotency_key ELSE 'retired-scheduled:' || command_id END,
             result=CASE WHEN cancel_requested=1 THEN ? ELSE ? END
             WHERE project_id=? AND ${UNACCEPTED_SCHEDULED}`).run(now,
@@ -282,8 +282,8 @@ export class AuditSchedules {
     private run(projectId: string, planId: string, slot?: Slot): Run | null {
         const db = this.database;
         const row = slot
-            ? db.sql.prepare('SELECT command_id,state,result,envelope FROM commands WHERE project_id=? AND idempotency_key=?').get(projectId, slot.key) as Row | undefined
-            : db.sql.prepare(`SELECT command_id,state,result,envelope FROM commands WHERE project_id=?
+            ? db.sql.prepare('SELECT command_id,active_state AS state,result,envelope FROM commands WHERE project_id=? AND idempotency_key=?').get(projectId, slot.key) as Row | undefined
+            : db.sql.prepare(`SELECT command_id,active_state AS state,result,envelope FROM commands WHERE project_id=?
                 AND idempotency_key GLOB ? ORDER BY created_at DESC,rowid DESC LIMIT 1`).get(projectId, keysFor(planId)) as Row | undefined;
         if (!row) return null;
         return { commandId: row.command_id, state: row.state, ...JSON.parse(row.envelope).scheduledAudit,
@@ -294,7 +294,7 @@ export class AuditSchedules {
         const outcome = run.result?.outcome;
         const unacceptedExpired = (run.state === 'queued' || run.state === 'dispatched') && now >= run.expiresAt;
         const skipReasons = [EXPIRED_REASON, CHANGED_REASON, 'SCHEDULE_WORKSPACE_BUSY', 'SCHEDULE_WORKSPACE_DIRTY', 'SCHEDULE_WORKSPACE_NO_BASE',
-            'SCHEDULE_WORKSPACE_INCOMPLETE', 'RUNNER_UNAVAILABLE', NOTES_UNSUPPORTED];
+            'SCHEDULE_WORKSPACE_INCOMPLETE', 'RUNNER_UNAVAILABLE', 'SCHEDULE_ROLLBACK_CONFLICT', NOTES_UNSUPPORTED];
         const skipped = unacceptedExpired || (typeof outcome?.reason === 'string' && skipReasons.includes(outcome.reason));
         const reason = outcome?.message ?? outcome?.detail ?? outcome?.reason;
         return { commandId: run.commandId, scheduledAt: run.scheduledAt, state: skipped ? 'skipped' as const : run.state,
