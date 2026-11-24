@@ -29,7 +29,7 @@ import { openAuditStageChannel } from './audit-stage-channel.js';
 import { runAuditSelfTest, type AuditSelfTestTools } from './audit-self-test.js';
 import { loadReviewers } from './reviewers.js';
 import { ReviewStore } from './store.js';
-import { AuditStages, auditUserFields, renderAuditCoordinator, type AuditPriorityEntry } from './audit-stages.js';
+import { AuditStages, auditUserFields, renderAuditCoordinator, type AuditPriorityEntry, type AuditStageExecution } from './audit-stages.js';
 import { assertStageArtifacts, compatibleAuditBase, publishStageArtifacts, readSvnAuditUrl, verifyStageGates } from './audit-stage-artifacts.js';
 import { auditObject, AuditStopUnknown, type AuditExecutor } from './audit-stage-runner.js';
 import type { AuditStage } from './audit-prompts.js';
@@ -48,12 +48,25 @@ import {
   type TrustedActor,
 } from './api-context.js';
 
+interface StageRecoveryOutcome {
+  status: 'RECOVERY_REQUIRED';
+  reason: 'SYNC_STATE_UNKNOWN';
+  auditId: string;
+  sessionId: string;
+  detail: string;
+  stageFailure: AuditStageExecution;
+}
+
 /** 将审查执行和租约状态机接入 Host。路由负责请求受理，租约在执行期间持续约束共享写入。 */
 export class AuditRuntime {
   private readonly leaseTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly finalizing = new Set<string>();
 
   isFinalizing(auditId: string): boolean { return this.finalizing.has(auditId); }
+
+  hasActiveAuditWork(auditId: string): boolean {
+    return this.isFinalizing(auditId) || this.stages.get(auditId)?.busy === true;
+  }
 
   private clearAuditLeaseTimeout(auditId: string): void {
     clearTimeout(this.leaseTimeouts.get(auditId));
@@ -66,6 +79,7 @@ export class AuditRuntime {
   }
   private lifecycle: AuditLifecycle | null = null;
   private readonly stages = new Map<string, AuditStages>();
+  private readonly stageRecoveries = new WeakMap<AuditStages, Promise<StageRecoveryOutcome>>();
   private readonly testSessions = new Map<string, AuditSelfTestTools>();
   private readonly testShutdown = new AbortController();
   private closed = false;
@@ -119,7 +133,36 @@ export class AuditRuntime {
     try {
       return await session.run(stage, runner, task, signal);
     } finally {
-      if (session.uncertain) await this.auditLifecycle.markReleasable(session.lease.auditId);
+      const failure = session.interruptedStage;
+      if (failure) {
+        if (session.lease.sessionId) await this.settleStageRecovery(session, failure, failure.detail);
+        else await this.auditLifecycle.markReleasable(session.lease.auditId);
+      }
+    }
+  }
+
+  private async settleStageRecovery(session: AuditStages, { stage, runner }: AuditStageExecution, detail: string): Promise<void> {
+    const { auditId, sessionId } = session.lease;
+    if (!sessionId) return;
+    let recovery = this.stageRecoveries.get(session);
+    if (!recovery) {
+      recovery = this.recordStageRecovery({
+        status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', auditId, sessionId, detail, stageFailure: { stage, runner },
+      });
+      this.stageRecoveries.set(session, recovery);
+    }
+    this.finishAuditTracking(auditId, await recovery);
+  }
+
+  private async recordStageRecovery(outcome: StageRecoveryOutcome): Promise<StageRecoveryOutcome> {
+    const { auditId } = outcome;
+    this.stopStages(auditId);
+    this.clearAuditLeaseTimeout(auditId);
+    try {
+      await this.auditLifecycle.markReleasable(auditId);
+      return outcome;
+    } catch {
+      return { ...outcome, detail: outcome.detail + ' 审查租约状态保存失败，仍保留写入阻塞。' };
     }
   }
 
@@ -347,6 +390,11 @@ export class AuditRuntime {
     const timer = setTimeout(() => {
       this.leaseTimeouts.delete(auditId);
       if (this.isFinalizing(auditId)) return;
+      const stage = this.stages.get(auditId);
+      if (stage?.lease.sessionId && stage.runningStage) {
+        void this.settleStageRecovery(stage, stage.runningStage, '审查达到总时限，已请求停止当前阶段，请核验执行器与工作副本。');
+        return;
+      }
       this.stopStages(auditId);
       void this.auditLifecycle.markReleasable(auditId).then((changed) => {
         if (!changed) return;
@@ -387,15 +435,31 @@ export class AuditRuntime {
   }
 
   private trackAuditSession(runtime: Runtime, auditId: string, sessionId: string, requestId: string, managedSignal?: AbortSignal): JobRecord {
-    this.armAuditLeaseTimeout(auditId);
+    const stage = this.stages.get(auditId);
+    if (!stage || !this.stageRecoveries.has(stage)) this.armAuditLeaseTimeout(auditId);
     const watch = this.host.deps.withAuditSessionIdle;
-    return this.startAuditTrackingJob(auditId, !watch ? undefined : async (log, signal) => {
+    return this.startAuditTrackingJob(auditId, async (log, signal) => {
+      const existingRecovery = stage && this.stageRecoveries.get(stage);
+      if (existingRecovery) {
+        this.finishAuditTracking(auditId, await existingRecovery);
+        return;
+      }
+      if (!watch) return;
       const watching = managedSignal ? AbortSignal.any([signal, managedSignal]) : signal;
       let finished: boolean;
       try {
         finished = await watch(sessionId, requestId, watching, async maintenance => {
           const lease = this.auditLifecycle.find(auditId);
-          if (!lease || lease.state !== 'active' || this.isFinalizing(auditId)) return;
+          if (!lease || lease.state === 'released' || this.isFinalizing(auditId)) return false;
+          if (lease.state === 'releasable') {
+            const recovery = stage && this.stageRecoveries.get(stage);
+            this.clearAuditLeaseTimeout(auditId);
+            this.finishAuditTracking(auditId, recovery ? await recovery : {
+              status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', auditId, sessionId,
+              detail: '审查租约已进入恢复状态，请核验审查产物与工作副本。',
+            });
+            return;
+          }
           if (lease.phased && (!lease.stageSeal || this.stages.get(auditId)?.busy)) return false;
           this.clearAuditLeaseTimeout(auditId);
           log('审查会话已空闲，开始自动收尾');
@@ -415,6 +479,11 @@ export class AuditRuntime {
         if (!watching.aborted) log(`跟踪 DSH 会话失败：${error instanceof Error ? error.message : String(error)}`);
       }
       if (finished || signal.aborted) return;
+      const interrupted = stage && this.stageRecoveries.get(stage);
+      if (interrupted) {
+        this.finishAuditTracking(auditId, await interrupted);
+        return;
+      }
       if (!managedSignal) {
         log('无法确认 DSH 会话结束，请在审查结束后手动收尾');
         return;

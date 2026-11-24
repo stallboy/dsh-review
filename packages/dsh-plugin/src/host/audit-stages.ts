@@ -123,6 +123,11 @@ export async function renderAuditCoordinator(input: {
     });
 }
 
+export interface AuditStageExecution {
+    stage: AuditStage;
+    runner: AuditExecutor;
+}
+
 export class AuditStages {
     private readonly abort = new AbortController();
     private readonly leads = new Map<string, { token: string; navigation: Array<{ path: string; line: number }> }>();
@@ -132,8 +137,12 @@ export class AuditStages {
     private readonly authenticationFailures = new Set<AuditExecutor>();
     private taskCounter = 0;
     private scanned = false;
+    private execution?: AuditStageExecution & ({ state: 'running' } | { state: 'uncertain'; detail: string });
     busy = false;
-    uncertain = false;
+
+    get runningStage() { return this.execution?.state === 'running' ? this.execution : undefined; }
+    get interruptedStage() { return this.execution?.state === 'uncertain' ? this.execution : undefined; }
+    get uncertain(): boolean { return this.interruptedStage !== undefined; }
 
     constructor(
         readonly lease: AuditLeaseRecord,
@@ -184,7 +193,9 @@ export class AuditStages {
     }
 
     async run(stage: AuditStage, executor: AuditExecutor, task: unknown, outerSignal: AbortSignal): Promise<unknown> {
-        if (this.busy || this.uncertain || this.lease.stageSeal || this.lease.state !== 'active') throw new Error('此轮不能启动阶段任务');
+        if (this.busy || this.uncertain || this.abort.signal.aborted || this.lease.stageSeal || this.lease.state !== 'active') {
+            throw new Error('此轮不能启动阶段任务');
+        }
         const schema = taskSchemas[stage];
         if (!schema || !AUDIT_EXECUTORS.includes(executor)) throw new Error('未知审查阶段或执行器');
         if (this.authenticationFailures.has(executor)) {
@@ -240,6 +251,7 @@ export class AuditStages {
         if (remaining <= 0) throw new Error('审查租约已到期');
         const signal = AbortSignal.any([outerSignal, this.abort.signal, AbortSignal.timeout(remaining)]);
         this.busy = true;
+        this.execution = { state: 'running', stage, runner: executor };
         const taskId = stage + '-' + String(++this.taskCounter);
         const log = (line: string) => this.log?.(taskId + ' ' + executor + ' ' + line);
         let scratch: string | undefined;
@@ -324,16 +336,22 @@ export class AuditStages {
                 this.coverage.push(taskId + ' 未完成');
                 log(signal.aborted ? '阶段已取消或超时' : '阶段未完成');
             }
-            if (error instanceof AuditStopUnknown || signal.aborted) this.uncertain = true;
+            if (error instanceof AuditStopUnknown || signal.aborted) {
+                this.execution = { state: 'uncertain', stage, runner: executor,
+                    detail: error instanceof AuditStopUnknown ? error.message : '无法确认审查阶段已安全停止，请核验执行器与工作副本。' };
+            }
             throw error;
         } finally {
-            if (scratch && !this.uncertain) await rm(scratch, { recursive: true, force: true }).catch(() => { this.uncertain = true; });
+            if (scratch && !this.uncertain) await rm(scratch, { recursive: true, force: true }).catch(() => {
+                this.execution = { state: 'uncertain', stage, runner: executor, detail: '阶段临时目录清理失败，请核验工作副本。' };
+            });
+            if (!this.uncertain) delete this.execution;
             this.busy = false;
         }
     }
 
     publication(input: unknown): { path: string; body: string; candidates: StageCandidate[]; items: AuditItem[]; overview: AuditPriorityEntry[] } {
-        if (this.busy || this.uncertain || this.lease.state !== 'active' || this.lease.stageSeal || !this.scanned) {
+        if (this.busy || this.uncertain || this.abort.signal.aborted || this.lease.state !== 'active' || this.lease.stageSeal || !this.scanned) {
             throw new Error('发布需要完成初审、停止阶段执行并且没有恢复事项');
         }
         const value = auditObject(input);

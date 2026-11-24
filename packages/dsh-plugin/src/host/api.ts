@@ -124,6 +124,10 @@ export class ReviewApi implements ApiHost {
     return this.auditLifecycle.find(auditId);
   }
 
+  hasActiveAuditWork(auditId: string): boolean {
+    return this.auditRuntime.hasActiveAuditWork(auditId);
+  }
+
   async leaseTransition(auditId: string, state: 'released' | 'releasable'): Promise<void> {
     await this.auditLifecycle.transition(auditId, state);
   }

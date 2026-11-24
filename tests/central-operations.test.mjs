@@ -6,7 +6,11 @@ import test from 'node:test';
 import { createGitFixture, runCommand } from './helpers.mjs';
 import { reviewFixture, patchFixture } from './fixtures/contract.mjs';
 import { registerAuditStageTools } from '../packages/dsh-plugin/dist/host/audit-stage-tools.js';
+import { AuditStopUnknown } from '../packages/dsh-plugin/dist/host/audit-stage-runner.js';
 import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
+import { ManagedDelivery } from '../packages/dsh-plugin/dist/managed/managed-delivery.js';
+import { ManagedNode } from '../packages/dsh-plugin/dist/managed/managed-node.js';
+import { bindProject, setupCentral } from './central-helpers.mjs';
 
 async function fixture(t, auditSessions) {
     const root = await createGitFixture();
@@ -181,6 +185,150 @@ test('中央桌面节点使用绑定会话访问共享阶段工具', async t => 
     assert.equal(result.delivery.state, 'delivered');
     assert.match(runCommand('git', ['show', 'HEAD:' + result.outcome.reportPath], root).stdout, /确认走共享阶段/);
 });
+
+for (const timing of ['已注册 Job', '尚未注册 Job', '租约保存失败', '整轮时限与阶段重合']) {
+    test(`桌面审查阶段超时及时回报待核验（${timing}）`, { timeout: 30_000 }, async t => {
+        const watching = Promise.withResolvers();
+        const sessionId = 'desktop-stage-timeout';
+        const signal = new AbortController().signal;
+        const scan = { taskScope: ['src'], scenarios: [], questions: [], constraints: [] };
+        const executorStarted = Promise.withResolvers();
+        const executorResult = Promise.withResolvers();
+        let operations, stageApi, expire, phaseFailure;
+        if (timing === '整轮时限与阶段重合') {
+            const schedule = globalThis.setTimeout;
+            t.mock.method(globalThis, 'setTimeout', (callback, delay, ...args) => {
+                if (delay <= 10_000_000) return schedule(callback, delay, ...args);
+                expire = () => callback(...args);
+                return schedule(() => {}, delay);
+            });
+        }
+        const runStage = async () => {
+            stageApi = operations.auditStageApi(sessionId);
+            assert.ok(stageApi);
+            await stageApi.runAuditStage(sessionId, 'scan', 'codex', scan, signal);
+            if (timing === '租约保存失败') {
+                t.mock.method(stageApi.auditLifecycle, 'markReleasable', async () => { throw new Error('无法保存'); });
+            }
+            phaseFailure = assert.rejects(stageApi.runAuditStage(sessionId, 'scan', 'claude-code', scan, signal), /执行器超时/);
+            await executorStarted.promise;
+            if (timing === '整轮时限与阶段重合') {
+                assert.equal(typeof expire, 'function');
+                expire();
+                return;
+            }
+            executorResult.reject(new AuditStopUnknown('claude-code 执行器超时，需确认子进程已经停止'));
+            if (timing === '已注册 Job') {
+                await assert.rejects(stageApi.runAuditStage(sessionId, 'verify', 'codex', {}, signal));
+            }
+            await phaseFailure;
+        };
+        const setup = await fixture(t, {
+            auditStageExecutor: async ({ executor, location }) => {
+                if (executor === 'claude-code') {
+                    t.after(() => rm(location, { recursive: true, force: true }));
+                    executorStarted.resolve();
+                    return executorResult.promise;
+                }
+                return { leads: [], coverage: [], limits: [] };
+            },
+            async createAuditSession(input) {
+                await input.onCreated(sessionId);
+                if (timing === '尚未注册 Job') await runStage();
+                return { sessionId };
+            },
+            withAuditSessionIdle(_id, _requestId, watchingSignal) {
+                watching.resolve();
+                return new Promise(resolve => watchingSignal.addEventListener('abort', () => resolve(false), { once: true }));
+            },
+        });
+        ({ operations } = setup);
+        const { project, journal, root, remote, target } = setup;
+        const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+        const findCommit = t.mock.method(ManagedDelivery.prototype, 'findCommandCommit', async () => { throw new Error('阶段恢复回报不应等待提交查询'); });
+        const withinBudget = pending => Promise.race([pending, new Promise((_, reject) => {
+            const timer = setTimeout(() => reject(new Error('会话未结束时中央未收到恢复结果')), 6000);
+            timer.unref();
+        })]);
+        let result;
+        if (timing === '已注册 Job') {
+            const { app, headers } = await setupCentral(t);
+            const credential = app.database.createNode('超时恢复节点');
+            let dropReceipt = true;
+            const node = new ManagedNode({
+                config: { centerUrl: 'http://127.0.0.1:3081', ...credential, workspaces: operations.registrations() },
+                journal, execute: (...args) => operations.execute(...args),
+                read: () => { throw new Error('未预期的查询'); },
+                fetch: async (url, options) => {
+                    const pathname = new URL(url).pathname;
+                    const response = await app.inject({ method: options.method, url: pathname, headers: options.headers, payload: options.body });
+                    if (dropReceipt && response.statusCode === 200 && pathname.endsWith('/events')
+                        && JSON.parse(options.body).events.some(event => event.result?.outcome.status === 'RECOVERY_REQUIRED')) {
+                        dropReceipt = false;
+                        throw new Error('模拟中央回执丢失');
+                    }
+                    return new Response(response.body, { status: response.statusCode, headers: response.headers });
+                },
+            });
+            await node.tick();
+            const binding = await bindProject(app, headers, { ...credential, workspaceId: project.workspaceId });
+            const start = await app.inject({ method: 'POST', url: '/api/v1/projects/' + binding.projectId + '/commands', headers,
+                payload: { operation: 'audit', idempotencyKey: 'review-stage-timeout', payload: { targetPath: '.' } } });
+            assert.equal(start.statusCode, 202, start.body);
+            const id = start.json().command.commandId;
+            await node.tick();
+            await withinBudget(watching.promise);
+            await runStage();
+            await withinBudget(node.drain());
+            await assert.rejects(node.tick(), /中央回执丢失/);
+            const readCommand = async () => (await app.inject({ url: '/api/v1/commands/' + id, headers })).json().command;
+            const interrupted = await readCommand();
+            assert.equal(interrupted.state, 'recovery_required');
+            assert.equal(journal.pending().filter(event => event.result).length, 1);
+            await node.tick();
+            assert.deepEqual((await readCommand()).result, interrupted.result);
+            assert.deepEqual(journal.pending(), []);
+            result = interrupted.result;
+        } else {
+            const command = auditCommand(project);
+            journal.accept(command);
+            const running = operations.execute(command, signal, () => {}, project);
+            if (timing !== '尚未注册 Job') {
+                await withinBudget(watching.promise);
+                await runStage();
+            }
+            try {
+                result = await withinBudget(running);
+                if (timing === '整轮时限与阶段重合') {
+                    findCommit.mock.restore();
+                    const blocked = await operations.recover(command, result, project);
+                    assert.equal(blocked.outcome.status, 'RECOVERY_REQUIRED');
+                    assert.match(blocked.outcome.detail, /仍在执行/);
+                    assert.equal(stageApi.leaseLookup(result.outcome.auditId).state, 'releasable');
+                }
+            } finally {
+                if (timing === '整轮时限与阶段重合') {
+                    executorResult.reject(new AuditStopUnknown('claude-code 执行器超时'));
+                    await phaseFailure;
+                }
+            }
+        }
+        const auditId = result.outcome.auditId;
+        assert.equal(result.outcome.status, 'RECOVERY_REQUIRED');
+        assert.equal(result.outcome.reason, 'SYNC_STATE_UNKNOWN');
+        assert.equal(result.outcome.sessionId, sessionId);
+        assert.deepEqual(result.outcome.stageFailure, { stage: 'scan', runner: 'claude-code' });
+        const detail = timing === '整轮时限与阶段重合' ? /审查达到总时限/ : /执行器超时/;
+        assert.match(result.outcome.detail, detail);
+        if (timing === '租约保存失败') assert.match(result.outcome.detail, /租约.*保存失败/);
+        assert.equal(result.delivery.state, 'unknown');
+        assert.equal(stageApi.auditLifecycle.blockingLeaseFor(await realpath(root))?.auditId, auditId);
+        assert.equal(stageApi.leaseLookup(auditId).state, timing === '租约保存失败' ? 'active' : 'releasable');
+        await assert.rejects(stageApi.runAuditStage(sessionId, 'scan', 'codex', scan, signal));
+        assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), head);
+        assert.equal(runCommand('git', ['rev-parse', `refs/heads/${target}`], remote).stdout.trim(), head);
+    });
+}
 
 test('桌面审查取消跟踪保留会话和未决记录，恢复不重新创建会话', async t => {
     const watching = Promise.withResolvers();

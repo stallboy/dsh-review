@@ -275,9 +275,13 @@ export class ManagedOperations {
             outcome = { ...data, status: typeof commitRevision === 'string' ? 'COMMITTED' : 'SUCCEEDED', ...(typeof commitRevision === 'string' ? { commitRevision } : {}) };
         }
         if (session) outcome = { ...outcome, ...session };
-        let commit = typeof outcome.commitRevision === 'string' ? outcome.commitRevision : null;
-        if (!commit) commit = await runtime.delivery.findCommandCommit(command.commandId);
         const unverifiedAudit = command.operation === 'audit' && outcome.status === 'RECOVERY_REQUIRED';
+        const stageLease = inSession && unverifiedAudit && session && outcome.stageFailure
+            ? runtime.api.leaseLookup(session.auditId) : undefined;
+        let commit = typeof outcome.commitRevision === 'string' ? outcome.commitRevision : null;
+        if (!commit && (!stageLease || stageLease.stageSeal || stageLease.commitOutcomeUnknown)) {
+            commit = await runtime.delivery.findCommandCommit(command.commandId);
+        }
         const result: ManagedResult = { outcome, delivery: unverifiedAudit
             ? { state: 'unknown', ...(commit ? { commitRevision: commit } : {}) }
             : commit ? { state: 'pending', commitRevision: commit } : { state: outcome.status === 'RECOVERY_REQUIRED' ? 'unknown' : 'not_required' } };
@@ -357,6 +361,10 @@ export class ManagedOperations {
                                 const paths = (reviewData?.paths ?? workspace.dirtyPaths).slice(0, 5);
                                 diagnostic = !workspace.clean && !paths.length ? workspace.message : `工作副本仍有待处理的改动${paths.length ? `（${paths.join('、')}）` : ''}。请在执行节点保留并处理这些改动，再重试核验。`;
                                 return { outcome: { ...unknownResult(diagnostic).outcome, ...session }, delivery: { state: 'unknown' } };
+                            }
+                            if (runtime.api.hasActiveAuditWork(lease.auditId)) {
+                                const active = unknownResult('审查阶段或收尾仍在执行，须等待停止后再核验。');
+                                return { outcome: { ...active.outcome, ...session }, delivery: active.delivery };
                             }
                             this.options.journal.checkpoint(command.commandId, { phase: 'session_releasing', ...session });
                             if (lease.state !== 'released') await runtime.api.leaseTransition(lease.auditId, 'released');
