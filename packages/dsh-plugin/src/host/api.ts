@@ -99,6 +99,10 @@ export class ReviewApi implements ApiHost {
 
   closeAudit(): Promise<void> { return this.auditRuntime.close(); }
 
+  runAuditSelfTest(signal: AbortSignal, progress: (step: string, message: string) => void) {
+    return this.auditRuntime.runSelfTest(signal, progress);
+  }
+
   hasAuditStageSession(sessionId: string): boolean {
     return this.auditRuntime.hasStageSession(sessionId);
   }

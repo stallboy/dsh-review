@@ -92,6 +92,7 @@ export interface ApiDeps {
     prompt: string;
     requestId?: string;
     requireWorkspace?: boolean;
+    cwdOnly?: true;
     signal?: AbortSignal;
     /** 新会话继承面板所属会话的权限预设与审批策略。 */
     ownerSessionId?: string;

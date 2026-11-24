@@ -61,7 +61,7 @@ export class ManagedJournal {
     awaitingAcknowledgement(): ManagedCommand[] {
         return this.database.prepare("SELECT envelope FROM commands WHERE phase='accepted'").all()
             .map(row => validateCommand(JSON.parse(String(row.envelope)), true))
-            .filter(command => command.scheduledAudit || command.operation === RETIRED_MANUAL_REVISION);
+            .filter(command => command.scheduledAudit || command.operation === RETIRED_MANUAL_REVISION || command.operation === 'test');
     }
 
     settleBeforeExecution(commandId: string, result: ManagedResult): void {

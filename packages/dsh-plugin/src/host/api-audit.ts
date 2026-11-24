@@ -25,6 +25,7 @@ import { SCHEDULED_AUDIT_ACTOR } from '@dsh-review/protocol';
 import { assertScheduledCheckout, captureReviewWorktree, matchesAuditTarget, scheduledReviewDataClean, syncScheduledAudit, type ReviewWorktreeState } from './scheduled-audit-vcs.js';
 import { runAgent, wrapAgentPrompt } from './runner.js';
 import { openAuditStageChannel } from './audit-stage-channel.js';
+import { runAuditSelfTest, type AuditSelfTestTools } from './audit-self-test.js';
 import { loadReviewers } from './reviewers.js';
 import { ReviewStore } from './store.js';
 import { AuditStages, auditUserFields, renderAuditCoordinator, type AuditPriorityEntry } from './audit-stages.js';
@@ -64,11 +65,14 @@ export class AuditRuntime {
   }
   private lifecycle: AuditLifecycle | null = null;
   private readonly stages = new Map<string, AuditStages>();
+  private readonly testSessions = new Map<string, AuditSelfTestTools>();
+  private readonly testShutdown = new AbortController();
   private closed = false;
   private leaseWrites: Promise<void> = Promise.resolve();
 
   close(): Promise<void> {
     this.closed = true;
+    this.testShutdown.abort();
     for (const [jobId] of this.host.auditJobLeases) this.host.jobManager.abort(jobId);
     for (const auditId of new Set([...this.leaseTimeouts.keys(), ...this.stages.keys()])) {
       this.clearAuditLeaseTimeout(auditId);
@@ -91,7 +95,7 @@ export class AuditRuntime {
   }
 
   hasStageSession(sessionId: string): boolean {
-    return this.findStageSession(sessionId) !== undefined;
+    return !this.closed && (this.testSessions.has(sessionId) || this.findStageSession(sessionId) !== undefined);
   }
 
   private findStageSession(sessionId: string): AuditStages | undefined {
@@ -106,7 +110,8 @@ export class AuditRuntime {
   }
 
   async runStage(sessionId: string, stage: AuditStage, runner: AuditExecutor, task: unknown, signal: AbortSignal): Promise<unknown> {
-    return this.executeStage(this.stageForSession(sessionId), stage, runner, task, signal);
+    const test = this.testSessions.get(sessionId);
+    return test ? test.run(stage, runner, task, signal) : this.executeStage(this.stageForSession(sessionId), stage, runner, task, signal);
   }
 
   private async executeStage(session: AuditStages, stage: AuditStage, runner: AuditExecutor, task: unknown, signal: AbortSignal): Promise<unknown> {
@@ -129,7 +134,16 @@ export class AuditRuntime {
   }
 
   async publishStages(sessionId: string, input: unknown, signal?: AbortSignal): Promise<{ reportPath: string; overview: AuditPriorityEntry[] }> {
-    return this.publishStage(this.stageForSession(sessionId), input, signal);
+    const test = this.testSessions.get(sessionId);
+    return test ? test.publish(input, signal) : this.publishStage(this.stageForSession(sessionId), input, signal);
+  }
+
+  runSelfTest(signal: AbortSignal, progress: (step: string, message: string) => void) {
+    return runAuditSelfTest({
+      deps: this.host.deps, settings: this.host.currentSettings(),
+      signal: AbortSignal.any([signal, this.testShutdown.signal]), progress,
+      sessions: this.testSessions,
+    });
   }
 
   private async publishStage(stage: AuditStages, input: unknown, signal?: AbortSignal, recheck?: AuditRecheck): Promise<{ reportPath: string; overview: AuditPriorityEntry[] }> {

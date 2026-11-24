@@ -30,8 +30,21 @@ export class Commands {
             workspace.workspaceId === project.workspaceId && workspace.findingWorkflow === true);
     }
 
-    create(projectId: string, input: JsonRecord, user: User): CommandRecord {
-        if (input.operation === RETIRED_MANUAL_REVISION) throw new ProtocolError('operation');
+    private supportsSelfTest(project: ProjectRecord): boolean {
+        return this.database.getNode(project.nodeId).workspaces.some(workspace =>
+            workspace.workspaceId === project.workspaceId && workspace.auditSelfTest);
+    }
+
+    private finishUnsupportedSelfTest(commandId: string): CommandRecord {
+        const result: ManagedResult = { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', step: 'workspace',
+            message: '执行节点已不支持审查流程自检' }, delivery: { state: 'not_required' } };
+        this.database.sql.prepare("UPDATE commands SET state='completed',result=?,updated_at=? WHERE command_id=?")
+            .run(JSON.stringify(result), this.database.now(), commandId);
+        return this.get(commandId);
+    }
+
+    create(projectId: string, input: JsonRecord, user: User, selfTest = false): CommandRecord {
+        if (input.operation === RETIRED_MANUAL_REVISION || (input.operation === 'test' && !selfTest)) throw new ProtocolError('operation');
         const db = this.database;
         const project = db.getProject(projectId);
         const key = entityId(input.idempotencyKey, 'idempotencyKey');
@@ -56,6 +69,9 @@ export class Commands {
             }
             const issues = db.workspaceIssues(node.nodeId);
             if (Object.hasOwn(issues, project.workspaceId)) throw new CentralError(503, 'workspace_unavailable', issues[project.workspaceId]!);
+            if (input.operation === 'test' && !this.supportsSelfTest(project)) {
+                throw new CentralError(409, 'conflict', '节点尚未声明审查流程自检能力');
+            }
             this.schedules.yieldToManual(projectId, now);
             const command = input.operation === 'audit' && supportsFindings
                 ? { ...input, payload: { ...payload, findingWorkflow: true } } : input;
@@ -85,7 +101,9 @@ export class Commands {
             const unavailable = (command: CommandRecord) => Object.hasOwn(issues, db.getProject(command.projectId).workspaceId);
             const all = (db.sql.prepare("SELECT command_id FROM commands WHERE node_id=? AND state!='completed' ORDER BY created_at").all(nodeId) as Row[])
                 .map(row => this.get(row.command_id));
-            const supports = (command: CommandRecord) => !(
+            const supports = (command: CommandRecord) => command.operation === 'test'
+                ? this.supportsSelfTest(db.getProject(command.projectId))
+                : !(
                 command.operation === 'finding-decision' || (command.operation === 'approve' && 'expectedFindingVersion' in command.payload)
                 || (command.operation === 'audit' && command.payload.findingWorkflow === true)
             ) || this.supportsFindingWorkflow(db.getProject(command.projectId));
@@ -93,7 +111,12 @@ export class Commands {
                 if (command.state !== 'queued' && command.state !== 'dispatched') {
                     return command.state === 'accepted' || command.state === 'executing' || !unavailable(command);
                 }
+                if (unavailable(command) && command.operation === 'test') return false;
                 if (supports(command)) return !unavailable(command);
+                if (command.operation === 'test') {
+                    this.finishUnsupportedSelfTest(command.commandId);
+                    return false;
+                }
                 const result: ManagedResult = { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '执行节点已不支持新版发现' },
                     delivery: { state: 'not_required' } };
                 db.sql.prepare("UPDATE commands SET state='completed',result=?,updated_at=? WHERE command_id=?")
@@ -135,11 +158,13 @@ export class Commands {
             const now = db.now();
             this.schedules.expire(now);
             const command = this.get(commandId);
-            this.authorize(nodeId, command, !(command.state === 'completed' && (command.scheduledAudit || command.operation === RETIRED_MANUAL_REVISION)));
+            this.authorize(nodeId, command, !(command.state === 'completed' && (command.scheduledAudit || command.operation === RETIRED_MANUAL_REVISION || command.operation === 'test')));
             if (command.state === 'queued' || command.state === 'dispatched') {
                 if (!db.getNode(nodeId).compatible) throw new CentralError(409, 'protocol_incompatible', '节点协议不兼容，不能受理写指令');
                 const issues = db.workspaceIssues(nodeId);
-                if (Object.hasOwn(issues, db.getProject(command.projectId).workspaceId)) return command;
+                const project = db.getProject(command.projectId);
+                if (Object.hasOwn(issues, project.workspaceId)) return command;
+                if (command.operation === 'test' && !this.supportsSelfTest(project)) return this.finishUnsupportedSelfTest(commandId);
                 if (command.scheduledAudit && db.sql.prepare(`SELECT projects.workspace_id,commands.state FROM commands JOIN projects USING(project_id)
                     WHERE commands.node_id=? AND commands.state!='completed'
                     AND json_extract(envelope,'$.scheduledAudit') IS NULL`).all(nodeId)

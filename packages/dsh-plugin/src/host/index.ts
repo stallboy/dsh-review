@@ -205,13 +205,15 @@ async function createDshSession(
   }
   const registry = host.get('workspaceRegistry') as WorkspaceRegistryLike | undefined;
   let workspace: WorkspaceLike | undefined;
-  try {
-    workspace = await registry?.resolveByPath?.(input.cwd);
-  } catch (error) {
-    host.logger?.warn(`dsh-code-review: 按路径解析工作区失败：${describeSessionError(error)}`);
-  }
-  if (!workspace) {
-    workspace = registry?.list?.().find((item) => samePath(item.path, input.cwd));
+  if (!input.cwdOnly) {
+    try {
+      workspace = await registry?.resolveByPath?.(input.cwd);
+    } catch (error) {
+      host.logger?.warn(`dsh-code-review: 按路径解析工作区失败：${describeSessionError(error)}`);
+    }
+    if (!workspace) {
+      workspace = registry?.list?.().find((item) => samePath(item.path, input.cwd));
+    }
   }
   if (input.requireWorkspace) {
     const root = await realpath(input.cwd);

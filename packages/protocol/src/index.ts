@@ -8,7 +8,7 @@ export const RETIRED_MANUAL_REVISION = 'manual-revision';
 export const OPERATIONS = [
     'approve', 'comments', 'comments-batch', 'comment-status', 'takeover', 'reject', 'resume', 'rebase',
     'ai-fix', 'reopen', 'archive-stale', 'audit', 'audit-finalize',
-    'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'finding-decision', 'sync',
+    'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'finding-decision', 'sync', 'test',
 ] as const;
 
 export type ManagedOperation = typeof OPERATIONS[number];
@@ -76,6 +76,7 @@ export interface WorkspaceRegistration {
     target: string;
     executionConfigHash?: string;
     supportsScheduledAudit?: true;
+    auditSelfTest?: true;
     findingWorkflow?: true;
 }
 
@@ -216,7 +217,7 @@ export function validateCommand(value: unknown, allowRetiredManualRevision = fal
         throw new ProtocolError('scheduledAudit');
     }
     timestamp(input.createdAt, 'createdAt');
-    const needsGuard = !['audit', 'audit-finalize', 'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'finding-decision', 'sync'].includes(String(input.operation));
+    const needsGuard = !['audit', 'audit-finalize', 'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'finding-decision', 'sync', 'test'].includes(String(input.operation));
     if (needsGuard || input.guard !== undefined) {
         const guard = record(input.guard, 'guard');
         positiveInteger(guard.expectedRevision, 'guard.expectedRevision');
@@ -232,7 +233,7 @@ function validatePayload(operation: ManagedOperation, payload: JsonRecord): void
         'comments-batch': ['id', 'comments'], 'comment-status': ['id', 'commentId', 'status'], takeover: ['id'], reject: ['id', 'reason', 'category'], resume: ['id'],
         rebase: ['id'], 'ai-fix': ['id'], reopen: ['id', 'from', 'reason'], 'archive-stale': ['id'],
         audit: ['targetPath', 'note', 'findingWorkflow'], 'audit-finalize': ['auditId'], 'audit-release': ['auditId', 'confirmStopped'], 'candidate-finalize': ['id'],
-        convert: ['auditId', 'findingId', 'candidateId'], 'dismiss-finding': ['auditId', 'findingId', 'reason'], sync: [],
+        convert: ['auditId', 'findingId', 'candidateId'], 'dismiss-finding': ['auditId', 'findingId', 'reason'], sync: [], test: [],
         'finding-decision': ['findingId', 'expectedFindingVersion', 'action', 'reason', 'reviewAfter', 'reviewWhen', 'hint'],
     };
     for (const key of Object.keys(payload)) if (!fields[operation].includes(key)) throw new ProtocolError(`payload.${key}`);
@@ -285,7 +286,7 @@ export function validateRegistration(value: unknown): NodeRegistration {
     const ids = new Set<string>();
     for (const item of input.workspaces) {
         const workspace = record(item, 'workspace');
-        if (Object.keys(workspace).some(key => !['workspaceId', 'label', 'vcsType', 'target', 'executionConfigHash', 'supportsScheduledAudit', 'findingWorkflow'].includes(key))) throw new ProtocolError('workspace');
+        if (Object.keys(workspace).some(key => !['workspaceId', 'label', 'vcsType', 'target', 'executionConfigHash', 'supportsScheduledAudit', 'findingWorkflow', 'auditSelfTest'].includes(key))) throw new ProtocolError('workspace');
         const id = entityId(workspace.workspaceId, 'workspaceId');
         if (ids.has(id)) throw new ProtocolError('重复 workspaceId');
         ids.add(id);
@@ -293,6 +294,7 @@ export function validateRegistration(value: unknown): NodeRegistration {
         if (workspace.vcsType !== 'git' && workspace.vcsType !== 'svn') throw new ProtocolError('workspace.vcsType');
         textValue(workspace.target, 'workspace.target');
         if (workspace.executionConfigHash !== undefined && (typeof workspace.executionConfigHash !== 'string' || !/^[a-f0-9]{64}$/.test(workspace.executionConfigHash))) throw new ProtocolError('workspace.executionConfigHash');
+        if (workspace.auditSelfTest !== undefined && workspace.auditSelfTest !== true) throw new ProtocolError('workspace.auditSelfTest');
         if (workspace.supportsScheduledAudit !== undefined && workspace.supportsScheduledAudit !== true) throw new ProtocolError('workspace.supportsScheduledAudit');
         if (workspace.findingWorkflow !== undefined && workspace.findingWorkflow !== true) throw new ProtocolError('workspace.findingWorkflow');
     }

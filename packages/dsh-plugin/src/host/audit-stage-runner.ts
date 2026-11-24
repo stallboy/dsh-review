@@ -63,6 +63,14 @@ export class AuditStopUnknown extends Error {}
 
 const MAX_OUTPUT = 1024 * 1024;
 
+export function auditCliDiagnostic(output: string): string {
+    if (/sandbox|沙箱/i.test(output) && /denied|failed|requires|blocked|error|拒绝|失败|阻止/i.test(output)) return '执行器报告沙箱错误';
+    if (/EACCES|EPERM|permission denied|access is denied|operation not permitted|权限不足|拒绝访问/i.test(output)) return '执行器报告权限不足';
+    if (/ENOENT|command not found|找不到命令/i.test(output)) return '找不到执行命令或所需文件';
+    if (/unauthorized|not logged in|invalid api key|authentication failed/i.test(output)) return '执行器报告认证失败';
+    return '';
+}
+
 export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, prompt, schema, timeoutMs, signal }) => {
     const resultPath = path.join(location, 'result.json');
     const schemaPath = path.join(location, 'schema.json');
@@ -88,10 +96,11 @@ export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, p
         cwd: location, timeoutMs, signal, input: prompt, killTreeOnExit: true, maxBytes: MAX_OUTPUT,
         env: { CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1' },
     });
-    if (result.timedOut || result.aborted) throw new AuditStopUnknown(executor + ' 执行器取消或超时，需确认子进程已经停止');
-    if (result.code !== 0 || result.error || Buffer.byteLength(result.stdout) >= MAX_OUTPUT) {
-        throw new Error(executor + ' 阶段执行失败（退出码 ' + String(result.code) + '）');
-    }
+    if (result.timedOut || result.aborted) throw new AuditStopUnknown(executor + (result.timedOut ? ' 执行器超时' : ' 执行器已取消') + '，需确认子进程已经停止');
+    const diagnostic = auditCliDiagnostic([result.error, result.stderr, result.stdout].filter(Boolean).join('\n'));
+    if (result.error) throw new Error(executor + ' 无法启动' + (diagnostic ? '：' + diagnostic : ''));
+    if (result.code !== 0) throw new Error(executor + ' 阶段执行失败（退出码 ' + String(result.code) + '）' + (diagnostic ? '：' + diagnostic : ''));
+    if (Buffer.byteLength(result.stdout) >= MAX_OUTPUT) throw new Error(executor + ' 阶段输出过长');
     let value: unknown;
     if (codex) {
         for (const line of result.stdout.trim().split(/\r?\n/).filter(Boolean)) {

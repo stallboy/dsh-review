@@ -73,7 +73,7 @@ export class ManagedNode {
     private timer: ReturnType<typeof setInterval> | null = null;
     private registered = false;
     private registrationKey = '';
-    private capabilities?: { executionConfigHash: boolean; workspaceIssues: boolean; findingWorkflow: boolean };
+    private capabilities?: { executionConfigHash: boolean; workspaceIssues: boolean; findingWorkflow: boolean; auditSelfTest: boolean };
     private nextCapabilityCheck = 0;
     private workspaceCheck: Promise<void> | undefined;
     private initialized = false;
@@ -136,7 +136,7 @@ export class ManagedNode {
         const info = await this.transport(url, { signal: AbortSignal.timeout(3000) }).then(async response => {
             if (!response.ok) throw new Error('无法读取中央服务器协议能力');
             const data = await response.json() as { protocolVersion?: number; registrationCapabilities?: {
-                executionConfigHash?: boolean; workspaceIssues?: boolean; findingWorkflow?: boolean;
+                executionConfigHash?: boolean; workspaceIssues?: boolean; findingWorkflow?: boolean; auditSelfTest?: boolean;
             } };
             if (typeof data?.protocolVersion !== 'number') throw new Error('中央服务器协议能力响应无效');
             return data;
@@ -152,7 +152,8 @@ export class ManagedNode {
         }
         this.capabilities = { executionConfigHash: info.registrationCapabilities?.executionConfigHash === true,
             workspaceIssues: info.registrationCapabilities?.workspaceIssues === true,
-            findingWorkflow: info.registrationCapabilities?.findingWorkflow === true };
+            findingWorkflow: info.registrationCapabilities?.findingWorkflow === true,
+            auditSelfTest: info.registrationCapabilities?.auditSelfTest === true };
     }
 
     private async cycle(): Promise<void> {
@@ -161,6 +162,15 @@ export class ManagedNode {
             await this.options.initializeWorkspaces?.();
             for (const saved of journal.interrupted()) {
                 const checkpoint = journal.recoveryData(saved.command.commandId);
+                if (saved.command.operation === 'test') {
+                    journal.emit(saved.command.commandId, 'result', undefined,
+                        checkpoint?.result as ManagedResult | undefined ?? {
+                            outcome: { status: 'ABORTED', reason: 'NODE_RESTARTED', step: checkpoint?.step ?? 'coordinator',
+                                message: '节点在自检期间重启，请重新发起自检' },
+                            delivery: { state: 'not_required' },
+                        });
+                    continue;
+                }
                 const { sessionId, auditId } = checkpoint ?? {};
                 journal.emit(saved.command.commandId, 'recovery_required', undefined, {
                     outcome: { status: 'RECOVERY_REQUIRED', reason: 'NODE_RESTARTED', detail: '节点中断过执行，必须核验 VCS 与工作副本，不能直接重跑',
@@ -175,9 +185,10 @@ export class ManagedNode {
         const workspaceIssues = this.options.workspaceIssues?.() ?? [];
         const unavailable = new Map(workspaceIssues.map(issue => [issue.workspaceId, issue.message]));
         const declaredWorkspaces = workspaces.filter(workspace => !unavailable.has(workspace.workspaceId))
-            .map(({ supportsScheduledAudit: _scheduled, executionConfigHash, ...workspace }) =>
+            .map(({ supportsScheduledAudit: _scheduled, executionConfigHash, auditSelfTest, ...workspace }) =>
                 ({ ...workspace, ...(this.capabilities?.executionConfigHash === false ? {} : { executionConfigHash }),
-                    ...(this.capabilities?.findingWorkflow ? { findingWorkflow: true } : {}) }));
+                    ...(this.capabilities?.findingWorkflow ? { findingWorkflow: true } : {}),
+                    ...(this.capabilities?.auditSelfTest && auditSelfTest ? { auditSelfTest: true } : {}) }));
         const registrationKey = JSON.stringify(declaredWorkspaces);
         if (!this.registered || this.registrationKey !== registrationKey) {
             await this.request('/node-api/v1/register', { protocolVersion: PROTOCOL_VERSION, instanceId: this.instanceId,
@@ -210,7 +221,8 @@ export class ManagedNode {
             const workspace = project && workspaces.find(w => w.workspaceId === project.workspaceId);
             const valid = project && project.nodeId === config.nodeId && workspace && project.bindingGeneration === command.bindingGeneration
                 && project.projectConfigRevision === command.projectConfigRevision && workspace.vcsType === project.vcsType && workspace.target === project.target
-                && (!command.scheduledAudit || workspace.supportsScheduledAudit);
+                && (!command.scheduledAudit || workspace.supportsScheduledAudit)
+                && (command.operation !== 'test' || workspace.auditSelfTest);
             const { command: acknowledged } = await this.request<{ command?: CommandRecord }>(
                 `/node-api/v1/commands/${command.commandId}/ack`, { instanceId: this.instanceId });
             if (acknowledged?.state === 'completed' && acknowledged.result) {
@@ -221,11 +233,13 @@ export class ManagedNode {
             if (this.stopping) return;
             const issue = project && unavailable.get(project.workspaceId);
             if (issue) {
-                journal.emit(command.commandId, 'result', undefined, { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: issue }, delivery: { state: 'not_required' } });
+                journal.emit(command.commandId, 'result', undefined, { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: issue,
+                    ...(command.operation === 'test' ? { step: 'workspace' } : {}) }, delivery: { state: 'not_required' } });
                 continue;
             }
             if (!valid) {
-                journal.emit(command.commandId, 'result', undefined, { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '节点项目绑定或执行配置不一致' }, delivery: { state: 'not_required' } });
+                journal.emit(command.commandId, 'result', undefined, { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '节点项目绑定或执行配置不一致',
+                    ...(command.operation === 'test' ? { step: 'workspace' } : {}) }, delivery: { state: 'not_required' } });
                 continue;
             }
             if (command.operation === RETIRED_MANUAL_REVISION) {
@@ -309,10 +323,15 @@ export class ManagedNode {
         const promise = Promise.resolve().then(async () => {
             let result: ManagedResult;
             try {
-                if (controller.signal.aborted) result = { outcome: { status: 'ABORTED', reason: command.operation === 'approve' ? 'COMMIT_FAILED' : 'CANCELLED', message: '执行前已取消，没有产生副作用' }, delivery: { state: 'not_required' } };
+                if (controller.signal.aborted) result = { outcome: { status: 'ABORTED', reason: command.operation === 'approve' ? 'COMMIT_FAILED' : 'CANCELLED', message: '执行前已取消，没有产生副作用',
+                    ...(command.operation === 'test' ? { step: 'coordinator' } : {}) }, delivery: { state: 'not_required' } };
                 else result = await this.options.execute(command, controller.signal, line => { this.options.journal.emit(command.commandId, 'progress', [line]); }, project);
             } catch (error) {
-                result = { outcome: { status: 'RECOVERY_REQUIRED', reason: 'EXECUTION_EXCEPTION', detail: error instanceof Error ? error.message : '执行器异常，需要核验现场' }, delivery: { state: 'unknown' } };
+                result = command.operation === 'test'
+                    ? { outcome: { status: 'ABORTED', reason: 'SELF_TEST_FAILED',
+                        step: this.options.journal.recoveryData(command.commandId)?.step ?? 'workspace',
+                        message: error instanceof Error ? error.message : '自检执行器异常' }, delivery: { state: 'not_required' } }
+                    : { outcome: { status: 'RECOVERY_REQUIRED', reason: 'EXECUTION_EXCEPTION', detail: error instanceof Error ? error.message : '执行器异常，需要核验现场' }, delivery: { state: 'unknown' } };
             }
             this.options.journal.emit(command.commandId, 'result', undefined, result);
             this.lastSync.delete(command.projectId);

@@ -25,7 +25,7 @@ export interface ManagedWorkspace {
     settings?: Partial<Pick<AppSettings, 'runner' | 'dshCommand' | 'externalCommand' | 'gateTimeoutMs' | 'syncBeforeApprove' | 'autoFixOnFailure'>>;
 }
 
-const routes: Record<ManagedOperation, string> = {
+const routes: Record<Exclude<ManagedOperation, 'test'>, string> = {
     approve: '/approve', comments: '/comments', 'comments-batch': '/comments/batch', 'comment-status': '/comment-status', takeover: '/takeover', reject: '/reject', resume: '/resume',
     'finding-decision': '/finding/decision',
     rebase: '/rebase', 'ai-fix': '/ai-fix', reopen: '/reopen', 'archive-stale': '/archive-stale', audit: '/audit',
@@ -164,6 +164,7 @@ export class ManagedOperations {
             if (this.stopped) throw new Error('托管执行器已停止');
             const registration: WorkspaceRegistration = {
                 workspaceId: config.workspaceId, label: config.label, vcsType: type, target, executionConfigHash: executionConfigHash(config),
+                ...(this.options.auditSessions?.auditStageExecutor ? { auditSelfTest: true } : {}),
                 ...(settings.runner !== 'manual' && (settings.runner !== 'external' || settings.externalCommand.trim()) ? { supportsScheduledAudit: true } : {}),
             };
             const runtime = { root, api, registration, delivery: new ManagedDelivery({ root, type, target }) };
@@ -209,9 +210,21 @@ export class ManagedOperations {
         try { await this.checkTarget(runtime); }
         catch (error) {
             if (!(error instanceof WorkspaceTargetError)) throw error;
-            return { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: error.message }, delivery: { state: 'not_required' } };
+            return { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: error.message,
+                ...(command.operation === 'test' ? { step: 'workspace' } : {}) }, delivery: { state: 'not_required' } };
         }
         if (command.projectId !== project.projectId || command.bindingGeneration !== project.bindingGeneration || command.projectConfigRevision !== project.projectConfigRevision) throw new Error('执行配置已过期');
+        if (command.operation === 'test') {
+            const result: ManagedResult = {
+                outcome: await runtime.api.runAuditSelfTest(signal, (step, message) => {
+                    this.options.journal.checkpoint(command.commandId, { phase: 'test', step });
+                    emit(message);
+                }),
+                delivery: { state: 'not_required' },
+            };
+            this.options.journal.checkpoint(command.commandId, { phase: 'finished', result });
+            return result;
+        }
         if (command.payload.autoFix === true) return { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '托管模式请先提交评论，再单独启动 AI 修复' }, delivery: { state: 'not_required' } };
         if (command.scheduledAudit && !runtime.registration.supportsScheduledAudit) {
             return { outcome: { status: 'ABORTED', reason: 'RUNNER_UNAVAILABLE', message: '此工作副本未配置进程型审查 Runner' }, delivery: { state: 'not_required' } };
@@ -275,6 +288,14 @@ export class ManagedOperations {
     }
 
     async recover(command: ManagedCommand, previous: ManagedResult | undefined, project: ProjectRecord): Promise<ManagedResult> {
+        if (command.operation === 'test') {
+            const checkpoint = this.options.journal.recoveryData(command.commandId);
+            return checkpoint?.result as ManagedResult | undefined ?? {
+                outcome: { status: 'ABORTED', reason: 'NODE_RESTARTED', step: checkpoint?.step ?? 'coordinator',
+                    message: '自检执行中断，请重新发起自检' },
+                delivery: { state: 'not_required' },
+            };
+        }
         const runtime = await this.runtime(project);
         return runtime.api.withWriteLock(runtime.root, async () => {
             let checkpoint = this.options.journal.recoveryData(command.commandId);
