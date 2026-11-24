@@ -1,12 +1,21 @@
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { RETIRED_MANUAL_REVISION, validateCommand, type ManagedCommand, type ManagedResult, type NodeEvent } from '@dsh-review/protocol';
+import { RETIRED_MANUAL_REVISION, validateCommand, type ManagedCommand, type ManagedResult, type NodeEvent, type PendingCommandSummary } from '@dsh-review/protocol';
 
 export interface JournalCommand {
     command: ManagedCommand;
     phase: 'accepted' | 'executing' | 'completed' | 'recovery_required';
     result?: ManagedResult;
+}
+
+export interface UnconfirmedEvents {
+    commandId: string;
+    projectId?: string;
+    operation?: string;
+    count: number;
+    first: number;
+    last: number;
 }
 
 export class ManagedJournal {
@@ -128,5 +137,23 @@ export class ManagedJournal {
     hasUnsettled(): boolean {
         return Boolean(this.database.prepare("SELECT 1 FROM commands WHERE phase!='completed' LIMIT 1").get()
             || this.database.prepare('SELECT 1 FROM outbox LIMIT 1').get());
+    }
+
+    unsettled(): { commands: PendingCommandSummary[]; events: UnconfirmedEvents[] } {
+        const commands = this.database.prepare(`SELECT id, phase, json_extract(envelope,'$.projectId') AS projectId,
+            json_extract(envelope,'$.operation') AS operation,
+            COALESCE(json_extract(result,'$.outcome.detail'),json_extract(result,'$.outcome.message'),json_extract(result,'$.delivery.reason')) AS detail
+            FROM commands WHERE phase!='completed' ORDER BY id`).all().map(row => ({
+            commandId: String(row.id), projectId: String(row.projectId), operation: String(row.operation),
+            state: row.phase as PendingCommandSummary['state'], ...(typeof row.detail === 'string' ? { detail: row.detail.slice(0, 600) } : {}),
+        }));
+        const events = this.database.prepare(`SELECT o.command_id, COUNT(*) AS count, MIN(o.sequence) AS first, MAX(o.sequence) AS last,
+            json_extract(c.envelope,'$.projectId') AS projectId, json_extract(c.envelope,'$.operation') AS operation
+            FROM outbox o LEFT JOIN commands c ON c.id=o.command_id GROUP BY o.command_id ORDER BY o.command_id`).all().map(row => ({
+            commandId: String(row.command_id), count: Number(row.count), first: Number(row.first), last: Number(row.last),
+            ...(typeof row.projectId === 'string' ? { projectId: row.projectId } : {}),
+            ...(typeof row.operation === 'string' ? { operation: row.operation } : {}),
+        }));
+        return { commands, events };
     }
 }

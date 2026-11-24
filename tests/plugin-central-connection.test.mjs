@@ -418,10 +418,36 @@ test('未决中央任务阻止停用和更换中央，节点凭据与用户身�
     const accepted = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.projectId}/commands`, headers,
         payload: { operation: 'audit', idempotencyKey: 'pending-switch', payload: { note: '验证' } } });
     assert.equal(accepted.statusCode, 202, accepted.body);
-    await assert.rejects(value.disable(), /未决|未核验|未确认/);
+    await assert.rejects(value.disable(), error => {
+        assert.equal(error.code, 'connection_busy');
+        assert.deepEqual(error.blockers.map(({ projectId, operation, state }) => ({ projectId, operation, state })),
+            [{ projectId: project.projectId, operation: 'audit', state: 'queued' }]);
+        assert.equal(error.blockers[0].project, app.database.getProject(project.projectId).name);
+        return true;
+    });
     await assert.rejects(value.forget({ centralId: app.database.centralId, stopCurrent: true }), /未决|未核验|未确认/);
     await assert.rejects(value.apply({ mode: 'local', reviewIdentity: '其他中央审核者' }), /未决|未核验|未确认/);
     assert.equal((await value.status()).centralId, app.database.centralId);
+    await assert.rejects(value.disable('another-central'), /重新确认/);
+    await value.disable(app.database.centralId);
+    const stopped = await value.status();
+    assert.equal(stopped.enabled, false);
+    assert.equal(stopped.phase, 'stopped');
+    assert.equal(app.database.pendingNodeCommands(node.nodeId), 1);
+    assert.equal((await fetch(new URL('api/v1/info', centerUrl))).status, 200);
+    await assert.rejects(value.apply({ mode: 'local', reviewIdentity: '其他中央审核者' }), /恢复强制退出/);
+    await assert.rejects(value.forget({ centralId: app.database.centralId }), /恢复强制退出/);
+    const activate = app.database.activateNode;
+    try {
+        app.database.activateNode = () => { throw new Error('无法激活节点'); };
+        await assert.rejects(value.apply({ mode: 'external', centerUrl, ...node }));
+        await assert.rejects(value.apply({ mode: 'local', reviewIdentity: '其他中央审核者' }), /恢复强制退出/);
+        await assert.rejects(value.forget({ centralId: app.database.centralId }), /恢复强制退出/);
+    } finally {
+        app.database.activateNode = activate;
+    }
+    await value.apply({ mode: 'external', centerUrl, ...node });
+    assert.equal((await value.status()).projects[0].projectId, project.projectId);
 });
 
 test('删除配置先校验原中央，凭据清理后中断仍可继续删除', async t => {

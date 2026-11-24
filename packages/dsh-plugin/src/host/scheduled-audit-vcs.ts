@@ -76,13 +76,18 @@ export async function syncScheduledAudit(runtime: Runtime, target: string, befor
     return after;
 }
 
-export async function scheduledReviewDataClean(runtime: Runtime): Promise<boolean> {
+export async function scheduledReviewDataStatus(runtime: Runtime): Promise<{ clean: boolean; paths: string[] }> {
     const result = await runProcess(runtime.vcsType, runtime.vcsType === 'git'
-        ? ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching', '--', '.ai-review']
+        ? ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching', '--no-renames', '--', '.ai-review']
         : ['--non-interactive', 'status', '--xml', '--no-ignore', '--ignore-externals', '--', '.ai-review'],
     { cwd: runtime.root, timeoutMs: 30000 });
     if (result.code !== 0) throw uncertain('无法核验评审数据是否干净');
-    return runtime.vcsType === 'git' ? !result.stdout : !/<entry\b/.test(result.stdout);
+    if (runtime.vcsType === 'svn') return { clean: !/<entry\b/.test(result.stdout), paths: [] };
+    return { clean: !result.stdout, paths: result.stdout.split('\0').filter(Boolean).slice(0, 5).map(entry => entry.slice(3)) };
+}
+
+export async function scheduledReviewDataClean(runtime: Runtime): Promise<boolean> {
+    return (await scheduledReviewDataStatus(runtime)).clean;
 }
 
 async function svnScheduledPatch(vcs: VcsAdapter, patchPath: string, dryRun: boolean): Promise<ApplyPatchResult> {

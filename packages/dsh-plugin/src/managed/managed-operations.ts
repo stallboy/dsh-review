@@ -10,7 +10,7 @@ import { ManagedDelivery, decorateManagedVcs } from './managed-delivery.js';
 import { ManagedJournal } from './managed-journal.js';
 import { managedSource } from './managed-source.js';
 import { DEFAULT_SETTINGS } from '../host/settings.js';
-import { scheduledReviewDataClean } from '../host/scheduled-audit-vcs.js';
+import { scheduledReviewDataClean, scheduledReviewDataStatus } from '../host/scheduled-audit-vcs.js';
 import { readSvnAuditUrl } from '../host/audit-stage-artifacts.js';
 import { runProcess } from '../host/shell.js';
 import type { AppSettings } from '../host/types.js';
@@ -329,9 +329,14 @@ export class ManagedOperations {
                         const shared = current.vcsType === 'svn' ? await (await managedSource(current.root, current.vcsType)).source.snapshotId() : null;
                         if (revision !== lease.baseRevision || (current.vcsType === 'svn' && !shared?.endsWith(`@${revision}`))) {
                             diagnostic = '工作副本的版本与原审查基线不一致，请核验变更后重试恢复。';
-                        } else if (!(await current.vcs.ensureCleanWorkspace()).clean || !await scheduledReviewDataClean(current)) {
-                            diagnostic = '工作副本仍有业务改动或 .ai-review 草稿。请在执行节点保留并处理这些改动，再重试恢复。';
                         } else {
+                            const workspace = await current.vcs.ensureCleanWorkspace();
+                            const reviewData = workspace.clean ? await scheduledReviewDataStatus(current) : undefined;
+                            if (!workspace.clean || !reviewData?.clean) {
+                                const paths = (reviewData?.paths ?? workspace.dirtyPaths).slice(0, 5);
+                                diagnostic = !workspace.clean && !paths.length ? workspace.message : `工作副本仍有待处理的改动${paths.length ? `（${paths.join('、')}）` : ''}。请在执行节点保留并处理这些改动，再重试核验。`;
+                                return { outcome: { ...unknownResult(diagnostic).outcome, ...session }, delivery: { state: 'unknown' } };
+                            }
                             this.options.journal.checkpoint(command.commandId, { phase: 'session_releasing', ...session });
                             if (lease.state !== 'released') await runtime.api.leaseTransition(lease.auditId, 'released');
                             const recovered: ManagedResult = {

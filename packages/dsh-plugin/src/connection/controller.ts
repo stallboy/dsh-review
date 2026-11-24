@@ -4,9 +4,9 @@ import { mkdir } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { PROTOCOL_VERSION, type ProjectRecord } from '@dsh-review/protocol';
+import { PROTOCOL_VERSION, type PendingCommandSummary, type ProjectRecord } from '@dsh-review/protocol';
 import { startManagedNode, type ManagedHandle, type ManagedConfiguration } from '../managed/managed-config.js';
-import { ManagedJournal } from '../managed/managed-journal.js';
+import { ManagedJournal, type UnconfirmedEvents } from '../managed/managed-journal.js';
 import { NodeRegistrationError } from '../managed/managed-node.js';
 import { normalizeCenterUrl, readJson, saveJson, type Candidate, type ConnectionConfig, type ConnectionSecrets } from './config.js';
 import { CentralGateway, CENTRAL_PREFIX, requestBody } from './gateway.js';
@@ -32,6 +32,7 @@ interface NodeStatus {
     online: boolean;
     projects: ProjectRecord[];
     pending: number;
+    pendingCommands?: PendingCommandSummary[];
 }
 
 type RegistrationCompatibility = 'supported' | 'unknown' | 'incompatible';
@@ -42,22 +43,33 @@ interface CentralCheck {
     registrationCompatibility: RegistrationCompatibility;
 }
 
+interface ConnectionBlocker {
+    commandId: string;
+    projectId?: string;
+    project?: string;
+    operation?: string;
+    state?: PendingCommandSummary['state'];
+    detail?: string;
+    events?: Pick<UnconfirmedEvents, 'count' | 'first' | 'last'>;
+}
+
 interface ConnectionIssue {
     stage: 'address' | 'server' | 'credentials' | 'registration' | 'startup';
     code: string;
     detail?: string;
+    blockers?: ConnectionBlocker[];
     registrationCompatibility?: RegistrationCompatibility;
 }
 
 class ConnectionIssueError extends Error implements ConnectionIssue {
     constructor(readonly stage: ConnectionIssue['stage'], readonly code: string, message: string, readonly detail?: string,
-        readonly registrationCompatibility?: RegistrationCompatibility) {
+        readonly registrationCompatibility?: RegistrationCompatibility, readonly blockers?: ConnectionBlocker[]) {
         super(message);
     }
 }
 
 class CentralRequestError extends Error {
-    constructor(readonly status: number, message: string) { super(message); }
+    constructor(readonly status: number, message: string, readonly code?: string) { super(message); }
 }
 
 class CentralOfflineError extends ConnectionIssueError {
@@ -137,7 +149,9 @@ export class ConnectionController {
         const message = this.redact(problem instanceof Error ? problem.message : fallback, extraSecret);
         return problem instanceof ConnectionIssueError
             ? { message, issue: { stage: problem.stage, code: problem.code, detail: problem.detail ? this.redact(problem.detail, extraSecret) : undefined,
-                registrationCompatibility: problem.registrationCompatibility } }
+                registrationCompatibility: problem.registrationCompatibility,
+                blockers: problem.blockers?.map(({ detail, project, ...blocker }) => ({ ...blocker,
+                    project: project && this.redact(project, extraSecret), detail: detail && this.redact(detail, extraSecret) })) } }
             : { message };
     }
 
@@ -186,10 +200,10 @@ export class ConnectionController {
             }, ...(payload === undefined ? {} : { body: JSON.stringify(payload) }), redirect: 'error', signal: AbortSignal.timeout(5000),
         });
         if (!response.ok) {
-            const value = await response.json().catch(() => null) as { error?: { message?: unknown } } | null;
+            const value = await response.json().catch(() => null) as { error?: { message?: unknown; code?: unknown } } | null;
             const message = value?.error?.message;
             throw new CentralRequestError(response.status, typeof message === 'string'
-                ? this.redact(message, token) : `中央请求失败（HTTP ${response.status}）`);
+                ? this.redact(message, token) : `中央请求失败（HTTP ${response.status}）`, typeof value?.error?.code === 'string' ? value.error.code : undefined);
         }
         return await response.json();
     }
@@ -351,7 +365,12 @@ export class ConnectionController {
             await this.persist();
             centralReady = true;
             await this.connectNode();
-            await this.persist();
+            if (config.forcedStopped) {
+                const restored = { ...config };
+                delete restored.forcedStopped;
+                await saveJson(path.join(this.options.directory, 'connection.json'), restored);
+                this.config = restored;
+            } else await this.persist();
             this.connectGateway();
             this.phase = 'ready';
             this.generation++;
@@ -435,36 +454,81 @@ export class ConnectionController {
         this.node.completeConfiguration();
     }
 
-    private assertSettled(centralId: string): void {
+    private localBlockers(centralId: string): ConnectionIssueError | undefined {
         const journalFile = path.join(this.options.directory, 'connections', centralId, 'journal.sqlite');
-        if (this.node?.hasUnsettled()) throw new ConnectionIssueError('startup', 'connection_busy', '节点存在未核验执行或未确认事件，请先处理原任务');
-        if (!this.node && existsSync(journalFile)) {
-            const journal = new ManagedJournal(journalFile);
-            try { if (journal.hasUnsettled()) throw new ConnectionIssueError('startup', 'connection_busy', '节点存在未核验执行或未确认事件，请先恢复原连接'); }
-            finally { journal.close(); }
-        }
+        const journal = !this.node && existsSync(journalFile) ? new ManagedJournal(journalFile) : undefined;
+        try {
+            const unsettled = (this.node ?? journal)?.unsettled();
+            if (!unsettled) return;
+            const blockers = new Map<string, ConnectionBlocker>();
+            for (const command of unsettled.commands) blockers.set(command.commandId, command);
+            for (const { commandId, projectId, operation, ...events } of unsettled.events) {
+                blockers.set(commandId, { commandId, projectId, operation, ...blockers.get(commandId), events });
+            }
+            if (blockers.size) {
+                const projects = this.config?.profiles[centralId]?.workspaces ?? [];
+                const details = [...blockers.values()].slice(0, 30).map(blocker => ({ ...blocker,
+                    project: projects.find(project => project.projectId === blocker.projectId)?.label }));
+                return new ConnectionIssueError('startup', 'connection_busy', `本机节点有 ${blockers.size} 条未决任务或待确认回报`, undefined, undefined, details);
+            }
+        } finally { journal?.close(); }
     }
 
-    private async idle(): Promise<NodeStatus | null> {
+    private pendingIssue(status: NodeStatus, local?: ConnectionIssueError): ConnectionIssueError | undefined {
+        if (!status.pending) return local;
+        const blockers = new Map<string, ConnectionBlocker>();
+        if (Array.isArray(status.pendingCommands)) {
+            for (const command of status.pendingCommands.slice(0, 30)) {
+                blockers.set(command.commandId, { ...command, project: status.projects.find(project => project.projectId === command.projectId)?.name });
+            }
+        }
+        for (const blocker of local?.blockers ?? []) {
+            const previous = blockers.get(blocker.commandId);
+            blockers.set(blocker.commandId, { ...previous, ...blocker,
+                detail: blocker.detail ?? previous?.detail, project: blocker.project ?? previous?.project });
+        }
+        const centralMessage = `原中央有 ${status.pending} 条未决任务`;
+        return new ConnectionIssueError('startup', 'connection_busy', local ? `${local.message}。 ${centralMessage}` : centralMessage,
+            undefined, undefined, [...blockers.values()]);
+    }
+
+    private async idle(includeCentral = false): Promise<NodeStatus | null> {
         if (this.legacy) throw new Error('检测到旧 managed-node.json；请先在原中央处理未决任务，停用旧托管配置并重启插件，再应用新连接。旧执行记录不会自动迁移');
         if (!this.config?.centralId) return null;
-        this.assertSettled(this.config.centralId);
-        if (!this.config.enabled) return null;
-        const credentials = this.secrets.nodes[this.config.centralId];
-        if (!credentials) throw new Error('无法核验原中央节点状态，请恢复原连接');
-        const verified = await this.inspectCentral(this.config.centerUrl);
-        if (verified.centralId !== this.config.centralId) {
-            throw new ConnectionIssueError('server', 'central_identity_changed', '该地址已属于另一中央，请核对原中央地址');
-        }
-        const status = await this.request(this.config.centerUrl, 'node-api/v1/status', credentials.token, {}) as NodeStatus;
-        if (status.centralId !== this.config.centralId || status.nodeId !== credentials.nodeId) throw new Error('原中央或节点身份已变化，请核对原连接');
-        if (status.pending) throw new ConnectionIssueError('startup', 'connection_busy', '原中央仍有未决任务，请先处理后再切换或停止连接');
+        const { centralId, centerUrl, enabled } = this.config;
+        const local = this.localBlockers(centralId);
+        if (local && (!includeCentral || !enabled)) throw local;
+        if (!enabled) return null;
+        const credentials = this.secrets.nodes[centralId];
+        if (!credentials) throw local ?? new Error('无法核验原中央节点状态，请恢复原连接');
+        const checkStatus = async (): Promise<NodeStatus> => {
+            const status = await this.request(centerUrl, 'node-api/v1/status', credentials.token, {}) as NodeStatus;
+            if (status.centralId !== centralId || status.nodeId !== credentials.nodeId) throw new Error('原中央或节点身份已变化，请核对原连接');
+            return status;
+        };
+        let status: NodeStatus;
+        try {
+            const verified = await this.inspectCentral(centerUrl);
+            if (verified.centralId !== centralId) {
+                throw new ConnectionIssueError('server', 'central_identity_changed', '该地址已属于另一中央，请核对原中央地址');
+            }
+            status = await checkStatus();
+        } catch (error) { throw local ?? error; }
+        const issue = this.pendingIssue(status, this.localBlockers(centralId));
+        if (issue) throw issue;
         if (!this.node) {
             if (typeof status.activeInstance !== 'boolean' || typeof status.instanceId !== 'string') throw new Error('中央缺少实例恢复状态，请升级后重试');
             if (status.activeInstance) throw new Error('原节点仍有活动实例，请先确认旧节点已停止');
         }
         const instanceId = this.node?.instanceId ?? status.instanceId;
-        if (instanceId) await this.request(this.config.centerUrl, 'node-api/v1/quiesce', credentials.token, { instanceId });
+        if (instanceId) {
+            try { await this.request(centerUrl, 'node-api/v1/quiesce', credentials.token, { instanceId }); }
+            catch (error) {
+                if (!(error instanceof CentralRequestError) || error.code !== 'node_busy') throw error;
+                const updated = await checkStatus().catch(() => null);
+                throw (updated && this.pendingIssue(updated, this.localBlockers(centralId))) || error;
+            }
+        }
         return status;
     }
 
@@ -541,6 +605,9 @@ export class ConnectionController {
             }
             return;
         }
+        if (this.config?.forcedStopped && (!same || (mode === 'external' && this.config.centerUrl !== centerUrl))) {
+            throw new ConnectionIssueError('startup', 'connection_busy', '请先恢复强制退出的原连接，再切换中央或修改地址');
+        }
         if (mode === 'local') this.runtimeProgress = { stage: 'preparing' };
         const entry = mode === 'local' ? await this.localEntry(true) ?? await this.runtime.download(input.confirmRuntimeDownload,
             progress => { this.runtimeProgress = progress; }) : undefined;
@@ -551,8 +618,10 @@ export class ConnectionController {
             catch (error) {
                 if (mode !== 'local' || this.config?.mode !== 'external' || !isCentralOffline(error)) throw error;
                 await this.shutdown(false, false);
-                try { this.assertSettled(this.config.centralId); }
-                catch (journalError) {
+                try {
+                    const issue = this.localBlockers(this.config.centralId);
+                    if (issue) throw issue;
+                } catch (journalError) {
                     this.phase = 'error';
                     this.fail(journalError, '无法核验原连接的本机执行记录');
                     throw journalError;
@@ -572,7 +641,8 @@ export class ConnectionController {
         this.claimed = true;
         await this.shutdown(false);
         await this.runtime.discardReplaced();
-        this.config = { version: 1, enabled: true, mode, centerUrl, centralId, reviewIdentity: mode === 'local' ? reviewIdentity : '', profiles };
+        this.config = { version: 1, enabled: true, mode, centerUrl, centralId, reviewIdentity: mode === 'local' ? reviewIdentity : '', profiles,
+            ...(prior?.forcedStopped ? { forcedStopped: true } : {}) };
         if (credentials) {
             this.secrets.nodes[centralId] = credentials;
             const profile = profiles[centralId] ??= { nodeId: credentials.nodeId, workspaces: [] };
@@ -585,13 +655,23 @@ export class ConnectionController {
         await this.resume(entry);
     }
 
-    async disable(): Promise<void> {
+    async disable(forceCentralId?: string): Promise<void> {
         return this.run(() => this.withOwnership(async () => {
             if (!this.config) return;
-            await this.idle();
-            await this.shutdown(false);
-            this.config.enabled = false;
-            await this.persist();
+            if (forceCentralId !== undefined) {
+                if (this.legacy || !forceCentralId || this.config.centralId !== forceCentralId) throw new Error('当前连接已变化，请重新确认强制退出');
+                if (!this.config.enabled) return;
+                const stopped: ConnectionConfig = { ...this.config, enabled: false, forcedStopped: true };
+                await saveJson(path.join(this.options.directory, 'connection.json'), stopped);
+                this.config = stopped;
+                await this.shutdown(false);
+            } else {
+                if (!this.config.enabled && this.config.forcedStopped) return;
+                await this.idle(true);
+                await this.shutdown(false);
+                this.config.enabled = false;
+                await this.persist();
+            }
             this.phase = 'stopped';
             this.runtimeProgress = undefined;
             this.error = '';
@@ -608,6 +688,7 @@ export class ConnectionController {
             const configFile = path.join(this.options.directory, 'connection.json');
             const current = config.mode === 'external' && config.centralId === centralId;
             if (current) {
+                if (config.forcedStopped) throw new Error('请先恢复强制退出的原连接，再删除配置');
                 if (config.enabled && input.stopCurrent !== true) throw new Error('该连接正在使用，请刷新后确认停止并删除');
                 await this.idle();
                 await this.shutdown(false);
@@ -762,6 +843,10 @@ export class ConnectionController {
             if (endpoint === '/test') result = await this.test(input);
             else if (endpoint === '/apply') await this.apply(input);
             else if (endpoint === '/stop') await this.disable();
+            else if (endpoint === '/force-stop') {
+                if (input.confirm !== true || typeof input.centralId !== 'string') throw new Error('请确认强制退出当前连接');
+                await this.disable(input.centralId);
+            }
             else if (endpoint === '/forget') await this.forget(input);
             else if (endpoint === '/projects') await this.project(input, url.searchParams.get('sessionId') ?? undefined);
             else { res.writeHead(404); res.end(); return; }
