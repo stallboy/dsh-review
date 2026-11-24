@@ -14,6 +14,7 @@ export interface ManagedHandle {
     nodeId: string;
     instanceId: string;
     auditStageApi(sessionId: string): ReviewApi | undefined;
+    hasUnsettled(): boolean;
     unsettled(): ReturnType<ManagedJournal['unsettled']>;
     workspaceIssue(workspaceId: string): string | undefined;
     completeConfiguration(): void;
@@ -64,6 +65,7 @@ export async function startManagedNode(input: ManagedConfiguration, directory: s
         catch (error) { await node.stop(); throw error; }
         return { centerUrl: input.centerUrl, nodeId: input.nodeId, instanceId: node.instanceId,
             auditStageApi: sessionId => operations.auditStageApi(sessionId),
+            hasUnsettled: () => journal.hasUnsettled(),
             unsettled: () => journal.unsettled(),
             workspaceIssue: workspaceId => operations.workspaceIssue(workspaceId),
             completeConfiguration: () => node.completeConfiguration(), stop: async (disconnect = true) => {
