@@ -129,6 +129,9 @@ async function runRetryAudit(t, tamper, versioned = false) {
         extraRequirements: ['保持 API 与存储接口兼容', '分别记录两个入口的覆盖情况', '同一请求最多写一次'],
     });
     assert.equal(status, 202, JSON.stringify(body));
+    const deadline = /"deadlineAt": "([^"]+)"/.exec(requests[0].prompt)?.[1];
+    assert.equal(Date.parse(deadline) - Date.parse(api.leaseLookup(body.auditId).createdAt), 3 * 60 * 60_000);
+    assert.equal(tools.get('runAuditStage').timeoutMs, 3 * 60 * 60_000);
     assert.match(requests[0].prompt, /兼容旧备注 \{\{taskJson\}\}/);
     assert.match(requests[0].prompt, /分别记录两个入口的覆盖情况/);
     for (const type of ['bugfix', 'delete', 'shrink', 'reuse', 'merge', 'split', 'stdlib', 'native', 'yagni']) {

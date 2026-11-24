@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { runAuditSelfTest } from '../packages/dsh-plugin/dist/host/audit-self-test.js';
 import { registerAuditStageTools } from '../packages/dsh-plugin/dist/host/audit-stage-tools.js';
 import { parseAuditMarkdown } from '../packages/dsh-plugin/dist/host/audit-archive.js';
 import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
@@ -12,6 +13,19 @@ import { bindProject, registerNode, setupCentral } from './central-helpers.mjs';
 import { createGitFixture, runCommand } from './helpers.mjs';
 
 const stage = { stage: 'scan', task: JSON.stringify({ taskScope: [], scenarios: [], questions: [], constraints: [] }) };
+
+test('自检到达五分钟预算时返回超时', async t => {
+    t.mock.method(AbortSignal, 'timeout', delay => {
+        assert.equal(delay, 5 * 60_000);
+        return AbortSignal.abort();
+    });
+    const result = await runAuditSelfTest({
+        deps: {}, settings: {}, signal: new AbortController().signal, progress() {}, sessions: new Map(),
+    });
+    assert.equal(result.status, 'ABORTED');
+    assert.equal(result.step, 'coordinator');
+    assert.equal(result.message, '自检超过 5 分钟');
+});
 
 test('中央 /test 受登录和 CSRF 保护，拒绝旧节点和自带参数', async t => {
     const { app, headers } = await setupCentral(t);

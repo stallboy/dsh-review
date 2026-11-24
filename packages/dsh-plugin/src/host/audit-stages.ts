@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { AuditLeaseRecord } from './audit-lifecycle.js';
+import { AUDIT_TIMEOUT_MS, type AuditLeaseRecord } from './audit-lifecycle.js';
 import type { AuditItem } from './audit-archive.js';
 import { findingIdOf } from './auditor.js';
 import { parseReviewMarkdown, serializeReviewMarkdown } from './frontmatter.js';
@@ -114,7 +114,7 @@ export async function renderAuditCoordinator(input: {
 }): Promise<string> {
     const { lease, reviewers } = input;
     return renderAuditTemplate('orchestrator', {
-        ...common(lease, input.vcsType), deadlineAt: new Date(Date.parse(lease.createdAt) + 3600_000).toISOString(),
+        ...common(lease, input.vcsType), deadlineAt: new Date(Date.parse(lease.createdAt) + AUDIT_TIMEOUT_MS).toISOString(),
         reportPath: reportPath(lease), executionMode: input.executionMode, availableRunners: AUDIT_EXECUTORS,
         repoOutline: input.repoOutline, ownerRouting: {
             rules: reviewers.rules, defaultOwner: reviewers.defaultOwner, allowedGateCommands: reviewers.allowedGateCommands,
@@ -230,7 +230,7 @@ export class AuditStages {
         if (stage === 'patch' && (!commands.length || commands.some(command => !this.reviewers.allowedGateCommands.includes(command)))) {
             throw new Error('候选门禁需要命中本轮共享快照的允许列表');
         }
-        const remaining = Date.parse(this.lease.createdAt) + 3600_000 - Date.now();
+        const remaining = Date.parse(this.lease.createdAt) + AUDIT_TIMEOUT_MS - Date.now();
         if (remaining <= 0) throw new Error('审查租约已到期');
         const signal = AbortSignal.any([outerSignal, this.abort.signal, AbortSignal.timeout(remaining)]);
         this.busy = true;

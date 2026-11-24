@@ -4,7 +4,6 @@ import type { ApiRequest, ApiResponse } from './api-context.js';
 import path from 'node:path';
 import process from 'node:process';
 import {
-  AUDIT_TIMEOUT_MS,
   Auditor,
   buildAuditPrompt,
   permittedScanOutputs,
@@ -15,6 +14,8 @@ import {
   resolveAuditTarget,
 } from './auditor.js';
 import {
+  AUDIT_TIMEOUT_HOURS,
+  AUDIT_TIMEOUT_MS,
   AuditLifecycle,
   LeaseTransitionError,
   type AuditLeaseRecord,
@@ -346,12 +347,12 @@ export class AuditRuntime {
           reason: 'SYNC_STATE_UNKNOWN',
           // 超时也可能表示会话已完成但尚未收尾。直接释放会留下未提交的本地候选。
           detail:
-            '审查执行超过 1 小时上限，租约已置为 releasable。若审查会话已完成，请执行收尾（/audit/finalize）校验并提交候选；'
+            '审查执行超过 ' + AUDIT_TIMEOUT_HOURS + ' 小时上限，租约已置为 releasable。若审查会话已完成，请执行收尾（/audit/finalize）校验并提交候选；'
             + '确认外部执行已停止且不需要提交时，再人工确认释放（/audit/release）',
         });
         this.host.auditJobFinishes.delete(auditId);
       }).catch(() => undefined);
-    }, Math.max(0, Date.parse(lease.createdAt) + 60 * 60 * 1000 - Date.now()));
+    }, Math.max(0, Date.parse(lease.createdAt) + AUDIT_TIMEOUT_MS - Date.now()));
     this.leaseTimeouts.set(auditId, timer);
     timer.unref?.();
   }

@@ -16,7 +16,7 @@ import { currentTrustedActor } from './api-context.js';
 import { renderDirectAuditPrompt } from './audit-prompts.js';
 import { auditRecheckPrompt, auditRecheckSection, loadAuditHistory, verifyAuditRecheck, verifyPublishedRecheck, type AuditRecheck } from './audit-history.js';
 import { validateReviewData } from './review-data-validation.js';
-import type { AuditLeaseRecord } from './audit-lifecycle.js';
+import { AUDIT_TIMEOUT_HOURS, AUDIT_TIMEOUT_MS, type AuditLeaseRecord } from './audit-lifecycle.js';
 import type {
   AppSettings,
   AuditCandidateResult,
@@ -29,7 +29,6 @@ import type {
 } from './types.js';
 import { ApiError } from './types.js';
 
-export const AUDIT_TIMEOUT_MS = 60 * 60 * 1000;
 const OUTLINE_LIMIT = 220;
 const REPORT_MARKER_START = '<!-- ai-review:audit-verification -->';
 const REPORT_MARKER_END = '<!-- /ai-review:audit-verification -->';
@@ -766,7 +765,7 @@ export class Auditor {
                 warnings.push(`历史复查未完成：${phase.errorMessage ?? '执行器未返回结果'}`);
             }
             if (this.deps.signal?.aborted || phase.aborted) return stopped('ABORTED', '定时审查在历史复查阶段已取消');
-            if (phase.timedOut || Date.now() - startedAt >= AUDIT_TIMEOUT_MS) return stopped('ABORTED', '定时审查超过 1 小时执行上限');
+            if (phase.timedOut || Date.now() - startedAt >= AUDIT_TIMEOUT_MS) return stopped('ABORTED', '定时审查超过 ' + AUDIT_TIMEOUT_HOURS + ' 小时执行上限');
         }
         recheck = await verifyAuditRecheck(history, output, base, vcs);
         this.log('第二阶段：全仓扫描');

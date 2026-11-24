@@ -1,4 +1,5 @@
 import type { ReviewApi } from './api.js';
+import { AUDIT_TIMEOUT_MS } from './audit-lifecycle.js';
 import type { AuditStage } from './audit-prompts.js';
 import type { AuditExecutor } from './audit-stage-runner.js';
 
@@ -44,7 +45,7 @@ export function registerAuditStageTools(registry: AuditToolRegistry, api: Review
                 task: { type: 'string' },
             }, required: ['stage', 'runner', 'task'], additionalProperties: false,
         },
-        output, timeoutMs: 3600_000,
+        output, timeoutMs: AUDIT_TIMEOUT_MS,
         async execute(args, context) {
             const { runtime, sessionId } = owner(context);
             const result = await runtime.runAuditStage(sessionId, args['stage'] as AuditStage, args['runner'] as AuditExecutor,

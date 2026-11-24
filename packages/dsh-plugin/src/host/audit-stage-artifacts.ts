@@ -3,7 +3,7 @@ import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, rmdir, unlink, 
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { x as extractTar } from 'tar';
-import type { AuditLeaseRecord } from './audit-lifecycle.js';
+import { AUDIT_TIMEOUT_MS, type AuditLeaseRecord } from './audit-lifecycle.js';
 import { serializeReviewMarkdown } from './frontmatter.js';
 import { isRepoRelativePath } from './invariants.js';
 import { parsePatch } from './patch.js';
@@ -211,7 +211,7 @@ export async function prepareStageCandidate(input: {
     const patch = await diff();
     const touched = parsePatch(patch).paths.sort();
     if (!patch || touched.length !== edits.size || touched.some(file => !edits.has(file))) throw new Error('补丁路径和编辑不符');
-    const remaining = Date.parse(lease.createdAt) + 3600_000 - Date.now();
+    const remaining = Date.parse(lease.createdAt) + AUDIT_TIMEOUT_MS - Date.now();
     if (remaining <= 0) throw new AuditStopUnknown('审查租约已到期');
     const evidence = await input.gate(input.commands, {
         cwd: work, baseRevision: lease.baseRevision, signal, timeoutMs: Math.min(input.gateTimeoutMs, remaining),

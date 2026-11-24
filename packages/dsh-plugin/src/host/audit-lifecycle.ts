@@ -1,5 +1,8 @@
 /** 审查租约状态机。取消或超时后的租约仍会阻塞写入，直到宿主完成收尾或确认释放。 */
 
+export const AUDIT_TIMEOUT_HOURS = 3;
+export const AUDIT_TIMEOUT_MS = AUDIT_TIMEOUT_HOURS * 60 * 60_000;
+
 export type AuditLeaseState = 'active' | 'releasable' | 'released';
 
 export interface AuditLeaseRecord {

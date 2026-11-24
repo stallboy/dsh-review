@@ -12,7 +12,7 @@ import type { AuditPriorityEntry } from './audit-stages.js';
 import { validateReviewData } from './review-data-validation.js';
 import { runAgent, wrapAgentPrompt } from './runner.js';
 
-const TIMEOUT_MS = 120_000;
+const TIMEOUT_MS = 5 * 60_000;
 const STAGE_TIMEOUT_MS = 40_000;
 const schema = objectSchema({ value: stringSchema });
 const stageTask = { taskScope: [], scenarios: [], questions: [], constraints: [] };
@@ -194,7 +194,7 @@ export async function runAuditSelfTest({ deps, settings, signal: commandSignal, 
             status: 'ABORTED', steps, reason: commandSignal.aborted ? 'CANCELLED' : 'SELF_TEST_FAILED',
             step: failure?.step ?? running.values().next().value ?? 'coordinator',
             message: commandSignal.aborted ? '自检已取消'
-                : timeout.aborted ? '自检超过 120 秒'
+                : timeout.aborted ? '自检超过 ' + TIMEOUT_MS / 60_000 + ' 分钟'
                 : failure?.message ?? (error instanceof Error ? error.message : String(error)),
         };
     } finally {
