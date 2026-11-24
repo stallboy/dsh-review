@@ -34,6 +34,7 @@ export interface ConnectionConfig {
     version: 1;
     mode: 'local' | 'external';
     enabled: boolean;
+    forcedStopped?: true;
     centerUrl: string;
     centralId: string;
     reviewIdentity: string;

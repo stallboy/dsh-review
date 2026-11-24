@@ -386,11 +386,29 @@ test('重试使用已保存配置，待应用草稿及令牌不会随重试提�
 test('失败操作原因在正常轮询后仍保留，避免未决任务阻止提示消失', async () => {
     const panel = createPanel();
     await panel.flush();
-    panel.failWrites('仍有未确认事件，不能停止连接');
+    panel.failWrites({ stage: 'startup', code: 'connection_busy', message: '仍有未确认事件，不能停止连接', blockers: [
+        { project: 'writer-in-dsh', projectId: 'project-a', commandId: 'command-a', operation: 'audit', state: 'recovery_required',
+            detail: '审查执行超时', events: { count: 2, first: 2, last: 3 } },
+    ] });
     panel.button('停止连接').props.onClick();
     await panel.flush();
     await panel.poll();
     assert.match(panel.text(), /仍有未确认事件，不能停止连接/);
+    assert.match(panel.text(), /writer-in-dsh/);
+    assert.match(panel.text(), /待核验/);
+    assert.match(panel.text(), /2 条事件待中央确认（序号 2–3）/);
+    panel.button('查看原任务').props.onClick();
+    await panel.flush();
+    assert.match(panel.nodes().find(node => node.type === 'iframe').props.src, /tasks\?commandId=command-a&projectId=project-a/);
+    panel.button('中央连接').props.onClick();
+    await panel.flush();
+    panel.button('强制退出连接').props.onClick();
+    await panel.flush();
+    assert.equal(panel.requests.filter(request => request.url.pathname.endsWith('/force-stop')).length, 0);
+    panel.failWrites('');
+    panel.button('确认强制退出').props.onClick();
+    await panel.flush();
+    assert.deepEqual(panel.requests.find(request => request.url.pathname.endsWith('/force-stop')).body, { confirm: true, centralId: 'central-a' });
     panel.unmount();
 });
 

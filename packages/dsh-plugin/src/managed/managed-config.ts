@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { ProjectRecord } from '@dsh-review/protocol';
+import type { ManagedJournal } from './managed-journal.js';
 import type { ManagedWorkspace } from './managed-operations.js';
 import type { ApiDeps } from '../host/api-context.js';
 import type { ReviewApi } from '../host/api.js';
@@ -13,7 +14,7 @@ export interface ManagedHandle {
     nodeId: string;
     instanceId: string;
     auditStageApi(sessionId: string): ReviewApi | undefined;
-    hasUnsettled(): boolean;
+    unsettled(): ReturnType<ManagedJournal['unsettled']>;
     workspaceIssue(workspaceId: string): string | undefined;
     completeConfiguration(): void;
     stop(disconnect?: boolean): Promise<void>;
@@ -63,7 +64,7 @@ export async function startManagedNode(input: ManagedConfiguration, directory: s
         catch (error) { await node.stop(); throw error; }
         return { centerUrl: input.centerUrl, nodeId: input.nodeId, instanceId: node.instanceId,
             auditStageApi: sessionId => operations.auditStageApi(sessionId),
-            hasUnsettled: () => journal.hasUnsettled(),
+            unsettled: () => journal.unsettled(),
             workspaceIssue: workspaceId => operations.workspaceIssue(workspaceId),
             completeConfiguration: () => node.completeConfiguration(), stop: async (disconnect = true) => {
                 await node.stop(disconnect);

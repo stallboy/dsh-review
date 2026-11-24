@@ -189,7 +189,7 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
     app.post('/node-api/v1/status', async req => {
         const id = (req as RequestContext).nodeId!;
         return { centralId: database.centralId, nodeId: id, instanceId: database.getNode(id).instanceId, online: database.getNode(id).online,
-            activeInstance: database.hasActiveNodeInstance(id), projects: database.listProjects(id), pending: database.pendingNodeCommands(id) };
+            activeInstance: database.hasActiveNodeInstance(id), projects: database.listProjects(id), pending: database.pendingNodeCommands(id), pendingCommands: database.pendingNodeCommandDetails(id) };
     });
     app.post('/node-api/v1/projects/ensure', async req => {
         const input = body(req);

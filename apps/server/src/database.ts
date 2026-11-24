@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { PROTOCOL_VERSION, type NodeRecord, type NodeRegistration, type ProjectRecord, textValue, entityId } from '@dsh-review/protocol';
+import { PROTOCOL_VERSION, type NodeRecord, type NodeRegistration, type PendingCommandSummary, type ProjectRecord, textValue, entityId } from '@dsh-review/protocol';
 import { digest, passwordHash, passwordMatches, secret } from './auth.js';
 
 export class CentralError extends Error {
@@ -232,6 +232,15 @@ export class CentralDatabase {
 
     pendingNodeCommands(nodeId: string): number {
         return Number((this.sql.prepare("SELECT COUNT(*) AS count FROM commands WHERE node_id=? AND state!='completed'").get(nodeId) as Row).count);
+    }
+
+    pendingNodeCommandDetails(nodeId: string): PendingCommandSummary[] {
+        const rows = this.sql.prepare(`SELECT command_id, project_id, state, json_extract(envelope,'$.operation') AS operation,
+            COALESCE(json_extract(result,'$.outcome.detail'),json_extract(result,'$.outcome.message'),json_extract(result,'$.delivery.reason')) AS detail
+            FROM commands WHERE node_id=? AND state!='completed' ORDER BY updated_at DESC, command_id LIMIT 30`).all(nodeId);
+        return rows.map(row => ({ commandId: String(row.command_id), projectId: String(row.project_id),
+            operation: String(row.operation), state: row.state as PendingCommandSummary['state'],
+            ...(typeof row.detail === 'string' ? { detail: row.detail.slice(0, 600) } : {}) }));
     }
 
     quiesceNode(nodeId: string, instanceId: string): void {

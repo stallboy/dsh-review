@@ -66,6 +66,8 @@
         stage: 'address' | 'server' | 'credentials' | 'registration' | 'startup';
         code: string;
         detail?: string;
+        blockers?: Array<{ commandId: string; projectId?: string; project?: string; operation?: string; state?: string; detail?: string;
+            events?: { count: number; first: number; last: number } }>;
         registrationCompatibility?: RegistrationCompatibility;
     }
     interface ConnectionCheck {
@@ -76,6 +78,7 @@
         message: string;
         issue?: ConnectionIssue;
         forDraft?: boolean;
+        stopFailed?: boolean;
     }
     interface ConnectionStatus {
         controlToken: string;
@@ -771,12 +774,13 @@
         const [runningLocalStart, setRunningLocalStart] = useState(false);
         const [runtimeProgress, setRuntimeProgress] = useState<RuntimeProgress | null>(null);
         const [downloadConfirmation, setDownloadConfirmation] = useState<{ source: NonNullable<ConnectionStatus['localRuntimeDownload']>; submit: () => void } | null>(null);
+        const [forceConfirmation, setForceConfirmation] = useState<string | null>(null);
         const [deleteConfirmation, setDeleteConfirmation] = useState<{ centralId: string; name: string; stopCurrent: boolean } | null>(null);
         const [downloadNotice, setDownloadNotice] = useState('');
         const [centralSession, setCentralSession] = useState<{ generation: number; identity: string } | null>(null);
         const [editing, setEditing] = useState(false);
         const [confirmed, setControlReady] = useState(false);
-        const [frameProject, setFrameProject] = useState<{ centralId: string; projectId: string } | null>(null);
+        const [frameProject, setFrameProject] = useState<{ centralId: string; projectId?: string; commandId?: string } | null>(null);
         const [localRepoRevision, setLocalRepoRevision] = useState(0);
         const reloadLocalRepo = useCallback(() => setLocalRepoRevision(value => value + 1), []);
         const initialized = useRef(false);
@@ -786,12 +790,15 @@
         const scopeRef = useRef<{ api: ApiClient; reads: ApiClient; active: boolean; loading: boolean; writing: boolean; ready: boolean; revision: number; token: string } | null>(null);
         const progress = runningLocalStart ? runtimeProgress : status?.runtimeProgress;
         const working = busy || status?.phase === 'starting' || Boolean(progress && !progress.error);
-        const controlsLocked = working || Boolean(downloadConfirmation || deleteConfirmation);
+        const controlsLocked = working || Boolean(downloadConfirmation || deleteConfirmation || forceConfirmation);
         const hasConnection = Boolean(status?.configured && (status.mode === 'local' || (status.centralId && status.centerUrl)));
         const localIdentity = status?.localReviewIdentity || (status?.mode === 'local' && status.configured && status.centralId ? status.reviewIdentity : '');
         const centralHome = '/dsh-code-review/central/';
         const framePath = frameProject && frameProject.centralId === status?.centralId
-            ? `${centralHome}projects/${encodeURIComponent(frameProject.projectId)}` : centralHome;
+            ? frameProject.commandId
+                ? `${centralHome}tasks?${new URLSearchParams({ commandId: frameProject.commandId, ...(frameProject.projectId ? { projectId: frameProject.projectId } : {}) })}`
+                : `${centralHome}projects/${encodeURIComponent(frameProject.projectId!)}`
+            : centralHome;
         const showLocal = Boolean(confirmed && !working && status && !status.configured && !status.legacy);
 
         useEffect(() => {
@@ -799,8 +806,8 @@
         }, [showLocal, tab, status]);
 
         useEffect(() => {
-            if ((downloadConfirmation || deleteConfirmation) && tab === 'connection') confirmationPanel.current?.focus();
-        }, [downloadConfirmation, deleteConfirmation, tab]);
+            if ((downloadConfirmation || deleteConfirmation || forceConfirmation) && tab === 'connection') confirmationPanel.current?.focus();
+        }, [downloadConfirmation, deleteConfirmation, forceConfirmation, tab]);
 
         const refresh = useCallback(async (afterWrite = false): Promise<void> => {
             const scope = scopeRef.current;
@@ -921,7 +928,8 @@
             } catch (reason) {
                 if (scope.active && (!forDraft || revision === draftRevision.current)) {
                     setFailure({ message: reason instanceof Error ? reason.message : String(reason),
-                        issue: reason instanceof ApiResponseError ? reason.issue : undefined, forDraft });
+                        issue: reason instanceof ApiResponseError ? reason.issue : undefined, forDraft,
+                        stopFailed: path === '/stop' || path === '/force-stop' });
                     if (forDraft && path === '/apply') setEditing(true);
                 }
                 if (scope.active) await refresh(true);
@@ -1065,6 +1073,7 @@
                 : code === 'registration_incompatible' || code === 'protocol_mismatch' ? '请管理员升级中央服务，使它与插件兼容。'
                 : code === 'instance_conflict' ? '确认使用此节点凭据的旧实例已停止，再重试。'
                 : code === 'binding_mismatch' ? '请核对原工作副本及其分支，恢复原目标后重试。'
+                : code === 'connection_busy' ? '在原中央处理未决任务。事件未确认时，保持原连接在线以便自动补报。'
                 : code === 'project_busy' ? '请先到中央工作台处理该项目的未决任务，再重试。'
                 : code === 'configuration_required' ? '请管理员核对中央服务与插件的构建版本，并检查节点执行配置。'
                 : code === 'registration_field_invalid' ? '展开诊断详情查看被拒绝的字段，请管理员核对节点配置后重试。'
@@ -1073,11 +1082,23 @@
                 : code === 'credential_check_failed' ? '请确认中央服务正常，再重新检查。'
                 : stage === 'credentials' ? '请核对中央管理员签发的节点 ID 和 Token。'
                 : code === 'local_start_failed' ? '展开诊断详情，检查本机中央的运行包和数据目录。' : '';
+            const states: Record<string, string> = { queued: '排队中', dispatched: '已分派', accepted: '已受理', executing: '执行中', recovery_required: '待核验' };
             return h('div', { className: 'dcr-connection-feedback' },
                 stage === 'registration' ? steps([['服务器可访问', 'passed'], ['节点凭据有效', 'passed'], code === 'registration_incompatible'
                     ? compatibilityStep('incompatible') : ['节点注册失败', 'failed']]) : null,
                 stage === 'credentials' ? steps([['服务器可访问', 'passed'], ['凭据验证失败', 'failed'], compatibilityStep(problem.issue?.registrationCompatibility)]) : null,
                 h('div', { className: 'dcr-banner err', role: 'alert', id: feedbackId }, h('strong', null, problem.message), guidance ? h('p', null, guidance) : null),
+                problem.issue?.blockers?.length ? h('ul', { 'aria-label': '阻塞任务' }, ...problem.issue.blockers.map(blocker =>
+                    h('li', { key: blocker.commandId },
+                        h('strong', null, blocker.project || blocker.projectId || '项目未知'),
+                        h('div', null, [blocker.operation, blocker.state && states[blocker.state], blocker.commandId].filter(Boolean).join(' · ')),
+                        blocker.detail ? h('p', null, blocker.detail) : null,
+                        blocker.events ? h('p', null, `${blocker.events.count} 条事件待中央确认（序号 ${blocker.events.first}${blocker.events.last === blocker.events.first ? '' : `–${blocker.events.last}`}）`) : null,
+                        status?.phase === 'ready' && blocker.projectId ? h('button', { className: 'dcr-btn', disabled: controlsLocked, onClick: () => {
+                            setFrameProject({ centralId: status.centralId, projectId: blocker.projectId, commandId: blocker.commandId });
+                            setTab('central');
+                        } }, '查看原任务') : null,
+                    ))) : null,
             );
         };
         const diagnostics = (status?.logs ?? []).map(line => draft.token.trim() ? line.replaceAll(draft.token.trim(), '[已隐藏]') : line).join('\n');
@@ -1164,6 +1185,16 @@
                         h('button', { className: 'dcr-btn p', onClick: downloadConfirmation.submit }, '下载并启动'),
                         h('button', { className: 'dcr-btn', onClick: () => { setDownloadConfirmation(null); setDownloadNotice('已取消，未开始下载。'); } }, '取消')),
                 ) : null,
+                forceConfirmation ? h('section', { className: 'dcr-card dcr-connection-card', ref: confirmationPanel, tabIndex: -1, 'aria-labelledby': 'dcr-force-stop-title' },
+                    h('h2', { id: 'dcr-force-stop-title' }, '强制退出当前连接'),
+                    h('p', null, '本机节点将停止。未决任务、执行记录和待确认事件会保留，再次接入原中央后继续核验或补报。已启动的 DSH 会话或外部工具可能继续运行，恢复前须确认它们已经停止。'),
+                    h('div', { className: 'dcr-connection-actions' },
+                        h('button', { className: 'dcr-btn d', onClick: () => {
+                            setForceConfirmation(null);
+                            void write('/force-stop', { confirm: true, centralId: forceConfirmation });
+                        } }, '确认强制退出'),
+                        h('button', { className: 'dcr-btn', onClick: () => setForceConfirmation(null) }, '取消')),
+                ) : null,
                 deleteConfirmation ? h('section', { className: 'dcr-card dcr-connection-card', ref: confirmationPanel, tabIndex: -1, 'aria-labelledby': 'dcr-delete-connection-title' },
                     h('h2', { id: 'dcr-delete-connection-title' }, `删除连接「${deleteConfirmation.name}」`),
                     h('p', null, `${deleteConfirmation.stopCurrent ? '此操作会先停止插件连接。' : ''}本机保存的地址、名称和节点凭据将被移除。审核历史和项目绑定会保留。`),
@@ -1213,7 +1244,9 @@
                                  visibleFailure?.issue?.code === 'connection_busy' ? '返回原中央处理任务' : '前往工作台切换账号') : null,
                         !status.legacy && !showForm ? h('button', { className: 'dcr-btn', disabled, onClick: editConnection }, '修改连接') : null,
                         status.configured && !status.legacy && !showForm ? h('button', { className: 'dcr-btn d', disabled: disabled || !status.enabled, onClick: () => { void write('/stop', {}); } },
-                            busy && pendingAction === '/stop' ? '正在停止…' : '停止连接') : null,
+                            busy && (pendingAction === '/stop' || pendingAction === '/force-stop') ? '正在停止…' : '停止连接') : null,
+                        status.enabled && !status.legacy && !showForm && visibleFailure?.stopFailed ? h('button', { className: 'dcr-btn d', disabled,
+                            onClick: () => setForceConfirmation(status.centralId) }, '强制退出连接') : null,
                         !status.legacy && !showForm && status.mode === 'external' ? h('button', { className: 'dcr-btn d', disabled,
                             onClick: () => setDeleteConfirmation({ centralId: status.centralId, name: currentSaved?.label || status.centerUrl, stopCurrent: status.enabled }) }, '删除当前配置') : null,
                     ),

@@ -211,6 +211,7 @@ test('桌面审查取消跟踪保留会话和未决记录，恢复不重新创�
     const blocked = await operations.recover(command, result, project);
     assert.equal(blocked.outcome.status, 'RECOVERY_REQUIRED');
     assert.equal(blocked.outcome.sessionId, 'desktop-audit-cancelled');
+    assert.match(blocked.outcome.detail, /\.ai-review\/unfinished\.md/);
     await rm(draft);
     const recovered = await operations.recover(command, blocked, project);
     assert.equal(recovered.outcome.status, 'ABORTED');
