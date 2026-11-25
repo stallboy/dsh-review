@@ -1,5 +1,5 @@
-import { lstat, mkdir, readFile, rm } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { lstat, mkdir, mkdtemp, readFile, readlink, rm, rmdir, writeFile } from 'node:fs/promises';
+import { createReadStream, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -40,6 +40,12 @@ export interface CommitInput {
   /** 提供核对条目时，授权路径下未列入清单的额外文件也会导致提交被拒绝。 */
   verifyEntries?: ExpectedCommitEntry[];
   verifyDeletions?: string[];
+  gitTarget?: GitApprovalTarget;
+}
+
+export interface GitApprovalTarget {
+  ref: string;
+  base: string;
 }
 
 export interface CommitResult {
@@ -48,6 +54,7 @@ export interface CommitResult {
   outOfDate: boolean;
   errorOutput: string;
     verificationFailed?: boolean;
+  targetChanged?: boolean;
   /** 只有调用方证实提交未落地后，才可撤销本次准备状态。 */
   restorePreparation?: () => Promise<void>;
 }
@@ -77,6 +84,7 @@ export interface ApprovalDeriveInput {
 export type ApprovalPatchAttempt = ApplyPatchResult & {
   workspace: 'untouched' | 'applied' | 'unknown';
   canMerge?: boolean;
+  restore?: () => Promise<void>;
 };
 
 export interface VcsAdapter {
@@ -85,6 +93,7 @@ export interface VcsAdapter {
   ensureCleanWorkspace(): Promise<CleanResult>;
   syncAndGetLatestBase(): Promise<SyncResult>;
   getCurrentBase(): Promise<string | null>;
+  getApprovalTarget?(): Promise<GitApprovalTarget | null>;
   /** 相关提交落地时探针必须变化。返回 null 时，调用方无法据此确定提交结果。 */
   getCommitProbe(paths: string[]): Promise<string | null>;
   getRemoteCommitProbe?(path: string): Promise<string | null>;
@@ -286,6 +295,71 @@ export class GitAdapter implements VcsAdapter {
   async getCurrentBase(): Promise<string | null> {
     const result = await git(this.root, ['rev-parse', 'HEAD']);
     return result.code === 0 ? result.stdout.trim() : null;
+  }
+
+  async getApprovalTarget(): Promise<GitApprovalTarget | null> {
+    const [ref, base] = await Promise.all([
+      git(this.root, ['rev-parse', '--symbolic-full-name', 'HEAD']), this.getCurrentBase(),
+    ]);
+    const name = ref.stdout.replace(/\r?\n$/, '');
+    return ref.code === 0 && base && /^(?:HEAD|refs\/heads\/[^\x00-\x20\x7f]+)$/.test(name) ? { ref: name, base } : null;
+  }
+
+  private async matchesApprovalTarget(target: GitApprovalTarget): Promise<boolean> {
+    const current = await this.getApprovalTarget();
+    return current?.ref === target.ref && current.base === target.base;
+  }
+
+  private async commitApprovedTree(target: GitApprovalTarget, tree: string, message: string): Promise<CommitResult> {
+    const failed = (errorOutput: string, flags: Partial<Pick<CommitResult, 'targetChanged' | 'verificationFailed'>> = {}): CommitResult =>
+      ({ success: false, commitRevision: null, outOfDate: false, errorOutput, ...flags });
+    if (!await this.matchesApprovalTarget(target)) return failed('Git 审批目标引用或基线已变化', { targetChanged: true });
+    const directory = await mkdtemp(path.join(tmpdir(), 'dcr-approved-message-')).catch(() => null);
+    if (!directory) return failed('无法创建审批提交消息文件');
+    try {
+      const messageFile = path.join(directory, 'COMMIT_EDITMSG');
+      await writeFile(messageFile, `${message}\n`, 'utf8');
+      for (const args of [['pre-commit'], ['prepare-commit-msg', '--', messageFile, 'message'], ['commit-msg', '--', messageFile]]) {
+        const hook = await runProcess('git', ['hook', 'run', '--ignore-missing', ...args], {
+          cwd: this.root, timeoutMs: VCS_TIMEOUT_MS, env: { GIT_EDITOR: ':' },
+        });
+        if (hook.code !== 0) return failed(describe(hook));
+      }
+      const afterHooks = await git(this.root, ['write-tree']);
+      if (afterHooks.code !== 0 || afterHooks.stdout.trim() !== tree) return failed('Git 提交钩子改变了已核验的提交树');
+      if (!await this.matchesApprovalTarget(target)) return failed('Git 审批目标在提交钩子期间变化', { targetChanged: true });
+      const signing = await git(this.root, ['config', '--bool', '--get', 'commit.gpgsign']);
+      if (signing.code !== 0 && signing.code !== 1) return failed(describe(signing));
+      const created = await git(this.root, ['commit-tree', tree, '-p', target.base,
+        ...(signing.stdout.trim() === 'true' ? ['-S'] : []), '-F', messageFile]);
+      const oid = created.stdout.trim();
+      if (created.code !== 0 || !/^(?:[\da-f]{40}|[\da-f]{64})$/.test(oid)) return failed(describe(created));
+      let sent = false;
+      let changed = false;
+      const updated = await runProcess('git', ['update-ref', '-m', `commit: ${message.split(/\r?\n/)[0] ?? ''}`, '--stdin'], {
+        cwd: this.root, timeoutMs: VCS_TIMEOUT_MS,
+        input: {
+          initial: `start\noption no-deref\nupdate ${target.ref} ${oid} ${target.base}\nprepare\n`,
+          reply: (line) => line === 'prepare: ok' ? (async () => {
+            changed = !await this.matchesApprovalTarget(target);
+            sent = !changed;
+            return changed ? 'abort\n' : 'commit\n';
+          })() : undefined,
+        },
+      });
+      if (changed || (!sent && !await this.matchesApprovalTarget(target))) {
+        return failed('Git 审批目标引用或基线在提交事务期间变化', { targetChanged: true });
+      }
+      if (updated.code !== 0 || !/^commit: ok$/m.test(updated.stdout.replaceAll('\r', ''))) {
+        if (!sent) return failed(describe(updated));
+        const actual = await git(this.root, ['rev-parse', '--verify', target.ref]);
+        if (actual.code !== 0 || actual.stdout.trim() !== oid) return failed(describe(updated), { verificationFailed: true });
+      }
+      await git(this.root, ['hook', 'run', '--ignore-missing', 'post-commit']);
+      return { success: true, commitRevision: oid, outOfDate: false, errorOutput: '' };
+    } finally {
+      await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   async getCommitProbe(_paths: string[]): Promise<string | null> {
@@ -614,6 +688,9 @@ export class GitAdapter implements VcsAdapter {
   }
 
   async atomicCommit(input: CommitInput): Promise<CommitResult> {
+    if (input.gitTarget && !await this.matchesApprovalTarget(input.gitTarget)) {
+      return { success: false, commitRevision: null, outOfDate: false, targetChanged: true, errorOutput: 'Git 审批目标引用或基线已变化' };
+    }
     const paths = input.paths.filter((item) => item.trim().length > 0);
     const deletions = (input.deletePaths ?? []).filter((item) => item.trim().length > 0);
     const stagingPaths = [...new Set(paths.map((item) => normalizeCommitPath(this.root, item)))];
@@ -635,7 +712,15 @@ export class GitAdapter implements VcsAdapter {
     if (add.code !== 0) {
       return { success: false, commitRevision: null, outOfDate: false, errorOutput: describe(add) };
     }
-    const stagedList = await git(this.root, ['diff', '--cached', '--name-only', '-z']);
+    const planned = input.gitTarget ? await git(this.root, ['write-tree']) : undefined;
+    if (planned && (planned.code !== 0 || !/^(?:[\da-f]{40}|[\da-f]{64})$/.test(planned.stdout.trim()))) {
+      return fail(`无法写出审批提交树：${describe(planned)}`);
+    }
+    const tree = planned?.stdout.trim();
+    const stagedDiff = (args: string[]): Promise<ProcessResult> => input.gitTarget && tree
+      ? git(this.root, ['diff-tree', '-r', ...args, input.gitTarget.base, tree])
+      : git(this.root, ['diff', '--cached', ...args]);
+    const stagedList = await stagedDiff(['--name-only', '-z']);
     if (stagedList.code !== 0) {
       return fail(`无法读取暂存区，拒绝提交：${describe(stagedList)}`);
     }
@@ -649,7 +734,9 @@ export class GitAdapter implements VcsAdapter {
     if (indexResult.code !== 0) {
       return fail(`无法读取索引，拒绝提交：${describe(indexResult)}`);
     }
-    const index = parseStagedIndex(indexResult.stdout);
+    const verifiedTree = tree ? await git(this.root, ['ls-tree', '-rz', '--format=%(objectmode) %(objectname) 0%x09%(path)', tree, '--', ...allowed]) : undefined;
+    if (verifiedTree && verifiedTree.code !== 0) return fail(`无法核对审批提交树：${describe(verifiedTree)}`);
+    const index = parseStagedIndex(verifiedTree?.stdout ?? indexResult.stdout);
     const fileMode = process.platform !== 'win32'
       ? true
       : (await git(this.root, ['config', '--get', 'core.filemode'])).stdout.trim() === 'true';
@@ -678,7 +765,7 @@ export class GitAdapter implements VcsAdapter {
       ]);
       const deletedSet = new Set((input.verifyDeletions ?? []).map((entry) => normalizeCommitPath(this.root, entry)));
       // 重命名和复制记录有两个路径字段，必须按状态读取，避免下一个记录错位。
-      const changed = await git(this.root, ['diff', '--cached', '--name-status', '-z']);
+      const changed = await stagedDiff(['--name-status', '-z']);
       if (changed.code !== 0) {
         return fail(`无法读取暂存变更，拒绝提交：${describe(changed)}`);
       }
@@ -707,9 +794,20 @@ export class GitAdapter implements VcsAdapter {
     if (problems.length > 0) {
       return fail(`已审核内容与暂存区不一致，已拒绝提交：\n${problems.slice(0, 20).join('\n')}`);
     }
-    const staged = await git(this.root, ['diff', '--cached', '--quiet']);
+    const staged = await stagedDiff(['--quiet']);
     if (staged.code === 0) {
       return { success: false, commitRevision: null, outOfDate: false, errorOutput: '没有可提交的改动' };
+    }
+    if (staged.code !== 1) return fail(`无法确认提交树差异：${describe(staged)}`);
+    const restorePreparation = async (): Promise<void> => {
+      const current = await git(this.root, ['ls-files', '-s', '-z', '--', ...allowed]);
+      if (current.code !== 0 || current.stdout !== indexResult.stdout) throw new Error('提交失败后本轮暂存项发生变化');
+      const restored = await git(this.root, ['reset', '-q', '--', ...allowed]);
+      if (restored.code !== 0) throw new Error(`无法撤销本轮暂存项：${describe(restored)}`);
+    };
+    if (input.gitTarget && tree) {
+      const result = await this.commitApprovedTree(input.gitTarget, tree, input.message);
+      return result.success ? result : { ...result, restorePreparation };
     }
     const commit = await git(this.root, ['commit', '-m', input.message]);
     if (commit.code !== 0) {
@@ -719,14 +817,7 @@ export class GitAdapter implements VcsAdapter {
         commitRevision: null,
         outOfDate: /index\.lock|cannot lock ref|unable to create.*lock|Another git process/i.test(output),
         errorOutput: output,
-        restorePreparation: async () => {
-          const current = await git(this.root, ['ls-files', '-s', '-z', '--', ...allowed]);
-          if (current.code !== 0 || current.stdout !== indexResult.stdout) {
-            throw new Error('提交失败后本轮暂存项发生变化');
-          }
-          const restored = await git(this.root, ['reset', '-q', '--', ...allowed]);
-          if (restored.code !== 0) throw new Error(`无法撤销本轮暂存项：${describe(restored)}`);
-        },
+        restorePreparation,
       };
     }
     const head = await git(this.root, ['rev-parse', 'HEAD']);
@@ -768,6 +859,44 @@ function parseSvnStatusEntries(output: string): { state: string; path: string }[
 
 function parseSvnStatus(output: string): string[] {
   return parseSvnStatusEntries(output).map((entry) => entry.path);
+}
+
+async function svnApprovalSnapshot(root: string, paths: string[]) {
+  const targets = paths.map(file => file.includes('@') ? `${file}@` : file);
+  const status = await svn(root, ['status', '--xml', '--verbose', '--no-ignore', '--ignore-externals', '--depth', 'empty', '--', ...targets]);
+  if (status.code !== 0 || !/<\/status>\s*$/.test(status.stdout) || Buffer.byteLength(status.stdout) >= SVN_APPROVAL_PATCH_LIMIT) {
+    throw new Error(`无法核对 SVN 补丁范围：${describe(status)}`);
+  }
+  const entries = new Map<string, Record<string, string>>();
+  for (const match of status.stdout.matchAll(/<entry\b([^>]*)>([\s\S]*?)<\/entry>/g)) {
+    const attributes = /<wc-status\b([^>]*)>/.exec(match[2] ?? '')?.[1] ?? '';
+    const fields = [...attributes.matchAll(/([\w-]+)="([^"]*)"/g)]
+      .map(field => [field[1]!, svnXmlText(field[2]!)])
+      .sort(([left], [right]) => left!.localeCompare(right!));
+    entries.set(toRepoRelative(svnXmlAttribute(match[1] ?? '', 'path')), Object.fromEntries(fields));
+  }
+  const files = await Promise.all(paths.map(async (file) => {
+    const absolute = path.join(root, file);
+    const info = await lstat(absolute).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return null;
+      throw error;
+    });
+    let contents: string | null = null;
+    if (info?.isSymbolicLink()) contents = await readlink(absolute);
+    if (info?.isFile()) {
+      const hash = createHash('sha256');
+      for await (const chunk of createReadStream(absolute)) hash.update(chunk);
+      contents = hash.digest('hex');
+    }
+    return { file, entry: entries.get(file), mode: info?.mode, directory: info?.isDirectory(), contents };
+  }));
+  const versioned = files.filter(file => file.entry && !['unversioned', 'ignored', 'external'].includes(file.entry['item'] ?? ''));
+  if (versioned.length === 0) return { files, diff: '' };
+  const diff = await svn(root, ['diff', '--git', '--depth', 'empty', '--', ...versioned.map(file => file.file)]);
+  if (diff.code !== 0 || Buffer.byteLength(diff.stdout) >= SVN_APPROVAL_PATCH_LIMIT) {
+    throw new Error(`无法核对 SVN 补丁内容与属性：${describe(diff)}`);
+  }
+  return { files, diff: diff.stdout };
 }
 
 function svnXmlText(value: string): string {
@@ -1050,10 +1179,52 @@ export class SvnAdapter implements VcsAdapter {
         && !/^(?:Skipped\b|>[ \t].*\balready applied\b)/m.test(diagnostics);
       return { ok: false, conflict: checked === 'conflict', workspace: 'untouched', canMerge, message: tailLines(describe(check), 80) };
     }
+    let paths: string[];
+    let before: Awaited<ReturnType<typeof svnApprovalSnapshot>>;
+    try {
+      const targets = parsePatch(await readFile(path.resolve(this.root, patchPath), 'utf8')).paths;
+      if (!targets.length || targets.some(file => file !== toRepoRelative(file)
+          || file.split('/').some(part => part === '..' || part === '.') || /[:\r\n\0]/.test(file))) {
+        throw new Error('无法确定 SVN 补丁的工作副本内路径');
+      }
+      paths = [...new Set(targets.flatMap(file => file.split('/').map((_, index, parts) => parts.slice(0, index + 1).join('/'))))];
+      before = await svnApprovalSnapshot(this.root, paths);
+      if (before.diff || before.files.some(file => file.entry
+        ? file.entry['item'] !== 'normal' || file.entry['switched'] === 'true'
+        : file.mode !== undefined)) {
+        throw new Error('SVN 补丁范围在应用前已发生变化');
+      }
+    } catch (error) {
+      return { ok: false, conflict: false, workspace: 'untouched', message: String(error) };
+    }
     const applied = await runProcess('svn', ['--non-interactive', 'patch', '--', patchPath], options);
     const status = classifySvnApprovalPatch(applied);
-    if (status === 'complete') return { ok: true, conflict: false, workspace: 'applied', message: '补丁已完整应用（svn patch）' };
-    return { ok: false, conflict: status === 'conflict', workspace: 'unknown', message: tailLines(describe(applied), 80) };
+    if (status !== 'complete') {
+      return { ok: false, conflict: status === 'conflict', workspace: 'unknown', message: tailLines(describe(applied), 80) };
+    }
+    try {
+      const after = await svnApprovalSnapshot(this.root, paths);
+      const changed = after.files.filter((file, index) => JSON.stringify(file) !== JSON.stringify(before.files[index]));
+      const restore = async (): Promise<void> => {
+        if (JSON.stringify(await svnApprovalSnapshot(this.root, paths)) !== JSON.stringify(after)) {
+          throw new Error('SVN 补丁路径已发生其他改动');
+        }
+        for (const file of [...changed].sort((left, right) => right.file.split('/').length - left.file.split('/').length)) {
+          const reverted = await svn(this.root, ['revert', '--depth', 'empty', '--', file.file.includes('@') ? `${file.file}@` : file.file]);
+          if (reverted.code !== 0) throw new Error(`无法撤销 ${file.file}：${describe(reverted)}`);
+          if (before.files.find(entry => entry.file === file.file)?.mode !== undefined || file.mode === undefined) continue;
+          const absolute = path.join(this.root, file.file);
+          if (file.directory) await rmdir(absolute);
+          else await rm(absolute, { force: true });
+        }
+        if (JSON.stringify(await svnApprovalSnapshot(this.root, paths)) !== JSON.stringify(before)) {
+          throw new Error('SVN 补丁范围未恢复到应用前状态');
+        }
+      };
+      return { ok: true, conflict: false, workspace: 'applied', message: '补丁已完整应用（svn patch）', restore };
+    } catch (error) {
+      return { ok: false, conflict: false, workspace: 'unknown', message: String(error) };
+    }
   }
 
   /** SVN 审批预检包含额外的完整性判定，详情预检保持仅诊断。 */

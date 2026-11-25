@@ -223,6 +223,19 @@ export class ApprovalOrchestrator {
       if (!base) {
         return { status: 'ABORTED', reason: 'SYNC_FAILED', message: '无法读取当前基线版本', jobId };
       }
+      const gitTarget = await vcs.getApprovalTarget?.();
+      if (vcs.getApprovalTarget && gitTarget?.base !== base) {
+        return { status: 'ABORTED', reason: 'SYNC_FAILED', message: '无法绑定 Git 审批目标引用和基线', jobId };
+      }
+      const gitTargetMatches = async (): Promise<boolean> => {
+        if (!gitTarget) return true;
+        const current = await vcs.getApprovalTarget?.().catch(() => null);
+        return current?.ref === gitTarget.ref && current.base === gitTarget.base;
+      };
+      const gitTargetRecovery = (detail: string): ApprovalOutcome => ({
+        status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', jobId,
+        message: 'Git 审批目标发生变化，已停止业务提交并保留现场', detail,
+      });
       const patch = sharedSource
         ? await store.currentPatch(candidate, sharedSource)
         : await store.currentPatch(candidate);
@@ -243,21 +256,25 @@ export class ApprovalOrchestrator {
           current.files[index]?.targetIdentity === file.targetIdentity);
       };
       let merge: { baseFiles: ApprovalMergeFile[]; output: Map<string, Buffer> } | undefined;
+      let restoreNative: (() => Promise<void>) | undefined;
       const restoreBusiness = async (): Promise<void> => {
-        if (!merge) {
+        if (restoreNative) {
+          await restoreNative();
+        } else if (!merge) {
           await vcs.revertBusinessWorkspace();
           return;
-        }
-        if (!await verifyMergeTarget(merge.baseFiles, false)) throw new Error('原生目标快照已变化');
-        const errors: string[] = [];
-        for (const file of merge.baseFiles) {
-          try {
-            await replaceApprovalMergeFile(vcs.root, file.path, merge.output.get(file.path)!, file.target);
-          } catch (error) {
-            errors.push(String(error));
+        } else {
+          if (!await verifyMergeTarget(merge.baseFiles, false)) throw new Error('原生目标快照已变化');
+          const errors: string[] = [];
+          for (const file of merge.baseFiles) {
+            try {
+              await replaceApprovalMergeFile(vcs.root, file.path, merge.output.get(file.path)!, file.target);
+            } catch (error) {
+              errors.push(String(error));
+            }
           }
+          if (errors.length) throw new Error(errors.join('\n'));
         }
-        if (errors.length) throw new Error(errors.join('\n'));
         const restored = await vcs.ensureCleanWorkspace();
         if (!restored.clean) throw new Error(restored.message);
       };
@@ -266,14 +283,13 @@ export class ApprovalOrchestrator {
           await restoreBusiness();
           return null;
         } catch (error) {
-          if (!merge) return null;
+          if (!merge && !restoreNative) return null;
           return { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', jobId,
-            message: '无法确认三方合并改动已安全恢复，保留剩余现场', detail: String(error) };
+            message: '工作区仍有无法确认归属的改动或恢复失败，已保留现场', detail: String(error) };
         }
       };
       const forbiddenPaths = touchedPaths.filter((file) => isAiReviewPath(file));
       if (forbiddenPaths.length > 0) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
         return {
           status: 'ABORTED',
           reason: 'INVALID_CANDIDATE',
@@ -289,6 +305,7 @@ export class ApprovalOrchestrator {
       let nativeAttempt;
       try {
         nativeAttempt = await vcs.applyPatchForApproval?.(tempPatch, this.deps.signal);
+        restoreNative = nativeAttempt?.restore;
         applied = nativeAttempt ?? await vcs.applyPatch(tempPatch, false);
       } finally {
         await rm(tempPatch, { force: true }).catch(() => undefined);
@@ -376,6 +393,7 @@ export class ApprovalOrchestrator {
         ...(this.deps.signal ? { signal: this.deps.signal } : {}),
       });
       log(report.allPassed ? '门禁检查全部通过' : '门禁检查存在失败项');
+      if (!await gitTargetMatches()) return gitTargetRecovery('门禁执行前后 Git 目标引用或基线不一致');
       if (this.deps.signal?.aborted) {
         const recovery = await rollbackApplied();
         if (recovery) return recovery;
@@ -468,6 +486,7 @@ export class ApprovalOrchestrator {
       const reviewRelPath = relative(store.repoRoot, fresh.reviewPath);
       const probePaths = [reviewRelPath, ...patchPaths];
       const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
+      if (!await gitTargetMatches()) return gitTargetRecovery('读取提交探针期间 Git 目标引用或基线变化');
       if (fresh.meta.findingId) {
         try {
           if (!this.deps.beginFindingCommit || !this.deps.finishFindingCommit) throw new Error('缺少发现审批状态存储');
@@ -506,7 +525,9 @@ export class ApprovalOrchestrator {
         deletePaths: patchPaths,
         verifyEntries,
         verifyDeletions,
+        ...(gitTarget ? { gitTarget } : {}),
       });
+      if (commit.targetChanged) return gitTargetRecovery(commit.errorOutput);
       if (commit.verificationFailed) return {
           status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN',
           message: '提交已执行但完整核验失败，请保留现场并人工核对。', detail: commit.errorOutput, jobId,

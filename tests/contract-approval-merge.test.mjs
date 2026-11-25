@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -50,7 +51,8 @@ async function fixture(t, type, options = {}) {
         const directory = '.ai-review/2026-11/' + id;
         await mkdir(path.join(root, directory), { recursive: true });
         await writeFile(path.join(root, directory, '001.patch'), patch);
-        const gate = id === 'second' && options.secondGate ? options.secondGate
+        const gate = id === 'first' && options.firstGate ? options.firstGate
+            : id === 'second' && options.secondGate ? options.secondGate
             : options.failSecond && id === 'second' ? 'node -e "process.exit(7)"' : 'node --version';
         await writeFile(path.join(root, directory, 'review.md'), [
             '---', 'schema_version: 1', 'title: "修复 ' + id + '"', 'module: review', 'audit_type: bugfix',
@@ -147,4 +149,43 @@ test('门禁切换到相同 HEAD 的其他 Git 分支时保留现场且停止提
     assert.equal(result.status, 'RECOVERY_REQUIRED', JSON.stringify(result));
     assert.equal(await vcs.getCurrentBase(), first.commitRevision);
     assert.equal(call('branch', '--show-current').trim(), 'same-sha-target');
+});
+
+test('SVN 原生审批门禁失败后撤销补丁并保留并发草稿', async (t) => {
+    const { root, approve, log, call } = await fixture(t, 'svn', { firstGate: 'node -e "process.exit(7)"' });
+    const revision = call('info', '-r', 'HEAD', '--show-item', 'revision').trim();
+    const draft = path.join(root, 'concurrent-draft.txt');
+    const push = log.push.bind(log);
+    log.push = (line) => {
+        if (line.includes('开始执行门禁')) writeFileSync(draft, '用户草稿');
+        return push(line);
+    };
+    const outcome = await approve('first');
+    assert.equal(await readFile(draft, 'utf8'), '用户草稿');
+    assert.equal(await readFile(path.join(root, file), 'utf8'), body(baseLines));
+    assert.equal(outcome.status, 'RECOVERY_REQUIRED', JSON.stringify(outcome));
+    assert.equal(call('info', '-r', 'HEAD', '--show-item', 'revision').trim(), revision);
+});
+
+test('Git 在提交探针时切换到同 SHA 的另一分支，审批不推进任一分支', async (t) => {
+    const { approve, vcs, log, call } = await fixture(t, 'git');
+    const first = await approve('first');
+    assert.equal(first.status, 'COMMITTED');
+    const original = call('symbolic-ref', 'HEAD').trim();
+    const probe = vcs.getCommitProbe.bind(vcs);
+    let switched = false;
+    vcs.getCommitProbe = (paths) => {
+        if (!switched) {
+            switched = true;
+            call('switch', '-qc', 'same-sha-after-gates');
+        }
+        return probe(paths);
+    };
+    const second = await approve('second');
+    assert.ok(switched);
+    assert.ok(log.some(line => line.includes('待交付差异与已审修改相符')));
+    assert.equal(second.status, 'RECOVERY_REQUIRED', JSON.stringify(second));
+    assert.equal(call('rev-parse', original).trim(), first.commitRevision);
+    assert.equal(call('rev-parse', 'refs/heads/same-sha-after-gates').trim(), first.commitRevision);
+    assert.match(call('show', 'HEAD:.ai-review/2026-11/second/review.md'), /^status: pending$/m);
 });
