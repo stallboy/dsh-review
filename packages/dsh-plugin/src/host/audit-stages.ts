@@ -108,18 +108,19 @@ export function auditUserFields(input: Readonly<Record<string, unknown>>): { foc
 }
 
 export async function renderAuditCoordinator(input: {
-    lease: AuditLeaseRecord; vcsType: VcsAdapter['type']; reviewers: ReviewersConfig; repoOutline: string[]; history: unknown;
+    lease: AuditLeaseRecord; vcsType: VcsAdapter['type']; reviewers: ReviewersConfig;
+    history: { activeCandidates: string; negativeMemory: string };
     executionMode: 'dsh-session' | 'host-channel'; findingWorkflow: boolean;
-    legacyNote: string; focus: string[]; extraRequirements: string[]; automaticCandidates?: boolean;
+    focus: string[]; extraRequirements: string[]; automaticCandidates?: boolean;
 }): Promise<string> {
     const { lease, reviewers } = input;
     return renderAuditTemplate('orchestrator', {
         ...common(lease, input.vcsType), deadlineAt: new Date(Date.parse(lease.createdAt) + AUDIT_TIMEOUT_MS).toISOString(),
         reportPath: reportPath(lease), executionMode: input.executionMode, availableRunners: AUDIT_EXECUTORS,
-        repoOutline: input.repoOutline, ownerRouting: {
-            rules: reviewers.rules, defaultOwner: reviewers.defaultOwner, allowedGateCommands: reviewers.allowedGateCommands,
+        ownerRouting: {
+            allowedGateCommands: reviewers.allowedGateCommands,
             automaticCandidates: input.automaticCandidates === true, findingWorkflow: input.findingWorkflow,
-        }, history: input.history, focus: input.focus, extraRequirements: input.extraRequirements, legacyNote: input.legacyNote,
+        }, history: input.history, focus: input.focus, extraRequirements: input.extraRequirements,
     });
 }
 

@@ -130,11 +130,18 @@ async function runRetryAudit(t, tamper, versioned = false) {
         extraRequirements: ['保持 API 与存储接口兼容', '分别记录两个入口的覆盖情况', '同一请求最多写一次'],
     });
     assert.equal(status, 202, JSON.stringify(body));
-    const deadline = /"deadlineAt": "([^"]+)"/.exec(requests[0].prompt)?.[1];
-    assert.equal(Date.parse(deadline) - Date.parse(api.leaseLookup(body.auditId).createdAt), 3 * 60 * 60_000);
+    const coordinator = requests[0].prompt;
+    const taskJson = JSON.parse(coordinator.split('## 本轮任务\n\n' + fence + 'json\n')[1].split('\n' + fence)[0]);
+    assert.equal(Date.parse(taskJson.deadlineAt) - Date.parse(api.leaseLookup(body.auditId).createdAt), 3 * 60 * 60_000);
     assert.equal(tools.get('runAuditStage').timeoutMs, 3 * 60 * 60_000);
-    assert.match(requests[0].prompt, /兼容旧备注 \{\{taskJson\}\}/);
-    assert.match(requests[0].prompt, /分别记录两个入口的覆盖情况/);
+    assert.deepEqual(taskJson.focus, ['分别看客户端和后台任务超时重试', '兼容旧备注 {{taskJson}}']);
+    assert.equal(taskJson.extraRequirements[1], '分别记录两个入口的覆盖情况');
+    assert.equal(taskJson.scope, '.');
+    assert.ok(!Object.hasOwn(taskJson, 'repoOutline'));
+    assert.ok(!Object.hasOwn(taskJson, 'legacyNote'));
+    assert.deepEqual(Object.keys(taskJson.history).sort(), ['activeCandidates', 'negativeMemory']);
+    assert.deepEqual(taskJson.ownerRouting, { allowedGateCommands: [gate], automaticCandidates: true, findingWorkflow: true });
+    assert.match(coordinator, /子 Harness[\s\S]*queryAuditHistory[\s\S]*publishAuditArtifacts/);
     for (const type of ['bugfix', 'delete', 'shrink', 'reuse', 'merge', 'split', 'stdlib', 'native', 'yagni']) {
         assert.ok(requests[0].prompt.includes(type), type);
     }

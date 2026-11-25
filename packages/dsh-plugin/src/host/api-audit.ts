@@ -57,6 +57,13 @@ interface AuditSessionRecoveryOutcome {
   stageFailure?: AuditStageExecution;
 }
 
+function summarizeAuditHistory(text: string): string {
+  const lines = text.trim().split('\n');
+  const summary = lines.slice(0, 8).map(line => line.length > 320 ? line.slice(0, 319) + '…' : line);
+  if (lines.length > summary.length) summary.push('…（其余历史条目已省略）');
+  return summary.join('\n');
+}
+
 /** 将审查执行和租约状态机接入 Host。路由负责请求受理，租约在执行期间持续约束共享写入。 */
 export class AuditRuntime {
   private readonly leaseTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
@@ -256,17 +263,18 @@ export class AuditRuntime {
     executionMode: 'dsh-session' | 'host-channel' = 'dsh-session'): Promise<string> {
     const source = await sharedSourceFor(runtime);
     const findingWorkflow = currentTrustedActor()?.findingWorkflow !== false;
-    const [reviewers, activeCandidates, negativeMemory, prior] = await Promise.all([
+    const [reviewers, activeCandidates, negativeMemory] = await Promise.all([
       loadReviewers(runtime.root, source),
       existingCandidateLines(runtime.store, lease.baseRevision, source),
       negativeMemoryLines(runtime.root, source),
-      source ? loadAuditHistory(runtime.store, source, lease.targetPath || '.', findingWorkflow) : undefined,
     ]);
-    return renderAuditCoordinator({ lease, vcsType: runtime.vcsType, executionMode, findingWorkflow, reviewers, repoOutline: [lease.targetPath || '.'],
-      history: { activeCandidates, negativeMemory, findings: prior?.protectedFindings.filter(item => item.repairPlan) ?? [] },
-      legacyNote: fields.focus.includes(note.trim()) ? '' : note,
-      automaticCandidates: this.host.deps.auditStageGates !== undefined,
-      ...fields });
+    const legacyFocus = note.trim();
+    const focus = legacyFocus && !fields.focus.includes(legacyFocus) ? [...fields.focus, legacyFocus] : fields.focus;
+    return renderAuditCoordinator({
+      lease, vcsType: runtime.vcsType, executionMode, findingWorkflow, reviewers, focus,
+      history: { activeCandidates: summarizeAuditHistory(activeCandidates), negativeMemory: summarizeAuditHistory(negativeMemory) },
+      automaticCandidates: this.host.deps.auditStageGates !== undefined, extraRequirements: fields.extraRequirements,
+    });
   }
 
   private async setupStages(runtime: Runtime, lease: AuditLeaseRecord, fields: ReturnType<typeof auditUserFields>): Promise<AuditStages> {
