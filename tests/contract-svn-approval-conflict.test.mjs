@@ -112,6 +112,12 @@ test('SVN 完整应用后通过门禁并提交原生版本', async (t) => {
 test('SVN 审批区分跳过目标和超限输出', () => {
     const result = { code: 0, signal: null, timedOut: false, stdout: "Skipped 'sample.txt'\n", stderr: '' };
     assert.equal(classifySvnApprovalPatch(result), 'conflict');
+    assert.equal(classifySvnApprovalPatch({
+        ...result, stdout: 'U         sample.txt\n>         applied hunk @@ -4,7 +4,7 @@ with fuzz 2\n',
+    }), 'conflict');
+    assert.equal(classifySvnApprovalPatch({
+        ...result, stdout: 'U         sample.txt\n>         applied hunk @@ -4,7 +4,7 @@ with offset 1\n',
+    }), 'complete');
     assert.equal(classifySvnApprovalPatch({ ...result, stdout: 'U         sample.txt\n' }, 12), 'unknown');
     assert.equal(classifySvnApprovalPatch({ ...result, stdout: 'U         sample.txt\n', timedOut: true }), 'unknown');
 });

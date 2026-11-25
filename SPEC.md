@@ -8,7 +8,9 @@
 > - `docs/superpowers/specs/2026-11-17-plugin-central-design.md` — 插件连接、项目接入与本机中央生命周期。
 > - `docs/plans/2026-11-20-finding-review-workflow-design.md` — 审查产物、三个审核动作和跨轮复查设计。
 > - `docs/plans/2026-11-20-human-takeover-follow-up-plan.md` — 可选修复线索与自动核验计划。
+> - `docs/plans/2026-11-25-approval-three-way-merge-design.md` — 固定候选基线与逐项审批的三方合并设计。
 > **生成日期**: 2026-11-23
+> **修订日期**: 2026-11-25
 
 `dsh-code-review` 是 DeepSeek Harness（DSH）的代码审核插件，支持本地工作台及中央托管模式。AI 提交带证据的发现及可选修复，人决定应用补丁、本次不修改或人工接手。获批补丁由插件重新执行门禁并原子提交。中央托管模式的多节点、平台持久化与交付扩展由 §16 定义。
 
@@ -125,7 +127,7 @@ flowchart TD
 
 ### 3.2 候选正交性
 
-所有同轮 A 类候选必须独立基于同一基线：
+所有同轮 A 类候选必须独立基于审查开始时固定的同一业务快照。Git 绑定提交，SVN 绑定仓库身份、目标路径及 revision。后续 Rebase 或修复产生的候选版本各自绑定其生成基线，审批以当前候选版本的基线为准：
 
 1. **互不重叠则拆分**：不同模块、不同文件，或同文件中上下文与逻辑均独立的修复，分别生成候选。每导出一个补丁后立即还原业务工作区。
 2. **同处耦合则合并**：若根因修复必须同时清理同一函数或结构体内的冗余代码，且分开会产生直接冲突，应合并为一个候选。
@@ -149,7 +151,7 @@ flowchart TD
 
 1. 重读共享事实并检查完整 guard、候选状态、人工判断项和提交信息。
 2. 检查工作区，按设置同步并取得批准时生效基线。
-3. 严格应用当前补丁并记录业务内容快照，重新执行全部门禁。
+3. 按 §7.5 验证当前补丁在目标基线上的交付内容，记录业务内容快照并重新执行全部门禁。
 4. 再次检查 guard 和业务快照，防止候选或业务代码在门禁期间被更新。
 5. 原子提交业务代码、`review.md` 批准记录和过程补丁删除。
 6. 提交成功后，Host 记录本次提交版本用于响应；后续读取从 VCS 历史派生该候选的业务提交版本；不向 `review.md` 写入提交哈希。
@@ -249,7 +251,7 @@ audit_smoke_commands: []
 | `status` | 是 | enum | `pending / changes_requested / approved / rejected`。 |
 | `target_files` | 是 | string[] | 当前补丁实际触及的业务文件；唯一、仓库相对、正斜杠。活跃候选必须非空，重命名同时包含旧、新路径，归档后保留。 |
 | `current_revision` | 是 | 正整数 | 等于最高 revision id。 |
-| `revisions[]` | 是 | 非空列表 | 每项必含正整数 `id`、非空 string `base_revision`、string `patch`、`author`。id 从 1 连续递增且与补丁编号一致；author 为 `ai` 或 `human`（历史版本）。YAML 数字基线不得隐式转换为字符串。 |
+| `revisions[]` | 是 | 非空列表 | 每项必含正整数 `id`、非空 string `base_revision`、string `patch`、`author`。id 从 1 连续递增且与补丁编号一致；author 为 `ai` 或 `human`（历史版本）。YAML 数字基线不得隐式转换为字符串。SVN 候选可携带 Host 写入的 `svn_approval_source: {uuid, relative_url}` 以核验合并来源。 |
 | `gate_checks` | 是 | string[] | 批准时顺序执行；列表非空，每条 trim 后非空。 |
 | `comments[]` | 是 | 列表 | 可为 `[]`；精确形状见下表。 |
 | `human_decisions[]` | 是 | 列表 | 可为 `[]`；每项含候选内唯一稳定、非空 string `id`、非空 string `question`，以及可选 string `note`。 |
@@ -757,7 +759,7 @@ Git 与 SVN 对核心流程提供统一能力：
 | --- | --- |
 | 工作区检查 | 返回脏文件清单；`.ai-review/`、`.tmp/`、`node_modules/` 的既有改动可按实现约定忽略，但不得因此提交无关文件。 |
 | 同步与基线 | 支持同步远端并取得最新基线，以及读取本地当前基线。Git 在 baseBranch 非空时同步该分支，否则使用当前分支 upstream；无远端或无 upstream 时可明确跳过并使用当前 HEAD。SVN 忽略 baseBranch。 |
-| 应用补丁 | 批准必须严格应用（threeWay=false）；AI 修复场景可使用 three-way。 |
+| 应用补丁 | 批准对候选源快照和原生严格应用路径使用严格应用（threeWay=false）。符合 §7.5 条件时，在隔离环境中计算三方合并并核对待交付差异。Rebase 按 §7.7 执行。 |
 | 工作区还原 | 彻底还原业务工作区，同时保留 `.ai-review/`。 |
 | 版本间差异 | resolutionMode 为 `same_base_direct`（同基线直接对比）、`cross_base_3way_clean`（跨基线三方应用后对比）或 `cross_base_hunk_fallback`（冲突时 Hunk 级降级）；SVN 可始终采用 Hunk 级降级。 |
 | 原子提交 | 只提交明确指定的业务与评审路径，支持删除归档补丁；Git 原子提交本身只 commit。本地模式不 push；中央托管模式随后按 §16 核验并交付原提交。 |
@@ -814,7 +816,7 @@ Runner 模式：
 4. **候选完整性**：全部适用不变量通过，否则返回 `ABORTED / INVALID_CANDIDATE`。
 5. **工作区检查**：不干净返回 `ABORTED / DIRTY_WORKSPACE`。
 6. **同步与基线**：默认先同步。已知且可安全恢复的失败返回 `ABORTED / SYNC_FAILED`；部分同步或基线状态无法确定时返回 `RECOVERY_REQUIRED / SYNC_STATE_UNKNOWN`，禁止自动重试。随后重新绑定同步后的共享快照，重跑步骤 1–4（包括负向记忆）；后续补丁、门禁与批准记录均使用该快照。
-7. **严格应用同一共享快照中的当前补丁**：失败则还原业务工作区并进入补丁冲突回退。成功后记录所有目标业务文件的内容、存在性与模式快照。
+7. **重建并验证同一共享快照中的当前补丁**：按下述规则计算当前补丁在目标基线上的交付结果。严格应用路径必须检测 SVN 部分应用。发生文本冲突或无法证明合并保留已审修改时，进入 `PATCH_CONFLICT` 回退。正式工作区只写入已验证的结果，随后记录所有目标业务文件的内容、存在性与模式快照。
 8. **重新执行门禁**：失败则终止完整进程树、还原业务工作区并进入门禁失败回退。
 9. **再次校验共享事实、guard、工作区与提交内容**：确认 HEAD/相关事实未变化并重新执行 §6 重复检查；候选变化返回 `ABORTED / CONCURRENCY_MISMATCH`，新重复返回 `ABORTED / DUPLICATE_CANDIDATE`。重新计算业务工作区快照，必须与步骤 7 完全一致且没有额外业务文件变化。业务提交还必须从已验证内容构造提交树，并逐路径核对暂存 blob、模式与删除集合；可使用临时 index，或强制重新暂存后核验。工作区、索引或提交树任一不一致均返回 `ABORTED / BUSINESS_CONTENT_CHANGED` 并恢复，防止门禁通过索引或 clean filter 夹带未审核代码。
 10. **原子提交**：写入 approval（不含提交哈希），提交业务代码、review.md 和补丁删除：
@@ -822,6 +824,13 @@ Runner 模式：
     - 明确的非撞车失败且提交不存在：撤销本次 VCS 暂存或调度，恢复候选文件与业务工作区并确认恢复结果，再返回 `ABORTED / COMMIT_FAILED`。恢复不完整时返回 `RECOVERY_REQUIRED / COMMIT_OUTCOME_UNKNOWN`。
     - 超时、断连或结果不明：先查询 HEAD/远端并核对候选批准内容。提交存在则按成功继续；证明不存在才可恢复并返回 COMMIT_FAILED；仍无法确定则返回 `RECOVERY_REQUIRED / COMMIT_OUTCOME_UNKNOWN`，禁止恢复备份或重试。
 11. **返回提交结果**：本次提交成功时返回其 VCS 版本号；后续读取按 §5.5 从历史派生。不得再产生仅用于记录哈希的第二次提交。
+
+**候选合并与原生交付**（2026-11-25 修订）：
+
+- 优先检查原生严格应用能力。严格应用能完整落地时复用原生路径。SVN 的拒绝块、跳过及部分或全部已生效均不得视为完整应用。SVN 报告以非零 fuzz 忽略上下文时按上下文失配处理。严格应用遇到文本上下文失配时，符合首期范围的候选以当前版本的 `base_revision` 重建源快照，再严格应用补丁得到候选快照。以实际使用的原生目标快照为另一侧，在独立临时 Git 环境执行三方合并。已提交的其他候选通过目标快照参与本次合并。
+- 首期三方合并覆盖已有普通文本文件的内容修改，路径、文件类型、模式、字节表示和原生属性须保持一致且可核验。范围之外的变更继续使用原生严格应用。旧候选缺少可验证来源、浅克隆缺少历史，或 SVN 环境未安装 Git 时，允许继续使用可完整应用的原生路径。若原生路径不能完整应用，则按具体原因报告冲突或 `ABORTED / SYNC_FAILED`。已确认的来源绑定不匹配必须中止。合并结果经核验被拒绝后禁止改走原生路径继续提交。正式工作副本的同步结果或状态无法确定时，按 `RECOVERY_REQUIRED / SYNC_STATE_UNKNOWN` 保留现场。
+- 合并无冲突后，Host 比较候选相对源快照的修改与合并结果相对目标快照的修改。路径、修改定位和增删内容须一一对应。允许行号偏移与上下文漂移，重复文本导致位置映射歧义、部分改动已生效、空结果或额外修改均进入 `PATCH_CONFLICT` 回退。修复产生的新版本须重新审批。
+- 正式写入前及门禁后再次校验工作副本和目标快照，SVN 核对工作副本绑定及涉及路径的基线与属性。写入后须确认实际内容与计算结果一致。门禁对实际待交付内容运行，批准记录、业务内容和补丁删除仍在原生 Git 或 SVN 中原子提交。失败时只恢复可归属于本次操作的改动。目标变化时按既有并发与恢复流程重新校验，远端交付遵循 §16.7。
 
 Backup 只能用于已证明业务提交不存在的路径和 AI 修复失败路径。业务提交成功或结果无法确定时，不得恢复旧 review.md、撤销业务内容或返回普通 ABORTED。
 
@@ -947,7 +956,7 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 | GET | `/health` | 应用、版本、configured、repoRoot、owner、VCS、当前基线、诊断和状态计数。 |
 | GET | `/settings` | `{settings, validation, suggestedOwner, runners}`。 |
 | GET | `/queue?owner=&statuses=&tag=&dir=&text=&createdAfter=&createdBefore=` | `{configured, items, errors, currentBase, counts, owner, me, repoRoot}`；owner 缺省为当前操作者、显式空值表示全部；statuses 为逗号分隔合法状态，缺省/空值为全部；tag 小写比较，dir/text 为大小写不敏感包含匹配；createdAfter/Before 均为含边界的 ISO 时间点。可含诊断字段 `auditLease`：该仓库当前阻塞中的审查租约 `{auditId, state: active\|releasable, trigger, createdAt, owner, baseRevision, targetPath, sessionId?}`，无阻塞租约时省略；仅用于面板展示与收尾/释放入口，不构成共享事实。items 中整体未进入共享快照的候选携带 `localOnly: true`（详情只读共享事实，共享快照可建立时 `/candidate` 对这类 id 返回 404，Client 不得为其提供详情入口；共享源创建失败的文件系统降级路径除外）。approved 项可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup: found / ambiguous / unknown`；`ambiguous/unknown` 只作诊断，不得阻塞队列。可含缓存字段 `patchCheck`，但必须携带 `checkedBase` 与非空 ISO-8601 `checkedAt`，且不得作为共享事实或批准依据。`patchCheck` 的执行策略：预检内存缓存以 `(candidateId, revision, base)` 为键；`/queue` 只读已有缓存，未命中时该项返回 `state: "unknown"` 或省略，并由 Host 在后台以低优先级异步触发预检填充缓存，严禁在队列请求内同步批量执行补丁检查；`/candidate` 未命中缓存时可同步执行单候选预检并写回缓存。 |
-| GET | `/candidate?id=` | `{candidate, currentBase, isBaseBehind, patchCheck, approvalCommitRevision?, approvalCommitLookup?, patchText, patchStats, patchPaths, comments, validation, revisionStats, canAct, me, jobs}`。approved 候选可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup`，含义同 `/queue`。`patchCheck` 为派生诊断：`{state: clean / conflicted / unknown, checkedBase: string, checkedAt: ISO-8601 string}`；`clean/conflicted` 只表示补丁能否应用到 `checkedBase`，不构成批准证据，批准 Job 必须重新严格应用。**`isBaseBehind`（2026-11-10 澄清）表示“业务代码基线是否变化”**：候选元数据随 `.ai-review/` 提交，会持续推进顶层版本号，因此不得用 `base_revision !== currentBase` 直接判定；两者不同时须比较两版本的变更路径并排除 `.ai-review/`，差异只含评审元数据时 `isBaseBehind = false`，与 `/rebase` 的 `BASE_UNCHANGED` 判定同源（规则见 §7.7「有效业务基线」）。无法证明是否变化时保守返回 `true`。 |
+| GET | `/candidate?id=` | `{candidate, currentBase, isBaseBehind, patchCheck, approvalCommitRevision?, approvalCommitLookup?, patchText, patchStats, patchPaths, comments, validation, revisionStats, canAct, me, jobs}`。approved 候选可含派生字段 `approvalCommitRevision` 与 `approvalCommitLookup`，含义同 `/queue`。`patchCheck` 为派生诊断：`{state: clean / conflicted / unknown, checkedBase: string, checkedAt: ISO-8601 string}`；`clean/conflicted` 只表示补丁能否严格应用到 `checkedBase`，批准 Job 必须按 §7.5 重新验证待交付内容。**`isBaseBehind`（2026-11-10 澄清）表示“业务代码基线是否变化”**：候选元数据随 `.ai-review/` 提交，会持续推进顶层版本号，因此不得用 `base_revision !== currentBase` 直接判定；两者不同时须比较两版本的变更路径并排除 `.ai-review/`，差异只含评审元数据时 `isBaseBehind = false`，与 `/rebase` 的 `BASE_UNCHANGED` 判定同源（规则见 §7.7「有效业务基线」）。无法证明是否变化时保守返回 `true`。 |
 | GET | `/patch?id=&name=` | `{name, text}`；name 必须是该候选已有 revision 的补丁文件名。 |
 | GET | `/diff?id=&from=&to=` | to 缺省当前版本；from 缺省或等于 to 返回 full，否则返回 incremental、resolutionMode 与 notes。 |
 | GET | `/fix-prompt?id=&mode=` | `{prompt, comments, mode, title, revision}`，comments 为全部未 resolved 评论；`mode=session` 返回与会话投递一致的新会话口径（2026-11-12），缺省为 headless 口径。 |
@@ -1020,7 +1029,7 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 
 默认筛选当前操作者，状态默认全部。卡片显示 ticket、title、revision、变更规模、Owner、人工判断项、未解决评论、基线状态与本地瞬态进度。
 
-stale、duplicate、local 和基线冲突必须使用不同徽标；local 不计入共享 KPI。local 中的 local-only（候选目录整体未进入共享快照）条目不可进入详情，卡片需提示"审查收尾提交后才可查看详情与批准"；队列头部需汇总本地未提交条目数。`/queue` 返回 `auditLease` 时，队列页必须展示阻塞审查租约横幅：`active` 提示审查执行中并提供收尾入口；`releasable` 额外提供经两段式确认的释放入口，并说明释放不提交本地候选。基线落后时提示批准将在新基线重放（“落后”同样按 §7.7「有效业务基线」判定，排除 `.ai-review/` 评审元数据提交，避免每次评论后所有候选集体显示落后）；`patchCheck.state == conflicted` 时提示可先 Rebase，但不得单独阻止查看或批准；批准 Job 仍须重新严格应用，冲突时按 §7.5 回退。无批量批准，整卡点击进入详情（local-only 卡除外）。
+stale、duplicate、local 和基线冲突必须使用不同徽标；local 不计入共享 KPI。local 中的 local-only（候选目录整体未进入共享快照）条目不可进入详情，卡片需提示"审查收尾提交后才可查看详情与批准"；队列头部需汇总本地未提交条目数。`/queue` 返回 `auditLease` 时，队列页必须展示阻塞审查租约横幅：`active` 提示审查执行中并提供收尾入口；`releasable` 额外提供经两段式确认的释放入口，并说明释放不提交本地候选。基线落后时提示批准将在新基线重放（“落后”同样按 §7.7「有效业务基线」判定，排除 `.ai-review/` 评审元数据提交，避免每次评论后所有候选集体显示落后）；`patchCheck.state == conflicted` 时提示可先 Rebase，但不得单独阻止查看或批准；批准 Job 仍须按 §7.5 验证交付内容，遇到冲突时按该节回退。无批量批准，整卡点击进入详情（local-only 卡除外）。
 
 ### 10.2 详情页
 
@@ -1260,6 +1269,7 @@ Agent 结束任务前必须逐项确认：
 | AC-LOCK-01 | 冻结时钟并连续两次评论，第二个旧 guard 必须 stale；时钟回拨也严格推进；revision、owner、updated_at 任一变化均可检测。 |
 | AC-DECISION-01 | 完整确认/waive 可批准；遗漏、未知 id、重复、交叉和空理由均拒绝；approval 只保存精确集合。 |
 | AC-APPROVE-01 | 同步后重建快照并重跑前置检查；门禁后工作区、Git 索引和提交树均等于已验证快照；单次原子提交；业务提交成功后从历史派生提交版本；后续修复提交不改变派生结果；ambiguous/unknown 只诊断。 |
+| AC-APPROVE-MERGE-01 | SVN 退出码为 0 但拒绝、跳过或报告已应用时不得视为完整应用；Git 和 SVN 上同文件不同位置的候选支持交换批准顺序；同一处冲突、部分已生效、重复文本歧义和合并结果不等价时不得沿用原批准；覆盖无历史、SVN 无 Git、路径级目标漂移及原生交付。 |
 | AC-FINDING-OPTIONS-01 | 单补丁可进入候选审核；多补丁各自独立验证且同组只能提交一个；未处置的纯文字方案可选本次不修改或人工接手；失效选项不可批准；如果组内候选缺失、已损坏或关联有误，返回发现诊断而不发布正常投影。 |
 | AC-FINDING-LOCK-01 | 同组并发审批至多一次业务提交；旧界面绕过、过期发现版本、非当前选项与已处置发现均被拒绝；重启后提交不明仍阻止审批同组其他选项。 |
 | AC-FINDING-HISTORY-01 | 人的结论跨轮保留；按范围和处置过滤；未给人工线索也能复查；能归因才补记提交；证据不足保持状态；旧数据仍可读取和按 v1 流转。 |

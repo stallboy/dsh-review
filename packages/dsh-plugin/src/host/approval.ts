@@ -4,6 +4,9 @@ import path from 'node:path';
 import { parsePatch, isAiReviewPath } from './patch.js';
 import { runGateChecks } from './validator.js';
 import { gitBlobHash } from './vcs.js';
+import { mergeApprovedText, supportedApprovalMergePatch } from './approval-merge.js';
+import { readApprovalMergeSnapshots, readSvnApprovalBinding, replaceApprovalMergeFile,
+  svnApprovalBinding, SVN_APPROVAL_SOURCE, type ApprovalMergeFile } from './approval-merge-snapshots.js';
 import type { Runner, RunnerRequest } from './runner.js';
 import type { CandidateSource, ReviewStore } from './store.js';
 import type {
@@ -224,6 +227,50 @@ export class ApprovalOrchestrator {
         ? await store.currentPatch(candidate, sharedSource)
         : await store.currentPatch(candidate);
       const touchedPaths = parsePatch(patch.text).paths;
+      const currentRevision = candidate.meta.revisions.find(revision => revision.id === candidate.meta.currentRevision);
+      const svnSource = vcs.type === 'svn' ? svnApprovalBinding(currentRevision?.extra?.[SVN_APPROVAL_SOURCE]) : null;
+      if (svnSource) {
+        const target = await readSvnApprovalBinding(vcs.root, this.deps.signal).catch(() => null);
+        if (!target || target.uuid !== svnSource.uuid || target.relativeUrl !== svnSource.relativeUrl) {
+          return { status: 'ABORTED', reason: 'SYNC_FAILED', jobId, message: 'SVN 候选来源与当前目标绑定不一致或无法核验' };
+        }
+      }
+      const mergeInput = { sourceRevision: patch.baseRevision, targetRevision: base, files: touchedPaths, svnBinding: svnSource };
+      const verifyMergeTarget = async (files: ApprovalMergeFile[], verifyWorktree: boolean): Promise<boolean> => {
+        if (await vcs.getCurrentBase() !== base) return false;
+        const current = await readApprovalMergeSnapshots(vcs, { ...mergeInput, verifyWorktree });
+        return current.status === 'ready' && files.every((file, index) =>
+          current.files[index]?.targetIdentity === file.targetIdentity);
+      };
+      let merge: { baseFiles: ApprovalMergeFile[]; output: Map<string, Buffer> } | undefined;
+      const restoreBusiness = async (): Promise<void> => {
+        if (!merge) {
+          await vcs.revertBusinessWorkspace();
+          return;
+        }
+        if (!await verifyMergeTarget(merge.baseFiles, false)) throw new Error('原生目标快照已变化');
+        const errors: string[] = [];
+        for (const file of merge.baseFiles) {
+          try {
+            await replaceApprovalMergeFile(vcs.root, file.path, merge.output.get(file.path)!, file.target);
+          } catch (error) {
+            errors.push(String(error));
+          }
+        }
+        if (errors.length) throw new Error(errors.join('\n'));
+        const restored = await vcs.ensureCleanWorkspace();
+        if (!restored.clean) throw new Error(restored.message);
+      };
+      const rollbackApplied = async (): Promise<ApprovalOutcome | null> => {
+        try {
+          await restoreBusiness();
+          return null;
+        } catch (error) {
+          if (!merge) return null;
+          return { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', jobId,
+            message: '无法确认三方合并改动已安全恢复，保留剩余现场', detail: String(error) };
+        }
+      };
       const forbiddenPaths = touchedPaths.filter((file) => isAiReviewPath(file));
       if (forbiddenPaths.length > 0) {
         await vcs.revertBusinessWorkspace().catch(() => undefined);
@@ -239,21 +286,24 @@ export class ApprovalOrchestrator {
       const tempPatch = path.join(tmpdir(), `dcr-approval-${String(process.pid)}-${String(Date.now())}.patch`);
       await writeFile(tempPatch, patch.text, 'utf8');
       let applied;
-      let svnAttempt;
+      let nativeAttempt;
       try {
-        svnAttempt = await vcs.applyPatchForApproval?.(tempPatch, this.deps.signal);
-        applied = svnAttempt ?? await vcs.applyPatch(tempPatch, false);
+        nativeAttempt = await vcs.applyPatchForApproval?.(tempPatch, this.deps.signal);
+        applied = nativeAttempt ?? await vcs.applyPatch(tempPatch, false);
       } finally {
         await rm(tempPatch, { force: true }).catch(() => undefined);
       }
       if (!applied.ok) {
-        if (svnAttempt?.workspace === 'unknown') {
+        if (nativeAttempt?.workspace === 'unknown') {
           return { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', jobId,
-            message: 'SVN 实际应用结果无法核验，已保留现场', detail: applied.message };
+            message: '原生补丁应用结果无法核验，已保留现场', detail: applied.message };
         }
-        if (svnAttempt) {
+        if (this.deps.signal?.aborted) {
+          return { status: 'ABORTED', reason: 'COMMIT_FAILED', jobId, message: '已取消补丁应用，未产生共享提交' };
+        }
+        if (nativeAttempt) {
           if (!applied.conflict) {
-            return { status: 'ABORTED', reason: 'SYNC_FAILED', jobId, message: 'SVN 补丁预检无法核验', detail: applied.message };
+            return { status: 'ABORTED', reason: 'SYNC_FAILED', jobId, message: '原生补丁预检无法核验', detail: applied.message };
           }
           const afterCheck = await vcs.ensureCleanWorkspace();
           if (!afterCheck.clean) {
@@ -262,17 +312,59 @@ export class ApprovalOrchestrator {
         } else {
           await vcs.revertBusinessWorkspace().catch(() => undefined);
         }
-        return this.fixOrFallback(
-          'PATCH_CONFLICT',
-          applied.message,
-          candidate,
-          jobId,
-          log,
-          base,
-        );
+        let failure = applied.message;
+        if (nativeAttempt?.canMerge && (vcs.type === 'git' || svnSource) && supportedApprovalMergePatch(patch.text)) {
+          const inputs = await readApprovalMergeSnapshots(vcs, {
+            ...mergeInput, ...(this.deps.signal ? { signal: this.deps.signal } : {}),
+          });
+          if (inputs.status === 'ready') {
+            log('原生补丁上下文变化，尝试隔离的 Git 三方合并');
+            const result = await mergeApprovedText(patch.text, inputs.files, this.deps.signal);
+            if (this.deps.signal?.aborted) {
+              return { status: 'ABORTED', reason: 'COMMIT_FAILED', jobId, message: '已取消三方合并，未产生共享提交' };
+            }
+            if (result.status === 'merged') {
+              if (!await verifyMergeTarget(inputs.files, true) || !(await vcs.ensureCleanWorkspace()).clean) {
+                return { status: 'ABORTED', reason: 'CONCURRENCY_MISMATCH', jobId, message: '三方合并期间原生目标发生变化' };
+              }
+              merge = { baseFiles: inputs.files, output: result.files };
+              const written: ApprovalMergeFile[] = [];
+              try {
+                for (const file of inputs.files) {
+                  await replaceApprovalMergeFile(vcs.root, file.path, file.target, result.files.get(file.path)!);
+                  written.push(file);
+                }
+              } catch (error) {
+                if (written.length && await verifyMergeTarget(written, false)) {
+                  for (const file of written) {
+                    await replaceApprovalMergeFile(vcs.root, file.path, result.files.get(file.path)!, file.target).catch(() => undefined);
+                  }
+                }
+                return { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', jobId,
+                  message: '写入合并结果时工作副本变化或写入失败，已保留待核验现场', detail: String(error) };
+              }
+              log('三方合并的待交付差异与已审修改相符');
+            } else if (result.status === 'unavailable') {
+              failure = result.detail;
+              return { status: 'ABORTED', reason: 'SYNC_FAILED', jobId, message: '无法完成隔离三方合并', detail: failure };
+            } else {
+              failure = result.detail;
+            }
+          } else if (inputs.status === 'mismatch' || inputs.status === 'unavailable') {
+            if (this.deps.signal?.aborted) {
+              return { status: 'ABORTED', reason: 'COMMIT_FAILED', jobId, message: '已取消来源快照读取，未产生共享提交' };
+            }
+            return { status: 'ABORTED', reason: 'SYNC_FAILED', jobId, message: '无法核验三方合并输入', detail: inputs.detail };
+          }
+        }
+        if (!merge) return this.fixOrFallback('PATCH_CONFLICT', failure, candidate, jobId, log, base);
       }
       const businessPaths = touchedPaths.filter((file) => !isAiReviewPath(file));
       const businessSnapshot = await this.snapshotBusiness(businessPaths);
+      if (merge && [...merge.output].some(([file, contents]) => businessSnapshot.get(file)?.blobHash !== gitBlobHash(contents))) {
+        return { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', jobId,
+          message: '三方合并写入与已验证结果不一致，已保留现场', detail: '实际写入的文件快照在门禁前发生变化' };
+      }
       log('补丁已应用，开始执行门禁检查');
       const report = await runGateChecks(candidate.meta.gateChecks, {
         cwd: store.repoRoot,
@@ -285,17 +377,20 @@ export class ApprovalOrchestrator {
       });
       log(report.allPassed ? '门禁检查全部通过' : '门禁检查存在失败项');
       if (this.deps.signal?.aborted) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        const recovery = await rollbackApplied();
+        if (recovery) return recovery;
         return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: '门禁已按取消请求终止，未产生共享提交', jobId };
       }
       if (!report.allPassed) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        const recovery = await rollbackApplied();
+        if (recovery) return recovery;
         return this.fixOrFallback('GATE_CHECK_FAILED', report.formattedEvidenceMarkdown, candidate, jobId, log, base);
       }
       // AC-APPROVE-01 要求门禁后重新验证共享事实和业务内容，防止门禁期间的改动混入提交。
       const baseAfterGates = await vcs.getCurrentBase();
-      if (baseAfterGates === null || baseAfterGates !== base) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
+      if (baseAfterGates === null || baseAfterGates !== base || (merge && !await verifyMergeTarget(merge.baseFiles, false))) {
+        const recovery = await rollbackApplied();
+        if (recovery) return recovery;
         return {
           status: 'ABORTED',
           reason: 'CONCURRENCY_MISMATCH',
@@ -304,12 +399,14 @@ export class ApprovalOrchestrator {
         };
       }
       if (this.deps.shouldCancel?.()) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        const recovery = await rollbackApplied();
+        if (recovery) return recovery;
         return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: '已按取消请求中止（提交前，未产生共享提交）', jobId };
       }
       const duplicate3 = await this.deps.checkDuplicate?.();
       if (duplicate3) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        const recovery = await rollbackApplied();
+        if (recovery) return recovery;
         return {
           status: 'ABORTED',
           reason: 'DUPLICATE_CANDIDATE',
@@ -320,7 +417,8 @@ export class ApprovalOrchestrator {
       }
       const freshReload = await this.reload(id, guard, log);
       if (!freshReload.candidate) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        const recovery = await rollbackApplied();
+        if (recovery) return recovery;
         return {
           status: 'ABORTED',
           reason: 'CONCURRENCY_MISMATCH',
@@ -331,14 +429,16 @@ export class ApprovalOrchestrator {
       const fresh = freshReload.candidate;
       const findingConflict = await this.findingConflict(fresh);
       if (findingConflict) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        const recovery = await rollbackApplied();
+        if (recovery) return recovery;
         return { status: 'ABORTED', ...findingConflict, jobId };
       }
       if (messageOverride !== undefined) {
         fresh.meta.commitMessage = messageOverride;
         const replacedMessageError = checkCommitMessage(fresh.meta.title, fresh.meta.commitMessage);
         if (replacedMessageError) {
-          await vcs.revertBusinessWorkspace().catch(() => undefined);
+          const recovery = await rollbackApplied();
+          if (recovery) return recovery;
           return {
             status: 'ABORTED',
             reason: 'COMMIT_MESSAGE_MISMATCH',
@@ -352,7 +452,8 @@ export class ApprovalOrchestrator {
       const dirtyAfter = await vcs.ensureCleanWorkspace();
       const extraDirty = dirtyAfter.dirtyPaths.filter((file) => !businessPaths.includes(file.replaceAll('\\', '/')));
       if (businessChanged.length > 0 || extraDirty.length > 0) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        const recovery = await rollbackApplied();
+        if (recovery) return recovery;
         return {
           status: 'ABORTED',
           reason: 'BUSINESS_CONTENT_CHANGED',
@@ -372,7 +473,8 @@ export class ApprovalOrchestrator {
           if (!this.deps.beginFindingCommit || !this.deps.finishFindingCommit) throw new Error('缺少发现审批状态存储');
           await this.deps.beginFindingCommit(fresh, probePaths, probeBefore);
         } catch (error) {
-          await vcs.revertBusinessWorkspace().catch(() => undefined);
+          const recovery = await rollbackApplied();
+          if (recovery) return recovery;
           return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: error instanceof Error ? error.message : String(error), jobId };
         }
       }
@@ -423,6 +525,7 @@ export class ApprovalOrchestrator {
           outOfDate: commit.outOfDate,
           errorOutput: commit.errorOutput,
           restorePreparation: commit.restorePreparation,
+          restoreBusiness,
           canRetry: attempt < maxAttempts,
           jobId,
           log,
@@ -477,6 +580,7 @@ export class ApprovalOrchestrator {
     outOfDate: boolean;
     errorOutput: string;
     restorePreparation?: () => Promise<void>;
+    restoreBusiness: () => Promise<void>;
     canRetry: boolean;
     jobId: string;
     log: (line: string) => void;
@@ -524,7 +628,7 @@ export class ApprovalOrchestrator {
     try {
       await input.restorePreparation?.();
       await this.restore(input.backup);
-      await vcs.revertBusinessWorkspace();
+      await input.restoreBusiness();
       const restored = await vcs.ensureCleanWorkspace();
       if (!restored.clean) throw new Error(restored.message);
     } catch (error) {

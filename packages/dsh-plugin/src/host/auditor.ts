@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { patchTouchesReviewData, gitBlobHash, type VcsAdapter } from './vcs.js';
 import { auditFiles } from './audit-files.js';
+import { stampSvnApprovalSource } from './approval-merge-snapshots.js';
 import { reviewersPath } from './reviewers.js';
 import { runAgent, wrapAgentPrompt } from './runner.js';
 import { AuditStopUnknown } from './audit-stage-runner.js';
@@ -905,7 +906,9 @@ export class Auditor {
       } catch (error) {
         errors = [`无法读取评审文件：${error instanceof Error ? error.message : String(error)}`];
       }
-      dataValidation.push({ path: file, errors });
+      const checked = dataValidation.find(entry => entry.path === file);
+      if (checked) checked.errors = errors;
+      else dataValidation.push({ path: file, errors });
       return errors;
     };
     const aborted = (): AuditFinalizeResult => ({
@@ -944,6 +947,16 @@ export class Auditor {
       return recovery('SYNC_STATE_UNKNOWN', '无法安全读取审查报告，现场保留待核验');
     }
     const created = await this.verifyCandidates(input.beforeIds, input.baseRevision, warnings, input.reviewersCreated === true, checkFile);
+    if (vcs.type === 'svn' && !input.phasedItems && input.svnUrl) {
+      for (const item of created.filter(candidate => !candidate.errors.length)) {
+        const { candidate } = await store.get(item.id, input.baseRevision);
+        const revision = candidate.meta.revisions[0];
+        if (revision && await stampSvnApprovalSource(vcs, revision, candidate.meta.targetFiles)) {
+          await store.write(candidate, { touchUpdatedAt: false });
+          item.errors.push(...await checkFile('.ai-review/' + item.id + '/review.md'));
+        }
+      }
+    }
     this.log(`收尾：新增候选 ${String(created.length)} 个，校验问题 ${String(created.filter((item) => item.errors.length > 0).length)} 个`);
 
     if (body === null) {

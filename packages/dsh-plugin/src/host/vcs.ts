@@ -76,6 +76,7 @@ export interface ApprovalDeriveInput {
 
 export type ApprovalPatchAttempt = ApplyPatchResult & {
   workspace: 'untouched' | 'applied' | 'unknown';
+  canMerge?: boolean;
 };
 
 export interface VcsAdapter {
@@ -463,6 +464,24 @@ export class GitAdapter implements VcsAdapter {
       : { ok: false, conflict: true, message: tailLines(describe(apply), 80) };
   }
 
+  async applyPatchForApproval(patchPath: string, signal?: AbortSignal): Promise<ApprovalPatchAttempt> {
+    const options = { cwd: this.root, timeoutMs: VCS_TIMEOUT_MS,
+      env: { LC_ALL: 'C' }, ...(signal ? { signal } : {}) };
+    const checked = await runProcess('git', ['apply', '--check', '--binary', '--', patchPath], options);
+    if (checked.code !== 0) {
+      return { ok: false, conflict: checked.code !== null, workspace: 'untouched',
+        canMerge: checked.code === 1 && /^error: patch failed:/m.test(checked.stderr)
+          &&
+          !checked.stderr.split(/\r?\n/).some(line => line.startsWith('error:')
+            && !/^error: (?:patch failed:|.+: patch does not apply$)/.test(line)),
+        message: tailLines(describe(checked), 80) };
+    }
+    const applied = await runProcess('git', ['apply', '--binary', '--', patchPath], options);
+    return applied.code === 0
+      ? { ok: true, conflict: false, workspace: 'applied', message: '补丁已应用到工作区' }
+      : { ok: false, conflict: false, workspace: 'unknown', message: tailLines(describe(applied), 80) };
+  }
+
   async checkPatch(patchPath: string): Promise<ApplyPatchResult> {
     if (!existsSync(patchPath)) return { ok: false, conflict: false, message: `补丁不存在：${patchPath}` };
     const check = await git(this.root, ['apply', '--check', '--binary', patchPath]);
@@ -721,13 +740,16 @@ export function svnPatchReportsConflict(output: string): boolean {
   return /^(?:Skipped\b|C[ \t]|.C[ \t]|Summary of conflicts:)/m.test(output);
 }
 
+const SVN_PATCH_FUZZ = /^>[ \t]+applied hunk\b[^\r\n]*\bfuzz [1-9]\d*\b/m;
+
 export function classifySvnApprovalPatch(result: ProcessResult, maxBytes = SVN_APPROVAL_PATCH_LIMIT): 'complete' | 'conflict' | 'unknown' {
   if (result.timedOut || result.aborted || result.signal || result.error
     || Buffer.byteLength(result.stdout) >= maxBytes || Buffer.byteLength(result.stderr) >= maxBytes) {
     return 'unknown';
   }
   const output = result.stdout + '\n' + result.stderr;
-  if (svnPatchReportsConflict(output) || /^>[ \t].*\balready applied\b/m.test(output)) return 'conflict';
+  if (svnPatchReportsConflict(output) || SVN_PATCH_FUZZ.test(output) || /^>[ \t].*\balready applied\b/m.test(output)) return 'conflict';
+  if (/^>[ \t](?![ \t]*applied hunk\b[^\r\n]*\bwith offset -?\d+[ \t]*\r?$)/m.test(output)) return 'unknown';
   return result.code === 0 && result.stdout.trim() && !result.stderr.trim() ? 'complete' : 'unknown';
 }
 
@@ -1023,7 +1045,10 @@ export class SvnAdapter implements VcsAdapter {
     const check = await runProcess('svn', ['--non-interactive', 'patch', '--dry-run', '--', patchPath], options);
     const checked = classifySvnApprovalPatch(check);
     if (checked !== 'complete') {
-      return { ok: false, conflict: checked === 'conflict', workspace: 'untouched', message: tailLines(describe(check), 80) };
+      const diagnostics = check.stdout + '\n' + check.stderr;
+      const canMerge = checked === 'conflict' && (SVN_PATCH_FUZZ.test(diagnostics) || /^>[ \t]+rejected hunk\b/m.test(diagnostics))
+        && !/^(?:Skipped\b|>[ \t].*\balready applied\b)/m.test(diagnostics);
+      return { ok: false, conflict: checked === 'conflict', workspace: 'untouched', canMerge, message: tailLines(describe(check), 80) };
     }
     const applied = await runProcess('svn', ['--non-interactive', 'patch', '--', patchPath], options);
     const status = classifySvnApprovalPatch(applied);
