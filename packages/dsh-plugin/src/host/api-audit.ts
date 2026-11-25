@@ -48,13 +48,13 @@ import {
   type TrustedActor,
 } from './api-context.js';
 
-interface StageRecoveryOutcome {
+interface AuditSessionRecoveryOutcome {
   status: 'RECOVERY_REQUIRED';
   reason: 'SYNC_STATE_UNKNOWN';
   auditId: string;
   sessionId: string;
   detail: string;
-  stageFailure: AuditStageExecution;
+  stageFailure?: AuditStageExecution;
 }
 
 /** 将审查执行和租约状态机接入 Host。路由负责请求受理，租约在执行期间持续约束共享写入。 */
@@ -79,7 +79,7 @@ export class AuditRuntime {
   }
   private lifecycle: AuditLifecycle | null = null;
   private readonly stages = new Map<string, AuditStages>();
-  private readonly stageRecoveries = new WeakMap<AuditStages, Promise<StageRecoveryOutcome>>();
+  private readonly stageRecoveries = new WeakMap<AuditStages, Promise<AuditSessionRecoveryOutcome>>();
   private readonly testSessions = new Map<string, AuditSelfTestTools>();
   private readonly testShutdown = new AbortController();
   private closed = false;
@@ -146,7 +146,7 @@ export class AuditRuntime {
     if (!sessionId) return;
     let recovery = this.stageRecoveries.get(session);
     if (!recovery) {
-      recovery = this.recordStageRecovery({
+      recovery = this.recordAuditSessionRecovery({
         status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', auditId, sessionId, detail, stageFailure: { stage, runner },
       });
       this.stageRecoveries.set(session, recovery);
@@ -154,7 +154,7 @@ export class AuditRuntime {
     this.finishAuditTracking(auditId, await recovery);
   }
 
-  private async recordStageRecovery(outcome: StageRecoveryOutcome): Promise<StageRecoveryOutcome> {
+  private async recordAuditSessionRecovery(outcome: AuditSessionRecoveryOutcome): Promise<AuditSessionRecoveryOutcome> {
     const { auditId } = outcome;
     this.stopStages(auditId);
     this.clearAuditLeaseTimeout(auditId);
@@ -460,7 +460,18 @@ export class AuditRuntime {
             });
             return;
           }
-          if (lease.phased && (!lease.stageSeal || this.stages.get(auditId)?.busy)) return false;
+          if (lease.phased) {
+            if (stage?.busy) return false;
+            if (!lease.stageSeal) {
+              if (!stage?.allScanExecutorsFailed) return false;
+              const detail = '审查会话已结束，Codex 和 Claude Code 均未完成初审，请核验工作副本后重试。';
+              log(detail);
+              this.finishAuditTracking(auditId, await this.recordAuditSessionRecovery({
+                status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', auditId, sessionId, detail,
+              }));
+              return;
+            }
+          }
           this.clearAuditLeaseTimeout(auditId);
           log('审查会话已空闲，开始自动收尾');
           try {

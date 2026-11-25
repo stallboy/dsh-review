@@ -6,7 +6,7 @@ import test from 'node:test';
 import { createGitFixture, runCommand } from './helpers.mjs';
 import { reviewFixture, patchFixture } from './fixtures/contract.mjs';
 import { registerAuditStageTools } from '../packages/dsh-plugin/dist/host/audit-stage-tools.js';
-import { AuditStopUnknown } from '../packages/dsh-plugin/dist/host/audit-stage-runner.js';
+import { AuditExecutorAuthenticationError, AuditStopUnknown } from '../packages/dsh-plugin/dist/host/audit-stage-runner.js';
 import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
 import { ManagedDelivery } from '../packages/dsh-plugin/dist/managed/managed-delivery.js';
 import { ManagedNode } from '../packages/dsh-plugin/dist/managed/managed-node.js';
@@ -184,6 +184,61 @@ test('中央桌面节点使用绑定会话访问共享阶段工具', async t => 
     assert.equal(result.outcome.sessionId, sessionId);
     assert.equal(result.delivery.state, 'delivered');
     assert.match(runCommand('git', ['show', 'HEAD:' + result.outcome.reportPath], root).stdout, /确认走共享阶段/);
+});
+
+test('桌面审查会话结束且两个执行器均初审失败时回报待核验', { timeout: 30_000 }, async t => {
+    const sessionId = 'desktop-scan-failed';
+    const idle = Promise.withResolvers();
+    const firstScanFinished = Promise.withResolvers();
+    const firstIdleResult = Promise.withResolvers();
+    const bothScansFinished = Promise.withResolvers();
+    const finalIdleResult = Promise.withResolvers();
+    const signal = new AbortController().signal;
+    const { operations, project, journal, root, remote, target } = await fixture(t, {
+        auditStageExecutor: async ({ executor }) => {
+            if (executor === 'codex') throw new Error('codex 无法启动');
+            throw new AuditExecutorAuthenticationError(executor, 1);
+        },
+        async createAuditSession(input) {
+            await input.onCreated(sessionId);
+            return { sessionId };
+        },
+        async withAuditSessionIdle(_id, _requestId, watchingSignal, finalize) {
+            idle.resolve();
+            await firstScanFinished.promise;
+            firstIdleResult.resolve(await finalize(watchingSignal));
+            await bothScansFinished.promise;
+            const result = await finalize(watchingSignal);
+            finalIdleResult.resolve(result);
+            return result !== false;
+        },
+    });
+    const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+    const logs = [];
+    const command = auditCommand(project);
+    journal.accept(command);
+    const controller = new AbortController();
+    t.after(() => controller.abort());
+    const running = operations.execute(command, controller.signal, line => logs.push(line), project);
+    await idle.promise;
+    const stageApi = operations.auditStageApi(sessionId);
+    assert.ok(stageApi);
+    const scan = { taskScope: ['src'], scenarios: [], questions: [], constraints: [] };
+    await assert.rejects(stageApi.runAuditStage(sessionId, 'scan', 'codex', scan, signal), /无法启动/);
+    firstScanFinished.resolve();
+    assert.equal(await firstIdleResult.promise, false);
+    await assert.rejects(stageApi.runAuditStage(sessionId, 'scan', 'claude-code', scan, signal), /认证失败/);
+    bothScansFinished.resolve();
+    assert.notEqual(await finalIdleResult.promise, false, '两个执行器均失败后会话应结束跟踪');
+    const result = await running;
+    assert.equal(result.outcome.status, 'RECOVERY_REQUIRED');
+    assert.equal(result.outcome.sessionId, sessionId);
+    assert.match(result.outcome.detail, /Codex 和 Claude Code 均未完成初审/);
+    assert.equal(result.delivery.state, 'unknown');
+    assert.ok(logs.some(line => line.includes('均未完成初审')));
+    assert.equal(stageApi.leaseLookup(result.outcome.auditId).state, 'releasable');
+    assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), head);
+    assert.equal(runCommand('git', ['rev-parse', `refs/heads/${target}`], remote).stdout.trim(), head);
 });
 
 for (const timing of ['已注册 Job', '尚未注册 Job', '租约保存失败', '整轮时限与阶段重合']) {
