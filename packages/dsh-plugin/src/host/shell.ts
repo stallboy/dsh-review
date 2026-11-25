@@ -21,7 +21,7 @@ export interface ProcessOptions {
   timeoutMs?: number;
   env?: Record<string, string>;
   inheritEnv?: boolean;
-  input?: string;
+  input?: string | { initial: string; reply: (line: string) => Promise<string> | undefined };
   onLine?: (line: string, stream: 'stdout' | 'stderr') => void;
   maxBytes?: number;
   /** 门禁和执行器可能留下后台进程，按需清理以免 VCS 短命令承担 taskkill 的开销。 */
@@ -108,15 +108,28 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
     let termination: Promise<void> | undefined;
     let settled = false;
     const terminate = () => (termination ??= killTree(child.pid));
+    const exchange = typeof options.input === 'object' ? options.input : undefined;
+    let replied = false;
 
     const emit = (stream: 'stdout' | 'stderr', chunk: string): void => {
-      if (!options.onLine) return;
+      if (!options.onLine && (!exchange || stream !== 'stdout')) return;
       const buffer = stream === 'stdout' ? pendingStdout + chunk : pendingStderr + chunk;
       const lines = buffer.split(/\r?\n/);
       const rest = lines.pop() ?? '';
       if (stream === 'stdout') pendingStdout = rest;
       else pendingStderr = rest;
-      for (const line of lines) options.onLine(line, stream);
+      for (const line of lines) {
+        options.onLine?.(line, stream);
+        if (stream !== 'stdout' || replied) continue;
+        const response = exchange?.reply(line);
+        if (!response) continue;
+        replied = true;
+        void response.then((value) => {
+          if (!settled) child.stdin?.end(value);
+        }, () => {
+          if (!settled) child.stdin?.end();
+        });
+      }
     };
 
     child.stdout?.on('data', (data: Buffer) => {
@@ -173,7 +186,8 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
     child.stdin?.on('error', (error: NodeJS.ErrnoException) => {
       stdinError = error.code ?? 'UNKNOWN';
     });
-    child.stdin?.end(options.input);
+    if (exchange) child.stdin?.write(exchange.initial);
+    else child.stdin?.end(typeof options.input === 'string' ? options.input : undefined);
   });
 }
 

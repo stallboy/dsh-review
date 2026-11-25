@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { x as extractTar } from 'tar';
 import { AUDIT_TIMEOUT_MS, type AuditLeaseRecord } from './audit-lifecycle.js';
 import { serializeReviewMarkdown } from './frontmatter.js';
+import { readSvnApprovalBinding, svnApprovalSourceMetadata, SVN_APPROVAL_SOURCE } from './approval-merge-snapshots.js';
 import { isRepoRelativePath } from './invariants.js';
 import { parsePatch } from './patch.js';
 import { resolveOwner, type ReviewersConfig } from './reviewers.js';
@@ -170,6 +171,7 @@ export async function prepareStageCandidate(input: {
 }): Promise<StageCandidate> {
     const { lease, vcsType, scratch, signal } = input;
     const work = await extractBaseline(lease, vcsType, scratch, signal);
+    const svnSource = vcsType === 'svn' ? await readSvnApprovalBinding(work, signal) : null;
     if (vcsType === 'git') {
         await auditGit(work, ['init', '-q'], signal);
         await auditGit(work, ['add', '-f', '--', '.'], signal);
@@ -232,7 +234,8 @@ export async function prepareStageCandidate(input: {
     const review = serializeReviewMarkdown({
         schemaVersion: 1, module, title, auditType: input.auditType, owner, tags: [], ticket: null, status: 'pending',
         createdAt: lease.createdAt, updatedAt: lease.createdAt, targetFiles: touched, currentRevision: 1,
-        revisions: [{ id: 1, baseRevision: lease.baseRevision, patch: '001.patch', author: 'ai' }],
+        revisions: [{ id: 1, baseRevision: lease.baseRevision, patch: '001.patch', author: 'ai',
+            ...(svnSource ? { extra: { [SVN_APPROVAL_SOURCE]: svnApprovalSourceMetadata(svnSource) } } : {}) }],
         gateChecks: input.commands, comments: [], humanDecisions: [], approval: null, rejection: null,
         commitMessage: title + '\n\n' + input.confirmed + '\n\n' + gates, extra: {},
     }, body);

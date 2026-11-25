@@ -2383,7 +2383,7 @@
             detail.patchCheck ? h('div', { className: `dcr-banner ${detail.patchCheck.state === 'conflicted' ? 'warn' : 'info'}`, style: { marginTop: 6 } },
               h('span', { className: 'dcr-grow' },
                 detail.patchCheck.state === 'conflicted'
-                  ? `补丁预检：在基线 ${short(detail.patchCheck.checkedBase)} 无法干净应用；可先 Rebase（批准时仍会重新严格应用）。`
+                  ? `补丁预检：在基线 ${short(detail.patchCheck.checkedBase)} 无法直接应用；可先 Rebase。批准时在当前目标重新校验，符合条件时会尝试三方合并。`
                   : detail.patchCheck.state === 'clean'
                     ? `补丁预检：可应用到基线 ${short(detail.patchCheck.checkedBase)}（仅诊断，不构成批准证据）。`
                     : '补丁预检：状态未知（仅诊断）。'),

@@ -529,7 +529,7 @@ export class AuditRuntime {
     this.assertAuditStartAllowed(runtime, clean);
     const auditId = await new AuditArchive(runtime.root).nextAuditId(input.targetPath, input.now);
     const candidateIdsBefore = await runtime.store.listCandidateIds();
-    const svnUrl = input.phased && runtime.vcsType === 'svn' ? await readSvnAuditUrl(runtime.root) : undefined;
+    const svnUrl = runtime.vcsType === 'svn' ? await readSvnAuditUrl(runtime.root) : undefined;
     await this.upsertLease({
       auditId,
       root: runtime.root,

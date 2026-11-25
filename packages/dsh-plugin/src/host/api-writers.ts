@@ -4,6 +4,7 @@ import type { ApiRequest, ApiResponse } from './api-context.js';
 import path from 'node:path';
 import { AuditArchive } from './audit-archive.js';
 import { auditFiles } from './audit-files.js';
+import { stampSvnApprovalSource } from './approval-merge-snapshots.js';
 import { findingDecisionFromRequest, findingRecordPath, parseFindingEvents, serializeFindingEvents } from './finding-decisions.js';
 import { FindingApprovalState } from './finding-approval-state.js';
 import { isAiReviewPath, parsePatch } from './patch.js';
@@ -194,6 +195,9 @@ export class Writers {
         await runtime.vcs.revertBusinessWorkspace().catch(() => undefined);
         if (!applied.ok) errors.push(`新补丁无法在基线上严格应用：${applied.message}`);
       }
+    }
+    if (!errors.length && await stampSvnApprovalSource(runtime.vcs, current, latest.meta.targetFiles)) {
+      await runtime.store.write(latest, { touchUpdatedAt: false });
     }
     return [...new Set(errors)];
   }
@@ -1038,6 +1042,7 @@ export class Writers {
       // 收尾归一化不代表候选内容再次变更，因此保留原 updated_at。
       const { readFile: readFs } = await import('node:fs/promises');
       const reviewBackup = await readFs(detail.candidate.reviewPath, 'utf8');
+      if (current) await stampSvnApprovalSource(vcs, current, detail.candidate.meta.targetFiles);
       await store.write(detail.candidate, { touchUpdatedAt: false });
       const writtenReview = await readFs(detail.candidate.reviewPath, 'utf8').catch(() => null);
       const outcome = await this.commitAndClassify({
