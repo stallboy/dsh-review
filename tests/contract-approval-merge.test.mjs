@@ -189,3 +189,23 @@ test('Git 在提交探针时切换到同 SHA 的另一分支，审批不推进�
     assert.equal(call('rev-parse', 'refs/heads/same-sha-after-gates').trim(), first.commitRevision);
     assert.match(call('show', 'HEAD:.ai-review/2026-11/second/review.md'), /^status: pending$/m);
 });
+
+test('Git 审批保留状态干净但尚未完成的用户合并', async (t) => {
+    const { approve, call, log, root } = await fixture(t, 'git');
+    const original = call('branch', '--show-current').trim();
+    call('switch', '-qc', 'other-merge-side');
+    call('commit', '--allow-empty', '-qm', 'other side');
+    call('switch', '-q', original);
+    call('commit', '--allow-empty', '-qm', 'original side');
+    const head = call('rev-parse', 'HEAD').trim();
+    call('merge', '--no-ff', '--no-commit', 'other-merge-side');
+    const mergeHead = call('rev-parse', 'MERGE_HEAD').trim();
+    assert.equal(call('status', '--porcelain').trim(), '');
+    const result = await approve('first');
+    assert.equal(result.status, 'ABORTED', JSON.stringify(result));
+    assert.equal(result.reason, 'SYNC_FAILED');
+    assert.equal(call('rev-parse', 'HEAD').trim(), head);
+    assert.equal(call('rev-parse', 'MERGE_HEAD').trim(), mergeHead);
+    assert.equal(await readFile(path.join(root, file), 'utf8'), body(baseLines));
+    assert.ok(log.every(line => !line.includes('开始执行门禁')));
+});

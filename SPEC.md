@@ -814,7 +814,7 @@ Runner 模式：
 2. **人工判断项**：按 §5.4 精确校验，失败返回 `ABORTED / DECISIONS_UNCONFIRMED`。
 3. **提交信息**：commit_message 非空且首行等于 title，否则返回 `ABORTED / COMMIT_MESSAGE_MISMATCH`。批准请求经 `/approve` 提供了 `commitMessage` 时，先以该值替换候选 `commit_message` 再做本项校验；校验通过的替换值在步骤 10 的原子提交中一并写入 `review.md`，不产生独立的元数据提交。请求携带 `commitDetail` 时，步骤 10 的业务提交说明按 §5.6「提交信息详略」由 Host 生成（规范单行 / 单行 + 事实正文），该字段不影响本项校验。
 4. **候选完整性**：全部适用不变量通过，否则返回 `ABORTED / INVALID_CANDIDATE`。
-5. **工作区检查**：不干净返回 `ABORTED / DIRTY_WORKSPACE`。
+5. **工作区检查**：不干净返回 `ABORTED / DIRTY_WORKSPACE`。Git 正在合并、变基、挑拣或撤销时无法建立本次审批目标，返回 `ABORTED / SYNC_FAILED` 并保留进行中的操作。
 6. **同步与基线**：默认先同步。已知且可安全恢复的失败返回 `ABORTED / SYNC_FAILED`；部分同步或基线状态无法确定时返回 `RECOVERY_REQUIRED / SYNC_STATE_UNKNOWN`，禁止自动重试。随后重新绑定同步后的共享快照，重跑步骤 1–4（包括负向记忆）；后续补丁、门禁与批准记录均使用该快照。
 7. **重建并验证同一共享快照中的当前补丁**：按下述规则计算当前补丁在目标基线上的交付结果。严格应用路径必须检测 SVN 部分应用。发生文本冲突或无法证明合并保留已审修改时，进入 `PATCH_CONFLICT` 回退。正式工作区只写入已验证的结果，随后记录所有目标业务文件的内容、存在性与模式快照。
 8. **重新执行门禁**：失败则终止完整进程树、还原业务工作区并进入门禁失败回退。

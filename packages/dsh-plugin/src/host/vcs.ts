@@ -298,10 +298,14 @@ export class GitAdapter implements VcsAdapter {
   }
 
   async getApprovalTarget(): Promise<GitApprovalTarget | null> {
-    const [ref, base] = await Promise.all([
+    const [ref, base, sequencer] = await Promise.all([
       git(this.root, ['rev-parse', '--symbolic-full-name', 'HEAD']), this.getCurrentBase(),
+      git(this.root, ['rev-parse', ...['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'sequencer']
+        .flatMap(file => ['--git-path', file])]),
     ]);
     const name = ref.stdout.replace(/\r?\n$/, '');
+    const statePaths = sequencer.stdout.trimEnd().split(/\r?\n/);
+    if (sequencer.code !== 0 || statePaths.length !== 6 || statePaths.some(file => existsSync(path.resolve(this.root, file)))) return null;
     return ref.code === 0 && base && /^(?:HEAD|refs\/heads\/[^\x00-\x20\x7f]+)$/.test(name) ? { ref: name, base } : null;
   }
 
@@ -311,7 +315,7 @@ export class GitAdapter implements VcsAdapter {
   }
 
   private async commitApprovedTree(target: GitApprovalTarget, tree: string, message: string): Promise<CommitResult> {
-    const failed = (errorOutput: string, flags: Partial<Pick<CommitResult, 'targetChanged' | 'verificationFailed'>> = {}): CommitResult =>
+    const failed = (errorOutput: string, flags: Partial<Pick<CommitResult, 'targetChanged' | 'verificationFailed' | 'outOfDate'>> = {}): CommitResult =>
       ({ success: false, commitRevision: null, outOfDate: false, errorOutput, ...flags });
     if (!await this.matchesApprovalTarget(target)) return failed('Git 审批目标引用或基线已变化', { targetChanged: true });
     const directory = await mkdtemp(path.join(tmpdir(), 'dcr-approved-message-')).catch(() => null);
@@ -351,7 +355,7 @@ export class GitAdapter implements VcsAdapter {
         return failed('Git 审批目标引用或基线在提交事务期间变化', { targetChanged: true });
       }
       if (updated.code !== 0 || !/^commit: ok$/m.test(updated.stdout.replaceAll('\r', ''))) {
-        if (!sent) return failed(describe(updated));
+        if (!sent) return failed(describe(updated), { outOfDate: /cannot lock ref|index\.lock/i.test(updated.stderr) });
         const actual = await git(this.root, ['rev-parse', '--verify', target.ref]);
         if (actual.code !== 0 || actual.stdout.trim() !== oid) return failed(describe(updated), { verificationFailed: true });
       }
