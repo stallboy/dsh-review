@@ -35,6 +35,10 @@ test('Git 快照绑定当前候选版本，历史不可读时不构造快照', a
     assert.deepEqual(loaded.files[0].source, Buffer.from('rebased\n'));
     assert.deepEqual(loaded.files[0].target, Buffer.from('target\n'));
     assert.equal((await readApprovalMergeSnapshots(vcs, { ...input, sourceRevision: 'abcdef0123456789' })).status, 'unavailable');
+    git('switch', '-qc', 'same-sha-other-target');
+    const switched = await readApprovalMergeSnapshots(vcs, input);
+    assert.equal(switched.status, 'ready', JSON.stringify(switched));
+    assert.notEqual(switched.files[0].targetIdentity, loaded.files[0].targetIdentity);
     await link(path.join(root, 'file.txt'), path.join(root, 'alias.txt'));
     assert.equal((await readApprovalMergeSnapshots(vcs, input)).status, 'unsupported');
 });

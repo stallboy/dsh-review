@@ -138,3 +138,13 @@ test('门禁改写已核对的合并文件时保留现场，且不会提交', as
     assert.equal(await vcs.getCurrentBase(), first.commitRevision);
     assert.equal(await readFile(path.join(root, file), 'utf8'), 'changed by gate');
 });
+
+test('门禁切换到相同 HEAD 的其他 Git 分支时保留现场且停止提交', async (t) => {
+    const { approve, vcs, call } = await fixture(t, 'git', { secondGate: 'git switch -c same-sha-target' });
+    const first = await approve('first');
+    assert.equal(first.status, 'COMMITTED');
+    const result = await approve('second');
+    assert.equal(result.status, 'RECOVERY_REQUIRED', JSON.stringify(result));
+    assert.equal(await vcs.getCurrentBase(), first.commitRevision);
+    assert.equal(call('branch', '--show-current').trim(), 'same-sha-target');
+});

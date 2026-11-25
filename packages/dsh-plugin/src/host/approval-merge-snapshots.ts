@@ -130,6 +130,10 @@ export async function readApprovalMergeSnapshots(
     try {
         const resolvedRoot = await realpath(root);
         const binding = type === 'svn' ? await readSvnApprovalBinding(root, signal) : null;
+        const gitRef = type === 'git'
+            ? (await command('git', ['rev-parse', '--symbolic-full-name', 'HEAD'], root, signal)).toString('utf8').trim()
+            : '';
+        if (type === 'git' && !gitRef) return { status: 'unavailable', detail: '无法核验 Git 目标引用' };
         if (type === 'svn' && (!input.svnBinding || !binding || !/^\d+$/.test(sourceRevision))) {
             return { status: 'unavailable', detail: '缺少可核验的 SVN 候选来源' };
         }
@@ -161,7 +165,7 @@ export async function readApprovalMergeSnapshots(
                 }
                 source = before.content;
                 target = current.content;
-                targetIdentity = identity([targetRevision, current.mode, current.object]);
+                targetIdentity = identity([gitRef, targetRevision, current.mode, current.object]);
             } else {
                 const beforeTarget = file + '@' + sourceRevision;
                 const workingTarget = file + '@';
