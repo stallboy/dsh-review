@@ -1,11 +1,12 @@
 import test from 'node:test';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { registerAuditStageTools } from '../packages/dsh-plugin/dist/host/audit-stage-tools.js';
-import { AuditExecutorAuthenticationError, executeAuditCli, isAuditAuthenticationFailure } from '../packages/dsh-plugin/dist/host/audit-stage-runner.js';
+import { AuditExecutorAuthenticationError, executeAuditCli, isAuditAuthenticationFailure, resolveAuditCliLaunch } from '../packages/dsh-plugin/dist/host/audit-stage-runner.js';
 import { compatibleAuditBase } from '../packages/dsh-plugin/dist/host/audit-stage-artifacts.js';
 import { GitAdapter } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { runGateChecks } from '../packages/dsh-plugin/dist/host/validator.js';
@@ -377,6 +378,59 @@ test('认证失败只派发一次，复核证据不足可以通过阶段工具�
     const jobLog = job.log.join('\n');
     assert.match(jobLog, /verify-2 claude-code.*认证失败/);
     assert.match(jobLog, /已封存.*0 个正式发现/);
+});
+
+test('审查执行器从节点持久配置加载绝对路径和指定的 Claude 认证', async t => {
+    const home = await mkdtemp(path.join(os.tmpdir(), 'audit-executor-config-'));
+    t.after(() => rm(home, { recursive: true, force: true }));
+    const keys = ['DSH_HOME', 'DSH_AUDIT_CODEX', 'DSH_AUDIT_CLAUDE', 'ANTHROPIC_AUTH_TOKEN',
+        'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
+        'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_MANTLE',
+        'CLAUDE_CODE_USE_ANTHROPIC_AWS', 'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD', 'ANTHROPIC_PROFILE',
+        'ANTHROPIC_FEDERATION_RULE_ID', 'ANTHROPIC_ORGANIZATION_ID', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_CUSTOM_HEADERS',
+        'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST'];
+    const originalEnv = keys.map(key => [key, process.env[key]]);
+    t.after(() => {
+        for (const [key, value] of originalEnv) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+        }
+    });
+    for (const key of keys) delete process.env[key];
+    process.env.DSH_HOME = home;
+    assert.equal((await resolveAuditCliLaunch('codex')).exe, process.platform === 'win32' ? 'codex.exe' : 'codex');
+
+    const codexPath = path.join(home, 'Codex Tools', 'codex');
+    const claudeSettingsPath = path.join(home, 'claude-settings.json');
+    const settingsDir = path.join(home, 'dsh-code-review');
+    const settingsFile = path.join(settingsDir, 'audit-executors.json');
+    await mkdir(settingsDir);
+    await writeFile(settingsFile, JSON.stringify({ codexPath, claudeSettingsPath }));
+    await writeFile(claudeSettingsPath, JSON.stringify({
+        env: { ANTHROPIC_AUTH_TOKEN: 'fixture-auth', ANTHROPIC_BASE_URL: 'https://example.test',
+            ANTHROPIC_DEFAULT_SONNET_MODEL: 'fixture-model', PATH: 'ignored', NODE_OPTIONS: 'ignored' },
+        hooks: { ignored: true },
+    }));
+    assert.deepEqual(await resolveAuditCliLaunch('codex'), { exe: codexPath, env: {} });
+    const claude = await resolveAuditCliLaunch('claude-code');
+    assert.deepEqual(claude.env, {
+        ANTHROPIC_AUTH_TOKEN: 'fixture-auth',
+        ANTHROPIC_BASE_URL: 'https://example.test',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'fixture-model',
+    });
+    assert.equal(process.env.ANTHROPIC_AUTH_TOKEN, undefined);
+    process.env.DSH_AUDIT_CODEX = 'override-codex';
+    assert.equal((await resolveAuditCliLaunch('codex')).exe, 'override-codex');
+    for (const key of ['ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_CUSTOM_HEADERS',
+        'CLAUDE_CODE_USE_MANTLE', 'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST']) {
+        process.env[key] = 'explicit-launch-value';
+        assert.deepEqual((await resolveAuditCliLaunch('claude-code')).env, {}, key);
+        delete process.env[key];
+    }
+    await assert.rejects(resolveAuditCliLaunch('claude-code', AbortSignal.abort()), { name: 'AbortError' });
+    await writeFile(claudeSettingsPath, '{ rejected-secret');
+    await assert.rejects(resolveAuditCliLaunch('claude-code'), { message: '无法读取配置的 Claude Code 用户设置' });
 });
 
 test('认证熔断依据执行器错误事件，忽略模型结果中提到的认证字样', () => {

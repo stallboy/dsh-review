@@ -1,6 +1,8 @@
+import { addAbortListener } from 'node:events';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { dshHome } from './settings.js';
 import { runProcess } from './shell.js';
 
 export const AUDIT_EXECUTORS = ['codex', 'claude-code'] as const;
@@ -107,15 +109,73 @@ export function auditCliDiagnostic(output: string, includeAuthentication = true)
     return '';
 }
 
+const CLAUDE_AUTH_ENV = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY'] as const;
+const CLAUDE_CONNECTION_ENV = [...CLAUDE_AUTH_ENV, 'ANTHROPIC_BASE_URL'] as const;
+const CLAUDE_LAUNCH_OVERRIDES = [...CLAUDE_CONNECTION_ENV, 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_CUSTOM_HEADERS',
+    'ANTHROPIC_PROFILE', 'ANTHROPIC_FEDERATION_RULE_ID', 'ANTHROPIC_ORGANIZATION_ID', 'CLAUDE_CODE_USE_BEDROCK',
+    'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_ANTHROPIC_AWS',
+    'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD', 'CLAUDE_CODE_USE_MANTLE', 'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST'] as const;
+const CLAUDE_SETTINGS_ENV = [...CLAUDE_CONNECTION_ENV, 'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL'] as const;
+
+async function readExecutorSettings(file: string, diagnostic: string, signal: AbortSignal, optional = false): Promise<unknown> {
+    let listener: ReturnType<typeof addAbortListener> | undefined;
+    try {
+        signal.throwIfAborted();
+        const aborted = new Promise<never>((_, reject) => {
+            listener = addAbortListener(signal, () => reject(signal.reason));
+        });
+        const contents = await Promise.race([readFile(file, { encoding: 'utf8', signal }), aborted]);
+        signal.throwIfAborted();
+        return JSON.parse(contents);
+    } catch (error) {
+        signal.throwIfAborted();
+        if (optional && (error as NodeJS.ErrnoException).code === 'ENOENT') return {};
+        throw new Error(diagnostic);
+    } finally {
+        listener?.[Symbol.dispose]();
+    }
+}
+
+export async function resolveAuditCliLaunch(executor: AuditExecutor, signal = new AbortController().signal):
+    Promise<{ exe: string; env: Record<string, string> }> {
+    signal.throwIfAborted();
+    const codex = executor === 'codex';
+    const override = process.env[codex ? 'DSH_AUDIT_CODEX' : 'DSH_AUDIT_CLAUDE'];
+    const defaultExe = (codex ? 'codex' : 'claude') + (process.platform === 'win32' ? '.exe' : '');
+    if (codex ? override : CLAUDE_LAUNCH_OVERRIDES.some(key => process.env[key])) {
+        return { exe: override || defaultExe, env: {} };
+    }
+
+    const config = auditObject(await readExecutorSettings(path.join(dshHome(), 'dsh-code-review', 'audit-executors.json'),
+        '无法读取审查执行器启动配置', signal, true));
+    const key = codex ? 'codexPath' : 'claudeSettingsPath';
+    const configuredPath = config[key];
+    if (configuredPath === undefined) return { exe: override || defaultExe, env: {} };
+    if (typeof configuredPath !== 'string' || !path.isAbsolute(configuredPath)) throw new Error(key + ' 必须是绝对路径');
+    if (codex) return { exe: configuredPath, env: {} };
+
+    const settings = auditObject(await readExecutorSettings(configuredPath, '无法读取配置的 Claude Code 用户设置', signal));
+    const configuredEnv = auditObject(settings['env']);
+    if (!CLAUDE_AUTH_ENV.some(name => typeof configuredEnv[name] === 'string' && configuredEnv[name].trim())) {
+        throw new Error('配置的 Claude Code 用户设置缺少认证环境变量');
+    }
+    const env: Record<string, string> = {};
+    for (const name of CLAUDE_SETTINGS_ENV) {
+        const value = configuredEnv[name];
+        if (!process.env[name] && typeof value === 'string' && value.trim()) env[name] = value;
+    }
+    return { exe: override || defaultExe, env };
+}
+
 export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, prompt, schema, timeoutMs, signal, logProcessExit }) => {
     const resultPath = path.join(location, 'result.json');
     const schemaPath = path.join(location, 'schema.json');
     const schemaText = JSON.stringify(schema);
     await writeFile(schemaPath, schemaText, { flag: 'wx' });
     const codex = executor === 'codex';
-    const exe = codex
-        ? process.env['DSH_AUDIT_CODEX'] || (process.platform === 'win32' ? 'codex.exe' : 'codex')
-        : process.env['DSH_AUDIT_CLAUDE'] || (process.platform === 'win32' ? 'claude.exe' : 'claude');
+    const now = Date.now();
+    const { exe, env } = await resolveAuditCliLaunch(executor, AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]));
     const args = codex ? [
         '--ask-for-approval', 'never', 'exec', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check',
         '--sandbox', 'read-only', '--json', '--output-schema', schemaPath, '--output-last-message', resultPath,
@@ -129,8 +189,8 @@ export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, p
         '--output-format', 'json', '--json-schema', schemaText,
     ];
     const result = await runProcess(exe, args, {
-        cwd: location, timeoutMs, signal, input: prompt, killTreeOnExit: true, maxBytes: MAX_OUTPUT,
-        env: { CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1' },
+        cwd: location, timeoutMs: Math.max(1, timeoutMs - (Date.now() - now)), signal, input: prompt, killTreeOnExit: true, maxBytes: MAX_OUTPUT,
+        env: { ...env, CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1' },
     });
     logProcessExit?.([
         '执行器进程结束', '退出码=' + String(result.code),

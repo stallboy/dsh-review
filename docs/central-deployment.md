@@ -115,6 +115,19 @@ npm install ./dsh-code-review-local-0.3.0.tgz --offline --omit=dev --ignore-scri
 
 整合包的隔离离线安装与中央 IPC 启停测试用于验证交付物可脱离源码运行。真实 DSH 宿主界面、宿主内 Node/Electron 行为及 Windows、macOS、Linux 三平台仍须分别实际验收，不能以自动化测试替身代替。
 
+#### 持久化分阶段审查执行器
+
+在执行节点的 `<DSH_HOME>/dsh-code-review/audit-executors.json` 保存需要的绝对路径，例如：
+
+```json
+{
+    "codexPath": "C:/ReviewTools/codex.exe",
+    "claudeSettingsPath": "C:/Users/your-account/.claude/settings.json"
+}
+```
+
+两个字段均可省略。`DSH_AUDIT_CODEX` 和 `DSH_AUDIT_CLAUDE` 继续覆盖相应的程序路径。启用 `claudeSettingsPath` 后，如果 DSH 启动环境已显式指定 Claude 认证、服务地址或云服务商，执行器沿用该环境。否则，Host 从指定用户设置的 `env` 中仅读取 Anthropic 认证、服务地址和模型变量，并只传给 Claude 子进程。凭据仍保存在原用户设置里。该文件中的钩子、工具和其他设置均不会传给子进程，执行器继续使用原有隔离参数。配置后用日常入口重启 DSH，再从中央运行节点自检。
+
 ## 2. 安装并启动中央服务
 
 ### 2.1 生成安装包
