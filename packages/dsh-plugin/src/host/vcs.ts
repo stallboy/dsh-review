@@ -74,6 +74,10 @@ export interface ApprovalDeriveInput {
   targetFiles: string[];
 }
 
+export type ApprovalPatchAttempt = ApplyPatchResult & {
+  workspace: 'untouched' | 'applied' | 'unknown';
+};
+
 export interface VcsAdapter {
   readonly type: VcsType;
   readonly root: string;
@@ -86,6 +90,7 @@ export interface VcsAdapter {
   readFileAt(revision: string, relPath: string): Promise<string | null>;
   listCommitPaths?(revision: string): Promise<string[] | null>;
   applyPatch(patchPath: string, threeWay: boolean): Promise<ApplyPatchResult>;
+  applyPatchForApproval?(patchPath: string, signal?: AbortSignal): Promise<ApprovalPatchAttempt>;
   exportWorkingTreeDiff(base: string, paths: string[]): Promise<string>;
   revertBusinessWorkspace(): Promise<void>;
   computeInterRevisionDiff(input: DiffInput): Promise<InterRevisionDiff>;
@@ -710,6 +715,22 @@ export class GitAdapter implements VcsAdapter {
   }
 }
 
+const SVN_APPROVAL_PATCH_LIMIT = 8 * 1024 * 1024;
+
+export function svnPatchReportsConflict(output: string): boolean {
+  return /^(?:Skipped\b|C[ \t]|.C[ \t]|Summary of conflicts:)/m.test(output);
+}
+
+export function classifySvnApprovalPatch(result: ProcessResult, maxBytes = SVN_APPROVAL_PATCH_LIMIT): 'complete' | 'conflict' | 'unknown' {
+  if (result.timedOut || result.aborted || result.signal || result.error
+    || Buffer.byteLength(result.stdout) >= maxBytes || Buffer.byteLength(result.stderr) >= maxBytes) {
+    return 'unknown';
+  }
+  const output = result.stdout + '\n' + result.stderr;
+  if (svnPatchReportsConflict(output) || /^>[ \t].*\balready applied\b/m.test(output)) return 'conflict';
+  return result.code === 0 && result.stdout.trim() && !result.stderr.trim() ? 'complete' : 'unknown';
+}
+
 async function svn(root: string, args: string[], timeoutMs = VCS_TIMEOUT_MS): Promise<ProcessResult> {
   return runProcess('svn', ['--non-interactive', ...args], { cwd: root, timeoutMs, maxBytes: 8 * 1024 * 1024 });
 }
@@ -991,7 +1012,26 @@ export class SvnAdapter implements VcsAdapter {
     return { ok: false, conflict: true, message: tailLines(describe(result), 80) };
   }
 
-  /** SVN 缺少等价的 dry-run 检查，只能返回未知。 */
+  async applyPatchForApproval(patchPath: string, signal?: AbortSignal): Promise<ApprovalPatchAttempt> {
+    const options = {
+      cwd: this.root,
+      timeoutMs: VCS_TIMEOUT_MS,
+      maxBytes: SVN_APPROVAL_PATCH_LIMIT,
+      env: { LC_ALL: '', LC_MESSAGES: 'C', LANGUAGE: 'C' },
+      ...(signal ? { signal } : {}),
+    };
+    const check = await runProcess('svn', ['--non-interactive', 'patch', '--dry-run', '--', patchPath], options);
+    const checked = classifySvnApprovalPatch(check);
+    if (checked !== 'complete') {
+      return { ok: false, conflict: checked === 'conflict', workspace: 'untouched', message: tailLines(describe(check), 80) };
+    }
+    const applied = await runProcess('svn', ['--non-interactive', 'patch', '--', patchPath], options);
+    const status = classifySvnApprovalPatch(applied);
+    if (status === 'complete') return { ok: true, conflict: false, workspace: 'applied', message: '补丁已完整应用（svn patch）' };
+    return { ok: false, conflict: status === 'conflict', workspace: 'unknown', message: tailLines(describe(applied), 80) };
+  }
+
+  /** SVN 审批预检包含额外的完整性判定，详情预检保持仅诊断。 */
   async checkPatch(_patchPath: string): Promise<ApplyPatchResult> {
     return { ok: false, conflict: false, message: 'SVN 暂不支持补丁预检（仅诊断）' };
   }

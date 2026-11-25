@@ -6,7 +6,7 @@ import type { Runtime } from './api-context.js';
 import { runProcess } from './shell.js';
 import { ApiError } from './types.js';
 import type { ApplyPatchResult, VcsType } from './types.js';
-import type { VcsAdapter } from './vcs.js';
+import { svnPatchReportsConflict, type VcsAdapter } from './vcs.js';
 
 export async function matchesAuditTarget(runtime: Runtime, target: string): Promise<boolean> {
     const result = await runProcess(runtime.vcsType, runtime.vcsType === 'git' ? ['branch', '--show-current'] :
@@ -93,7 +93,7 @@ export async function scheduledReviewDataClean(runtime: Runtime): Promise<boolea
 async function svnScheduledPatch(vcs: VcsAdapter, patchPath: string, dryRun: boolean): Promise<ApplyPatchResult> {
     const result = await runProcess('svn', ['--non-interactive', 'patch', ...(dryRun ? ['--dry-run'] : []), '--',
         path.relative(vcs.root, patchPath)], { cwd: vcs.root, timeoutMs: 180000, env: { LC_ALL: 'C' } });
-    const conflict = /^(?:Skipped\b|C[ \t]|.C[ \t]|Summary of conflicts:)/m.test(result.stdout);
+    const conflict = svnPatchReportsConflict(result.stdout);
     return { ok: result.code === 0 && !conflict, conflict, message: (result.stderr || result.stdout).trim() };
 }
 
@@ -133,7 +133,7 @@ export async function undoScheduledGatePatch(vcs: VcsAdapter, patchPath: string,
         return result.code === 0;
     }
     const reverse = await runProcess('svn', ['--non-interactive', 'patch', '--reverse-diff', '--', path.relative(vcs.root, patchPath)], options);
-    if (reverse.code !== 0 || /^(?:Skipped\b|C[ \t]|.C[ \t]|Summary of conflicts:)/m.test(reverse.stdout)) return false;
+    if (reverse.code !== 0 || svnPatchReportsConflict(reverse.stdout)) return false;
     // 反向补丁恢复被删除的路径时，SVN 会把它记为 replaced，即使文件内容已恢复原样。
     for (const file of targetFiles) {
         const target = file.includes('@') ? `${file}@` : file;

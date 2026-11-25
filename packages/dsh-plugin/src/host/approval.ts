@@ -239,13 +239,29 @@ export class ApprovalOrchestrator {
       const tempPatch = path.join(tmpdir(), `dcr-approval-${String(process.pid)}-${String(Date.now())}.patch`);
       await writeFile(tempPatch, patch.text, 'utf8');
       let applied;
+      let svnAttempt;
       try {
-        applied = await vcs.applyPatch(tempPatch, false);
+        svnAttempt = await vcs.applyPatchForApproval?.(tempPatch, this.deps.signal);
+        applied = svnAttempt ?? await vcs.applyPatch(tempPatch, false);
       } finally {
         await rm(tempPatch, { force: true }).catch(() => undefined);
       }
       if (!applied.ok) {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        if (svnAttempt?.workspace === 'unknown') {
+          return { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', jobId,
+            message: 'SVN 实际应用结果无法核验，已保留现场', detail: applied.message };
+        }
+        if (svnAttempt) {
+          if (!applied.conflict) {
+            return { status: 'ABORTED', reason: 'SYNC_FAILED', jobId, message: 'SVN 补丁预检无法核验', detail: applied.message };
+          }
+          const afterCheck = await vcs.ensureCleanWorkspace();
+          if (!afterCheck.clean) {
+            return { status: 'ABORTED', reason: 'DIRTY_WORKSPACE', jobId, message: afterCheck.message };
+          }
+        } else {
+          await vcs.revertBusinessWorkspace().catch(() => undefined);
+        }
         return this.fixOrFallback(
           'PATCH_CONFLICT',
           applied.message,
