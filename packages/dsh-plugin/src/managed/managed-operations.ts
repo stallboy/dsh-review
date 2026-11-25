@@ -204,7 +204,8 @@ export class ManagedOperations {
         if (result.code !== 0 || result.stdout.trim() !== runtime.registration.target) throw new WorkspaceTargetError(runtime.registration.target, result.code === 0 ? result.stdout.trim() : undefined);
     }
 
-    async execute(command: ManagedCommand, signal: AbortSignal, emit: (line: string) => void, project: ProjectRecord): Promise<ManagedResult> {
+    async execute(command: ManagedCommand, signal: AbortSignal, emit: (line: string) => void, project: ProjectRecord,
+        reportStopping?: (line: string) => Promise<void>, nodeShutdown?: AbortSignal): Promise<ManagedResult> {
         if (command.operation === RETIRED_MANUAL_REVISION) return retiredManualRevisionResult();
         const runtime = await this.runtime(project);
         try { await this.checkTarget(runtime); }
@@ -235,7 +236,7 @@ export class ManagedOperations {
         const response = await runtime.api.invoke({ method: 'POST', path: inSession ? '/audit/session' : routes[command.operation], body: { ...command.payload, ...command.guard,
             ...(command.operation === 'takeover' ? { owner: command.actor.reviewIdentity } : {}) },
         actor: { ...command.actor, commandId: command.commandId, findingWorkflow: command.payload.findingWorkflow === true,
-            ...(inSession ? { managedAuditSession: { signal, onCreated: (auditId: string, sessionId: string) => {
+            ...(inSession ? { managedAuditSession: { signal, ...(reportStopping ? { reportStopping } : {}), ...(nodeShutdown ? { nodeShutdown } : {}), onCreated: (auditId: string, sessionId: string) => {
                 session = { auditId, sessionId };
                 this.options.journal.checkpoint(command.commandId, { phase: 'session', workspaceId: project.workspaceId, ...session });
                 emit(`已在 DSH 项目中创建审查会话：${sessionId}`);
@@ -249,7 +250,7 @@ export class ManagedOperations {
                 status: response.status < 500 ? 'ABORTED' : 'RECOVERY_REQUIRED', reason: details.reason ?? error.code ?? 'EXECUTION_EXCEPTION', message: error.message, httpStatus: response.status,
             };
         } else if (typeof data.jobId === 'string') {
-            this.options.journal.checkpoint(command.commandId, { phase: 'job', workspaceId: project.workspaceId, jobId: data.jobId, ...session });
+            this.options.journal.checkpoint(command.commandId, { ...this.options.journal.recoveryData(command.commandId), phase: 'job', workspaceId: project.workspaceId, jobId: data.jobId, ...session });
             let offset = 0;
             const cancel = () => runtime.api.jobManager.abort(String(data.jobId));
             if (!inSession) {
@@ -263,6 +264,7 @@ export class ManagedOperations {
                     const start = job.logStartOffset ?? 0;
                     for (const line of job.log.slice(Math.max(0, offset - start))) emit(line);
                     offset = start + job.log.length;
+                    if (job.status === 'running' && nodeShutdown?.aborted && session && runtime.api.isAuditStopping(session.auditId)) nodeShutdown.throwIfAborted();
                     if (job.status !== 'running') {
                         outcome = job.status === 'succeeded' && typeof object(job.result).status === 'string' ? object(job.result) as ManagedResult['outcome'] : unknownResult(job.error ?? '任务没有可证明的结果').outcome;
                         break;

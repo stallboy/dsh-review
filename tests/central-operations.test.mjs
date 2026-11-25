@@ -6,7 +6,8 @@ import test from 'node:test';
 import { createGitFixture, runCommand } from './helpers.mjs';
 import { reviewFixture, patchFixture } from './fixtures/contract.mjs';
 import { registerAuditStageTools } from '../packages/dsh-plugin/dist/host/audit-stage-tools.js';
-import { AuditExecutorAuthenticationError, AuditStopUnknown } from '../packages/dsh-plugin/dist/host/audit-stage-runner.js';
+import { AuditExecutorAuthenticationError, AuditStageTimedOut, AuditStopUnknown } from '../packages/dsh-plugin/dist/host/audit-stage-runner.js';
+import { runProcess } from '../packages/dsh-plugin/dist/host/shell.js';
 import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
 import { ManagedDelivery } from '../packages/dsh-plugin/dist/managed/managed-delivery.js';
 import { ManagedNode } from '../packages/dsh-plugin/dist/managed/managed-node.js';
@@ -241,6 +242,161 @@ test('桌面审查会话结束且两个执行器均初审失败时回报待核�
     assert.equal(runCommand('git', ['rev-parse', `refs/heads/${target}`], remote).stdout.trim(), head);
 });
 
+for (const processTreeStopped of [true, false]) {
+    test(`桌面审查超时先收到日志回执再停止主会话（进程树已确认=${processTreeStopped}）`, { timeout: 30_000 }, async t => {
+        const sessionId = 'desktop-timeout-order';
+        const watching = Promise.withResolvers();
+        const reporting = Promise.withResolvers();
+        const logReceipt = Promise.withResolvers();
+        const stopping = Promise.withResolvers();
+        const sessionStopped = Promise.withResolvers();
+        const executorStopped = Promise.withResolvers();
+        let stopRequested = false;
+        const setup = await fixture(t, {
+            auditStageExecutor: async ({ onTimeout }) => {
+                onTimeout();
+                return executorStopped.promise;
+            },
+            async createAuditSession(input) {
+                await input.onCreated(sessionId);
+                return { sessionId };
+            },
+            withAuditSessionIdle(_sessionId, _requestId, signal) {
+                watching.resolve();
+                return new Promise(resolve => signal.addEventListener('abort', () => resolve(false), { once: true }));
+            },
+            async stopAuditSession(id) {
+                assert.equal(id, sessionId);
+                stopRequested = true;
+                stopping.resolve();
+                return sessionStopped.promise;
+            },
+        });
+        const { operations, project, journal } = setup;
+        const command = auditCommand(project);
+        journal.accept(command);
+        const controller = new AbortController();
+        t.after(() => controller.abort());
+        let finished = false;
+        const messages = [];
+        const running = operations.execute(command, controller.signal, line => messages.push(line), project, async line => {
+            assert.match(line, /codex.*超时/);
+            reporting.resolve();
+            await logReceipt.promise;
+        }).then(result => { finished = true; return result; });
+        await watching.promise;
+        const api = operations.auditStageApi(sessionId);
+        const scan = { taskScope: ['src'], scenarios: [], questions: [], constraints: [] };
+        const stageResult = assert.rejects(api.runAuditStage(sessionId, 'scan', 'codex', scan, controller.signal), /执行器超时/);
+        await reporting.promise;
+        assert.equal(finished, false);
+        assert.equal(stopRequested, false);
+        logReceipt.resolve();
+        await stopping.promise;
+        assert.equal(finished, false);
+        sessionStopped.resolve(true);
+        assert.equal(finished, false);
+        executorStopped.reject(new AuditStageTimedOut('codex', processTreeStopped));
+        await stageResult;
+        if (processTreeStopped) {
+            const result = await running;
+            assert.equal(result.outcome.status, 'RECOVERY_REQUIRED');
+            assert.equal(result.outcome.sessionId, sessionId);
+        } else {
+            while (!messages.some(line => line.includes('仍无法确认执行器进程树已经停止'))) {
+                await new Promise(resolve => setTimeout(resolve, 20));
+            }
+            assert.equal(finished, false);
+            assert.equal(api.auditLifecycle.blockingLeaseFor(await realpath(setup.root)).state, 'active');
+            await operations.stop();
+            await running;
+        }
+    });
+}
+
+test('本机中央先收到真实子进程的超时日志，再等待主会话停止后结算', { timeout: 30_000 }, async t => {
+    const sessionId = 'desktop-timeout-central';
+    const watching = Promise.withResolvers();
+    const deadline = Promise.withResolvers();
+    const delivered = Promise.withResolvers();
+    const ack = Promise.withResolvers();
+    const cancelling = Promise.withResolvers();
+    const sessionStopped = Promise.withResolvers();
+    let cancellationRequested = false;
+    const { operations, project, journal } = await fixture(t, {
+        async auditStageExecutor({ executor, location, onTimeout, signal }) {
+            const execution = await runProcess(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+                cwd: location, timeoutMs: 1200, signal, killTreeOnExit: true,
+                onTimeout() { onTimeout(); deadline.resolve(); },
+            });
+            assert.equal(execution.timedOut, true);
+            assert.equal(execution.processTreeStopped, true);
+            throw new AuditStageTimedOut(executor, execution.processTreeStopped);
+        },
+        async createAuditSession(input) {
+            await input.onCreated(sessionId);
+            return { sessionId };
+        },
+        withAuditSessionIdle(_sessionId, _requestId, signal) {
+            watching.resolve();
+            return new Promise(resolve => signal.addEventListener('abort', () => resolve(false), { once: true }));
+        },
+        async stopAuditSession(id) {
+            assert.equal(id, sessionId);
+            cancellationRequested = true;
+            cancelling.resolve();
+            return sessionStopped.promise;
+        },
+    });
+    const { app, headers } = await setupCentral(t);
+    const credential = app.database.createNode('本机超时回执节点');
+    const node = new ManagedNode({
+        config: { centerUrl: 'http://127.0.0.1:3081', ...credential, workspaces: operations.registrations() },
+        journal, execute: (...args) => operations.execute(...args),
+        read: () => { throw new Error('未预期的查询'); },
+        fetch: async (url, options) => {
+            const pathname = new URL(url).pathname;
+            const response = await app.inject({ method: options.method, url: pathname, headers: options.headers, payload: options.body });
+            if (pathname.endsWith('/events') && JSON.parse(options.body).events.some(event => event.logs?.some(line => /正在停止 DSH 主审查/.test(line)))) {
+                delivered.resolve();
+                await ack.promise;
+            }
+            return new Response(response.body, { status: response.statusCode, headers: response.headers });
+        },
+    });
+    t.after(() => { ack.resolve(); sessionStopped.resolve(true); });
+    await node.tick();
+    const binding = await bindProject(app, headers, { ...credential, workspaceId: project.workspaceId });
+    const started = await app.inject({ method: 'POST', url: '/api/v1/projects/' + binding.projectId + '/commands', headers,
+        payload: { operation: 'audit', idempotencyKey: 'real-timeout-order', payload: { targetPath: '.' } } });
+    assert.equal(started.statusCode, 202, started.body);
+    const id = started.json().command.commandId;
+    const centralTask = async () => (await app.inject({ url: '/api/v1/commands/' + id, headers })).json().command;
+    await node.tick();
+    await watching.promise;
+    const api = operations.auditStageApi(sessionId);
+    const scan = { taskScope: ['src'], scenarios: [], questions: [], constraints: [] };
+    const phase = assert.rejects(api.runAuditStage(sessionId, 'scan', 'codex', scan, new AbortController().signal), /执行器超时/);
+    await deadline.promise;
+    const flush = node.tick();
+    await delivered.promise;
+    const lines = (await app.inject({ url: '/api/v1/tasks/' + id + '/logs', headers })).json().log;
+    assert.ok(lines.some(line => /codex 执行器超时/.test(line)));
+    assert.equal((await centralTask()).state, 'executing');
+    assert.equal(cancellationRequested, false);
+    app.database.disconnectNode(credential.nodeId, node.instanceId);
+    assert.equal((await centralTask()).state, 'executing');
+    ack.resolve();
+    await flush;
+    await cancelling.promise;
+    await phase;
+    assert.equal((await centralTask()).state, 'executing');
+    sessionStopped.resolve(true);
+    await node.drain();
+    await node.tick();
+    assert.equal((await centralTask()).state, 'recovery_required');
+});
+
 for (const timing of ['已注册 Job', '尚未注册 Job', '租约保存失败', '整轮时限与阶段重合']) {
     test(`桌面审查阶段超时及时回报待核验（${timing}）`, { timeout: 30_000 }, async t => {
         const watching = Promise.withResolvers();
@@ -250,6 +406,7 @@ for (const timing of ['已注册 Job', '尚未注册 Job', '租约保存失败',
         const executorStarted = Promise.withResolvers();
         const executorResult = Promise.withResolvers();
         let operations, stageApi, expire, phaseFailure;
+        const stopRequested = Promise.withResolvers();
         if (timing === '整轮时限与阶段重合') {
             const schedule = globalThis.setTimeout;
             t.mock.method(globalThis, 'setTimeout', (callback, delay, ...args) => {
@@ -292,6 +449,7 @@ for (const timing of ['已注册 Job', '尚未注册 Job', '租约保存失败',
                 if (timing === '尚未注册 Job') await runStage();
                 return { sessionId };
             },
+            async stopAuditSession() { stopRequested.resolve(); return true; },
             withAuditSessionIdle(_id, _requestId, watchingSignal) {
                 watching.resolve();
                 return new Promise(resolve => watchingSignal.addEventListener('abort', () => resolve(false), { once: true }));
@@ -347,26 +505,23 @@ for (const timing of ['已注册 Job', '尚未注册 Job', '租约保存失败',
         } else {
             const command = auditCommand(project);
             journal.accept(command);
-            const running = operations.execute(command, signal, () => {}, project);
+            let settled = false;
+            const running = operations.execute(command, signal, () => {}, project).then(value => { settled = true; return value; });
             if (timing !== '尚未注册 Job') {
                 await withinBudget(watching.promise);
                 await runStage();
             }
-            try {
-                result = await withinBudget(running);
-                if (timing === '整轮时限与阶段重合') {
-                    findCommit.mock.restore();
-                    const blocked = await operations.recover(command, result, project);
-                    assert.equal(blocked.outcome.status, 'RECOVERY_REQUIRED');
-                    assert.match(blocked.outcome.detail, /仍在执行/);
-                    assert.equal(stageApi.leaseLookup(result.outcome.auditId).state, 'releasable');
-                }
-            } finally {
-                if (timing === '整轮时限与阶段重合') {
-                    executorResult.reject(new AuditStopUnknown('claude-code 执行器超时'));
+            if (timing === '整轮时限与阶段重合') {
+                try {
+                    await withinBudget(stopRequested.promise);
+                    assert.equal(settled, false);
+                    assert.equal(stageApi.auditLifecycle.blockingLeaseFor(await realpath(root)).state, 'active');
+                } finally {
+                    executorResult.reject(new AuditStageTimedOut('claude-code', true));
                     await phaseFailure;
                 }
             }
+            result = await withinBudget(running);
         }
         const auditId = result.outcome.auditId;
         assert.equal(result.outcome.status, 'RECOVERY_REQUIRED');

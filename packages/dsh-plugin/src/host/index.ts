@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
-import { withDshAuditSessionIdle } from './audit-session-idle.js';
+import { stopDshAuditSession, withDshAuditSessionIdle } from './audit-session-idle.js';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from './api.js';
 import { executeAuditCli } from './audit-stage-runner.js';
@@ -303,6 +303,9 @@ export function apply(ctx: HostContext): void {
     ...stageCapabilities,
     auditSessionTools: typeof tools?.register === 'function',
     createAuditSession: (input) => createDshAuditSession(ctx, input),
+    stopAuditSession: (sessionId, signal, processStopped) => stopDshAuditSession(
+      ctx, sessionId, AbortSignal.any([signal, shutdown.signal]), processStopped,
+    ),
     withAuditSessionIdle: (sessionId, requestId, signal, finalize) => withDshAuditSessionIdle(
       ctx, sessionId, requestId, AbortSignal.any([signal, shutdown.signal]), finalize,
     ),

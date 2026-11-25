@@ -71,6 +71,11 @@ export class AuditRuntime {
 
   isFinalizing(auditId: string): boolean { return this.finalizing.has(auditId); }
 
+  isAuditStopping(auditId: string): boolean {
+    const stage = this.stages.get(auditId);
+    return stage !== undefined && this.stageTimeouts.has(stage);
+  }
+
   hasActiveAuditWork(auditId: string): boolean {
     return this.isFinalizing(auditId) || this.stages.get(auditId)?.busy === true;
   }
@@ -87,6 +92,8 @@ export class AuditRuntime {
   private lifecycle: AuditLifecycle | null = null;
   private readonly stages = new Map<string, AuditStages>();
   private readonly stageRecoveries = new WeakMap<AuditStages, Promise<AuditSessionRecoveryOutcome>>();
+  private readonly stageTimeouts = new WeakSet<AuditStages>();
+  private readonly managedAuditSessions = new Map<string, NonNullable<TrustedActor['managedAuditSession']>>();
   private readonly testSessions = new Map<string, AuditSelfTestTools>();
   private readonly testShutdown = new AbortController();
   private closed = false;
@@ -122,7 +129,7 @@ export class AuditRuntime {
 
   private findStageSession(sessionId: string): AuditStages | undefined {
     if (!sessionId || this.closed) return undefined;
-    return [...this.stages.values()].find(item => item.lease.sessionId === sessionId && item.lease.state === 'active');
+    return [...this.stages.values()].find(item => item.lease.sessionId === sessionId && item.lease.state === 'active' && !this.stageTimeouts.has(item));
   }
 
   private stageForSession(sessionId: string): AuditStages {
@@ -138,23 +145,53 @@ export class AuditRuntime {
 
   private async executeStage(session: AuditStages, stage: AuditStage, runner: AuditExecutor, task: unknown, signal: AbortSignal): Promise<unknown> {
     try {
-      return await session.run(stage, runner, task, signal);
+      return await session.run(stage, runner, task, signal, () => {
+        if (session.lease.sessionId) void this.settleStageTimeout(session, runner + ' 执行器超时', session.stageStopConfirmed, { stage, runner });
+      });
     } finally {
       const failure = session.interruptedStage;
-      if (failure) {
-        if (session.lease.sessionId) await this.settleStageRecovery(session, failure, failure.detail);
-        else await this.auditLifecycle.markReleasable(session.lease.auditId);
+      if (failure && !this.stageTimeouts.has(session)) {
+        if (!session.lease.sessionId) await this.auditLifecycle.markReleasable(session.lease.auditId);
+        else if (failure.timedOut) void this.settleStageTimeout(session, failure.detail, session.stageStopConfirmed, failure);
+        else await this.settleStageRecovery(session, failure, failure.detail);
       }
     }
   }
 
-  private async settleStageRecovery(session: AuditStages, { stage, runner }: AuditStageExecution, detail: string): Promise<void> {
+  private async settleStageTimeout(session: AuditStages, reason: string, processStopped: Promise<boolean>, failure?: AuditStageExecution): Promise<void> {
+    const { auditId, sessionId } = session.lease;
+    if (!sessionId || this.stageTimeouts.has(session)) return;
+    this.stageTimeouts.add(session);
+    this.stopStages(auditId);
+    this.clearAuditLeaseTimeout(auditId);
+    const detail = reason + '，正在停止 DSH 主审查会话并核验进程树。';
+    try {
+      const managed = this.managedAuditSessions.get(auditId);
+      if (managed?.reportStopping) await managed.reportStopping(detail);
+      else this.logAuditStage(auditId, detail);
+      const signal = managed?.nodeShutdown ? AbortSignal.any([this.testShutdown.signal, managed.nodeShutdown]) : this.testShutdown.signal;
+      const stopped = await this.host.deps.stopAuditSession?.(sessionId, signal, processStopped);
+      const treeStopped = await processStopped;
+      if (!stopped || !treeStopped) {
+        this.logAuditStage(auditId, !treeStopped ? '仍无法确认执行器进程树已经停止，任务保持执行中。'
+          : '仍无法确认 DSH 主审查会话已经停止，任务保持执行中。');
+        return;
+      }
+      this.logAuditStage(auditId, '已确认 DSH 主审查会话和执行器进程树停止。');
+      await this.settleStageRecovery(session, failure, reason + '，主审查会话与执行器进程树均已停止。');
+    } catch {
+      this.logAuditStage(auditId, '停止审查期间未能核验日志回执或会话状态，任务保持执行中。');
+    }
+  }
+
+  private async settleStageRecovery(session: AuditStages, failure: AuditStageExecution | undefined, detail: string): Promise<void> {
     const { auditId, sessionId } = session.lease;
     if (!sessionId) return;
     let recovery = this.stageRecoveries.get(session);
     if (!recovery) {
       recovery = this.recordAuditSessionRecovery({
-        status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', auditId, sessionId, detail, stageFailure: { stage, runner },
+        status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', auditId, sessionId, detail,
+        ...(failure ? { stageFailure: { stage: failure.stage, runner: failure.runner } } : {}),
       });
       this.stageRecoveries.set(session, recovery);
     }
@@ -399,8 +436,8 @@ export class AuditRuntime {
       this.leaseTimeouts.delete(auditId);
       if (this.isFinalizing(auditId)) return;
       const stage = this.stages.get(auditId);
-      if (stage?.lease.sessionId && stage.runningStage) {
-        void this.settleStageRecovery(stage, stage.runningStage, '审查达到总时限，已请求停止当前阶段，请核验执行器与工作副本。');
+      if (stage?.lease.sessionId) {
+        void this.settleStageTimeout(stage, '审查达到总时限', stage.stageStopConfirmed, stage.runningStage);
         return;
       }
       this.stopStages(auditId);
@@ -436,6 +473,7 @@ export class AuditRuntime {
       } finally {
         finished.abort();
         this.host.auditJobLeases.delete(id);
+        this.managedAuditSessions.delete(auditId);
       }
     });
     this.host.auditJobLeases.set(job.id, auditId);
@@ -444,7 +482,7 @@ export class AuditRuntime {
 
   private trackAuditSession(runtime: Runtime, auditId: string, sessionId: string, requestId: string, managedSignal?: AbortSignal): JobRecord {
     const stage = this.stages.get(auditId);
-    if (!stage || !this.stageRecoveries.has(stage)) this.armAuditLeaseTimeout(auditId);
+    if (!stage || (!this.stageRecoveries.has(stage) && !this.stageTimeouts.has(stage))) this.armAuditLeaseTimeout(auditId);
     const watch = this.host.deps.withAuditSessionIdle;
     return this.startAuditTrackingJob(auditId, async (log, signal) => {
       const existingRecovery = stage && this.stageRecoveries.get(stage);
@@ -457,6 +495,7 @@ export class AuditRuntime {
       let finished: boolean;
       try {
         finished = await watch(sessionId, requestId, watching, async maintenance => {
+          if (stage && this.stageTimeouts.has(stage)) return false;
           const lease = this.auditLifecycle.find(auditId);
           if (!lease || lease.state === 'released' || this.isFinalizing(auditId)) return false;
           if (lease.state === 'releasable') {
@@ -497,7 +536,7 @@ export class AuditRuntime {
         finished = false;
         if (!watching.aborted) log(`跟踪 DSH 会话失败：${error instanceof Error ? error.message : String(error)}`);
       }
-      if (finished || signal.aborted) return;
+      if (finished || signal.aborted || (stage && this.stageTimeouts.has(stage))) return;
       const interrupted = stage && this.stageRecoveries.get(stage);
       if (interrupted) {
         this.finishAuditTracking(auditId, await interrupted);
@@ -700,6 +739,7 @@ export class AuditRuntime {
         ...(phased || managed ? { onCreated: async (sessionId: string) => {
           lease.sessionId = sessionId;
           await this.upsertLease(lease);
+          if (managed) this.managedAuditSessions.set(auditId, managed);
           managed?.onCreated(auditId, sessionId);
         } } : {}),
       });

@@ -23,6 +23,7 @@ interface AuditAgent {
 }
 
 interface SessionController {
+    cancel?(request: { sessionId: string }): unknown;
     wait(request: { sessionId: string; timeoutMs: number; maxMessages: number }, signal: AbortSignal):
         Promise<{ reason: 'idle' | 'input-required' | 'timeout'; state: SessionState }>;
     state(request: { sessionId: string }, signal: AbortSignal): Promise<SessionState>;
@@ -45,6 +46,29 @@ function completed(events: readonly SessionEvent[], requestId: string): boolean 
         }
     }
     return ended;
+}
+
+export async function stopDshAuditSession(host: AuditSessionHost, sessionId: string, signal: AbortSignal,
+    processStopped: Promise<boolean>): Promise<boolean> {
+    const controller = host.get('sessionController') as SessionController | undefined;
+    const subagents = host.get('subagents') as {
+        listDescendants(sessionId: string, signal: AbortSignal): Promise<unknown[]>;
+    } | undefined;
+    if (typeof controller?.cancel !== 'function' || typeof controller.state !== 'function'
+        || typeof subagents?.listDescendants !== 'function') return false;
+    signal.throwIfAborted();
+    await controller.cancel({ sessionId });
+    if (!await processStopped) return false;
+    while (!signal.aborted) {
+        const state = await controller.state({ sessionId }, signal);
+        if (isIdle(state)) {
+            const descendants = await subagents.listDescendants(sessionId, signal);
+            const fresh = await controller.state({ sessionId }, signal);
+            if (fresh.cursor === state.cursor && isIdle(fresh) && Array.isArray(descendants) && !descendants.length) return true;
+        }
+        await delay(500, undefined, { signal });
+    }
+    return false;
 }
 
 export async function withDshAuditSessionIdle(

@@ -42,6 +42,8 @@ export interface TrustedActor {
     managedAuditSession?: {
         signal: AbortSignal;
         onCreated(auditId: string, sessionId: string): void;
+        reportStopping?: (line: string) => Promise<void>;
+        nodeShutdown?: AbortSignal;
     };
     scheduledAudit?: NonNullable<ManagedCommand['scheduledAudit']> & { target: string; signal: AbortSignal };
 }
@@ -107,6 +109,7 @@ export interface ApiDeps {
   }) => Promise<{ sessionId: string }>;
   withAuditSessionIdle?: (sessionId: string, requestId: string, signal: AbortSignal,
     finalize: (signal: AbortSignal) => Promise<void | false>) => Promise<boolean>;
+  stopAuditSession?: (sessionId: string, signal: AbortSignal, processStopped: Promise<boolean>) => Promise<boolean>;
   onAuditTurnEnd?: (sessionId: string, callback: () => void) => () => void;
   clientEntry?: () => unknown;
   /** 缺省落在 DSH_HOME/dsh-code-review/runtime-state.json，使未释放的租约在宿主重启后仍能阻塞写入。 */

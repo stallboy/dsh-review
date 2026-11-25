@@ -58,11 +58,21 @@ export interface AuditExecution {
     timeoutMs: number;
     signal: AbortSignal;
     logProcessExit?: (line: string) => void;
+    onTimeout?: () => void;
+    onProcessTreeStopped?: (stopped: boolean) => void;
 }
 
 export type ExecuteAuditStage = (input: AuditExecution) => Promise<unknown>;
 
-export class AuditStopUnknown extends Error {}
+export class AuditStopUnknown extends Error {
+    constructor(message: string, readonly processTreeStopped = false) { super(message); }
+}
+
+export class AuditStageTimedOut extends AuditStopUnknown {
+    constructor(executor: AuditExecutor, processTreeStopped: boolean) {
+        super(executor + ' 执行器超时', processTreeStopped);
+    }
+}
 
 export class AuditExecutorAuthenticationError extends Error {
     constructor(executor: AuditExecutor, code?: number | null) {
@@ -168,14 +178,19 @@ export async function resolveAuditCliLaunch(executor: AuditExecutor, signal = ne
     return { exe: override || defaultExe, env };
 }
 
-export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, prompt, schema, timeoutMs, signal, logProcessExit }) => {
+export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, prompt, schema, timeoutMs, signal, logProcessExit, onTimeout, onProcessTreeStopped }) => {
     const resultPath = path.join(location, 'result.json');
     const schemaPath = path.join(location, 'schema.json');
     const schemaText = JSON.stringify(schema);
     await writeFile(schemaPath, schemaText, { flag: 'wx' });
     const codex = executor === 'codex';
     const now = Date.now();
-    const { exe, env } = await resolveAuditCliLaunch(executor, AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]));
+    const launchDeadline = AbortSignal.timeout(timeoutMs);
+    const { exe, env } = await resolveAuditCliLaunch(executor, AbortSignal.any([signal, launchDeadline])).catch(error => {
+        onProcessTreeStopped?.(true);
+        if (launchDeadline.aborted && !signal.aborted) throw new AuditStageTimedOut(executor, true);
+        throw error;
+    });
     const args = codex ? [
         '--ask-for-approval', 'never', 'exec', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check',
         '--sandbox', 'read-only', '--json', '--output-schema', schemaPath, '--output-last-message', resultPath,
@@ -189,9 +204,10 @@ export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, p
         '--output-format', 'json', '--json-schema', schemaText,
     ];
     const result = await runProcess(exe, args, {
-        cwd: location, timeoutMs: Math.max(1, timeoutMs - (Date.now() - now)), signal, input: prompt, killTreeOnExit: true, maxBytes: MAX_OUTPUT,
+        cwd: location, timeoutMs: Math.max(1, timeoutMs - (Date.now() - now)), signal, input: prompt, killTreeOnExit: true, maxBytes: MAX_OUTPUT, ...(onTimeout ? { onTimeout } : {}),
         env: { ...env, CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1' },
     });
+    onProcessTreeStopped?.(result.processTreeStopped === true || Boolean(result.error) && result.code === null);
     logProcessExit?.([
         '执行器进程结束', '退出码=' + String(result.code),
         ...(result.signal ? ['信号=' + result.signal] : []),
@@ -200,7 +216,8 @@ export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, p
         ...(result.timedOut ? ['超时'] : []),
         ...(result.aborted ? ['已取消'] : []),
     ].join(' '));
-    if (result.timedOut || result.aborted) throw new AuditStopUnknown(executor + (result.timedOut ? ' 执行器超时' : ' 执行器已取消') + '，需确认子进程已经停止');
+    if (result.timedOut) throw new AuditStageTimedOut(executor, result.processTreeStopped === true);
+    if (result.aborted) throw new AuditStopUnknown(executor + ' 执行器已取消，需确认子进程已经停止', result.processTreeStopped === true);
     const diagnostic = auditCliDiagnostic([result.error, result.stderr, result.stdout].filter(Boolean).join('\n'), false);
     if (result.error) throw new Error(executor + ' 无法启动' + (diagnostic ? '：' + diagnostic : ''));
     if (result.code !== 0) {

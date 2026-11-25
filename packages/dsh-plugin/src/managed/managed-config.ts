@@ -7,7 +7,7 @@ import type { ApiDeps } from '../host/api-context.js';
 import type { ReviewApi } from '../host/api.js';
 import { dshHome } from '../host/settings.js';
 
-export type ManagedAuditSessions = Pick<ApiDeps, 'createAuditSession' | 'withAuditSessionIdle' | 'auditSessionTools' | 'auditStageExecutor' | 'auditStageGates'>;
+export type ManagedAuditSessions = Pick<ApiDeps, 'createAuditSession' | 'withAuditSessionIdle' | 'stopAuditSession' | 'auditSessionTools' | 'auditStageExecutor' | 'auditStageGates'>;
 
 export interface ManagedHandle {
     centerUrl: string;

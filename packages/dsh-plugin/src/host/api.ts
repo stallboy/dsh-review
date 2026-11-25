@@ -124,6 +124,8 @@ export class ReviewApi implements ApiHost {
     return this.auditLifecycle.find(auditId);
   }
 
+  isAuditStopping(auditId: string): boolean { return this.auditRuntime.isAuditStopping(auditId); }
+
   hasActiveAuditWork(auditId: string): boolean {
     return this.auditRuntime.hasActiveAuditWork(auditId);
   }

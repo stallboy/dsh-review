@@ -82,12 +82,12 @@ export class ManagedJournal {
         return this.database.prepare("SELECT id FROM commands WHERE phase='executing'").all().map(row => this.get(String(row.id))!);
     }
 
-    emit(commandId: string, type: NodeEvent['type'], logs?: string[], result?: ManagedResult): NodeEvent {
+    emit(commandId: string, type: NodeEvent['type'], logs?: string[], result?: ManagedResult, auditTimeoutStopping?: true): NodeEvent {
         return this.transaction(() => {
             const row = this.database.prepare('SELECT sequence FROM commands WHERE id=?').get(commandId);
             if (!row) throw new Error('不能为未知指令写入事件');
             const sequence = Number(row.sequence) + 1;
-            const event: NodeEvent = { commandId, sequence, type, ...(logs?.length ? { logs: logs.map(line => line.slice(0, 4000)) } : {}), ...(result ? { result } : {}) };
+            const event: NodeEvent = { commandId, sequence, type, ...(logs?.length ? { logs: logs.map(line => line.slice(0, 4000)) } : {}), ...(auditTimeoutStopping ? { auditTimeoutStopping } : {}), ...(result ? { result } : {}) };
             if (result) {
                 const pending = result.outcome.status === 'RECOVERY_REQUIRED' || ['pending', 'conflict', 'unknown'].includes(result.delivery.state);
                 this.database.prepare('UPDATE commands SET sequence=?,phase=?,result=? WHERE id=?').run(sequence, pending ? 'recovery_required' : 'completed', JSON.stringify(result), commandId);
@@ -99,6 +99,10 @@ export class ManagedJournal {
 
     pending(): NodeEvent[] {
         return this.database.prepare('SELECT event FROM outbox ORDER BY command_id,sequence LIMIT 100').all().map(row => JSON.parse(String(row.event)));
+    }
+
+    hasPendingEvent(commandId: string, sequence: number): boolean {
+        return this.database.prepare('SELECT 1 FROM outbox WHERE command_id=? AND sequence=?').get(commandId, sequence) !== undefined;
     }
 
     acknowledge(commandId: string, sequence: number): void {

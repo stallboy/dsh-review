@@ -228,6 +228,11 @@ export class Commands {
         return db.transaction(() => {
             const command = this.get(commandId);
             this.authorize(nodeId, command);
+            if (event.auditTimeoutStopping !== undefined && (event.auditTimeoutStopping !== true
+                || event.type !== 'progress' || event.result !== undefined || !Array.isArray(event.logs) || !event.logs.length
+                || command.operation !== 'audit' || command.scheduledAudit)) {
+                throw new CentralError(422, 'bad_request', '审查超时停止标记无效');
+            }
             const current = db.sql.prepare('SELECT last_event FROM commands WHERE command_id=?').get(commandId) as Row;
             const hash = digest(stableJson(event));
             const previous = db.sql.prepare('SELECT payload FROM events WHERE command_id=? AND sequence=?').get(commandId, sequence) as Row | undefined;

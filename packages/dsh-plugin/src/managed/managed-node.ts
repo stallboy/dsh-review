@@ -15,7 +15,8 @@ export interface ManagedNodeOptions {
         pauseAdmission?: boolean;
     };
     journal: ManagedJournal;
-    execute(command: ManagedCommand, signal: AbortSignal, emit: (line: string) => void, project: ProjectRecord): Promise<ManagedResult>;
+    execute(command: ManagedCommand, signal: AbortSignal, emit: (line: string) => void, project: ProjectRecord,
+        reportStopping?: (line: string) => Promise<void>, nodeShutdown?: AbortSignal): Promise<ManagedResult>;
     read(query: ManagedQuery, project: ProjectRecord): Promise<ManagedQueryResult>;
     snapshot?: (project: ProjectRecord) => Promise<Pick<ProjectSnapshot, 'vcsSnapshot' | 'queue' | 'findings' | 'audits' | 'errors'>>;
     recover?: (command: ManagedCommand, previous: ManagedResult | undefined, project: ProjectRecord) => Promise<ManagedResult>;
@@ -67,6 +68,7 @@ export class ManagedNode {
     readonly instanceId: string;
     private readonly transport: typeof globalThis.fetch;
     private readonly clock: () => Date;
+    private readonly shutdown = new AbortController();
     private readonly active = new Map<string, { projectId: string; controller: AbortController; promise: Promise<void> }>();
     private readonly background = new Map<string, { projectId: string; promise: Promise<void> }>();
     private readonly lastSync = new Map<string, number>();
@@ -169,6 +171,10 @@ export class ManagedNode {
                                 message: '节点在自检期间重启，请重新发起自检' },
                             delivery: { state: 'not_required' },
                         });
+                    continue;
+                }
+                if (checkpoint?.timeoutStopping === true) {
+                    journal.emit(saved.command.commandId, 'progress', ['节点重启，尚无本轮主会话和进程树的停止证据，保留执行中与审查占用。']);
                     continue;
                 }
                 const { sessionId, auditId } = checkpoint ?? {};
@@ -326,8 +332,17 @@ export class ManagedNode {
             try {
                 if (controller.signal.aborted) result = { outcome: { status: 'ABORTED', reason: command.operation === 'approve' ? 'COMMIT_FAILED' : 'CANCELLED', message: '执行前已取消，没有产生副作用',
                     ...(command.operation === 'test' ? { step: 'coordinator' } : {}) }, delivery: { state: 'not_required' } };
-                else result = await this.options.execute(command, controller.signal, line => { this.options.journal.emit(command.commandId, 'progress', [line]); }, project);
+                else result = await this.options.execute(command, controller.signal, line => { this.options.journal.emit(command.commandId, 'progress', [line]); },
+                    project, async line => {
+                        this.options.journal.checkpoint(command.commandId, { ...this.options.journal.recoveryData(command.commandId), timeoutStopping: true });
+                        const { sequence } = this.options.journal.emit(command.commandId, 'progress', [line], undefined, true);
+                        while (this.options.journal.hasPendingEvent(command.commandId, sequence)) {
+                            this.shutdown.signal.throwIfAborted();
+                            await new Promise(resolve => setTimeout(resolve, 100));
+                        }
+                    }, this.shutdown.signal);
             } catch (error) {
+                if (this.shutdown.signal.aborted && error === this.shutdown.signal.reason) return;
                 result = command.operation === 'test'
                     ? { outcome: { status: 'ABORTED', reason: 'SELF_TEST_FAILED',
                         step: this.options.journal.recoveryData(command.commandId)?.step ?? 'workspace',
@@ -361,6 +376,7 @@ export class ManagedNode {
 
     async stop(flushPending = true): Promise<void> {
         this.stopping = true;
+        this.shutdown.abort();
         if (this.timer) clearInterval(this.timer);
         this.timer = null;
         for (const value of this.active.values()) value.controller.abort();

@@ -26,6 +26,10 @@ export function assignCommandState(state: CommandRecord['state']): string {
         protected_state=${state === 'completed' ? 'NULL' : `CASE WHEN protected_state IS NOT NULL THEN '${state}' END`}`;
 }
 
+const withoutAcknowledgedAuditTimeout = `NOT EXISTS (
+    SELECT 1 FROM events WHERE events.command_id=commands.command_id AND events.sequence<=commands.last_event
+    AND json_extract(events.payload,'$.event.auditTimeoutStopping')=1)`;
+
 export class CentralDatabase {
     readonly sql: DatabaseSync;
     readonly clock: () => Date;
@@ -276,7 +280,7 @@ export class CentralDatabase {
                 if (!workspace.executionConfigHash) throw new CentralError(409, 'configuration_required', '节点必须继续提供已登记的执行配置摘要');
                 if (!project.executionConfigHash) {
                     this.sql.prepare("UPDATE commands SET cancel_requested=1,updated_at=? WHERE project_id=? AND active_state IN ('queued','dispatched')").run(this.now(), project.projectId);
-                    this.sql.prepare(`UPDATE commands SET ${assignCommandState('recovery_required')},updated_at=? WHERE project_id=? AND active_state IN ('accepted','executing')`).run(this.now(), project.projectId);
+                    this.sql.prepare(`UPDATE commands SET ${assignCommandState('recovery_required')},updated_at=? WHERE project_id=? AND active_state IN ('accepted','executing') AND ${withoutAcknowledgedAuditTimeout}`).run(this.now(), project.projectId);
                     this.sql.prepare('UPDATE projects SET execution_config_hash=? WHERE project_id=?').run(workspace.executionConfigHash, project.projectId);
                     continue;
                 }
@@ -286,7 +290,7 @@ export class CentralDatabase {
             }
             if (workspaceIssues || node.instanceId !== registration.instanceId) this.setWorkspaceIssues(nodeId, workspaceIssues ?? {});
             if (node.instanceId && node.instanceId !== registration.instanceId) {
-                this.sql.prepare(`UPDATE commands SET ${assignCommandState('recovery_required')},updated_at=? WHERE node_id=? AND active_state IN ('accepted','executing')`).run(this.now(), nodeId);
+                this.sql.prepare(`UPDATE commands SET ${assignCommandState('recovery_required')},updated_at=? WHERE node_id=? AND active_state IN ('accepted','executing') AND ${withoutAcknowledgedAuditTimeout}`).run(this.now(), nodeId);
             }
             const paused = node.instanceId === registration.instanceId
                 ? Number((this.sql.prepare('SELECT admission_paused FROM nodes WHERE node_id=?').get(nodeId) as Row).admission_paused)
@@ -343,7 +347,7 @@ export class CentralDatabase {
             const node = this.getNode(nodeId);
             if (!node.enabled || !instanceId || node.instanceId !== instanceId) throw new CentralError(409, 'instance_conflict', '节点实例已失效，请重新核验');
             this.sql.prepare('UPDATE nodes SET last_seen_at=NULL,admission_paused=1 WHERE node_id=?').run(nodeId);
-            this.sql.prepare(`UPDATE commands SET ${assignCommandState('recovery_required')},updated_at=? WHERE node_id=? AND active_state IN ('accepted','executing')`).run(this.now(), nodeId);
+            this.sql.prepare(`UPDATE commands SET ${assignCommandState('recovery_required')},updated_at=? WHERE node_id=? AND active_state IN ('accepted','executing') AND ${withoutAcknowledgedAuditTimeout}`).run(this.now(), nodeId);
         });
     }
 

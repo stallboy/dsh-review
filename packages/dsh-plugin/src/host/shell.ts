@@ -14,6 +14,7 @@ export interface ProcessResult {
   stderr: string;
   error?: string;
   stdinError?: string;
+  processTreeStopped?: boolean;
 }
 
 export interface ProcessOptions {
@@ -23,6 +24,7 @@ export interface ProcessOptions {
   inheritEnv?: boolean;
   input?: string | { initial: string; reply: (line: string) => Promise<string> | undefined };
   onLine?: (line: string, stream: 'stdout' | 'stderr') => void;
+  onTimeout?: () => void;
   maxBytes?: number;
   /** 门禁和执行器可能留下后台进程，按需清理以免 VCS 短命令承担 taskkill 的开销。 */
   killTreeOnExit?: boolean;
@@ -37,27 +39,28 @@ function delay(ms: number): Promise<void> {
 }
 
 /** 发送终止信号后子进程可能仍未退出，因此短时探测进程组是否消失。 */
-async function waitProcessGroupGone(pid: number): Promise<void> {
+async function waitProcessGroupGone(pid: number): Promise<boolean> {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
       process.kill(-pid, 0);
-    } catch {
-      return;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ESRCH';
     }
     await delay(50);
   }
+  return false;
 }
 
-function killTree(pid: number | undefined): Promise<void> {
-  if (pid === undefined) return Promise.resolve();
+function killTree(pid: number | undefined): Promise<boolean> {
+  if (pid === undefined) return Promise.resolve(true);
   if (process.platform === 'win32') {
     return new Promise((resolve) => {
       const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], {
         windowsHide: true,
         stdio: 'ignore',
       });
-      killer.on('close', () => resolve());
-      killer.on('error', () => resolve());
+      killer.on('close', (code) => resolve(code === 0));
+      killer.on('error', () => resolve(false));
     });
   }
   try {
@@ -105,7 +108,7 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
     let timedOut = false;
     let aborted = false;
     let stdinError: string | undefined;
-    let termination: Promise<void> | undefined;
+    let termination: Promise<boolean> | undefined;
     let settled = false;
     const terminate = () => (termination ??= killTree(child.pid));
     const exchange = typeof options.input === 'object' ? options.input : undefined;
@@ -151,6 +154,7 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
 
     const timer = setTimeout(() => {
       timedOut = true;
+      options.onTimeout?.();
       void terminate();
     }, options.timeoutMs ?? 120_000);
     timer.unref?.();
@@ -172,12 +176,12 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
       clearTimeout(timer);
       options.signal?.removeEventListener('abort', onAbort);
       const shouldKill = timedOut || aborted || process.platform !== 'win32' || options.killTreeOnExit === true;
-      const cleanup = shouldKill ? terminate() : Promise.resolve();
-      void cleanup.then(() => {
+      const cleanup = shouldKill ? terminate() : Promise.resolve(undefined);
+      void cleanup.then((processTreeStopped) => {
         if (pendingStdout) options.onLine?.(pendingStdout, 'stdout');
         if (pendingStderr) options.onLine?.(pendingStderr, 'stderr');
         resolve({ code, signal, timedOut, aborted, stdout, stderr, ...(error ? { error } : {}),
-          ...(stdinError ? { stdinError } : {}) });
+          ...(stdinError ? { stdinError } : {}), ...(timedOut || aborted || options.killTreeOnExit ? { processTreeStopped } : {}) });
       });
     };
 

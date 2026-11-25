@@ -177,6 +177,7 @@ export interface NodeEvent {
     sequence: number;
     type: 'accepted' | 'progress' | 'result' | 'recovery_required';
     logs?: string[];
+    auditTimeoutStopping?: true;
     result?: ManagedResult;
 }
 

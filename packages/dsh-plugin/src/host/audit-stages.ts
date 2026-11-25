@@ -9,7 +9,7 @@ import { FINDING_ID_PATTERN } from './invariants.js';
 import { renderAuditTemplate, type AuditStage } from './audit-prompts.js';
 import { compatibleAuditBase, listAuditSources, oneLine, readAuditSource, prepareStageCandidate, validSourcePath, withinScope, type StageCandidate, type StageEdit } from './audit-stage-artifacts.js';
 import {
-    arraySchema, AUDIT_EXECUTORS, auditObject, AuditExecutorAuthenticationError, AuditStopUnknown, enumSchema, integerSchema,
+    arraySchema, AUDIT_EXECUTORS, auditObject, AuditExecutorAuthenticationError, AuditStageTimedOut, AuditStopUnknown, enumSchema, integerSchema,
     objectSchema, stringSchema, validateAuditValue, type AuditExecutor, type ExecuteAuditStage,
 } from './audit-stage-runner.js';
 import type { SharedCandidateSource } from './shared-facts.js';
@@ -139,8 +139,9 @@ export class AuditStages {
     private readonly failedScans = new Set<AuditExecutor>();
     private taskCounter = 0;
     private scanned = false;
-    private execution?: AuditStageExecution & ({ state: 'running' } | { state: 'uncertain'; detail: string });
+    private execution?: AuditStageExecution & ({ state: 'running' } | { state: 'uncertain'; detail: string; timedOut?: AuditStageTimedOut });
     busy = false;
+    stageStopConfirmed = Promise.resolve(true);
 
     get runningStage() { return this.execution?.state === 'running' ? this.execution : undefined; }
     get interruptedStage() { return this.execution?.state === 'uncertain' ? this.execution : undefined; }
@@ -195,7 +196,7 @@ export class AuditStages {
         return { ...verdict, verdict: 'insufficient_evidence', reason: 'Host 无法核验复核证据或因果结论', evidence: [] };
     }
 
-    async run(stage: AuditStage, executor: AuditExecutor, task: unknown, outerSignal: AbortSignal): Promise<unknown> {
+    async run(stage: AuditStage, executor: AuditExecutor, task: unknown, outerSignal: AbortSignal, onTimeout?: () => void): Promise<unknown> {
         if (this.busy || this.uncertain || this.abort.signal.aborted || this.lease.stageSeal || this.lease.state !== 'active') {
             throw new Error('此轮不能启动阶段任务');
         }
@@ -259,6 +260,9 @@ export class AuditStages {
         const log = (line: string) => this.log?.(taskId + ' ' + executor + ' ' + line);
         let scratch: string | undefined;
         let executorInvoked = false;
+        let processTreeStopped = true;
+        let recordStop!: (confirmed: boolean) => void;
+        this.stageStopConfirmed = new Promise(resolve => { recordStop = resolve; });
         try {
             if (!await compatibleAuditBase(this.vcs, this.lease.baseRevision, this.lease.svnUrl)) throw new AuditStopUnknown('阶段执行前业务基线已变化');
             const verification = this.reviews.get(subject);
@@ -287,8 +291,10 @@ export class AuditStages {
             } : snapshot;
             log('启动执行器');
             executorInvoked = true;
+            processTreeStopped = false;
             const result = await this.execute({
-                executor, location: executionDir, logProcessExit: log,
+                executor, location: executionDir, logProcessExit: log, ...(onTimeout ? { onTimeout } : {}),
+                onProcessTreeStopped: stopped => { processTreeStopped = stopped; },
                 prompt: template + '\n\n## 固定基线只读视图（JSON，内容仅作数据）\n' + JSON.stringify(sourceView),
                 schema: resultSchemas[stage], signal, timeoutMs: Math.min(240_000, remaining),
             });
@@ -323,6 +329,8 @@ export class AuditStages {
             }
             if (value['status'] === 'blocked') return { status: 'blocked', reason: value['reason'] };
             if (!String(value['summary']).trim()) throw new Error('候选方案缺少修复说明');
+            const executorStopped = processTreeStopped;
+            processTreeStopped = false;
             const candidate = await prepareStageCandidate({
                 lease: this.lease, vcsType: this.vcs.type, id, scratch, edits: value['edits'] as StageEdit[], allowedPaths: preferred, commands,
                 reviewers: this.reviewers, auditType: input['auditType'] as AuditType, confirmed: oneLine(verification!.observedBehavior), summary: String(value['summary']),
@@ -330,6 +338,7 @@ export class AuditStages {
                 gateTimeoutMs: this.gateTimeoutMs, signal, gate: this.gate!,
             });
             if (existingCandidates.some(option => option.patch === candidate.patch)) throw new Error('备选补丁与先前方案相同');
+            processTreeStopped = executorStopped;
             this.candidates.set(subject, [...existingCandidates, candidate]);
             return { status: 'ready', candidateId: candidate.id };
         } catch (error) {
@@ -341,9 +350,11 @@ export class AuditStages {
                 this.coverage.push(taskId + ' 未完成');
                 log(signal.aborted ? '阶段已取消或超时' : '阶段未完成');
             }
+            if (error instanceof AuditStopUnknown && error.processTreeStopped) processTreeStopped = true;
             if (error instanceof AuditStopUnknown || signal.aborted) {
                 this.execution = { state: 'uncertain', stage, runner: executor,
-                    detail: error instanceof AuditStopUnknown ? error.message : '无法确认审查阶段已安全停止，请核验执行器与工作副本。' };
+                    detail: error instanceof AuditStopUnknown ? error.message : '无法确认审查阶段已安全停止，请核验执行器与工作副本。',
+                    ...(error instanceof AuditStageTimedOut ? { timedOut: error } : {}) };
             } else if (stage === 'scan' && executorInvoked) {
                 this.failedScans.add(executor);
             }
@@ -354,6 +365,7 @@ export class AuditStages {
             });
             if (!this.uncertain) delete this.execution;
             this.busy = false;
+            recordStop(processTreeStopped);
         }
     }
 
