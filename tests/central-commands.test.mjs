@@ -175,3 +175,35 @@ test('中央审计指令不再注入旧版 findingWorkflow 或 issueWorkflow 兼
     assert.equal(started.json().command.payload.issueWorkflow, undefined);
     assert.equal(started.json().command.payload.findingWorkflow, undefined);
 });
+
+test('中央 takeover 显式转派目标 owner 校验：已登记用户返回 202，未知用户返回 422', async t => {
+    const { app, headers } = await setupCentral(t);
+    const node = await registerNode(app, 'node-takeover', 'repo-takeover');
+    const project = await bindProject(app, headers, node);
+    const url = `/api/v1/projects/${project.projectId}/commands`;
+    const guard = { expectedRevision: 1, expectedOwner: '审核者甲', expectedUpdatedAt: '2026-11-16T06:00:00.000Z' };
+
+    const unknownOwner = await app.inject({
+        method: 'POST', url, headers,
+        payload: {
+            operation: 'takeover',
+            idempotencyKey: 'takeover-unknown',
+            payload: { id: '2026-11/fix-retry', owner: '不存在用户', reason: '转派测试' },
+            guard,
+        },
+    });
+    assert.equal(unknownOwner.statusCode, 422, unknownOwner.body);
+    assert.match(unknownOwner.json().error.message, /不存在用户/);
+
+    const validOwner = await app.inject({
+        method: 'POST', url, headers,
+        payload: {
+            operation: 'takeover',
+            idempotencyKey: 'takeover-valid',
+            payload: { id: '2026-11/fix-retry', owner: '审核者甲', reason: '显式转派给有效用户' },
+            guard,
+        },
+    });
+    assert.equal(validOwner.statusCode, 202, validOwner.body);
+    assert.equal(validOwner.json().command.payload.owner, '审核者甲');
+});

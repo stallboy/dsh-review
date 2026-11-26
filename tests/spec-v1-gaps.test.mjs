@@ -607,3 +607,64 @@ test('对抗审查回归 P0-3 / P1-3：/fix-session/release 核验释放闭环�
   });
   assert.equal(badFin.status, 409, JSON.stringify(badFin.body));
 });
+
+test('对抗审查回归 Round2 P1-1：POST /fix-session 向 createFixSession 与 withAuditSessionIdle 传入一致 requestId 并在空闲时并行自动释放', async t => {
+  const root = await createGitFixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const baseRev = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const candidate = await commitCandidate(root, '20261126-fix-idle-reqid', {
+    review: {
+      baseRevision: JSON.stringify(baseRev),
+      comments: '\n  - id: c1\n    revision: 1\n    file: ""\n    line: 0\n    author: tester\n    content: 需修订\n    status: unresolved',
+      bodyLines: ['# 需人工判断项', '', '- 无'],
+    },
+  });
+  let createdRequestId = '';
+  let idleRequestId = '';
+  let triggerIdle;
+  let onTurnEndUnsubscribed = false;
+  let idleAborted = false;
+  const api = new ReviewApi({
+    settings: { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType: 'git', syncBeforeApprove: false },
+    saveSettings: async (v) => v,
+    statePath: path.join(root, '.tmp', 'fix-idle-state.json'),
+    createFixSession: async (input) => {
+      createdRequestId = input.requestId ?? '';
+      return { sessionId: 'fix-sess-idle-1' };
+    },
+    stopAuditSession: async () => true,
+    onAuditTurnEnd: () => () => { onTurnEndUnsubscribed = true; },
+    withAuditSessionIdle: async (_sessionId, requestId, signal, finalize) => {
+      idleRequestId = requestId;
+      signal.addEventListener('abort', () => { idleAborted = true; });
+      await new Promise((resolve) => { triggerIdle = resolve; });
+      await finalize(signal);
+      return true;
+    },
+  });
+  await api.init();
+
+  const g1 = (await api.invoke({ method: 'GET', path: '/candidate', query: { id: candidate.id } })).body.candidate.meta;
+  const started = await api.invoke({
+    method: 'POST', path: '/fix-session',
+    body: { id: candidate.id, expectedRevision: g1.recordRevision, expectedOwner: g1.owner, expectedUpdatedAt: g1.updatedAt, optionId: 'opt-a', patchId: 1 },
+  });
+  assert.equal(started.status, 202, JSON.stringify(started.body));
+  assert.ok(createdRequestId.startsWith('fix-session-'), `unexpected createdRequestId: ${createdRequestId}`);
+  assert.equal(idleRequestId, createdRequestId, 'withAuditSessionIdle 必须收到与 createFixSession 相同的 requestId');
+
+  const beforeQueue = await api.invoke({ method: 'GET', path: '/queue' });
+  assert.equal(beforeQueue.body.fixSession?.sessionId, 'fix-sess-idle-1');
+
+  // 触发 withAuditSessionIdle 回调，应通过 releaseVerified 自动释放占用并清理两个监听器
+  triggerIdle();
+  for (let i = 0; i < 50; i += 1) {
+    const queue = await api.invoke({ method: 'GET', path: '/queue' });
+    if (!queue.body.fixSession) break;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const afterQueue = await api.invoke({ method: 'GET', path: '/queue' });
+  assert.equal(afterQueue.body.fixSession, undefined);
+  assert.equal(onTurnEndUnsubscribed, true);
+  assert.equal(idleAborted, true);
+});

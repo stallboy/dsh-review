@@ -113,6 +113,7 @@ export interface ApiDeps {
     cwd: string;
     title: string;
     prompt: string;
+    requestId?: string;
     ownerSessionId?: string;
   }) => Promise<{ sessionId: string }>;
   withAuditSessionIdle?: (

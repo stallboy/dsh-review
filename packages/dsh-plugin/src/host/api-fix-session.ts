@@ -5,6 +5,7 @@
  * - 仅在核验会话停止且业务工作区干净还原后才释放占用（支持回合结束自动核验与显式释放）。
  */
 
+import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import {
@@ -218,12 +219,14 @@ export async function handleCreateFixSession(
   });
 
   const ownerSessionId = url.searchParams.get('sessionId') ?? undefined;
+  const requestId = `fix-session-${randomUUID()}`;
   let sessionId = '';
   try {
     const created = await host.deps.createFixSession({
       cwd: runtime.root,
       title: prepared.title,
       prompt: prepared.prompt,
+      requestId,
       ...(ownerSessionId ? { ownerSessionId } : {}),
     });
     sessionId = created.sessionId;
@@ -237,27 +240,41 @@ export async function handleCreateFixSession(
     throw error;
   }
 
-  // 回合结束或会话空闲时必须核验停止并还原清理工作区后才释放占用（绝不盲目释放或按固定时钟超时清除）。
-  if (host.deps.onAuditTurnEnd) {
-    const unsubscribe = host.deps.onAuditTurnEnd(sessionId, () => {
-      void host.withWriteLock(runtime.root, async () => {
+  // 同时挂接 onAuditTurnEnd 与 withAuditSessionIdle（对齐同一 requestId），任一通道捕获空闲即核验停止与工作区干净后释放占用。
+  const cleanups: Array<() => void> = [];
+  let releasing = false;
+  const triggerRelease = async (): Promise<void> => {
+    if (releasing || !registry.activeFor(runtime.root)) return;
+    releasing = true;
+    try {
+      await host.withWriteLock(runtime.root, async () => {
         await registry.releaseVerified(runtime.root, runtime, host.deps.stopAuditSession);
-      }).catch(() => undefined);
-    });
-    registry.attachTurnListener(runtime.root, unsubscribe);
-  } else if (host.deps.withAuditSessionIdle) {
+      });
+    } finally {
+      releasing = false;
+    }
+  };
+  if (host.deps.onAuditTurnEnd) {
+    cleanups.push(host.deps.onAuditTurnEnd(sessionId, () => {
+      void triggerRelease().catch(() => undefined);
+    }));
+  }
+  if (host.deps.withAuditSessionIdle) {
     const idleController = new AbortController();
-    registry.attachTurnListener(runtime.root, () => idleController.abort());
+    cleanups.push(() => idleController.abort());
     void host.deps.withAuditSessionIdle(
       sessionId,
-      `fix-session-${sessionId}`,
+      requestId,
       idleController.signal,
       async () => {
-        await host.withWriteLock(runtime.root, async () => {
-          await registry.releaseVerified(runtime.root, runtime, host.deps.stopAuditSession);
-        });
+        await triggerRelease();
       },
     ).catch(() => undefined);
+  }
+  if (cleanups.length > 0) {
+    registry.attachTurnListener(runtime.root, () => {
+      for (const cleanup of cleanups) cleanup();
+    });
   }
 
   sendJson(res, 202, {

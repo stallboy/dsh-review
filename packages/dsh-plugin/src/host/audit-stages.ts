@@ -620,6 +620,16 @@ export class AuditStageSession {
     }
     const patchText = patchBytes.toString('utf8');
     const parsedPatch = parsePatch(patchText);
+    if (parsedPatch.unsafeModes.length > 0) {
+      await rm(artifactAbs, { recursive: true, force: true }).catch(() => undefined);
+      return {
+        ok: false,
+        stage,
+        taskId,
+        reason: 'invalid_output',
+        diagnostic: `补丁包含禁止的文件模式（${parsedPatch.unsafeModes.join(', ')}），禁止符号链接或子模块变更`,
+      };
+    }
     const allowedSet = new Set(allowedPaths);
     if (
       parsedPatch.paths.length === 0

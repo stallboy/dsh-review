@@ -187,7 +187,7 @@ export async function createDshAuditSession(
 /** 与审查共用创建流程，单列动作标签以便失败提示指向用户刚选的入口。 */
 export async function createDshFixSession(
   host: AuditSessionHost,
-  input: { cwd: string; title: string; prompt: string; ownerSessionId?: string },
+  input: { cwd: string; title: string; prompt: string; requestId?: string; ownerSessionId?: string },
 ): Promise<{ sessionId: string }> {
   return createDshSession(host, input, '修复');
 }
@@ -363,12 +363,16 @@ export function apply(ctx: HostContext): void {
       },
       resolveCredential,
       ...auditSessions,
-      onAuditTurnEnd: (sessionId, callback) => {
-        const off = ctx.on?.('session.idle', (event: { sessionId?: string }) => {
-          if (event?.sessionId === sessionId) callback();
-        });
-        return typeof off === 'function' ? off : () => {};
-      },
+      ...(typeof ctx.on === 'function'
+        ? {
+            onAuditTurnEnd: (sessionId: string, callback: () => void) => {
+              const off = ctx.on!('session.idle', (event: { sessionId?: string }) => {
+                if (event?.sessionId === sessionId) callback();
+              });
+              return typeof off === 'function' ? off : () => {};
+            },
+          }
+        : {}),
       createFixSession: (input) => createDshFixSession(ctx, input),
       resolveSessionCwd: (sessionId) => {
         const sessions = ctx.get('sessions') as {

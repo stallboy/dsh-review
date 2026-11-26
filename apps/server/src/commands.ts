@@ -98,10 +98,10 @@ export class Commands {
                 if (typeof rawOwner === 'string' && rawOwner.trim()) {
                     const targetOwner = rawOwner.trim();
                     const found = db.sql
-                        .prepare('SELECT 1 FROM users WHERE review_identity=? AND disabled=0 LIMIT 1')
+                        .prepare('SELECT 1 FROM users WHERE review_identity=? LIMIT 1')
                         .get(targetOwner);
                     if (!found) {
-                        throw new CentralError(422, 'bad_request', `转派目标负责人 ${targetOwner} 不是有效的活跃评审用户`);
+                        throw new CentralError(422, 'bad_request', `转派目标负责人 ${targetOwner} 不是有效的评审用户`);
                     }
                 }
             }
