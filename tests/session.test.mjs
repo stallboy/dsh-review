@@ -24,13 +24,38 @@ function createHost(options = {}) {
       return options.promptResult ?? { accepted: true };
     },
   };
+  const sessionId = options.sessionId ?? 'session-audit';
+  const audit = { id: sessionId, header: { cwd: CWD } };
+  const toolService = { guard: () => () => {} };
   const services = {
+    sessions: { get: id => id === sessionId ? audit : undefined },
+    agents: { get: id => id === sessionId ? { id, session: audit, ctx: { get: () => toolService } } : undefined },
+    sandboxPolicy: { resolve: () => ({ mode: 'workspace-write', workspaceRoot: CWD }) },
+    fs: { sandboxMode: 'workspace-write' }, shell: { sandboxMode: 'workspace-write' },
+    tools: toolService, approval: { setPolicy() {} },
     sessionController: Object.hasOwn(options, 'controller') ? options.controller : controller,
     workspaceRegistry: options.registry,
     ...options.services,
   };
+  const createdSession = services.sessions?.get?.(sessionId);
+  if (createdSession) {
+    createdSession.id = sessionId;
+    createdSession.header = { ...createdSession.header, cwd: CWD };
+  }
+  if (services.agents?.get) {
+    const originalGet = services.agents.get.bind(services.agents);
+    services.agents = { get(id) {
+      const agent = originalGet(id);
+      if (agent && id === sessionId) {
+        agent.session ??= createdSession;
+        agent.ctx ??= { get: () => toolService };
+      }
+      return agent;
+    } };
+  }
   const warnings = [];
   const host = {
+    on() { return () => {}; },
     get(name) {
       return services[name];
     },
@@ -134,7 +159,7 @@ test('audit session keeps the created session when renaming fails', async () => 
   assert.match(warnings.join('\n'), /审查会话改名失败：title service down/);
 });
 
-test('audit session inherits the owner permission preset before the prompt starts', async () => {
+test('审查不继承所有者完整权限，并在投递前设置拒绝提权', async () => {
   const ownerSession = { header: {} };
   const auditSession = { header: {} };
   const inherited = [];
@@ -161,8 +186,8 @@ test('audit session inherits the owner permission preset before the prompt start
         overrideOf() {
           return 'never';
         },
-        setPolicy() {
-          throw new Error('the preset already carries the approval policy');
+        setPolicy(_agent, policy) {
+          inherited.push(`audit:${policy}`);
         },
       },
       agents: { get: () => ({ id: 'session-audit' }) },
@@ -176,12 +201,12 @@ test('audit session inherits the owner permission preset before the prompt start
     ownerSessionId: 'owner-session',
   });
 
-  assert.deepEqual(inherited, ['current', 'set:danger-full-access']);
+  assert.deepEqual(inherited, ['audit:never']);
   assert.deepEqual(order, ['prompt']);
   assert.equal(calls.prompt.length, 1);
 });
 
-test('audit session falls back to the owner approval policy for a custom preset', async () => {
+test('所有者自定义权限不会覆盖审查专用权限', async () => {
   const ownerSession = { header: {} };
   const auditSession = { header: {} };
   const { host, order } = createHost({
@@ -222,21 +247,13 @@ test('audit session falls back to the owner approval policy for a custom preset'
     ownerSessionId: 'owner-session',
   });
 
-  assert.deepEqual(order, ['current', 'policy:session-audit:never', 'prompt']);
+  assert.deepEqual(order, ['policy:session-audit:never', 'prompt']);
 });
 
-test('audit session still starts when permission inheritance is unavailable', async () => {
+test('审查缺少会话权限服务时拒绝启动且不投递提示词', async () => {
   const { host, calls } = createHost({ registry: registryWith(undefined), services: { sessions: {} } });
-
-  const result = await createDshAuditSession(host, {
-    cwd: CWD,
-    title: '仓库审查',
-    prompt: '任务',
-    ownerSessionId: 'owner-session',
-  });
-
-  assert.equal(result.sessionId, 'session-audit');
-  assert.equal(calls.prompt.length, 1);
+  await assert.rejects(createDshAuditSession(host, { cwd: CWD, title: '仓库审查', prompt: '任务', ownerSessionId: 'owner-session' }), /工作目录必须严格等于项目根目录/);
+  assert.equal(calls.prompt.length, 0);
 });
 
 test('桌面审查选择精确匹配的工作区，避免在上层项目创建会话', async () => {
@@ -258,9 +275,10 @@ test('桌面审查缺少绑定工作区时报错并保持会话列表不变', as
     assert.equal(calls.create.length, 0);
 });
 
-test('桌面审查支持登记在同一工作副本子目录的 DSH 项目', async () => {
+test('桌面审查不能使用子目录项目改变本轮 cwd，须先登记工作副本根目录', async () => {
     const workspace = { id: 'workspace-nested', path: `${CWD}/packages/dsh-plugin` };
     const { host, calls } = createHost({ registry: registryWith(workspace) });
-    await createDshAuditSession(host, { cwd: CWD, title: '仓库审查', prompt: '任务', requireWorkspace: true });
-    assert.deepEqual(calls.create, [{ workspaceId: 'workspace-nested' }]);
+    await assert.rejects(createDshAuditSession(host, { cwd: CWD, title: '仓库审查', prompt: '任务', requireWorkspace: true }), /请登记工作副本根目录/);
+    assert.deepEqual(calls.create, []);
+    assert.deepEqual(calls.prompt, []);
 });

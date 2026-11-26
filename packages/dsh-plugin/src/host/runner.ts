@@ -11,12 +11,15 @@ import type {
   RunnerExecutionResult,
   RunnerKind,
   RunnerMode,
+  IssueSelection,
 } from './types.js';
 import { patchTouchesReviewData } from './vcs.js';
+import { currentReviewPatch, requireIssueSelection } from './issue-review.js';
 
 const RUN_TIMEOUT_MS = 30 * 60 * 1000;
 
 export interface RunnerRequest {
+  selection?: IssueSelection;
   kind: RunnerKind;
   settings: AppSettings;
   store: ReviewStore;
@@ -73,14 +76,15 @@ function packageRoot(): string {
 }
 
 /** 提示词资产缺失时仍须提供修复执行的基本约束。 */
-export async function loadSystemPrompt(): Promise<string> {
+export async function loadSystemPrompt(schemaVersion = 1): Promise<string> {
   const fallback = [
     '你是 AI Fixer。你在一个产品仓库中修复代码，并更新 .ai-review 候选目录中的 review.md 与 NNN.patch。',
     '不要提交代码；完成后把业务代码工作区还原干净，仅保留 .ai-review 下的文件。',
   ].join('\n');
   try {
-    return (await readFile(path.join(packageRoot(), 'assets', 'ai-fixer-system.md'), 'utf8')).trim();
+    return (await readFile(path.join(packageRoot(), 'assets', schemaVersion === 3 ? 'ai-proposal-system.md' : 'ai-fixer-system.md'), 'utf8')).trim();
   } catch {
+    if (schemaVersion === 3) throw new Error('schema3 修复提案系统提示词缺失，无法安全降级');
     return fallback;
   }
 }
@@ -90,18 +94,34 @@ function commentLines(comments: ReviewComment[]): string {
   return comments
     .map((comment) => {
       const location = comment.file ? `${comment.file}${comment.line > 0 ? `:${String(comment.line)}` : ''}` : '总体';
-      return `- [rev ${String(comment.revision)}] ${location} · ${comment.author} · (${comment.status})\n  ${comment.content.replaceAll('\n', '\n  ')}`;
+      const option = comment.extra?.['option_id'] ? ` / 方案 ${String(comment.extra['option_id'])} / patch ${String(comment.extra['patch_id'])}` : '';
+      return `- [rev ${String(comment.revision)}${option}] ${location} · ${comment.author} · (${comment.status})\n  ${comment.content.replaceAll('\n', '\n  ')}`;
     })
     .join('\n');
 }
 
 export async function buildFixPrompt(request: RunnerRequest): Promise<string> {
   const { candidate } = request;
-  const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
+  const selection = requireIssueSelection(candidate.meta, request.selection);
+  const current = currentReviewPatch(candidate.meta, selection);
   const nextRevision = candidate.meta.currentRevision + 1;
   const baseRevision = request.baseRevision ?? current?.baseRevision ?? '未知';
   const month = candidate.month;
   const slug = candidate.slug;
+  if (candidate.meta.schemaVersion === 3) {
+    const patchId = candidate.meta.revisions.length + 1;
+    return [
+      '# 修复提案迭代', `工作目录：${request.store.repoRoot}`, `问题记录：${candidate.reviewPath}`,
+      `所选方案：${selection!.optionId}，当前补丁：${current!.patch}，目标基线：${baseRevision}`,
+      `将完整补丁写到 ${candidate.dirPath}/${String(patchId).padStart(3, '0')}.patch。`,
+      `保留 schema_version: 3；record_revision 恰好推进到 ${String(nextRevision)}；patches 只追加 id: ${String(patchId)}、base_revision、patch、author: ai、option_id: ${selection!.optionId}；只更新该方案 current_patch。`,
+      'status: pending，approval: null。保留全部旧补丁字节、其他方案、评论、观察、人工处置、修复尝试和未知字段，审核记录只能追加。',
+      '使用 Harness 自主读取任何项目内容。仅写 .ai-review 中的问题目录；直接生成统一 diff，禁止应用补丁、编辑业务源码、运行修复后验证或执行版本控制写操作。',
+      '修复门禁留给人工批准后的程序执行。如需大范围或业务取舍变化，保留原提案并在文字中解释，交给人类处理。',
+      '意见：', commentLines(request.comments.filter(comment => !comment.extra?.['option_id'] || comment.extra['option_id'] === selection!.optionId)), request.failureDetail ?? '',
+      '完成后返回 DONE 和摘要。',
+    ].join('\n\n');
+  }
   const lines = [
     '# 任务',
     `请以 ${request.mode} 模式执行修复，并把候选目录更新到版本 ${String(nextRevision)}。`,
@@ -322,7 +342,7 @@ export class Runner {
       return { success: false, manual: true, prompt, errorMessage: '已生成修复提示，请手动执行后重新提交' };
     }
     const user = await buildFixPrompt(this.request);
-    const system = await loadSystemPrompt();
+    const system = await loadSystemPrompt(this.request.candidate.meta.schemaVersion);
     const outcome = await runAgent({
       kind,
       settings: this.request.settings,
@@ -365,7 +385,8 @@ export class Runner {
         outputTail,
       };
     }
-    const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
+    const nextOption = candidate.meta.issue?.options.find(option => option.id === this.request.selection?.optionId);
+    const current = currentReviewPatch(candidate.meta, nextOption ? { optionId: nextOption.id, patchId: nextOption.currentPatch } : undefined);
     if (!current) {
       return { success: false, errorMessage: 'AI 更新了 current_revision，但 revisions 中缺少对应条目', outputTail };
     }

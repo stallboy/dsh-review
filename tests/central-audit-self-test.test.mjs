@@ -57,13 +57,17 @@ test('中央自检通过 DSH 阶段工具调用两种代理，校验后删除临
         workspaces: [{ workspaceId: registration.workspaceId, label: '示例项目', root, target }],
         auditSessions: {
             auditSessionTools: true,
-            async auditStageExecutor({ executor, location, prompt, timeoutMs, signal }) {
-                assert.equal(path.dirname(location), path.dirname(checkDir));
+            async auditStageExecutor({ executor, location, repoRoot, prompt, timeoutMs, signal }) {
+                assert.equal(repoRoot, checkDir);
+                assert.ok(location.startsWith(path.join(checkDir, '.ai-review')));
+                assert.doesNotMatch(prompt, /test-[a-f0-9]{10}/);
                 assert.ok(timeoutMs <= 40_000);
                 signal.throwIfAborted();
                 calls.push(executor);
                 if (mode === 'bad-claude' && executor === 'claude-code') return { value: 'INCORRECT' };
-                return { value: /样本：(test-[a-f0-9]+)$/.exec(prompt)[1].toUpperCase() };
+                const text = await readFile(path.join(repoRoot, executor + '-sample.txt'), 'utf8');
+                assert.ok(text.length > 150_000);
+                return { value: text.trim().split('\n').at(-1).toUpperCase() };
             },
             async createAuditSession(input) {
                 const id = 'self-test-' + (++sessionSequence);

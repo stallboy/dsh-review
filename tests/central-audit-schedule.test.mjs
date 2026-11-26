@@ -13,7 +13,7 @@ async function scheduledProject(t, startTime = '02:00', initialTime = '2026-11-1
     const path = `/api/v1/projects/${project.projectId}`;
     const register = (workspaces) => setup.app.inject({ method: 'POST', url: '/node-api/v1/register', headers: node.headers,
         payload: { protocolVersion: 1, instanceId: node.instanceId, pluginVersion: '0.3.0', dshVersion: '0.2.1', platform: 'linux', workspaces } });
-    const workspace = { workspaceId: node.workspaceId, label: node.workspaceId, vcsType: 'git', target: 'main' };
+    const workspace = { workspaceId: node.workspaceId, label: node.workspaceId, vcsType: 'git', target: 'main', issueWorkflow: true };
     const put = (payload) => setup.app.inject({ method: 'PUT', url: `${path}/audit-schedule`, headers: setup.headers, payload });
     const configured = await put({ enabled: true, startTime, timeZone });
     assert.equal(configured.statusCode, 200, configured.body);

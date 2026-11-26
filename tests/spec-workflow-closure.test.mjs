@@ -928,7 +928,7 @@ test('§7.6/§7.1：rejected 重开来源存在本地修改时必须拒绝', asy
 });
 
 
-test('§7.7：finalize 门禁取消不得提交档案或释放租约', async () => {
+test('§7.7：finalize 只读预检期间取消不得提交档案或释放租约', { timeout: 15000 }, async t => {
   const root = await createGitFixture();
   const { mkdir } = await import('node:fs/promises');
   await mkdir(path.join(root, '.ai-review'), { recursive: true });
@@ -939,7 +939,15 @@ test('§7.7：finalize 门禁取消不得提交档案或释放租约', async () 
   ].join('\n'), 'utf8');
   runCommand('git', ['add', '.ai-review/reviewers.yml'], root);
   runCommand('git', ['commit', '-q', '-m', 'declared finalize gates'], root);
-  const { api, base } = await startApi(root);
+  const checking = Promise.withResolvers();
+  const releaseCheck = Promise.withResolvers();
+  t.after(() => releaseCheck.resolve());
+  const { api, base } = await startApi(root, {}, { decorateVcs(vcs) {
+    const check = vcs.checkPatch.bind(vcs);
+    vcs.checkPatch = async (...args) => { checking.resolve(); await releaseCheck.promise; return check(...args); };
+    vcs.applyPatch = async () => { throw new Error('审查预检不得实际应用补丁'); };
+    return vcs;
+  } });
   const manual = await post(base, '/audit/manual', { targetPath: '', note: '' });
   const { auditId } = await manual.json();
   await commitCandidate(root, '20261111-finalize-cancel', {
@@ -954,14 +962,9 @@ test('§7.7：finalize 门禁取消不得提交档案或释放租约', async () 
   const response = await post(base, '/audit/finalize', { auditId });
   assert.equal(response.status, 202);
   const jobId = (await response.json()).jobId;
-  let running;
-  for (let index = 0; index < 120; index += 1) {
-    running = await (await fetch(`${base}/jobs/${jobId}`)).json();
-    if (running.log.some((line) => line.includes('收尾门禁复算'))) break;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  assert.ok(running.log.some((line) => line.includes('收尾门禁复算')), JSON.stringify(running));
+  await checking.promise;
   await post(base, `/jobs/${jobId}/cancel`, {});
+  releaseCheck.resolve();
   const job = await waitJob(base, jobId);
   assert.equal(job.result?.status, 'ABORTED', JSON.stringify(job.result));
   assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), head);

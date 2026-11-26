@@ -75,7 +75,7 @@ export class ManagedNode {
     private timer: ReturnType<typeof setInterval> | null = null;
     private registered = false;
     private registrationKey = '';
-    private capabilities?: { executionConfigHash: boolean; workspaceIssues: boolean; findingWorkflow: boolean; auditSelfTest: boolean };
+    private capabilities?: { executionConfigHash: boolean; workspaceIssues: boolean; findingWorkflow: boolean; issueWorkflow: boolean; auditSelfTest: boolean };
     private nextCapabilityCheck = 0;
     private workspaceCheck: Promise<void> | undefined;
     private initialized = false;
@@ -138,7 +138,7 @@ export class ManagedNode {
         const info = await this.transport(url, { signal: AbortSignal.timeout(3000) }).then(async response => {
             if (!response.ok) throw new Error('无法读取中央服务器协议能力');
             const data = await response.json() as { protocolVersion?: number; registrationCapabilities?: {
-                executionConfigHash?: boolean; workspaceIssues?: boolean; findingWorkflow?: boolean; auditSelfTest?: boolean;
+                executionConfigHash?: boolean; workspaceIssues?: boolean; findingWorkflow?: boolean; issueWorkflow?: boolean; auditSelfTest?: boolean;
             } };
             if (typeof data?.protocolVersion !== 'number') throw new Error('中央服务器协议能力响应无效');
             return data;
@@ -155,6 +155,7 @@ export class ManagedNode {
         this.capabilities = { executionConfigHash: info.registrationCapabilities?.executionConfigHash === true,
             workspaceIssues: info.registrationCapabilities?.workspaceIssues === true,
             findingWorkflow: info.registrationCapabilities?.findingWorkflow === true,
+            issueWorkflow: info.registrationCapabilities?.issueWorkflow === true,
             auditSelfTest: info.registrationCapabilities?.auditSelfTest === true };
     }
 
@@ -194,6 +195,7 @@ export class ManagedNode {
             .map(({ supportsScheduledAudit: _scheduled, executionConfigHash, auditSelfTest, ...workspace }) =>
                 ({ ...workspace, ...(this.capabilities?.executionConfigHash === false ? {} : { executionConfigHash }),
                     ...(this.capabilities?.findingWorkflow ? { findingWorkflow: true } : {}),
+                    ...(this.capabilities?.issueWorkflow ? { issueWorkflow: true } : {}),
                     ...(this.capabilities?.auditSelfTest && auditSelfTest ? { auditSelfTest: true } : {}) }));
         const registrationKey = JSON.stringify(declaredWorkspaces);
         if (!this.registered || this.registrationKey !== registrationKey) {
@@ -309,10 +311,14 @@ export class ManagedNode {
                 if (this.clock().getTime() - (this.lastSync.get(project.projectId) ?? 0) < 10000) continue;
                 this.track(project.projectId, `snapshot:${project.projectId}`, async () => {
                     const content = await this.options.snapshot!(project);
+                    if (!this.capabilities?.issueWorkflow && content.queue.some(item => Number(item['schemaVersion']) >= 3)) {
+                        throw new Error('中央不支持 schema3 问题记录，拒绝降级同步，请升级中央服务');
+                    }
                     const snapshot: ProjectSnapshot = { ...content, projectId: project.projectId, bindingGeneration: project.bindingGeneration,
                         projectConfigRevision: project.projectConfigRevision, snapshotSequence: journal.nextSnapshotSequence(project.projectId), collectedAt: this.clock().toISOString() };
                     await this.request('/node-api/v1/snapshots', { instanceId: this.instanceId, snapshot: {
                         ...snapshot, ...(this.capabilities?.findingWorkflow ? { findingWorkflow: true } : {}),
+                    ...(this.capabilities?.issueWorkflow ? { issueWorkflow: true } : {}),
                     } });
                     this.lastSync.set(project.projectId, this.clock().getTime());
                 });

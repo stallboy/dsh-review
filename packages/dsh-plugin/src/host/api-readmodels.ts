@@ -1,8 +1,10 @@
 import type { ApiResponse } from './api-context.js';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { isAiReviewPath, parsePatch } from './patch.js';
 import { loadReviewers } from './reviewers.js';
 import { Runner, loadSystemPrompt, toSessionFixPrompt } from './runner.js';
+import { projectIssue, issueSelection, readIssueSelection, currentReviewPatch, defaultIssueSelection, selectIssuePatch, requireIssueSelection } from './issue-review.js';
 import { AuditArchive, projectFindings, scopeCovers, type CandidateChainInfo } from './audit-archive.js';
 import { loadFindingEvents, type FindingDisposition } from './finding-decisions.js';
 import { FINDING_ID_PATTERN, isRepoRelativePath } from './invariants.js';
@@ -61,7 +63,8 @@ export class ReadModels {
       if (!source) return unknown();
       const { month, slug } = runtime.store.resolveCandidateDir(id);
       const detail = await runtime.store.get(id, null, source).catch(() => null);
-      const revisionEntry = detail?.candidate.meta.revisions.find((entry) => entry.id === revision);
+      const revisionEntry = detail?.candidate.meta.schemaVersion === 3 ? currentReviewPatch(detail.candidate.meta)
+        : detail?.candidate.meta.revisions.find((entry) => entry.id === revision);
       if (!revisionEntry || detail?.candidate.meta.currentRevision !== revision) return unknown();
       text = (await source.readPatchText(month, slug, revisionEntry.patch)) ?? undefined;
     }
@@ -142,9 +145,9 @@ export class ReadModels {
       if (cached) item.patchCheck = cached;
       else this.schedulePatchCheck(runtime, item.id, item.currentRevision, base);
     }
-    const counts: Record<ReviewStatus, number> = { pending: 0, changes_requested: 0, approved: 0, rejected: 0 };
+    const counts = { pending: 0, changes_requested: 0, approved: 0, rejected: 0 } as Record<ReviewStatus, number>;
     for (const item of all.items) {
-      if (!item.local) counts[item.status] += 1;
+      if (!item.local) counts[item.status] = (counts[item.status] ?? 0) + 1;
     }
     // 定位结果仅作诊断，无法定位业务提交仍保留队列项。
     for (const item of items) {
@@ -204,7 +207,10 @@ export class ReadModels {
     const id = idFrom(url);
     const view = await sharedViewFor(runtime);
     const currentBase = view?.snapshot ?? await vcs.getCurrentBase().catch(() => null);
-    const detail = await store.get(id, currentBase, view?.source);
+    let detail = await store.get(id, currentBase, view?.source);
+    const requestedSelection = readIssueSelection(detail.candidate.meta, Object.fromEntries(url.searchParams));
+    if (requestedSelection) detail = await store.get(id, currentBase, view?.source, requestedSelection);
+    const selection = detail.candidate.meta.schemaVersion === 3 ? requestedSelection ?? defaultIssueSelection(detail.candidate.meta) : undefined;
     const validation = await store.validateFullCandidate(detail.candidate, view?.source);
     const revisionStats: Record<number, unknown> = {};
     for (const revision of detail.candidate.meta.revisions) {
@@ -219,9 +225,9 @@ export class ReadModels {
     const patchPaths = parsePatch(patchText).paths.filter((file) => !isAiReviewPath(file));
     // 补丁预检只对 checkedBase 有效，批准时仍须重新严格应用。
     let patchCheck: PatchCheckDiagnostic | undefined;
-    if (!detail.candidate.parseError && detail.candidate.meta.status !== 'approved' && detail.candidate.meta.status !== 'rejected' && currentBase) {
+    if (detail.patchText && !detail.candidate.parseError && !['approved', 'rejected', 'resolved'].includes(detail.candidate.meta.status) && currentBase) {
       const revision = detail.candidate.meta.currentRevision;
-      const key = this.patchCheckKey(runtime, id, revision, currentBase);
+      const key = this.patchCheckKey(runtime, id, revision, currentBase) + (selection ? '|' + selection.optionId + '|' + String(selection.patchId) : '');
       const cached = state.patchCheckCache.get(key);
       if (cached) patchCheck = cached;
       else {
@@ -243,9 +249,7 @@ export class ReadModels {
       }
     }
     // 评论或状态变更也会推进 HEAD，须排除评审元数据变化以免误报基线落后。
-    const currentRevisionEntry = detail.candidate.meta.revisions.find(
-      (revision) => revision.id === detail.candidate.meta.currentRevision,
-    );
+    const currentRevisionEntry = currentReviewPatch(detail.candidate.meta, selection);
     let isBaseBehind = detail.isBaseBehind;
     if (!detail.candidate.parseError
       && currentRevisionEntry
@@ -257,8 +261,10 @@ export class ReadModels {
     }
     const finding = detail.candidate.meta.findingId && view ? (await this.findingProjection(runtime, view)).findings
       .find(item => item.findingId === detail.candidate.meta.findingId) : undefined;
+    if (selection) detail.candidate.meta.gateChecks = selectIssuePatch(detail.candidate.meta, selection).option.gateChecks;
     sendJson(res, 200, {
       candidate: detail.candidate,
+      ...(selection ? { selection } : {}),
       ...(finding ? { finding } : {}),
       currentBase: detail.currentBase,
       isBaseBehind,
@@ -327,7 +333,13 @@ export class ReadModels {
     const sharedSource = await sharedSourceFor(runtime);
     const id = idFrom(url);
     const detail = await store.get(id, null, sharedSource);
-    const current = detail.candidate.meta.currentRevision;
+    const selected = currentReviewPatch(detail.candidate.meta, readIssueSelection(detail.candidate.meta, Object.fromEntries(url.searchParams)));
+    if (detail.candidate.meta.schemaVersion === 3 && !selected && !url.searchParams.has('to')) {
+      sendJson(res, 200, { mode: 'full', unifiedDiff: '', fromRevision: null, toRevision: detail.candidate.meta.currentRevision,
+        fromBase: null, toBase: detail.candidate.meta.issue!.baseRevision, resolutionMode: null, notes: ['本问题为文字方案，没有当前补丁。'] });
+      return;
+    }
+    const current = selected?.id ?? detail.candidate.meta.currentRevision;
     const to = Number(url.searchParams.get('to') ?? String(current));
     const from = Number(url.searchParams.get('from') ?? '0');
     const toRevision = detail.candidate.meta.revisions.find((revision) => revision.id === to);
@@ -425,6 +437,20 @@ export class ReadModels {
       sharedItems.map((item) => item.id),
       view?.source ? { candidateInfo: (id) => v2Info.get(id) ?? null, events } : undefined,
     );
+    const native = new Map<string, ReturnType<typeof projectIssue>>();
+    for (const summary of queue.items.filter(item => !item.localOnly && item.schemaVersion === 3 && !item.parseError)) {
+      const { candidate } = await runtime.store.get(summary.id, null, view?.source);
+      if (!candidate.meta.issue) continue;
+      if (native.has(candidate.meta.findingId!)) throw new ApiError(409, 'conflict', '同一问题存在重复的权威 review.md');
+      const issue = projectIssue(candidate);
+      const patchHashes = await Promise.all(candidate.meta.revisions.map(async revision => {
+        const text = await view?.source?.readPatchText(candidate.month, candidate.slug, revision.patch);
+        return [revision.id, text == null ? null : createHash('sha256').update(text).digest('hex')];
+      }));
+      issue.findingVersion = createHash('sha256').update(JSON.stringify([issue.findingVersion, patchHashes])).digest('hex');
+      native.set(candidate.meta.findingId!, issue);
+    }
+    projected.findings = [...projected.findings.filter(item => !native.has(item.findingId)), ...native.values()];
     const errors = [
       ...records.filter((record) => record.parseError).map((record) => `${record.dirName}: ${record.parseError}`),
       ...projected.errors,
@@ -462,6 +488,7 @@ export class ReadModels {
     const runtime = await this.host.runtimeFor(url);
     const id = idFrom(url);
     const detail = await runtime.store.get(id, null, await sharedSourceFor(runtime));
+    const selection = requireIssueSelection(detail.candidate.meta, issueSelection(Object.fromEntries(url.searchParams)));
     const comments = detail.candidate.meta.comments.filter((comment) => comment.status !== 'resolved');
     const runner = new Runner({
       kind: 'manual',
@@ -469,13 +496,14 @@ export class ReadModels {
       store: runtime.store,
       candidate: detail.candidate,
       mode: 'ADDRESS_FEEDBACK',
+      ...(selection ? { selection } : {}),
       comments,
       log: () => undefined,
     });
     const result = await runner.run();
     const mode = url.searchParams.get('mode') === 'session' ? 'session' : 'headless';
     const rawPrompt = result.prompt ?? result.errorMessage ?? '';
-    const prompt = mode === 'session' && rawPrompt ? toSessionFixPrompt(rawPrompt, await loadSystemPrompt()) : rawPrompt;
+    const prompt = mode === 'session' && rawPrompt ? toSessionFixPrompt(rawPrompt, await loadSystemPrompt(detail.candidate.meta.schemaVersion)) : rawPrompt;
     sendJson(res, 200, { prompt, comments, mode, title: detail.candidate.meta.title, revision: detail.candidate.meta.currentRevision });
   }
 

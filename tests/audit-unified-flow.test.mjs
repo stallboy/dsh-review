@@ -10,6 +10,7 @@ import { ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { runGateChecks } from '../packages/dsh-plugin/dist/host/validator.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
+import { fullPatch, taskData } from './fixtures/proposal-patch.mjs';
 import { runAuditChannel } from './fixtures/phased-audit-agent.mjs';
 
 const source = 'export const add = (a, b) => a - b;';
@@ -90,7 +91,7 @@ async function waitForJob(api, id) {
 
 for (const vcsType of ['git', 'svn']) {
     for (const mode of ['external', 'headless']) {
-        test(vcsType + ' ' + mode + ' 共用阶段、报告排序和收尾门禁', { timeout: 35_000 }, async t => {
+        test(vcsType + ' ' + mode + ' 共用原目录阶段、问题索引和提案预检', { timeout: 35_000 }, async t => {
             const { root, temp } = await workspace(t, vcsType);
             const sourceFile = vcsType === 'svn' ? 'src/math@case.js' : 'src/math.js';
             const navigation = [{ path: sourceFile, line: 1 }];
@@ -101,7 +102,8 @@ for (const vcsType of ['git', 'svn']) {
                 statePath: path.join(temp, 'runtime.json'),
                 saveSettings: async settings => settings,
                 auditStageGates: runGateChecks,
-                auditStageExecutor: async ({ prompt }) => {
+                auditStageExecutor: async ({ prompt, repoRoot, onProcessTreeStopped }) => {
+                    onProcessTreeStopped?.(true);
                     if (prompt.startsWith('# 初审')) return {
                         leads: ['local-fix', 'policy-fix', 'future-fix'].map(leadId => ({
                             leadId, entry: leadId, navigation, preconditions: ['运行加法'], expectedBehavior: '正确计算', suspectedImpact: '计算错误',
@@ -111,7 +113,10 @@ for (const vcsType of ['git', 'svn']) {
                         verdict: 'confirmed', reason: '基线中实际执行减法', preconditions: ['输入两个非零数'],
                         observedBehavior: '返回差值', impact: '加法结果不正确', evidence: [{ ...navigation[0], excerpt: source, reason: '计算表达式' }], limits: [],
                     };
-                    return { status: 'ready', edits: [{ path: sourceFile, before: 'a - b', after: 'a + b' }], summary: '修正加法', reason: '' };
+                    const data = taskData(prompt);
+                    const patchPath = data.candidate.artifactDir + '/proposal.patch';
+                    await writeFile(path.join(repoRoot, patchPath), fullPatch(sourceFile, source + '\n', source.replace('a - b', 'a + b') + '\n'));
+                    return { status: 'ready', patchPath, confidence: 95, tradeoff: '直接修正表达式', humanDecisions: [], summary: '修正加法', reason: '' };
                 },
             });
             await api.init();
@@ -147,9 +152,13 @@ for (const vcsType of ['git', 'svn']) {
             const completed = await waitForJob(api, job);
             assert.equal(completed.result?.status, 'COMMITTED', JSON.stringify(completed));
             const report = await readFile(path.join(root, completed.result.reportPath), 'utf8');
-            assert.deepEqual([...report.matchAll(/^\| (P[0-3]) \| ([^|]+) \|/gm)].map(match => [match[1], match[2]]),
-                [['P0', '政策仍需确认'], ['P1', '等待政策落地'], ['P2', '加法结果错误']]);
-            assert.match(report, /1 通过/);
+            assert.ok(report.indexOf('政策仍需确认') < report.indexOf('等待政策落地'));
+            assert.ok(report.indexOf('等待政策落地') < report.indexOf('加法结果错误'));
+            assert.match(report, /schema_version: 3/);
+            assert.doesNotMatch(report, /门禁.*通过/);
+            const { body: findings } = await api.invoke({ method: 'GET', path: '/findings' });
+            assert.equal(findings.findings.length, 3);
+            assert.ok(findings.findings.every(item => item.reviewId));
         });
     }
 }

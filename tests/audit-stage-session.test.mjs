@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -7,6 +8,8 @@ import path from 'node:path';
 import { ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { registerAuditStageTools } from '../packages/dsh-plugin/dist/host/audit-stage-tools.js';
 import { AuditExecutorAuthenticationError, executeAuditCli, isAuditAuthenticationFailure, resolveAuditCliLaunch } from '../packages/dsh-plugin/dist/host/audit-stage-runner.js';
+import { fullPatch, taskData } from './fixtures/proposal-patch.mjs';
+import { parseReviewMarkdown } from '../packages/dsh-plugin/dist/host/frontmatter.js';
 import { compatibleAuditBase } from '../packages/dsh-plugin/dist/host/audit-stage-artifacts.js';
 import { GitAdapter } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { runGateChecks } from '../packages/dsh-plugin/dist/host/validator.js';
@@ -47,7 +50,8 @@ async function retryFixture(t) {
     return root;
 }
 
-function fakeExecutor({ prompt, executor }) {
+async function fakeExecutor({ prompt, executor, repoRoot, onProcessTreeStopped }) {
+    onProcessTreeStopped?.(true);
     if (prompt.startsWith('# 初审')) {
         assert.equal(executor, 'codex');
         return { leads: [lead('retry-job', 10), lead('retry-client', 4), lead('needs-decision', 4)], coverage: ['初审已检查两个入口'], limits: ['初审未覆盖并发请求'] };
@@ -70,10 +74,13 @@ function fakeExecutor({ prompt, executor }) {
     const optional = prompt.includes('使用空值合并');
     const addition = optional ? '    return store.find(request.id) ?? store.insert(request.id, request.value);'
         : '    const existing = store.find(request.id);\n    if (existing) return existing;\n    return store.insert(request.id, request.value);';
-    return { status: 'ready', summary: optional ? '查找不到现有记录时才写入' : '后台重试沿用现有记录', reason: '', edits: [
-        { path: sourcePath, before: insert, after: insert.split('\n')[0] + '\n' + addition },
-        { path: testPath, before: tests.split('\n').slice(-3).join('\n'), after: tests.split('\n').slice(-3).join('\n') + '\n' + regression },
-    ] };
+    const data = taskData(prompt);
+    const patchPath = data.candidate.artifactDir + '/proposal.patch';
+    const modified = (source + '\n').replace(insert, insert.split('\n')[0] + '\n' + addition);
+    await writeFile(path.join(repoRoot, patchPath), fullPatch(sourcePath, source + '\n', modified)
+        + fullPatch(testPath, tests + '\n', tests + '\n' + regression));
+    return { status: 'ready', patchPath, confidence: optional ? 90 : 95, tradeoff: optional ? '更简短的空值分支' : '显式保护分支', humanDecisions: [],
+        summary: optional ? '查找不到现有记录时才写入' : '后台重试沿用现有记录', reason: '' };
 }
 
 async function runRetryAudit(t, tamper, versioned = false) {
@@ -90,13 +97,9 @@ async function runRetryAudit(t, tamper, versioned = false) {
     const settings = { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType: 'git', gateTimeoutMs: 10_000 };
     const api = new ReviewApi({
         settings, saveSettings: async next => next, statePath: path.join(root, '.tmp', 'audit-state.json'),
-        auditStageGates: async (commands, options) => {
-            const check = await runGateChecks(commands, options);
-            if (tamper && ++gateCalls === 2) {
-                const file = path.join(root, '.ai-review', generatedCandidate, 'review.md');
-                await writeFile(file, await readFile(file, 'utf8') + '\nchanged after seal\n');
-            }
-            return check;
+        auditStageGates: async () => {
+            gateCalls++;
+            throw new Error('审查不得执行修复后门禁');
         },
         auditStageExecutor: async request => {
             stageContexts.push(request);
@@ -186,10 +189,10 @@ async function runRetryAudit(t, tamper, versioned = false) {
         assert.doesNotMatch(prompt, /"subjectId": "(?:retry-job|retry-client|needs-decision)"/);
         assert.match(prompt, /同一请求最多写一次/);
         assert.match(prompt, /本轮用户附加要求/);
-        assert.match(prompt, /"line":10,"text":"    return store\.insert\(request\.id, request\.value\);"/);
+        assert.doesNotMatch(prompt, /固定基线只读视图|\"files\"/);
+        assert.match(prompt, /Harness.*自主读取/);
         assert.match(prompt, new RegExp(base));
     }
-    const taskData = prompt => JSON.parse(prompt.split('## 任务数据\n')[1].split('\n\n从实际入口')[0]);
     assert.match(taskData(verificationPrompts[0]).question, /写入成功但响应超时后.*同一请求 ID.*写入几次/);
     assert.deepEqual(taskData(verificationPrompts[0]).navigation, taskFor(jobId).navigation);
     if (!live) {
@@ -204,8 +207,8 @@ async function runRetryAudit(t, tamper, versioned = false) {
         acceptance: ['后台同 ID 重试只写一次', '测试必须新增证明后台重试的用例', '保持 API 与存储接口兼容'], gateCommands: [gate] });
     assert.equal(result.status, 'ready', JSON.stringify(result));
     generatedCandidate = result.candidateId;
-    const findings = [{ subjectId: jobId, title: '后台重试重复写入', priority: 'P2', kind: 'A', decision: '', dependsOn: '' }];
-    if (!live) findings.push({ subjectId: 'needs-decision', title: '数据语义需要人工决定', priority: 'P0', kind: 'B', decision: '确认同 ID 不同 payload 的规则', dependsOn: '' });
+    const findings = [{ repairPlan: '按独立复核的证据修复重试并添加回归验收。', subjectId: jobId, title: '后台重试重复写入', priority: 'P2', kind: 'A', decision: '', dependsOn: '' }];
+    if (!live) findings.push({ subjectId: 'needs-decision', title: '数据语义需要人工决定', priority: 'P0', kind: 'B', repairPlan: '明确同 ID 不同 payload 的规则及取舍，再由执行人修改。', decision: '确认同 ID 不同 payload 的规则', dependsOn: '' });
     let alternative;
     if (versioned) {
         alternative = await stage('patch', 'codex', { subjectId: jobId, auditType: 'reuse', allowedPaths: [sourcePath, testPath],
@@ -218,6 +221,11 @@ async function runRetryAudit(t, tamper, versioned = false) {
             requirements: ['REQ-1 API 兼容'], history: [] }),
     });
     assert.equal(published.reportPath, body.reportPath);
+    const records = await new (await import('../packages/dsh-plugin/dist/host/store.js')).ReviewStore(root).listCandidateIds();
+    const repairId = records.find(id => parseReviewMarkdown(requireText(id)).meta.issue.options.length > 0);
+    function requireText(id) { return readFileSync(path.join(root, '.ai-review', id, 'review.md'), 'utf8'); }
+    generatedCandidate = repairId;
+    if (tamper) await writeFile(path.join(root, '.ai-review', repairId, 'review.md'), requireText(repairId) + '\nchanged after seal\n');
     assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), base);
     finishTurn();
     let job;
@@ -228,40 +236,42 @@ async function runRetryAudit(t, tamper, versioned = false) {
     }
     if (tamper) {
         assert.equal(job?.result?.status, 'RECOVERY_REQUIRED', JSON.stringify(job));
-        assert.match(job.result.detail, /快照与本轮封存内容不符/);
+        assert.match(job.result.detail, /发生变化|清单|封存/);
         assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), base);
         return;
     }
     assert.equal(job?.result?.status, 'COMMITTED', JSON.stringify(job));
     const report = await readFile(path.join(root, body.reportPath), 'utf8');
-    assert.match(report, /插件复核/);
-    assert.match(report, /declared/);
-    assert.match(report, versioned ? /2 通过/ : /1 通过/);
+    assert.match(report, /schema_version: 3/);
+    assert.match(report, /问题索引/);
+    assert.doesNotMatch(report, /门禁.*通过|未进入基线视图/);
+    assert.equal(gateCalls, 0, '审查阶段不得调用修复门禁');
+    const issue = parseReviewMarkdown(requireText(repairId)).meta;
+    assert.equal(issue.schemaVersion, 3);
+    assert.equal(issue.issue.options.length, alternative ? 2 : 1);
+    assert.equal(records.length, live ? 1 : 2, '每个问题一份记录，文字方案也有记录');
+    assert.equal(new Set(issue.issue.options.map(option => option.id)).size, alternative ? 2 : 1);
+    assert.deepEqual(issue.revisions.map(revision => revision.patch), alternative ? ['001.patch', '002.patch'] : ['001.patch']);
     if (alternative) {
-        assert.match(report, /schema_version: 2/);
-        const alternateReview = await readFile(path.join(root, '.ai-review', alternative.candidateId, 'review.md'), 'utf8');
-        assert.match(alternateReview, /^audit_type: reuse$/m);
         const { body: view } = await api.invoke({ method: 'GET', path: '/findings' });
         const grouped = view.findings.find(item => item.options?.length === 2);
-        assert.deepEqual(grouped.options.map(option => option.candidateId), [result.candidateId, alternative.candidateId]);
-        assert.ok(view.findings.some(item => item.repairPlan && item.options.length === 0));
+        assert.deepEqual(grouped.options.map(option => option.candidateId), [repairId, repairId]);
+        assert.deepEqual(grouped.options.map(option => option.patchId), [1, 2]);
+        assert.ok(view.findings.some(item => item.reviewId && item.options.length === 0));
     }
     if (!live) {
-        assert.ok(report.indexOf('| P0 |') < report.indexOf('| P2 |'));
-        assert.match(report, /retry-client：已排除/);
+        assert.ok(report.indexOf('数据语义需要人工决定') < report.indexOf('后台重试重复写入'));
+        assert.match(report, /retry-client/);
         assert.match(report, /初审已检查两个入口/);
         assert.match(report, /初审未覆盖并发请求/);
         assert.match(report, /复核未覆盖存储事务/);
-        for (const stage of ['scan', 'verify', 'patch']) {
-            assert.match(report, new RegExp(stage + '-\\d+ 有 1 个文件未进入基线视图'));
-        }
-        assert.match(report, /target_files:\s*\n\s+- src\/retry\.cjs/);
+        assert.ok(stageContexts.every(ctx => ctx.repoRoot === root));
+        assert.ok(stageContexts.every(ctx => !ctx.prompt.includes(' '.repeat(1000))));
     }
     const changed = runCommand('git', ['diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD'], root).stdout.trim().split(/\r?\n/);
-    assert.deepEqual(changed.sort(), [
-        '.ai-review/' + result.candidateId + '/001.patch', '.ai-review/' + result.candidateId + '/review.md', published.reportPath,
-        ...(alternative ? ['.ai-review/' + alternative.candidateId + '/001.patch', '.ai-review/' + alternative.candidateId + '/review.md'] : []),
-    ].sort());
+    assert.ok(changed.includes(published.reportPath));
+    assert.ok(records.every(id => changed.includes('.ai-review/' + id + '/review.md')));
+    assert.ok(changed.every(file => file.startsWith('.ai-review/')));
     assert.equal(await readFile(path.join(root, sourcePath), 'utf8'), source + '\n');
     assert.equal(api.leaseLookup(body.auditId).state, 'released');
 }
@@ -272,7 +282,7 @@ test('DSH 阶段工具完整运行重试案例，隔离复核，按优先级排�
 test('DSH 阶段工具发布同一发现的两个独立补丁与纯文字方案', { timeout: 900_000 },
     t => runRetryAudit(t, false, true));
 
-test('Host 门禁期间同一路径被改写时保留租约并拒绝提交', { timeout: 120_000 },
+test('封存后同一路径被改写时保留租约并拒绝提交', { timeout: 120_000 },
     t => runRetryAudit(t, true));
 
 test('阶段业务基线允许仅评审元数据推进，拒绝业务文件推进', async t => {
@@ -331,6 +341,7 @@ test('认证失败只派发一次，复核证据不足可以通过阶段工具�
         },
         auditStageExecutor: async request => {
             executions.push([request.executor, request.location]);
+            request.onProcessTreeStopped(true);
             if (request.executor === 'claude-code') throw new AuditExecutorAuthenticationError('claude-code');
             if (request.prompt.startsWith('# 初审')) {
                 return { leads: [lead('first', 4), lead('second', 10)], coverage: [], limits: [] };
@@ -374,7 +385,7 @@ test('认证失败只派发一次，复核证据不足可以通过阶段工具�
     assert.equal(api.leaseLookup(body.auditId).state, 'released');
     const report = await readFile(path.join(root, publication.reportPath), 'utf8');
     assert.match(report, /first：证据不足/);
-    assert.match(report, /插件复核/);
+    assert.match(report, /覆盖与限制/);
     const jobLog = job.log.join('\n');
     assert.match(jobLog, /verify-2 claude-code.*认证失败/);
     assert.match(jobLog, /已封存.*0 个正式发现/);

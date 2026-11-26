@@ -17,10 +17,10 @@ export const AUDIT_PROMPT_FIELDS: Readonly<Record<AuditTemplate, readonly string
 const AUDIT_TYPE_GUIDE = '审查类型：bugfix 修复可复现缺陷；delete 删除无引用代码；shrink 收缩实现并保留职责；reuse 复用已有实现；merge 合并必须同步演进的实现；split 按真实职责拆分；stdlib 改用标准库；native 改用平台原生能力；yagni 删除无当前需求的抽象或能力。';
 
 const CONTRACT: Record<AuditTemplate, string> = {
-    orchestrator: '按正确性、安全性、负载下的稳定性、测试、性能和精简的顺序安排覆盖。P0 为严重数据损坏、关键权限边界失效或核心服务大范围不可用，P1 为典型条件下有实质影响的核心路径错误，P2 为局部或受限缺陷，P3 为有证据的低收益改进。A 类须消除根因、收敛影响、保持公开 API、协议和持久化格式兼容，并有经过门禁验证的候选。涉及业务取舍或无法交付可验证候选的已确认问题进入 B。Deferred 须有先闭合的稳定 finding ID。' + AUDIT_TYPE_GUIDE,
+    orchestrator: '按正确性、安全性、负载下的稳定性、测试、性能和精简的顺序安排覆盖。P0 为严重数据损坏、关键权限边界失效或核心服务大范围不可用，P1 为典型条件下有实质影响的核心路径错误，P2 为局部或受限缺陷，P3 为有证据的低收益改进。A 类须消除根因、收敛影响、保持公开 API、协议和持久化格式兼容，并有经格式、路径、基线及只读应用预检的完整补丁提案。涉及业务取舍或无法交付可验证候选的已确认问题进入 B。Deferred 须有先闭合的稳定 finding ID。' + AUDIT_TYPE_GUIDE,
     scan: '只读初审。从构建和业务入口追到真实分支、状态变化及现有测试。缺陷需有可观察后果，精简需检查静态、配置、测试和动态引用。审查关注点用于安排覆盖。未取得证据的内容记入 limits。',
     verify: '固定基线，独立验证一条中性问题。对可达性、实际后果和阻止触发的保护都须核对。成立、排除或证据不足都要给具体理由；确定结论须附可回读的路径、行、原文和理由。',
-    patch: '候选独立以本轮基线为准。消除根因并保持公开 API、协议和持久化格式。Host 仅在专用副本应用文本编辑，按受信门禁白名单执行命令。Host 生成 UTF-8/LF 全量 001.patch 与 review.md，初始 pending/rev1/approval=null，归档时按发现格式关联，owner 按同一基线路由，门禁只写实际通过项。评审数据与暂存文件不得出现在业务补丁中。' + AUDIT_TYPE_GUIDE,
+    patch: '在项目原工作目录中自主读取文件，消除根因并保持公开 API、协议和持久化格式。直接在 candidate.artifactDir 写 UTF-8 完整统一 diff，返回仓库相对 patchPath、summary、tradeoff、0 到 100 的整数 confidence、humanDecisions 和 reason；无法安全生成时 status=blocked、patchPath 为空。禁止编辑业务源码或应用提案，包括临时副本；修复效果门禁留给人工批准后的程序。Host 只进行格式、路径、基线和只读应用预检，不把预检称为修复验证。评审数据不得出现在业务补丁中。' + AUDIT_TYPE_GUIDE,
 };
 
 const PLACEHOLDER = /\{\{([^{}]+)\}\}/g;

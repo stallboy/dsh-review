@@ -28,13 +28,13 @@ export async function setupCentral(t, options = {}) {
     return { app, dataDir, headers, createCentralApp };
 }
 
-export async function registerNode(app, name = 'node-a', workspaceId = 'workspace-a') {
+export async function registerNode(app, name = 'node-a', workspaceId = 'workspace-a', capabilities = { issueWorkflow: true }) {
     const credential = app.database.createNode(name);
     const headers = { authorization: `Bearer ${credential.token}` };
     const instanceId = `instance-${name}`;
     const reply = await app.inject({ method: 'POST', url: '/node-api/v1/register', headers, payload: {
         protocolVersion: 1, instanceId, pluginVersion: '0.3.0', dshVersion: '0.2.1', platform: 'linux',
-        workspaces: [{ workspaceId, label: workspaceId, vcsType: 'git', target: 'main' }],
+        workspaces: [{ workspaceId, label: workspaceId, vcsType: 'git', target: 'main', ...capabilities }],
     } });
     assert.equal(reply.statusCode, 200, reply.body);
     return { ...credential, headers, instanceId, workspaceId };

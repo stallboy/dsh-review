@@ -132,6 +132,14 @@ function isApprovedReview(text: string): boolean {
   }
 }
 
+function issueApproval(text: string | null): string | undefined {
+  if (!text) return undefined;
+  try {
+    const { meta } = parseReviewMarkdown(text);
+    return meta.schemaVersion === 3 && meta.approval ? JSON.stringify(meta.approval) : undefined;
+  } catch { return undefined; }
+}
+
 function toRepoRelative(value: string): string {
   return value
     .trim()
@@ -430,7 +438,9 @@ export class GitAdapter implements VcsAdapter {
       return { revision: null, lookup: 'unknown', diagnostic: '候选没有补丁文件，无法派生' };
     }
     // Git 默认不为合并提交列出逐文件差异，用 -m 才能发现相对任一父提交删除的补丁。
-    const deleters = await git(this.root, [
+    const reviewProbe = await this.getCommitProbe([input.reviewPath]);
+    const native = issueApproval(reviewProbe ? await this.readFileAt(reviewProbe, input.reviewPath) : null);
+    const deleters = await git(this.root, native ? ['log', '-m', '--format=%H', '--', input.reviewPath] : [
       'log', '-m', '--diff-filter=D', '--format=%H', '--', ...input.patchPaths,
     ]);
     if (deleters.code !== 0) {
@@ -441,13 +451,14 @@ export class GitAdapter implements VcsAdapter {
     for (const commit of commits) {
       const current = await this.readFileAt(commit, input.reviewPath);
       if (current === null || !isApprovedReview(current)) continue;
+      if (native && issueApproval(current) !== native) continue;
       const parentList = await git(this.root, ['show', '-s', '--format=%P', commit]);
       if (parentList.code !== 0) continue;
       const parents = [...new Set(parentList.stdout.split(/\s+/).map((item) => item.trim()).filter((item) => item.length > 0))];
       let parentApproved = false;
       for (const parent of parents) {
         const parentReview = await this.readFileAt(parent, input.reviewPath);
-        if (parentReview !== null && isApprovedReview(parentReview)) {
+        if (parentReview !== null && (native ? issueApproval(parentReview) === native : isApprovedReview(parentReview))) {
           parentApproved = true;
           break;
         }
@@ -456,7 +467,7 @@ export class GitAdapter implements VcsAdapter {
       let patchesDeleted = true;
       for (const patchPath of input.patchPaths) {
         const stillThere = await git(this.root, ['cat-file', '-e', `${commit}:${toRepoRelative(patchPath)}`]);
-        if (stillThere.code === 0) {
+        if (native ? stillThere.code !== 0 : stillThere.code === 0) {
           patchesDeleted = false;
           break;
         }
@@ -1112,6 +1123,8 @@ export class SvnAdapter implements VcsAdapter {
       return { revision: null, lookup: 'unknown', diagnostic: `无法读取 SVN 仓库相对 URL，不能精确匹配路径：${describe(relativeUrl)}` };
     }
     const reviewRepoPath = svnRepoPath(prefix, input.reviewPath);
+    const probe = await this.getCommitProbe([input.reviewPath]);
+    const native = issueApproval(probe ? await this.readFileAt(probe, input.reviewPath) : null);
     const patchRepoPaths = input.patchPaths.map((patch) => svnRepoPath(prefix, patch));
     const targetRepoPaths = input.targetFiles.map((target) => svnRepoPath(prefix, target));
     const normalizedReview = toRepoRelative(input.reviewPath);
@@ -1128,14 +1141,16 @@ export class SvnAdapter implements VcsAdapter {
       const reviewModified = paths.some((item) => item.action === 'M' && item.path === reviewRepoPath);
       const patchesDeleted = patchRepoPaths.every((patch) => paths.some((item) => item.action === 'D' && item.path === patch));
       const touchesTarget = targetRepoPaths.some((target) => paths.some((item) => item.path === target));
-      if (reviewModified && patchesDeleted && touchesTarget) matches.push(revision);
+      if (reviewModified && (native || patchesDeleted) && touchesTarget) matches.push(revision);
     }
     const verified: string[] = [];
     for (const revision of matches) {
       const current = await this.readFileAt(revision, input.reviewPath);
       if (current === null || !isApprovedReview(current)) continue;
+      if (native && issueApproval(current) !== native) continue;
       const parent = await this.readFileAt(String(Number(revision) - 1), input.reviewPath);
-      if (parent !== null && isApprovedReview(parent)) continue;
+      if (parent !== null && (native ? issueApproval(parent) === native : isApprovedReview(parent))) continue;
+      if (native && (await Promise.all(input.patchPaths.map(file => this.readFileAt(revision, file)))).some(text => text === null)) continue;
       verified.push(revision);
     }
     if (verified.length === 1) return { revision: verified[0] ?? null, lookup: 'found' };
@@ -1231,9 +1246,13 @@ export class SvnAdapter implements VcsAdapter {
     }
   }
 
-  /** SVN 审批预检包含额外的完整性判定，详情预检保持仅诊断。 */
-  async checkPatch(_patchPath: string): Promise<ApplyPatchResult> {
-    return { ok: false, conflict: false, message: 'SVN 暂不支持补丁预检（仅诊断）' };
+  async checkPatch(patchPath: string): Promise<ApplyPatchResult> {
+    const check = await runProcess('svn', ['--non-interactive', 'patch', '--dry-run', '--', patchPath], {
+      cwd: this.root, timeoutMs: VCS_TIMEOUT_MS, maxBytes: SVN_APPROVAL_PATCH_LIMIT,
+      env: { LC_ALL: '', LC_MESSAGES: 'C', LANGUAGE: 'C' },
+    });
+    const state = classifySvnApprovalPatch(check);
+    return { ok: state === 'complete', conflict: state === 'conflict', message: tailLines(describe(check), 80) };
   }
 
   async exportWorkingTreeDiff(_base: string, paths: string[]): Promise<string> {

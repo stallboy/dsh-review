@@ -1,4 +1,5 @@
-export type ReviewStatus = 'pending' | 'changes_requested' | 'approved' | 'rejected';
+export type ReviewStatus = 'pending' | 'changes_requested' | 'approved' | 'rejected'
+    | 'repair_failed' | 'human_takeover' | 'awaiting_verification' | 'resolved';
 export type CommentStatus = 'unresolved' | 'partial' | 'resolved';
 export type VcsType = 'git' | 'svn';
 export type DiffResolutionMode = 'same_base_direct' | 'cross_base_3way_clean' | 'cross_base_hunk_fallback';
@@ -102,6 +103,62 @@ export interface GateCheckResult {
     outputTail: string;
 }
 
+export interface RepairOption {
+    extra?: Record<string, unknown>;
+    id: string;
+    title: string;
+    tradeoff: string;
+    confidence: number;
+    currentPatch: number;
+    gateChecks: string[];
+}
+
+export interface IssueObservation {
+    extra?: Record<string, unknown>;
+    auditId: string;
+    baseRevision: string;
+    at: string;
+    verdict: 'confirmed' | 'resolved' | 'unverified';
+    reason: string;
+    evidence: Array<{ path: string; line: number; excerpt: string; reason: string; extra?: Record<string, unknown> }>;
+}
+
+export interface IssueDecision {
+    extra?: Record<string, unknown>;
+    action: 'accept_as_is' | 'defer' | 'human_takeover' | 'external_completed' | 'add_repair_hint' | 'resume_review';
+    actor: string;
+    at: string;
+    reason: string;
+    reviewAfter?: string;
+    reviewWhen?: string;
+}
+
+export interface RepairAttempt {
+    extra?: Record<string, unknown>;
+    optionId: string;
+    patchId: number;
+    baseRevision: string;
+    at: string;
+    actor: string;
+    result: 'applied' | 'verification_failed';
+    restored: boolean;
+    evidence: string;
+}
+
+export interface IssueReview {
+    priority: 'P0' | 'P1' | 'P2' | 'P3';
+    baseRevision: string;
+    options: RepairOption[];
+    observations: IssueObservation[];
+    decisions: IssueDecision[];
+    repairAttempts: RepairAttempt[];
+}
+
+export interface IssueSelection {
+    optionId: string;
+    patchId: number;
+}
+
 export interface ReviewFrontmatter {
     schemaVersion: number;
     findingId?: string;
@@ -133,6 +190,7 @@ export interface ReviewFrontmatter {
     reopenedReason?: string | null;
 
     extra: Record<string, unknown>;
+    issue?: IssueReview;
 }
 
 export interface HumanJudgmentItem {
@@ -186,6 +244,8 @@ export interface PatchCheckDiagnostic {
 }
 
 export interface CandidateSummary {
+    schemaVersion?: number;
+    issue?: IssueReview;
     findingId?: string;
     id: string;
     title: string;

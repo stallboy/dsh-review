@@ -11,6 +11,7 @@ import { isAiReviewPath, parsePatch } from './patch.js';
 import { loadReviewers, resolveOwner } from './reviewers.js';
 import { runGateChecks } from './validator.js';
 import { Runner } from './runner.js';
+import { issueSelection, requireIssueSelection } from './issue-review.js';
 import type { ReviewStore } from './store.js';
 import type { AiFixAbortReason, AiFixOutcome, AiFixRecoveryReason, JobRecord, ReviewCandidate } from './types.js';
 import { ApiError } from './types.js';
@@ -96,6 +97,7 @@ export class Writers {
     runtime: Runtime,
     previous: ReviewCandidate,
     latest: ReviewCandidate,
+    selection?: import('./types.js').IssueSelection,
   ): Promise<string[]> {
     const errors: string[] = [];
     if (latest.parseError) errors.push(latest.parseError);
@@ -172,7 +174,24 @@ export class Writers {
     if (latest.meta.commitMessage.split(/\r?\n/, 1)[0] !== latest.meta.title) {
       errors.push('commit_message 首行必须与 title 完全一致');
     }
-    const current = latest.meta.revisions.find((revision) => revision.id === latest.meta.currentRevision);
+    const current = latest.meta.schemaVersion === 3 ? latest.meta.revisions.at(-1)
+      : latest.meta.revisions.find((revision) => revision.id === latest.meta.currentRevision);
+    if (previous.meta.schemaVersion === 3 && previous.meta.issue && latest.meta.issue) {
+      const selected = selection ?? (() => {
+        const changed = latest.meta.issue!.options.filter(option => previous.meta.issue!.options.find(old => old.id === option.id)?.currentPatch !== option.currentPatch);
+        return changed.length === 1 ? { optionId: changed[0]!.id, patchId: previous.meta.issue!.options.find(option => option.id === changed[0]!.id)?.currentPatch ?? 0 } : undefined;
+      })();
+      if (!selected || current?.extra?.['option_id'] !== selected.optionId || current.id !== previous.meta.revisions.length + 1) errors.push('新补丁必须追加到明确选定的方案');
+      for (const field of ['observations', 'decisions', 'repairAttempts'] as const) {
+        if (JSON.stringify(previous.meta.issue[field]) !== JSON.stringify(latest.meta.issue[field])) errors.push('提案迭代不得修改问题观察、人工处置或修复结果');
+      }
+      if (previous.meta.issue.options.length !== latest.meta.issue.options.length) errors.push('提案迭代不得增删既有方案');
+      for (const option of previous.meta.issue.options) {
+        const next = latest.meta.issue.options.find(item => item.id === option.id);
+        if (!next || (option.id !== selected?.optionId && JSON.stringify(option) !== JSON.stringify(next))
+          || (option.id === selected?.optionId && next.currentPatch !== current?.id)) errors.push('只能推进所选方案的当前补丁，必须保留其他方案');
+      }
+    }
     if (!current) {
       errors.push('新版本缺少当前 revision 条目');
       return errors;
@@ -191,8 +210,9 @@ export class Writers {
       if (paths.length === 0) errors.push('新补丁没有业务文件');
       if (patchTouchesReviewData(patchText)) errors.push('新补丁包含禁止路径');
       if (errors.length === 0) {
-        const applied = await this.applyPatchText(runtime.vcs, patchText, false);
-        await runtime.vcs.revertBusinessWorkspace().catch(() => undefined);
+        const applied = latest.meta.schemaVersion === 3 ? await runtime.vcs.checkPatch(path.join(latest.dirPath, current.patch))
+          : await this.applyPatchText(runtime.vcs, patchText, false);
+        if (latest.meta.schemaVersion !== 3) await runtime.vcs.revertBusinessWorkspace().catch(() => undefined);
         if (!applied.ok) errors.push(`新补丁无法在基线上严格应用：${applied.message}`);
       }
     }
@@ -386,6 +406,7 @@ export class Writers {
       throw new ApiError(422, 'bad_request', 'anchor 必须是 {snippet: 非空 string, before?, after?}');
     }
     const candidate = await store.addComment(id, author, {
+      ...(issueSelection(body) ? { selection: issueSelection(body) } : {}),
       content: stringField(body, 'content'),
       ...(typeof body['file'] === 'string' ? { file: body['file'] } : {}),
       ...(typeof body['line'] === 'number' ? { line: body['line'] } : {}),
@@ -403,7 +424,7 @@ export class Writers {
           expectedRevision: candidate.meta.currentRevision,
           expectedOwner: candidate.meta.owner,
           expectedUpdatedAt: candidate.meta.updatedAt,
-        });
+        }, issueSelection(body));
       } catch (error) {
         autoFixError = error instanceof Error ? error.message : String(error);
       }
@@ -502,6 +523,7 @@ export class Writers {
       }
       return {
         content: typeof record['content'] === 'string' ? record['content'] : '',
+        ...(issueSelection(body) ? { selection: issueSelection(body) } : {}),
         ...(typeof record['file'] === 'string' ? { file: record['file'] } : {}),
         ...(typeof record['line'] === 'number' ? { line: record['line'] } : {}),
         ...(typeof record['revision'] === 'number' ? { revision: record['revision'] } : {}),
@@ -520,7 +542,7 @@ export class Writers {
           expectedRevision: candidate.meta.currentRevision,
           expectedOwner: candidate.meta.owner,
           expectedUpdatedAt: candidate.meta.updatedAt,
-        });
+        }, issueSelection(body));
       } catch (error) {
         autoFixError = error instanceof Error ? error.message : String(error);
       }
@@ -545,6 +567,9 @@ export class Writers {
     await this.requireOwnerOf(store, id);
     await this.requireSharedCandidate(runtime, id);
     await store.ensureWriteAllowed(detail.candidate, guard);
+    if (detail.candidate.meta.schemaVersion === 3) {
+      throw new ApiError(409, 'conflict', '问题记录应使用问题处置入口，补丁历史必须保留');
+    }
     // 补丁随后会被删除，需先提取符号供拒绝记录和后续复查使用。
     const relatedSymbols = [...new Set(
       [...detail.patchText.matchAll(/^@@[^\n]*@@\s*(\S[^\n]*)$/gm)]
@@ -642,12 +667,46 @@ export class Writers {
     }
     const actor = await this.host.ownerFor(runtime.root);
     const reviewers = await loadReviewers(runtime.root, view.source);
-    if (resolveOwner(reviewers, { paths: finding.targetFiles, tags: [] }).owner !== actor) {
+    const sharedIssue = finding.schemaVersion === 3 && finding.reviewId
+      ? (await runtime.store.get(finding.reviewId, null, view.source)).candidate : undefined;
+    if ((sharedIssue?.meta.owner ?? resolveOwner(reviewers, { paths: finding.targetFiles, tags: [] }).owner) !== actor) {
       throw new ApiError(403, 'forbidden', '只有发现负责人可以记录处置');
     }
     const state = new FindingApprovalState(runtime.root, id, this.host.deps.statePath);
     if (!await state.canRetry(runtime.vcs).catch(() => false)) {
       throw new ApiError(409, 'conflict', '该发现的上一次审批提交结果仍待核验');
+    }
+    if (finding.schemaVersion === 3 && finding.reviewId) {
+      const candidateId = finding.reviewId;
+      await this.requireSharedCandidate(runtime, candidateId);
+      const candidate = sharedIssue!;
+      const before = await this.reviewBackup(runtime.store, candidateId);
+      if (before === null) throw new ApiError(409, 'conflict', '问题记录无法备份');
+      const issue = candidate.meta.issue!;
+      if (decision.action === 'external_completed' && candidate.meta.status !== 'human_takeover') {
+        throw new ApiError(409, 'conflict', '只有人工接手的问题可以反馈外部完成');
+      }
+      issue.decisions.push({ action: decision.action, actor, at: new Date().toISOString(),
+        reason: ('hint' in decision ? decision.hint : 'reason' in decision ? decision.reason : '') ?? '',
+        ...('reviewAfter' in decision && decision.reviewAfter ? { reviewAfter: decision.reviewAfter } : {}),
+        ...('reviewWhen' in decision && decision.reviewWhen ? { reviewWhen: decision.reviewWhen } : {}) });
+      if (decision.action === 'human_takeover') candidate.meta.status = 'human_takeover';
+      if (decision.action === 'external_completed') candidate.meta.status = 'awaiting_verification';
+      if (decision.action === 'resume_review') candidate.meta.status = 'pending';
+      await runtime.store.write(candidate);
+      file = '.ai-review/' + candidateId + '/review.md';
+      const text = await readFile(candidate.reviewPath, 'utf8');
+      const commit = await this.commitAndClassify({ runtime, message: `review(${candidateId}): ${decision.action}`,
+        paths: [file], expectedFiles: [{ relPath: file, text }] });
+      if (!commit.landed) {
+        if (commit.outcome === 'RECOVERY_REQUIRED') throw new ApiError(409, 'conflict', '问题处置提交结果待核验，保留现场', {
+          status: commit.outcome, reason: 'COMMIT_OUTCOME_UNKNOWN', detail: commit.detail });
+        await auditFiles(runtime.root, { op: 'write', paths: [file], text: before, expectedText: text });
+        throw new ApiError(409, 'conflict', '问题处置未提交，已恢复原记录', { reason: 'COMMIT_FAILED', detail: commit.detail });
+      }
+      const updated = await this.readModels.findingProjection(runtime);
+      sendJson(res, 200, { finding: updated.findings.find(item => item.findingId === id), commitRevision: commit.commitRevision });
+      return;
     }
     const before = await view.source.readFindingText(id);
     const local = (await auditFiles(runtime.root, { op: 'read', paths: [file] })).bytes?.toString('utf8') ?? null;
@@ -849,6 +908,12 @@ export class Writers {
     if (detail.candidate.meta.owner !== me) throw new ApiError(403, 'forbidden', '只有候选 Owner 可以 Rebase');
     await this.requireSharedCandidate(runtime, id);
     await store.ensureWriteAllowed(detail.candidate, guard);
+    if (detail.candidate.meta.schemaVersion === 3) {
+      const selection = requireIssueSelection(detail.candidate.meta, issueSelection(body));
+      const job = await this.host.startAiFixJob(runtime, id, guard, selection, true);
+      sendJson(res, 202, { jobId: job.id, job });
+      return;
+    }
     const job = this.host.jobManager.start('ai_fix', (log, jobId, signal): Promise<AiFixOutcome> => this.host.withWriteLock(store.repoRoot, async () => {
       const source = await sharedSourceFor(runtime);
       if (!source) return this.aborted('INVALID_CANDIDATE', '当前仓库没有可用的共享快照，无法 Rebase', jobId);
@@ -1006,6 +1071,38 @@ export class Writers {
     if (!id) throw new ApiError(400, 'bad_request', '缺少候选 id');
     const sharedSource = await sharedSourceFor(runtime);
     const shared = sharedSource ? await sharedSource.readReviewText(...splitId(id)) : null;
+    if (shared !== null && sharedSource && (await store.get(id, null, sharedSource)).candidate.meta.schemaVersion === 3) {
+      const guard = guardFrom(body);
+      const selection = issueSelection(body);
+      const job = this.host.jobManager.start('ai_fix', (_log, jobId) => this.host.withWriteLock(store.repoRoot, async (): Promise<AiFixOutcome> => {
+        const source = await sharedSourceFor(runtime);
+        if (!source || await source.snapshotId() !== await sharedSource.snapshotId()) return this.aborted('CONCURRENCY_MISMATCH', '共享快照已变化，请重新核对提案', jobId);
+        const previous = (await store.get(id, null, source)).candidate;
+        if (previous.meta.schemaVersion !== 3) return this.aborted('INVALID_CANDIDATE', '此入口只支持问题级提案修订', jobId);
+        requireIssueSelection(previous.meta, selection);
+        if (previous.meta.owner !== await this.host.ownerFor(store.repoRoot)) return this.aborted('STATE_CONFLICT', '只有问题负责人可以收尾提案', jobId);
+        if (previous.meta.currentRevision !== guard.expectedRevision || previous.meta.owner !== guard.expectedOwner
+          || new Date(previous.meta.updatedAt).getTime() !== new Date(guard.expectedUpdatedAt).getTime()) return this.aborted('CONCURRENCY_MISMATCH', '问题已变化，旧提案不能收尾', jobId);
+        if (!['pending', 'changes_requested'].includes(previous.meta.status)) return this.aborted('STATE_CONFLICT', '当前问题状态不允许提案修订', jobId);
+        const clean = await vcs.ensureCleanWorkspace();
+        if (!clean.clean) return this.recoveryRequired('SYNC_STATE_UNKNOWN', '业务工作区有改动，提案收尾保留现场', jobId, clean.message);
+        const latest = (await store.get(id, null)).candidate;
+        const errors = await this.validateNewRevision(runtime, previous, latest, selection);
+        if (errors.length) return this.validationFailed('问题修订未通过校验，保留现场', jobId, errors);
+        const revision = latest.meta.revisions.at(-1)!;
+        const paths = [relative(store.repoRoot, latest.reviewPath), relative(store.repoRoot, path.join(latest.dirPath, revision.patch))];
+        const expectedFiles = await Promise.all(paths.map(async relPath => ({ relPath, text: await readFile(path.join(store.repoRoot, relPath), 'utf8') })));
+        if (await source.snapshotId() !== await (await sharedSourceFor(runtime))?.snapshotId()) return this.aborted('CONCURRENCY_MISMATCH', '校验期间共享快照已变化', jobId);
+        const outcome = await this.commitAndClassify({ runtime, message: `review(${id}): 收尾方案 ${selection!.optionId} 的修订提案`, paths,
+          probePaths: [paths[0]!], expectedFiles });
+        if (!outcome.landed) return outcome.outcome === 'RECOVERY_REQUIRED'
+          ? this.recoveryRequired('COMMIT_OUTCOME_UNKNOWN', '提案提交结果不明，保留现场', jobId, outcome.detail)
+          : this.aborted('COMMIT_FAILED', '提案未提交，保留已生成文件供重试', jobId, outcome.detail);
+        return this.committed('修订提案已提交，等待人工审核', jobId, { commitRevision: outcome.commitRevision, newRevision: latest.meta.currentRevision });
+      }));
+      sendJson(res, 202, { jobId: job.id, job });
+      return;
+    }
     if (shared !== null) throw new ApiError(409, 'conflict', `候选 ${id} 已是共享事实，独立收尾仅适用于本地候选`);
     const job = this.host.jobManager.start('ai_fix', (log, jobId): Promise<AiFixOutcome> => this.host.withWriteLock(store.repoRoot, async () => {
       const clean = await vcs.ensureCleanWorkspace();
@@ -1014,7 +1111,7 @@ export class Writers {
       const meta = detail.candidate.meta;
       const errors: string[] = [];
       if (detail.candidate.parseError) errors.push(detail.candidate.parseError);
-      if (meta.schemaVersion === 2) errors.push('发现候选必须随关联档案收尾');
+      if (meta.schemaVersion >= 2) errors.push('问题记录必须随关联审查档案收尾');
       if (meta.status !== 'pending') errors.push(`独立候选状态必须是 pending，当前为 ${meta.status}`);
       if (meta.currentRevision !== 1) errors.push(`独立候选 current_revision 必须为 1，当前为 ${String(meta.currentRevision)}`);
       if (meta.approval !== null) errors.push('独立候选的 approval 必须为 null');
@@ -1030,12 +1127,11 @@ export class Writers {
       const base = await vcs.getCurrentBase().catch(() => null);
       const current = meta.revisions.find((revision) => revision.id === meta.currentRevision);
       if (base && current && current.baseRevision === base) {
-        const applied = await vcs.applyPatch(path.join(detail.candidate.dirPath, current.patch), false);
+        const applied = await vcs.checkPatch(path.join(detail.candidate.dirPath, current.patch));
         if (!applied.ok) errors.push(`补丁无法应用到当前基线：${applied.message}`);
       } else if (current) {
         errors.push(`候选基线 ${current.baseRevision || '(空)'} 与当前基线 ${base ?? '(不可读)'} 不一致`);
       }
-      await vcs.revertBusinessWorkspace().catch(() => undefined);
       if (errors.length > 0) {
         return this.validationFailed(`候选 ${id} 未通过收尾校验`, jobId, errors);
       }

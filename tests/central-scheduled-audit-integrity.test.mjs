@@ -127,7 +127,7 @@ async function setup(t, mode) {
     const now = Date.now();
     const command = { commandId: 'scheduled-audit', requestHash: 'b'.repeat(64), projectId: project.projectId,
         nodeId: project.nodeId, bindingGeneration: 1, projectConfigRevision: 1, operation: 'audit',
-        payload: { targetPath: '.' }, actor: { userId: 'system-scheduled-audit', reviewIdentity: 'tester' },
+        payload: { ...(mode === 'legacy-central-with-v2-history' ? {} : { issueWorkflow: true, findingWorkflow: true }), targetPath: '.' }, actor: { userId: 'system-scheduled-audit', reviewIdentity: 'tester' },
         createdAt: new Date(now).toISOString(), scheduledAudit: { scheduledAt: new Date(now - 1000).toISOString(),
             expiresAt: new Date(now - 1000 + 30 * 60 * 1000).toISOString() } };
     journal.accept(command);
@@ -136,17 +136,14 @@ async function setup(t, mode) {
         remoteHead: () => runCommand('git', ['rev-parse', `refs/heads/${target}`], remote).stdout.trim() };
 }
 
-test('旧中央触发定时审查时不将已有新版发现复查写入旧档案', async t => {
-    const { result, root, remoteHead } = await setup(t, 'legacy-central-with-v2-history');
-    assert.equal(result.outcome.status, 'COMMITTED', JSON.stringify(result));
-    assert.equal(remoteHead(), result.outcome.commitRevision);
+test('旧中央不能触发新审查，保留已有新版发现和人工处置', async t => {
+    const { result, root, remoteHead, base } = await setup(t, 'legacy-central-with-v2-history');
+    assert.equal(result.outcome.status, 'ABORTED', JSON.stringify(result));
+    assert.equal(remoteHead(), base);
     const archive = new AuditArchive(root);
-    const report = await archive.read(result.outcome.auditId);
-    assert.equal(report.parseError, undefined);
-    assert.equal(report.meta.schemaVersion, 1);
-    assert.equal(report.meta.previousAudit, null);
-    assert.deepEqual(report.meta.items, []);
+    assert.deepEqual((await archive.list()).map(item => item.meta.auditId), [previous]);
     assert.equal((await archive.read(previous)).meta.schemaVersion, 2);
+    assert.match(await readFile(path.join(root, '.ai-review/findings/v2-takeover.yml'), 'utf8'), /human_takeover/);
 });
 
 test('定时全仓扫描改写已提交旧档案时保留现场并阻止提交，恢复原状后可核验结束', async t => {
@@ -204,23 +201,17 @@ test('首轮定时审查使用受信 Owner，并将合法候选以 pending 交�
     assert.match(git('show', 'HEAD:src/math.js'), /=> a - b/);
 });
 
-test('定时收尾门禁留下补丁以外的草稿时保留现场并阻止交付', async t => {
-    const { base, root, result, remoteHead } = await setup(t, 'smoke-gate-dirty');
-    assert.equal(result.outcome.status, 'RECOVERY_REQUIRED', JSON.stringify(result.outcome));
-    assert.equal(result.outcome.reason, 'SCHEDULE_SCAN_DIRTY');
-    assert.equal(result.delivery.state, 'unknown');
-    assert.equal(remoteHead(), base);
-    assert.match(await readFile(path.join(root, 'src/gate-draft.js'), 'utf8'), /gate draft/);
-});
-
-test('干净的定时收尾门禁在已应用补丁后验证，交付前还原该补丁', async t => {
-    const { git, result, remoteHead } = await setup(t, 'smoke-gate-clean');
-    assert.equal(result.outcome.status, 'COMMITTED', JSON.stringify(result.outcome));
-    assert.equal(result.delivery.state, 'delivered');
-    assert.equal(remoteHead(), git('rev-parse', 'HEAD'));
-    assert.equal(git('status', '--porcelain=v1'), '');
-    assert.match(git('show', 'HEAD:src/math.js'), /=> a - b/);
-});
+for (const mode of ['smoke-gate-dirty', 'smoke-gate-clean']) {
+    test(`审查收尾不运行配置的修复门禁（${mode}）`, async t => {
+        const { git, root, result, remoteHead } = await setup(t, mode);
+        assert.equal(result.outcome.status, 'COMMITTED', JSON.stringify(result.outcome));
+        assert.equal(result.delivery.state, 'delivered');
+        assert.equal(remoteHead(), git('rev-parse', 'HEAD'));
+        assert.equal(git('status', '--porcelain=v1'), '');
+        assert.match(git('show', 'HEAD:src/math.js'), /=> a - b/);
+        await assert.rejects(readFile(path.join(root, 'src/gate-draft.js')), { code: 'ENOENT' });
+    });
+}
 
 test('定时预检拒绝 Git 索引中存在未检出的业务路径', async t => {
     const { base, root, result, remoteHead } = await setup(t, 'skip-worktree');

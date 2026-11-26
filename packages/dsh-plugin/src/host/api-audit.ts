@@ -30,7 +30,7 @@ import { runAuditSelfTest, type AuditSelfTestTools } from './audit-self-test.js'
 import { loadReviewers } from './reviewers.js';
 import { ReviewStore } from './store.js';
 import { AuditStages, auditUserFields, renderAuditCoordinator, type AuditPriorityEntry, type AuditStageExecution } from './audit-stages.js';
-import { assertStageArtifacts, compatibleAuditBase, publishStageArtifacts, readSvnAuditUrl, verifyStageGates } from './audit-stage-artifacts.js';
+import { assertStageArtifacts, compatibleAuditBase, publishStageArtifacts, readSvnAuditUrl } from './audit-stage-artifacts.js';
 import { auditObject, AuditStopUnknown, type AuditExecutor } from './audit-stage-runner.js';
 import type { AuditStage } from './audit-prompts.js';
 import { dshHome } from './settings.js';
@@ -250,7 +250,7 @@ export class AuditRuntime {
         throw new Error('发布前业务基线或工作区发生变化');
       }
       const { reviewedFindings, ...publication } = auditObject(input);
-      const output = stage.publication(publication);
+      let output: Awaited<ReturnType<AuditStages['publication']>>;
       stage.busy = true;
       try {
         if (!recheck && reviewedFindings !== undefined) {
@@ -260,6 +260,9 @@ export class AuditRuntime {
           const history = await loadAuditHistory(new ReviewStore(lease.root), source, lease.targetPath || '.', stage.findingWorkflow);
           recheck = await verifyPublishedRecheck(history, reviewedFindings, lease.baseRevision, stage.vcs);
         }
+        stage.busy = false;
+        output = await stage.publication(publication, recheck, Array.isArray(reviewedFindings) ? reviewedFindings : []);
+        stage.busy = true;
         signal?.throwIfAborted();
         if (!await compatibleAuditBase(stage.vcs, lease.baseRevision, lease.svnUrl) || !(await stage.vcs.ensureCleanWorkspace()).clean) {
           throw new AuditStopUnknown('封存前业务基线或工作区发生变化');
@@ -272,6 +275,7 @@ export class AuditRuntime {
           signal?.throwIfAborted();
           if (this.closed || lease.state !== 'active' || stage.uncertain) throw new Error('审查租约已停止');
           lease.stageSeal = manifest;
+          lease.issueWorkflow = true;
           lease.stageItems = output.items;
           if (recheck) lease.stageRecheck = recheck;
           try { await this.upsertLease(lease); } catch (error) {
@@ -287,7 +291,7 @@ export class AuditRuntime {
       } finally {
         stage.busy = false;
       }
-      this.logAuditStage(lease.auditId, '已封存审查档案，' + String(output.overview.length) + ' 个正式发现');
+      this.logAuditStage(lease.auditId, `已封存审查档案，${String(output.overview.length)} 个正式发现`);
       return { reportPath: output.path, overview: output.overview };
     });
   }
@@ -310,7 +314,7 @@ export class AuditRuntime {
     return renderAuditCoordinator({
       lease, vcsType: runtime.vcsType, executionMode, findingWorkflow, reviewers, focus,
       history: { activeCandidates: summarizeAuditHistory(activeCandidates), negativeMemory: summarizeAuditHistory(negativeMemory) },
-      automaticCandidates: this.host.deps.auditStageGates !== undefined, extraRequirements: fields.extraRequirements,
+      automaticCandidates: reviewers.allowedGateCommands.length > 0, extraRequirements: fields.extraRequirements,
     });
   }
 
@@ -318,7 +322,7 @@ export class AuditRuntime {
     const source = await sharedSourceFor(runtime);
     const reviewers = await loadReviewers(runtime.root, source);
     const stage = new AuditStages(lease, runtime.vcs, reviewers, this.host.deps.auditStageExecutor!,
-      this.host.currentSettings().gateTimeoutMs, fields.extraRequirements, this.host.deps.auditStageGates, source,
+      fields.extraRequirements, source,
       currentTrustedActor()?.findingWorkflow, line => this.logAuditStage(lease.auditId, line));
     this.stages.set(lease.auditId, stage);
     return stage;
@@ -992,7 +996,7 @@ export class AuditRuntime {
           scheduledScan = await captureReviewWorktree(runtime.root, runtime.vcsType, true);
           const prior = new Set(lease.candidateIdsBefore);
           const newIds = (await runtime.store.listCandidateIds()).filter(candidate => !prior.has(candidate));
-          if (!await scheduledBaseMatches!() || !permittedScanOutputs(beforeScan, scheduledScan, auditId, newIds)) {
+          if (!await scheduledBaseMatches!() || !permittedScanOutputs(beforeScan, scheduledScan, auditId, newIds, lease.stageSeal)) {
             throw new Error('定时全仓审查写入了本轮产物以外的评审数据，或工作区绑定发生变化');
           }
         }
@@ -1116,8 +1120,10 @@ export class AuditRuntime {
             if (!current.stageSeal || this.stages.get(current.auditId)?.busy
               || !await compatibleAuditBase(runtime.vcs, current.baseRevision, current.svnUrl)
               || !(await runtime.vcs.ensureCleanWorkspace()).clean) throw new Error('未发布或基线发生变化');
-            const newCandidates = (await runtime.store.listCandidateIds()).filter(id => !before.has(id));
-            await assertStageArtifacts(runtime.root, current.stageSeal, newCandidates);
+            const published = current.issueWorkflow ? Object.keys(current.stageSeal)
+              .filter(file => /^\.ai-review\/\d{4}-\d{2}\/[^/]+\/review\.md$/.test(file)).map(file => file.slice(11, -10))
+              : (await runtime.store.listCandidateIds()).filter(id => !before.has(id));
+            await assertStageArtifacts(runtime.root, current.stageSeal, published);
           } catch (error) {
             await this.auditLifecycle.markReleasable(current.auditId);
             const failed = { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', auditId: current.auditId,
@@ -1150,11 +1156,8 @@ export class AuditRuntime {
           ...(current.phased ? {
             phasedItems: current.stageItems ?? [],
             phasedSeal: current.stageSeal!,
+            ...(current.issueWorkflow ? { issueWorkflow: true } : {}),
             ...(current.stageRecheck ? { recheck: current.stageRecheck } : {}),
-            ...(this.host.deps.auditStageGates ? {
-              phasedGate: (patch: string, commands: string[]) => verifyStageGates(current, runtime.vcsType, patch, commands,
-                this.host.deps.auditStageGates!, this.host.currentSettings().gateTimeoutMs, signal),
-            } : {}),
           } : {}),
           baseRevision: current.baseRevision,
           ...(current.svnUrl ? { svnUrl: current.svnUrl } : {}),

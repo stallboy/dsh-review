@@ -1,6 +1,9 @@
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { lstat, readFile, readdir, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { currentReviewPatch, issueInvariantErrors, selectIssuePatch } from './issue-review.js';
+import type { IssueSelection } from './types.js';
 import process from 'node:process';
 import {
   appendVersionSection,
@@ -310,9 +313,7 @@ export class ReviewStore {
       const candidate = this.parseCandidateText(month, slug, text);
       const entries = await readSource.listDirEntries(month, slug).catch(() => null);
       const entriesHas = (name: string): boolean => entries?.includes(name) ?? false;
-      const currentPatchName = candidate.meta.revisions.find(
-        (revision) => revision.id === candidate.meta.currentRevision,
-      )?.patch ?? '';
+      const currentPatchName = currentReviewPatch(candidate.meta)?.patch ?? '';
       let stats = EMPTY_STATS;
       const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
       if (candidate.parseError === undefined && currentPatchName) {
@@ -327,7 +328,7 @@ export class ReviewStore {
       if (candidate.parseError === undefined) {
         const violations = fullReviewInvariants({
           candidate,
-          patchExists: (revision) => archived || entriesHas(revision.patch),
+          patchExists: (revision) => candidate.meta.issue ? entriesHas(revision.patch) : archived || entriesHas(revision.patch),
           currentPatchPaths: stats === EMPTY_STATS ? null : stats.entries.map((entry) => entry.path),
         });
         if (violations.length > 0) invariantErrors = violations;
@@ -504,7 +505,7 @@ export class ReviewStore {
   }
 
   private toSummary(candidate: ReviewCandidate, stats: PatchStats, currentBase: string | null, staleDays?: number | null): CandidateSummary {
-    const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
+    const current = currentReviewPatch(candidate.meta);
     const baseRevision = current?.baseRevision ?? '';
     const unresolved = candidate.meta.comments.filter((comment) => comment.status !== 'resolved').length;
     const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
@@ -513,6 +514,8 @@ export class ReviewStore {
       && !Number.isNaN(anchor) && (Date.now() - anchor) / 86_400_000 >= staleDays;
     return {
       id: candidate.id,
+      schemaVersion: candidate.meta.schemaVersion,
+      ...(candidate.meta.issue ? { issue: structuredClone(candidate.meta.issue) } : {}),
       title: candidate.meta.title,
       owner: candidate.meta.owner,
       status: candidate.meta.status,
@@ -545,7 +548,7 @@ export class ReviewStore {
     return path.join(candidate.dirPath, name);
   }
 
-  async get(id: string, currentBase: string | null, source?: CandidateSource): Promise<CandidateDetail> {
+  async get(id: string, currentBase: string | null, source?: CandidateSource, selection?: IssueSelection): Promise<CandidateDetail> {
     const src = source ?? this.fsSource;
     const { month, slug } = this.resolveCandidateDir(id);
     const text = await src.readReviewText(month, slug);
@@ -563,7 +566,8 @@ export class ReviewStore {
         patchStats: EMPTY_STATS,
       };
     }
-    const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
+    const current = currentReviewPatch(candidate.meta, selection);
+    if (!current && candidate.meta.issue) return { candidate, currentBase, isBaseBehind: false, patchText: '', patchStats: EMPTY_STATS };
     if (!current) throw new ApiError(500, 'internal', '当前版本元数据缺失');
     const entries = await src.listDirEntries(month, slug).catch(() => null);
     const hasPatch = entries?.includes(current.patch) ?? false;
@@ -612,6 +616,7 @@ export class ReviewStore {
     await this.ensureSafeWriteTarget(candidate.reviewPath);
     if (options?.touchUpdatedAt !== false) {
       candidate.meta.updatedAt = nextUpdatedAt(candidate.meta.updatedAt);
+      if (candidate.meta.issue) candidate.meta.currentRevision += 1;
     }
     const text = serializeReviewMarkdown(candidate.meta, candidate.sections.rawBody);
     const temp = `${candidate.reviewPath}.tmp-${String(process.pid)}`;
@@ -640,29 +645,33 @@ export class ReviewStore {
     if (Number.isNaN(expectedAt) || expectedAt !== currentAt) {
       throw new ApiError(409, 'stale', '候选已被其他人更新，请重新加载', staleDetails());
     }
-    if (candidate.meta.status === 'approved' || candidate.meta.status === 'rejected') {
+    if (candidate.meta.status === 'approved' || candidate.meta.status === 'rejected' || candidate.meta.status === 'resolved') {
       throw new ApiError(409, 'conflict', '该候选已归档，不能再修改');
     }
   }
 
   private async normalizeCommentInput(
     candidate: ReviewCandidate,
-    input: { content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> } },
-  ): Promise<{ content: string; revision: number; file: string; line: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> } }> {
+    input: { selection?: IssueSelection; content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> } },
+  ): Promise<{ extra?: Record<string, unknown>; content: string; revision: number; file: string; line: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> } }> {
     const content = input.content.trim();
     if (!content) throw new ApiError(422, 'bad_request', '意见内容不能为空');
     const revision = input.revision ?? candidate.meta.currentRevision;
-    if (!Number.isInteger(revision) || !candidate.meta.revisions.some((item) => item.id === revision)) {
+    if (!Number.isInteger(revision) || (candidate.meta.schemaVersion === 3 ? revision < 1 || revision > candidate.meta.currentRevision : !candidate.meta.revisions.some((item) => item.id === revision))) {
       throw new ApiError(422, 'bad_request', `评论 revision 必须指向已有版本：${String(revision)}`);
     }
+    const selection = candidate.meta.schemaVersion === 3 ? input.selection : undefined;
+    if (selection) selectIssuePatch(candidate.meta, selection);
+    const binding = selection ? { extra: { option_id: selection.optionId, patch_id: selection.patchId } } : {};
     const file = (input.file ?? '').replaceAll('\\', '/');
     const line = input.line ?? 0;
     if (file === '') {
       if (line !== 0) throw new ApiError(422, 'bad_request', '总体评论必须 line=0');
       if (input.side !== undefined) throw new ApiError(422, 'bad_request', '总体评论不能携带 side');
       if (input.anchor !== undefined) throw new ApiError(422, 'bad_request', '总体评论不能携带 anchor');
-      return { content, revision, file: '', line: 0 };
+      return { ...binding, content, revision, file: '', line: 0 };
     }
+    if (candidate.meta.schemaVersion === 3 && !selection) throw new ApiError(422, 'bad_request', '行内意见必须绑定明确的方案和补丁');
     if (!isRepoRelativePath(file)) throw new ApiError(422, 'bad_request', `行内评论文件不是合法仓库相对路径：${file}`);
     if (!Number.isInteger(line) || line <= 0) throw new ApiError(422, 'bad_request', '行内评论 line 必须为正整数');
     if (input.side !== 'LEFT' && input.side !== 'RIGHT') {
@@ -678,9 +687,9 @@ export class ReviewStore {
         ...(anchor.extra ? { extra: anchor.extra } : {}),
       };
     } else {
-      anchor = await this.extractHostAnchor(candidate, revision, file, line, input.side);
+      anchor = await this.extractHostAnchor(candidate, selection?.patchId ?? revision, file, line, input.side);
     }
-    return { content, revision, file, line, side: input.side, ...(anchor ? { anchor } : {}) };
+    return { ...binding, content, revision, file, line, side: input.side, ...(anchor ? { anchor } : {}) };
   }
 
   private async extractHostAnchor(
@@ -703,7 +712,7 @@ export class ReviewStore {
   async addComment(
     id: string,
     author: string,
-    input: { content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string } },
+    input: { selection?: IssueSelection; content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string } },
     guard: ConcurrencyGuard,
   ): Promise<ReviewCandidate> {
     const { month, slug } = this.resolveCandidateDir(id);
@@ -742,7 +751,7 @@ export class ReviewStore {
   async addComments(
     id: string,
     author: string,
-    inputs: Array<{ content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string } }>,
+    inputs: Array<{ selection?: IssueSelection; content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string } }>,
     guard: ConcurrencyGuard,
   ): Promise<ReviewCandidate> {
     if (inputs.length === 0) throw new ApiError(422, 'bad_request', '批量评论不能为空');
@@ -910,21 +919,27 @@ export class ReviewStore {
   /** 调用方负责隔离工作区并运行门禁。此处写入评审数据和补丁。 */
   async appendRevision(
     id: string,
-    input: { baseRevision: string; patchText: string },
+    input: { baseRevision: string; patchText: string; optionId?: string },
     guard: ConcurrencyGuard,
   ): Promise<ReviewCandidate> {
     const { month, slug } = this.resolveCandidateDir(id);
     const candidate = await this.readCandidate(month, slug);
     if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
     await this.ensureWriteAllowed(candidate, guard);
-    const nextId = candidate.meta.currentRevision + 1;
+    const selected = candidate.meta.issue
+      ? candidate.meta.issue.options.find(option => option.id === input.optionId)
+      : undefined;
+    if (candidate.meta.issue && !selected) throw new ApiError(422, 'bad_request', '修订问题补丁须明确方案编号');
+    const nextId = candidate.meta.issue ? candidate.meta.revisions.length + 1 : candidate.meta.currentRevision + 1;
     const patchName = `${String(nextId).padStart(3, '0')}.patch`;
     const { writeFile: writePatchFile } = await import('node:fs/promises');
     const patchPath = path.join(candidate.dirPath, patchName);
     await this.ensureSafeWriteTarget(patchPath);
     await writePatchFile(patchPath, input.patchText, 'utf8');
-    candidate.meta.revisions.push({ id: nextId, baseRevision: input.baseRevision, patch: patchName, author: 'ai' });
-    candidate.meta.currentRevision = nextId;
+    candidate.meta.revisions.push({ id: nextId, baseRevision: input.baseRevision, patch: patchName, author: 'ai',
+      ...(selected ? { extra: { option_id: selected.id } } : {}) });
+    if (selected) selected.currentPatch = nextId;
+    else candidate.meta.currentRevision = nextId;
     candidate.meta.status = 'pending';
     candidate.meta.approval = null;
     await this.write(candidate);
@@ -936,13 +951,15 @@ export class ReviewStore {
     approvedBy: string,
     report: ValidationReport,
     decisions?: { confirmed: string[]; waived: { id: string; reason: string }[] },
+    selection?: IssueSelection,
+    binding?: { baseRevision: string; patchSha256: string },
   ): Promise<void> {
     candidate.meta.status = 'approved';
     candidate.meta.approval = {
       approvedBy,
       approvedAt: new Date().toISOString(),
       // 业务提交版本从 VCS 历史派生，避免为回填哈希额外产生一次提交。
-      gateChecks: [...candidate.meta.gateChecks],
+      gateChecks: report.results.map(result => result.command),
       gateResults: report.results.map((result) => ({
         command: result.command,
         exit_code: result.exitCode ?? -1,
@@ -950,8 +967,13 @@ export class ReviewStore {
       })),
       confirmedDecisions: decisions ? [...decisions.confirmed] : [],
       waivedDecisions: decisions ? decisions.waived.map((item) => ({ ...item })) : [],
+      ...(selection ? { extra: { option_id: selection.optionId, patch_id: selection.patchId,
+        record_revision: candidate.meta.currentRevision, base_revision: binding?.baseRevision, patch_sha256: binding?.patchSha256 } } : {}),
     };
-    const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
+    const current = currentReviewPatch(candidate.meta, selection);
+    if (candidate.meta.issue && selection) candidate.meta.issue.repairAttempts.push({ ...selection,
+      baseRevision: binding?.baseRevision ?? current?.baseRevision ?? candidate.meta.issue.baseRevision, at: candidate.meta.approval.approvedAt,
+      actor: approvedBy, result: 'applied', restored: false, evidence: report.formattedEvidenceMarkdown });
     candidate.sections.rawBody = appendVersionSection(
       candidate.sections.rawBody,
       candidate.meta.currentRevision,
@@ -962,6 +984,12 @@ export class ReviewStore {
   }
 
   async validateCandidate(candidate: ReviewCandidate): Promise<string[]> {
+    if (candidate.meta.issue) {
+      const errors = issueInvariantErrors(candidate.meta);
+      if (!candidate.meta.owner) errors.push('owner 为空');
+      if (candidate.meta.issue.options.length && !candidate.humanJudgmentDeclared) errors.push('需人工判断项未填写');
+      return errors;
+    }
     const errors: string[] = [];
     const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
     const ids = new Set<number>();
@@ -984,8 +1012,8 @@ export class ReviewStore {
     return errors;
   }
 
-  async currentPatch(candidate: ReviewCandidate, source?: CandidateSource): Promise<{ path: string; text: string; baseRevision: string }> {
-    const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
+  async currentPatch(candidate: ReviewCandidate, source?: CandidateSource, selection?: IssueSelection): Promise<{ path: string; text: string; baseRevision: string }> {
+    const current = currentReviewPatch(candidate.meta, selection);
     if (!current) throw new ApiError(500, 'internal', '当前版本缺失');
     const patchPath = this.patchPathFor(candidate, current.patch);
     const text = source
@@ -1006,7 +1034,7 @@ export class ReviewStore {
     revisionId?: number,
   ): Promise<{ revision: number; patchName: string; text: string; baseRevision: string }> {
     const revision = revisionId === undefined
-      ? candidate.meta.revisions.find((item) => item.id === candidate.meta.currentRevision)
+      ? currentReviewPatch(candidate.meta)
       : candidate.meta.revisions.find((item) => item.id === revisionId);
     if (!revision) throw new ApiError(500, 'internal', '版本缺失');
     const text = await source.readPatchText(candidate.month, candidate.slug, revision.patch);
@@ -1022,14 +1050,26 @@ export class ReviewStore {
     associationSource?: CandidateSource,
   ): Promise<string[]> {
     const errors = await this.validateCandidate(candidate);
-    const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
-    if (!current) return errors;
+    const current = currentReviewPatch(candidate.meta);
+    if (!current && !candidate.meta.issue) return errors;
     const entries = source
       ? await source.listDirEntries(candidate.month, candidate.slug).catch(() => null)
       : await readdir(candidate.dirPath).catch(() => null);
     const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
+    if (candidate.meta.schemaVersion === 3) {
+      for (const revision of candidate.meta.revisions) {
+        const text = source ? await source.readPatchText(candidate.month, candidate.slug, revision.patch)
+          : await readFile(this.patchPathFor(candidate, revision.patch), 'utf8').catch(() => null);
+        if (text === null) { errors.push('历史补丁不可读：' + revision.patch); continue; }
+        if (revision.extra?.['sha256'] && createHash('sha256').update(text).digest('hex') !== revision.extra['sha256']) errors.push('补丁内容与问题版本绑定的摘要不匹配：' + revision.patch);
+        const paths = parsePatch(text).paths;
+        if (paths.some(file => isAiReviewPath(file))) errors.push('补丁包含禁止路径：' + revision.patch);
+        if (candidate.meta.issue?.options.some(option => option.currentPatch === revision.id)
+          && paths.some(file => !candidate.meta.targetFiles.includes(file))) errors.push('方案补丁越出问题声明的文件范围：' + revision.patch);
+      }
+    }
     let currentPatchPaths: string[] | null = null;
-    if (!archived) {
+    if (!archived && current) {
       try {
         const text = source
           ? await source.readPatchText(candidate.month, candidate.slug, current.patch)
@@ -1069,14 +1109,14 @@ export class ReviewStore {
   }
 
   async listStatusCounts(owner: string, source?: CandidateSource): Promise<Record<ReviewStatus, number>> {
-    const counts: Record<ReviewStatus, number> = {
+    const counts = {
       pending: 0,
       changes_requested: 0,
       approved: 0,
       rejected: 0,
-    };
+    } as Record<ReviewStatus, number>;
     const { items } = await this.list({ owner }, null, undefined, undefined, source);
-    for (const item of items) if (!item.local) counts[item.status] += 1;
+    for (const item of items) if (!item.local) counts[item.status] = (counts[item.status] ?? 0) + 1;
     return counts;
   }
 

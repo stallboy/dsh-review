@@ -1,15 +1,12 @@
 import type { ReviewCandidate, RevisionEntry } from './types.js';
+import { issueInvariantErrors, selectIssuePatch } from './issue-review.js';
+import { isRepoRelativePath } from './patch.js';
+export { isRepoRelativePath } from './patch.js';
 
 /** 候选读取端的不变量检查。补丁能否应用须由有 VCS 上下文的调用方另行验证。 */
 
 const TIME_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 export const FINDING_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
-
-export function isRepoRelativePath(value: string): boolean {
-  if (!value || value.includes('\\') || value.includes('..') || value.startsWith('/') || value.endsWith('/')) return false;
-  if (value.includes('./')) return false;
-  return true;
-}
 
 export function parseTime(value: string, field: string, errors: string[]): Date | null {
   if (!TIME_WITH_ZONE.test(value)) {
@@ -41,16 +38,18 @@ export function quickReviewInvariants(candidate: ReviewInvariantInput['candidate
   if (!/^\d{4}-\d{2}$/.test(candidate.month) || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(candidate.slug)) {
     errors.push(`I1: 候选目录命名非法：${candidate.id}`);
   }
-  if (meta.schemaVersion !== 1 && meta.schemaVersion !== 2) {
-    errors.push(`I2: schema_version 必须是 1 或 2，实际 ${String(meta.schemaVersion)}`);
+  if (meta.schemaVersion !== 1 && meta.schemaVersion !== 2 && meta.schemaVersion !== 3) {
+    errors.push(`I2: schema_version 必须是 1、2 或 3，实际 ${String(meta.schemaVersion)}`);
   }
-  if ((meta.schemaVersion === 2 && !FINDING_ID_PATTERN.test(meta.findingId ?? ''))
+  if ((meta.schemaVersion >= 2 && !FINDING_ID_PATTERN.test(meta.findingId ?? ''))
     || (meta.schemaVersion === 1 && meta.findingId !== undefined)) {
     errors.push('I2: 只有 v2 候选必须绑定合法的 finding_id');
   }
 
   const ids = meta.revisions.map((revision) => revision.id);
-  if (ids.length === 0) {
+  if (meta.schemaVersion === 3) {
+    errors.push(...issueInvariantErrors(meta));
+  } else if (ids.length === 0) {
     errors.push('I3: revisions 为空');
   } else {
     if (new Set(ids).size !== ids.length) errors.push('I3: revisions 存在重复版本号');
@@ -82,7 +81,7 @@ export function quickReviewInvariants(candidate: ReviewInvariantInput['candidate
     commentIds.add(comment.id);
     if (!comment.author.trim()) errors.push(`I11: ${at}.author 不能为空`);
     if (comment.createdAt !== undefined) parseTime(comment.createdAt, `${at}.created_at`, errors);
-    if (!knownIds.has(comment.revision)) errors.push(`I11: ${at}.revision=${String(comment.revision)} 指向不存在的版本`);
+    if (meta.schemaVersion === 3 ? !Number.isSafeInteger(comment.revision) || comment.revision < 1 || comment.revision > meta.currentRevision : !knownIds.has(comment.revision)) errors.push(`I11: ${at}.revision=${String(comment.revision)} 指向不存在的版本`);
     const inline = comment.file !== '' || comment.line !== 0;
     if (inline) {
       if (!comment.file) errors.push(`I11: ${at} 行内评论缺少文件`);
@@ -111,7 +110,12 @@ export function quickReviewInvariants(candidate: ReviewInvariantInput['candidate
     if (!meta.approval.gateChecks) errors.push('I7: approval.gate_checks 是必填快照');
     if (!meta.approval.gateResults) errors.push('I7: approval.gate_results 是必填逐条结果');
     const snapshot = meta.approval.gateChecks ?? [];
-    if (meta.approval.gateChecks && JSON.stringify(snapshot) !== JSON.stringify(meta.gateChecks)) {
+    let expectedGates = meta.gateChecks;
+    if (meta.issue && meta.approval.extra) {
+      try { expectedGates = selectIssuePatch(meta, { optionId: String(meta.approval.extra['option_id']), patchId: Number(meta.approval.extra['patch_id']) }).option.gateChecks; }
+      catch { errors.push('批准的方案和补丁引用无效'); }
+    }
+    if (meta.approval.gateChecks && JSON.stringify(snapshot) !== JSON.stringify(expectedGates)) {
       errors.push('I7: approval.gate_checks 快照与顶层 gate_checks 不一致（疑似外部改写）');
     }
     const results = meta.approval.gateResults ?? [];
@@ -175,7 +179,7 @@ export function fullReviewInvariants(input: ReviewInvariantInput): string[] {
   const meta = input.candidate.meta;
   const archived = meta.status === 'approved' || meta.status === 'rejected';
 
-  if (!archived) {
+  if (!archived || meta.schemaVersion === 3) {
     for (const revision of meta.revisions) {
       if (!input.patchExists(revision)) {
         errors.push(`I4: 版本 ${String(revision.id)} 的补丁不存在：${revision.patch}`);
@@ -183,13 +187,13 @@ export function fullReviewInvariants(input: ReviewInvariantInput): string[] {
     }
   }
 
-  if (!archived && meta.targetFiles.length === 0) {
+  if (!archived && meta.targetFiles.length === 0 && !meta.issue) {
     errors.push('I5: 活跃候选 target_files 不能为空');
   }
   if (input.currentPatchPaths !== null && meta.targetFiles.length > 0 && !archived) {
     const declared = [...meta.targetFiles].sort();
     const actual = [...input.currentPatchPaths].sort();
-    if (JSON.stringify(declared) !== JSON.stringify(actual)) {
+    if (meta.issue ? actual.some(file => !declared.includes(file)) : JSON.stringify(declared) !== JSON.stringify(actual)) {
       errors.push(`I5: target_files 与补丁实际路径不一致：声明 ${JSON.stringify(declared)} vs 实际 ${JSON.stringify(actual)}`);
     }
   }

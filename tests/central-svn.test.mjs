@@ -109,7 +109,7 @@ test('中央定时 SVN 首轮使用同步后的基线并直接交付审查档案
         bindingGeneration: 1, projectConfigRevision: 1, vcsType: 'svn', target: '^/', enabled: true };
     const start = Date.now();
     const command = { commandId: 'svn-scheduled-audit', requestHash: 'b'.repeat(64), projectId: project.projectId,
-        nodeId: project.nodeId, bindingGeneration: 1, projectConfigRevision: 1, operation: 'audit', payload: { targetPath: '.' },
+        nodeId: project.nodeId, bindingGeneration: 1, projectConfigRevision: 1, operation: 'audit', payload: { issueWorkflow: true, findingWorkflow: true, targetPath: '.' },
         actor: { userId: 'system-scheduled-audit', reviewIdentity: 'tester' }, createdAt: new Date(start).toISOString(),
         scheduledAudit: { scheduledAt: new Date(start).toISOString(), expiresAt: new Date(start + 30 * 60_000).toISOString() } };
     journal.accept(command);
@@ -152,7 +152,7 @@ test('中央定时审查遇到稀疏 SVN 检出时保留原范围并跳过', asy
         bindingGeneration: 1, projectConfigRevision: 1, vcsType: 'svn', target: '^/', enabled: true };
     const start = Date.now();
     const command = { commandId: 'svn-sparse-scheduled-audit', requestHash: 'b'.repeat(64), projectId: project.projectId, nodeId: project.nodeId,
-        bindingGeneration: 1, projectConfigRevision: 1, operation: 'audit', payload: { targetPath: '.' },
+        bindingGeneration: 1, projectConfigRevision: 1, operation: 'audit', payload: { issueWorkflow: true, findingWorkflow: true, targetPath: '.' },
         actor: { userId: 'system-scheduled-audit', reviewIdentity: 'tester' }, createdAt: new Date(start).toISOString(),
         scheduledAudit: { scheduledAt: new Date(start).toISOString(), expiresAt: new Date(start + 30 * 60_000).toISOString() } };
     journal.accept(command);

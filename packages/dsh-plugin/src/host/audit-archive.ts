@@ -143,7 +143,7 @@ export function parseAuditMarkdown(text: string): { meta: AuditFrontmatter; body
     if (!isRecord(doc)) throw new AuditFormatError('audit.md Frontmatter 必须是 YAML 对象');
     const field = (key: string) => requiredField(doc, key);
     const schemaVersion = field('schema_version');
-    if (schemaVersion !== 1 && schemaVersion !== 2) {
+    if (schemaVersion !== 1 && schemaVersion !== 2 && schemaVersion !== 3) {
         throw new AuditFormatError('schema_version 必须是数字 1 或 2；更高版本需要升级插件');
     }
     const trigger = asString(field('trigger'), 'trigger');
@@ -160,8 +160,8 @@ export function parseAuditMarkdown(text: string): { meta: AuditFrontmatter; body
             scope,
             trigger,
             previousAudit: asNullableString(field('previous_audit'), 'previous_audit'),
-            candidates: asStringArray(field('candidates'), 'candidates'),
-            items: asArray(field('items'), 'items').map((item, index) => parseAuditItem(item, index, schemaVersion)),
+            candidates: asStringArray(field(schemaVersion === 3 ? 'issues' : 'candidates'), schemaVersion === 3 ? 'issues' : 'candidates'),
+            items: schemaVersion === 3 ? [] : asArray(field('items'), 'items').map((item, index) => parseAuditItem(item, index, schemaVersion)),
         },
         body,
     };
@@ -194,6 +194,11 @@ export function serializeAuditMarkdown(meta: AuditFrontmatter, body: string): st
       ...(item.repairAttribution !== undefined ? { repair_attribution: item.repairAttribution } : {}),
     })),
   };
+  if (meta.schemaVersion === 3) {
+    doc.issues = meta.candidates;
+    delete doc.candidates;
+    delete doc.items;
+  }
   const yamlText = dump(doc, { lineWidth: -1, noRefs: true, sortKeys: false }).replace(/\n$/, '');
   return `---\n${yamlText}\n---\n${body.startsWith('\n') ? body : `\n${body}`}`;
 }
@@ -202,7 +207,8 @@ export function auditInvariantErrors(meta: AuditFrontmatter, dirName: string): s
   const errors: string[] = [];
   if (!AUDIT_DIR_PATTERN.test(dirName)) errors.push(`I1: audit 目录名非法：${dirName}`);
   if (meta.auditId !== dirName) errors.push(`I1: audit_id=${meta.auditId} 与目录名 ${dirName} 不一致`);
-  if (meta.schemaVersion !== 1 && meta.schemaVersion !== 2) errors.push('I2: 档案 schema_version 无效');
+  if (meta.schemaVersion !== 1 && meta.schemaVersion !== 2 && meta.schemaVersion !== 3) errors.push('I2: 档案 schema_version 无效');
+  if (meta.schemaVersion === 3 && meta.items.length) errors.push('新版审查索引不得内嵌可编辑问题');
   const findingIds = new Set<string>();
   const optionIds = new Set<string>();
   const publishedIds = new Set(meta.candidates);
@@ -424,7 +430,7 @@ export class AuditArchive {
 export type ProjectedState = 'open' | 'closed' | 'dismissed' | 'reopened';
 
 export interface CandidateChainInfo {
-  status: 'pending' | 'changes_requested' | 'approved' | 'rejected';
+  status: import('./types.js').ReviewStatus;
   reopenedFrom: string | null;
   broken?: boolean;
   findingId?: string;
@@ -441,7 +447,7 @@ export interface FindingProjection {
   lastStatus: AuditItemStatus;
   lastObservedAudit: string;
   lastObservedAt: string;
-  candidateStatus?: 'pending' | 'changes_requested' | 'approved' | 'rejected';
+  candidateStatus?: import('./types.js').ReviewStatus;
   candidate?: string;
   findingVersion?: string;
   disposition?: FindingDisposition;
@@ -451,7 +457,10 @@ export interface FindingProjection {
   baseRevision?: string;
   repairRevisions?: string[];
   repairAttribution?: string;
-  options?: { candidateId: string; tradeoff: string; status: CandidateChainInfo['status'] }[];
+  options?: { candidateId: string; tradeoff: string; status: CandidateChainInfo['status']; optionId?: string; patchId?: number; title?: string; confidence?: number }[];
+  reviewId?: string;
+  issueStatus?: import('./types.js').ReviewStatus;
+  schemaVersion?: number;
 }
 
 export function scopeCovers(scope: string, targetFiles: string[]): boolean {
@@ -541,7 +550,7 @@ export function projectFindings(
       const decision = events.filter((event) => event.action !== 'add_repair_hint').at(-1);
       const winningId = approved[0]?.[0];
       const disposition: FindingDisposition = current.item.status === 'resolved' ? 'resolved' : winningId ? 'applied'
-        : decision && decision.action !== 'resume_review' ? decision.action : 'undecided';
+        : decision && decision.action !== 'resume_review' ? decision.action === 'external_completed' ? 'human_takeover' : decision.action : 'undecided';
       const options = (plan.item.options ?? []).flatMap((option) => {
         const info = optionInfo.get(option.candidateId);
         return info ? [{ ...option, status: info.status }] : [];
