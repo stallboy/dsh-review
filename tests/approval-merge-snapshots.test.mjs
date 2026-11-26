@@ -58,10 +58,10 @@ test('SVN 核对原生来源及路径版本，根 revision 不变时也能识别
     svn('commit', '-qm', 'first');
     svn('update', '-q');
     const vcs = new SvnAdapter(root);
-    const version = { id: 1, baseRevision: '1', patch: '001.patch', author: 'ai' };
+    const version = { id: 1, patch: '001.patch', optionId: 'opt-a', baseRevision: '1', author: 'ai', sha256: '0'.repeat(64) };
     assert.equal(await stampSvnApprovalSource(vcs, version, ['trunk/file.txt']), true);
     const binding = await readSvnApprovalBinding(root);
-    assert.deepEqual(version.extra.svn_approval_source, { uuid: binding.uuid, relative_url: binding.relativeUrl });
+    assert.deepEqual(version.svnApprovalSource, { uuid: binding.uuid, relativeUrl: binding.relativeUrl });
     const input = { files: ['trunk/file.txt'], sourceRevision: '1', targetRevision: '1', svnBinding: binding };
     const before = await readApprovalMergeSnapshots(vcs, input);
     assert.equal(before.status, 'ready', JSON.stringify(before));

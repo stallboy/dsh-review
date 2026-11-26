@@ -1,50 +1,118 @@
-import type { DiffResolutionMode, GateCheckResult, PatchStats, ReviewStatus, VcsType, WaivedDecision } from '@dsh-review/protocol';
-
-export { AUDIT_TYPES } from '@dsh-review/protocol';
-export type {
-    IssueReview,
-    IssueSelection,
-    RepairOption,
-    IssueObservation,
-    IssueDecision,
-    RepairAttempt,
-    ReviewStatus,
-    CommentStatus,
-    VcsType,
-    DiffResolutionMode,
-    AuditType,
-    RevisionEntry,
-    ReviewComment,
-    HumanDecision,
-    RejectionMeta,
-    WaivedDecision,
-    ApprovalMeta,
-    AuthorStatBucket,
-    AuthorStats,
-    GateCheckResult,
-    ReviewFrontmatter,
-    HumanJudgmentItem,
-    ReviewSections,
-    ReviewCandidate,
-    PatchFileStat,
-    PatchStats,
-    PatchCheckDiagnostic,
-    CandidateSummary,
-    ReviewFilter,
-    ConcurrencyGuard,
+import type {
+  ApprovalInfo,
+  AuditType,
+  CandidateSummary,
+  CommentAnchor,
+  CommentSide,
+  CommentStatus,
+  FindingDisposition,
+  GateCheckResult,
+  HumanDecision,
+  HumanJudgmentItem,
+  IssueDecision,
+  IssueDecisionAction,
+  IssueEvidence,
+  IssueFindingView,
+  IssueKind,
+  IssueObservation,
+  IssueSelection,
+  OptionPatchCheck,
+  OptionSummary,
+  PatchEntry,
+  PatchFileStat,
+  PatchStats,
+  RejectionInfo,
+  RepairApplyMode,
+  RepairAttempt,
+  RepairAttemptResult,
+  RepairOption,
+  ReviewCandidate,
+  ReviewComment,
+  ReviewFrontmatter,
+  ReviewPriority,
+  ReviewSections,
+  ReviewStatus,
+  SvnApprovalSource,
+  WaivedDecision,
 } from '@dsh-review/protocol';
+import { REVIEW_STATUSES } from '@dsh-review/protocol';
 
-export type RunnerKind = 'dsh' | 'manual' | 'external';
-export type RunnerMode = 'ADDRESS_FEEDBACK' | 'RESOLVE_CONFLICT';
+export { REVIEW_STATUSES };
+export type {
+  ApprovalInfo,
+  AuditType,
+  CandidateSummary,
+  CommentAnchor,
+  CommentSide,
+  CommentStatus,
+  FindingDisposition,
+  GateCheckResult,
+  HumanDecision,
+  HumanJudgmentItem,
+  IssueDecision,
+  IssueDecisionAction,
+  IssueEvidence,
+  IssueFindingView,
+  IssueKind,
+  IssueObservation,
+  IssueSelection,
+  OptionPatchCheck,
+  OptionSummary,
+  PatchEntry,
+  PatchFileStat,
+  PatchStats,
+  RejectionInfo,
+  RepairApplyMode,
+  RepairAttempt,
+  RepairAttemptResult,
+  RepairOption,
+  ReviewCandidate,
+  ReviewComment,
+  ReviewFrontmatter,
+  ReviewPriority,
+  ReviewSections,
+  ReviewStatus,
+  SvnApprovalSource,
+  WaivedDecision,
+};
 
-export interface ApplyPatchResult {
-  ok: boolean;
-  conflict: boolean;
-  message: string;
+export type VcsType = 'git' | 'svn';
+export type RunnerType = 'dsh' | 'manual' | 'external';
+
+export interface AppSettings {
+  repoRoot: string;
+  owner: string;
+  vcsType: 'auto' | VcsType;
+  baseBranch: string;
+  runner: RunnerType;
+  dshCommand: string;
+  externalCommand: string;
+  /** 分阶段审查与自检优先尝试的外部专业执行器清单；不可用时自动降级为本 Harness 独立子代理。 */
+  stageExecutors: string[];
+  /** 仅控制批准时程序应用受阻是否唤起 Mode C 修复 Agent；门禁失败绝不自动触发 Agent。 */
+  autoFixOnFailure: boolean;
+  gateTimeoutMs: number;
+  syncBeforeApprove: boolean;
+}
+
+export interface ReviewFilter {
+  owner?: string;
+  statuses?: ReviewStatus[];
+  tag?: string;
+  dir?: string;
+  text?: string;
+  createdAfter?: string;
+  createdBefore?: string;
+}
+
+export interface ConcurrencyGuard {
+  expectedRevision: number;
+  expectedOwner: string;
+  expectedUpdatedAt: string;
 }
 
 export interface InterRevisionDiff {
-  resolutionMode: DiffResolutionMode;
+  resolutionMode: 'same_base_direct' | 'cross_base_3way_clean' | 'cross_base_hunk_fallback';
   unifiedDiff: string;
   fromRevision: number;
   toRevision: number;
@@ -53,29 +121,34 @@ export interface InterRevisionDiff {
   notes: string[];
 }
 
-export interface ValidationReport {
-  allPassed: boolean;
-  baseRevision: string;
-  environmentSummary: string;
-  results: GateCheckResult[];
-  formattedEvidenceMarkdown: string;
+export interface ApplyPatchResult {
+  ok: boolean;
+  conflict: boolean;
+  message: string;
 }
 
-export interface RunnerExecutionResult {
-  success: boolean;
-  newRevisionId?: number;
-  newPatchPath?: string;
-  schemeChanged?: boolean;
-  errorMessage?: string;
-  /** 仅手动模式返回，交给用户在外部 Agent 中执行。 */
-  prompt?: string;
-  outputTail?: string;
-  manual?: boolean;
-  aborted?: boolean;
+export interface AuthorStatBucket {
+  name: string;
+  email: string;
+  commits: number;
 }
 
-export type ApprovalOutcomeStatus = 'COMMITTED' | 'REPAIR_FAILED' | 'FALLBACK_TO_PENDING' | 'ABORTED' | 'RECOVERY_REQUIRED';
-export type ApprovalFallbackReason = 'PATCH_CONFLICT' | 'GATE_CHECK_FAILED';
+export interface AuthorStats {
+  buckets: AuthorStatBucket[];
+  historyCommits: number;
+  pendingFiles: number;
+  diagnostic?: string;
+  scope: 'tracked' | 'repo';
+}
+
+export interface ApprovalCommitLookup {
+  revision: string | null;
+  lookup: 'found' | 'ambiguous' | 'unknown';
+  diagnostic?: string;
+}
+
+export type ApprovalFallbackReason = 'PATCH_CONFLICT' | 'MATERIAL_CHANGE';
+
 export type ApprovalAbortReason =
   | 'CONCURRENCY_MISMATCH'
   | 'STATE_CONFLICT'
@@ -88,82 +161,61 @@ export type ApprovalAbortReason =
   | 'BUSINESS_CONTENT_CHANGED'
   | 'COMMIT_FAILED'
   | 'MAX_RETRIES_EXCEEDED'
-  | 'RUNNER_FAILED';
-export type ApprovalRecoveryReason = 'COMMIT_OUTCOME_UNKNOWN' | 'SYNC_STATE_UNKNOWN';
+  | 'RUNNER_FAILED'
+  | 'CANCELLED';
 
-export interface ApprovalDecisions {
-  confirmed: string[];
-  waived: WaivedDecision[];
-}
+export type ApprovalRecoveryReason =
+  | 'COMMIT_OUTCOME_UNKNOWN'
+  | 'SYNC_STATE_UNKNOWN'
+  | 'RESTORE_INCOMPLETE'
+  | 'REMOTE_PUSH_UNREVERTIBLE';
 
-export interface ApprovalOutcome {
-  status: ApprovalOutcomeStatus;
-  reason?: ApprovalAbortReason | ApprovalFallbackReason | ApprovalRecoveryReason;
-  message: string;
-  /** 恢复状态须给出需要人工确认的具体事实。 */
-  detail?: string;
-  commitRevision?: string;
-  newRevision?: number;
-  manualPrompt?: string;
-  jobId?: string;
-}
-
-export type AiFixOutcomeStatus = 'COMMITTED' | 'MANUAL_REQUIRED' | 'VALIDATION_FAILED' | 'ABORTED' | 'RECOVERY_REQUIRED';
+export type ApprovalOutcome =
+  | { status: 'COMMITTED'; jobId: string; commitRevision: string; message: string; gateResults?: GateCheckResult[] }
+  | { status: 'REPAIR_FAILED'; jobId: string; reason: 'GATE_CHECK_FAILED'; commitRevision: string; message: string; gateResults: GateCheckResult[] }
+  | { status: 'FALLBACK_TO_PENDING'; jobId: string; reason: ApprovalFallbackReason; newRevision?: number; manualPrompt?: string; message: string }
+  | { status: 'ABORTED'; jobId: string; reason: ApprovalAbortReason; detail?: string; message: string }
+  | { status: 'RECOVERY_REQUIRED'; jobId: string; reason: ApprovalRecoveryReason; detail: string; message: string };
 
 export type AiFixAbortReason =
-    /** 三方应用产生冲突，且没有可用的自动修复结果。 */
   | 'REBASE_CONFLICT'
-  | 'GATE_CHECK_FAILED'
-  /** 两个 VCS 版本之间只有评审元数据变化时，也视为业务基线未变。 */
   | 'BASE_UNCHANGED'
   | 'DIRTY_WORKSPACE'
   | 'CONCURRENCY_MISMATCH'
   | 'STATE_CONFLICT'
   | 'INVALID_CANDIDATE'
   | 'SYNC_FAILED'
-  /** 已证明提交未落地且已恢复时使用。 */
   | 'COMMIT_FAILED'
   | 'RUNNER_FAILED'
   | 'CANCELLED';
 
-export type AiFixRecoveryReason = 'COMMIT_OUTCOME_UNKNOWN' | 'SYNC_STATE_UNKNOWN';
+export type AiFixOutcome =
+  | { status: 'COMMITTED'; newRevision: number; newPatchId?: number; optionId?: string; commitRevision: string | null; message: string }
+  | { status: 'MANUAL_REQUIRED'; prompt: string; message: string }
+  | { status: 'VALIDATION_FAILED'; errors: string[]; message: string }
+  | { status: 'ABORTED'; reason: AiFixAbortReason; detail?: string; message: string }
+  | { status: 'RECOVERY_REQUIRED'; reason: 'COMMIT_OUTCOME_UNKNOWN' | 'SYNC_STATE_UNKNOWN' | 'RESTORE_INCOMPLETE'; detail: string; message: string };
 
-export interface AiFixOutcome {
-  status: AiFixOutcomeStatus;
-  reason?: AiFixAbortReason | AiFixRecoveryReason;
-  message: string;
-  detail?: string;
-  commitRevision?: string | null;
-  newRevision?: number;
-  manualPrompt?: string;
-  errors?: string[];
-  jobId?: string;
-}
+export type AuditOutcomeStatus =
+  | 'COMMITTED'
+  | 'MANUAL_REQUIRED'
+  | 'VALIDATION_FAILED'
+  | 'ABORTED'
+  | 'RECOVERY_REQUIRED';
 
-export interface ApprovalCommitLookup {
-  revision: string | null;
-  lookup: 'found' | 'ambiguous' | 'unknown';
-  diagnostic?: string;
-}
-
-export interface AppSettings {
-  repoRoot: string;
-  owner: string;
-  vcsType: 'auto' | VcsType;
-  baseBranch: string;
-  runner: RunnerKind;
-  dshCommand: string;
-  externalCommand: string;
-  autoFixOnFailure: boolean;
-  gateTimeoutMs: number;
-  syncBeforeApprove: boolean;
-}
+export type AuditRecoveryReason =
+  | 'COMMIT_OUTCOME_UNKNOWN'
+  | 'SYNC_STATE_UNKNOWN'
+  | 'SCHEDULE_RECHECK_DIRTY'
+  | 'SCHEDULE_SCAN_DIRTY';
 
 export interface AuditCandidateResult {
   id: string;
+  findingId?: string;
   title: string;
   owner: string;
-  status: ReviewStatus;
+  status: string;
+  issueKind?: IssueKind;
   patch: string;
   baseRevision: string;
   patchStats: PatchStats;
@@ -171,82 +223,63 @@ export interface AuditCandidateResult {
   errors: string[];
 }
 
-export interface ReviewDataFileValidation {
-    path: string;
-    errors: string[];
-}
-
-export interface AuditDeferredItem {
-  label: string;
-  text: string;
-  category: 'confirm' | 'deferred';
-}
-
 export interface AuditReportInfo {
   path: string;
   text: string;
-  deferred: AuditDeferredItem[];
+  issues: string[];
+}
+
+export interface ReviewDataFileValidation {
+  path: string;
+  errors: string[];
 }
 
 export interface AuditOutcome {
-  /** 审查业务结果须单独判定。跟踪任务成功结束时仍可能需要人工收尾。 */
-  status: 'MANUAL_REQUIRED' | 'COMMITTED' | 'VALIDATION_FAILED' | 'ABORTED' | 'RECOVERY_REQUIRED';
   manual: boolean;
+  status: AuditOutcomeStatus;
   auditId: string;
   prompt?: string;
   created: AuditCandidateResult[];
-  deferred: AuditDeferredItem[];
+  issues: string[];
   report: AuditReportInfo | null;
-  dataValidation?: ReviewDataFileValidation[];
   commitRevision: string | null;
-  reason?: 'COMMIT_OUTCOME_UNKNOWN' | 'SYNC_STATE_UNKNOWN' | 'SCHEDULE_RECHECK_DIRTY' | 'SCHEDULE_SCAN_DIRTY';
-  detail?: string;
   baseRevision: string;
   targetPath: string;
   warnings: string[];
+  dataValidation?: ReviewDataFileValidation[];
+  reason?: AuditRecoveryReason;
+  detail?: string;
   message: string;
   outputTail?: string;
 }
 
 export interface JobRecord {
   id: string;
-  type: 'approve' | 'ai_fix' | 'audit' | 'reject' | 'feedback';
+  type: 'approve' | 'ai_fix' | 'audit';
   status: 'running' | 'succeeded' | 'failed';
   startedAt: string;
   finishedAt?: string;
   log: string[];
-  /** 截断日志时继续累加，以便轮询端识别已经丢弃的行。 */
   logStartOffset?: number;
   result?: unknown;
   error?: string;
-}
-
-export interface HealthInfo {
-  app: string;
-  version: string;
-  configured: boolean;
-  repoRoot: string;
-  owner: string;
-  vcsType: VcsType | null;
-  currentBase: string | null;
-  diagnostics: string[];
 }
 
 export type ApiErrorCode =
   | 'bad_request'
   | 'not_configured'
   | 'not_found'
-  | 'stale'
   | 'forbidden'
   | 'conflict'
+  | 'stale'
   | 'internal';
 
 export class ApiError extends Error {
   constructor(
-    readonly status: number,
-    readonly code: ApiErrorCode,
+    public readonly status: number,
+    public readonly code: ApiErrorCode,
     message: string,
-    readonly details?: unknown,
+    public readonly details?: Record<string, unknown>,
   ) {
     super(message);
     this.name = 'ApiError';

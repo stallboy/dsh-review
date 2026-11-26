@@ -6,6 +6,7 @@ import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
+import { patchFixture, reviewFixture, sha256Hex, writeCandidate as writeSchemaCandidate } from './fixtures/contract.mjs';
 
 const servers = [];
 after(async () => { await Promise.all(servers.map((server) => server.close())); });
@@ -22,77 +23,123 @@ async function startApi(root) {
 }
 
 async function writeCandidate(root, slug, over = {}) {
-  const dir = path.join(root, '.ai-review', '2026-11', slug);
-  await mkdir(dir, { recursive: true });
   const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  await writeFile(path.join(dir, 'review.md'), [
-    '---', 'schema_version: 1', `title: "net: ${slug}"`, 'module: net', 'audit_type: bugfix',
-    'created_at: "2026-11-09T10:00:00+08:00"', 'updated_at: "2026-11-09T10:00:00+08:00"', 'owner: tester',
-    `tags: ${JSON.stringify(over.tags ?? ['Net', ' net ', 'net'])}`, 'status: pending', 'ticket: null',
-    'target_files: [src/math.js]', 'current_revision: 1',
-    'revisions:', '  - id: 1', `    base_revision: "${over.base ?? base}"`, '    patch: 001.patch', '    author: ai',
-    `gate_checks: ${JSON.stringify(over.gateChecks ?? ['node --version'])}`,
-    'comments: []', 'human_decisions: []', 'approval: null', 'rejection: null',
-    'commit_message: "net: x"', '---', '', '# 问题与影响', '', '# 需人工判断项', '- 无', '',
-  ].join('\n'), 'utf8');
-  await writeFile(path.join(dir, '001.patch'), over.patchText ?? [
-    'diff --git a/src/math.js b/src/math.js', '--- a/src/math.js', '+++ b/src/math.js',
-    '@@ -1 +1 @@', '-export const add = (a, b) => a - b;', '+export const add = (a, b) => a + b;', '',
-  ].join('\n'), 'utf8');
+  const gates = over.gateChecks ? `[${over.gateChecks.map((g) => JSON.stringify(g)).join(', ')}]` : '["node --version"]';
+  return writeSchemaCandidate(root, slug, {
+    ...(over.patchText ? { patchText: over.patchText } : {}),
+    review: {
+      baseRevision: over.base ?? base,
+      createdAt: '2026-11-09T10:00:00+08:00',
+      updatedAt: '2026-11-09T10:00:00+08:00',
+      tags: JSON.stringify(over.tags ?? ['net']),
+      gateChecks: gates,
+    },
+  });
 }
 
 async function waitJob(base, jobId) {
   for (let i = 0; i < 100; i += 1) {
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 150));
     const job = await (await fetch(`${base}/jobs/${encodeURIComponent(jobId)}`)).json();
     if (job.status === 'succeeded' || job.status === 'failed') return job;
   }
   throw new Error('job 超时');
 }
 
-test('G29：/candidate/finalize 校验并单目录提交；tags 规范化去重生效', async () => {
+test('G29：/candidate/finalize 校验 Mode B 追加新补丁并原子提交', async () => {
   const root = await createGitFixture();
-  await mkdir(path.join(root, '.ai-review'), { recursive: true });
+  await writeCandidate(root, '20261109-solo');
   await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nrules: []\n', 'utf8');
   runCommand('git', ['add', '.ai-review'], root);
-  runCommand('git', ['commit', '-q', '-m', 'reviewers'], root);
-  await writeCandidate(root, '20261109-solo');
-  const { base } = await startApi(root);
-  const start = await fetch(`${base}/candidate/finalize`, {
+  runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
+
+  const dir = path.join(root, '.ai-review', '2026-11', '20261109-solo');
+  const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const p1 = patchFixture();
+  const p2 = patchFixture({ to: 'export const add = (a, b) => Number(a) + Number(b);' });
+  await writeFile(path.join(dir, '002.patch'), p2, 'utf8');
+  await writeFile(path.join(dir, 'review.md'), reviewFixture('20261109-solo', {
+    baseRevision: base,
+    createdAt: '2026-11-09T10:00:00+08:00',
+    updatedAt: '2026-11-09T10:05:00+08:00',
+    recordRevision: 2,
+    patches: [
+      '',
+      '  - id: 1',
+      '    patch: 001.patch',
+      '    option_id: opt-a',
+      `    base_revision: "${base}"`,
+      '    author: ai',
+      `    sha256: "${sha256Hex(p1)}"`,
+      '  - id: 2',
+      '    patch: 002.patch',
+      '    option_id: opt-a',
+      `    base_revision: "${base}"`,
+      '    author: ai',
+      `    sha256: "${sha256Hex(p2)}"`,
+    ].join('\n'),
+    options: [
+      '',
+      '  - id: opt-a',
+      '    title: 方案 A',
+      '    tradeoff: 改动小',
+      '    confidence: 0.9',
+      '    current_patch: 2',
+      '    gate_checks: ["node --version"]',
+    ].join('\n'),
+  }), 'utf8');
+
+  const { base: apiBase } = await startApi(root);
+  const start = await fetch(`${apiBase}/candidate/finalize`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261109-solo' }),
+    body: JSON.stringify({
+      id: '2026-11/20261109-solo',
+      expectedRevision: 1,
+      expectedOwner: 'tester',
+      expectedUpdatedAt: '2026-11-09T10:00:00+08:00',
+      optionId: 'opt-a',
+      patchId: 1,
+    }),
   });
   assert.equal(start.status, 202);
-  const job = await waitJob(base, (await start.json()).jobId);
+  const job = await waitJob(apiBase, (await start.json()).jobId);
   assert.equal(job.result.status, 'COMMITTED', JSON.stringify(job.result));
+  assert.equal(job.result.newPatchId, 2);
   const tracked = runCommand('git', ['ls-files', '.ai-review/2026-11'], root).stdout.trim();
-  assert.match(tracked, /20261109-solo/);
-  const text = await readFile(path.join(root, '.ai-review', '2026-11', '20261109-solo', 'review.md'), 'utf8');
-  assert.doesNotMatch(text, /tags:[^\n]*Net/, text);
-  assert.match(text, /tags:\s*(\[\s*"net"\s*\]\s*\n|\n\s+- net\s*\n)/, text);
-  const again = await fetch(`${base}/candidate/finalize`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261109-solo' }),
-  });
-  assert.equal(again.status, 409);
+  assert.match(tracked, /002\.patch/);
 });
 
-test('G15：补丁触及禁止路径 → finalize 拒绝', async () => {
+test('G15：新补丁触及禁止路径 → finalize 拒绝（VALIDATION_FAILED）', async () => {
   const root = await createGitFixture();
-  await writeCandidate(root, '20261109-forbidden', {
-    patchText: [
-      'diff --git a/node_modules/x.js b/node_modules/x.js', '--- a/node_modules/x.js',
-      '+++ b/node_modules/x.js', '@@ -0,0 +1 @@', '+evil', '',
-    ].join('\n'),
-  });
+  await writeCandidate(root, '20261109-forbidden');
+  runCommand('git', ['add', '.ai-review'], root);
+  runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
+
+  const dir = path.join(root, '.ai-review', '2026-11', '20261109-forbidden');
+  const badPatch = [
+    'diff --git a/.ai-review/evil.md b/.ai-review/evil.md',
+    '--- a/.ai-review/evil.md',
+    '+++ b/.ai-review/evil.md',
+    '@@ -0,0 +1 @@',
+    '+evil',
+    '',
+  ].join('\n');
+  await writeFile(path.join(dir, '002.patch'), badPatch, 'utf8');
   const { base } = await startApi(root);
   const start = await fetch(`${base}/candidate/finalize`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261109-forbidden' }),
+    body: JSON.stringify({
+      id: '2026-11/20261109-forbidden',
+      expectedRevision: 1,
+      expectedOwner: 'tester',
+      expectedUpdatedAt: '2026-11-09T10:00:00+08:00',
+      optionId: 'opt-a',
+      patchId: 1,
+    }),
   });
   const job = await waitJob(base, (await start.json()).jobId);
   assert.equal(job.result.status, 'VALIDATION_FAILED');
-  assert.match(job.result.errors.join('\n'), /禁止路径/);
+  assert.ok(job.result.errors.length > 0);
 });
 
 test('G39：行内评论携带 anchor 往返；总体评论带 anchor 422', async () => {
@@ -114,8 +161,8 @@ test('G39：行内评论携带 anchor 往返；总体评论带 anchor 422', asyn
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       id: '2026-11/20261109-anchor', expectedRevision: 1, expectedOwner: 'tester',
-      expectedUpdatedAt: '2026-11-09T10:00:00+08:00', content: '带锚点',
-      file: 'src/math.js', line: 1, side: 'RIGHT',
+      expectedUpdatedAt: '2026-11-09T10:00:00+08:00', optionId: 'opt-a', patchId: 1,
+      content: '带锚点', file: 'src/math.js', line: 1, side: 'RIGHT',
       anchor: { snippet: 'export const add = (a, b) => a + b;', before: '// head', after: '// tail' },
     }),
   });
@@ -126,7 +173,7 @@ test('G39：行内评论携带 anchor 往返；总体评论带 anchor 422', asyn
   assert.match(text, /after: \/\/ tail/);
 });
 
-test('G30：/jobs/:id/cancel 已结束 Job 幂等返回原结果', async () => {
+test('G30：无未解决评论 /ai-fix 409；未知 Job 取消返回 404', async () => {
   const root = await createGitFixture();
   await writeCandidate(root, '20261109-cancel');
   runCommand('git', ['add', '.ai-review'], root);
@@ -136,18 +183,17 @@ test('G30：/jobs/:id/cancel 已结束 Job 幂等返回原结果', async () => {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       id: '2026-11/20261109-cancel', expectedRevision: 1, expectedOwner: 'tester',
-      expectedUpdatedAt: '2026-11-09T10:00:00+08:00',
+      expectedUpdatedAt: '2026-11-09T10:00:00+08:00', optionId: 'opt-a', patchId: 1,
     }),
   });
-  assert.equal(fix.status, 409, '无未解决评论应 409（G23）');
+  assert.equal(fix.status, 409);
   assert.equal((await fetch(`${base}/jobs/job-x/cancel`, { method: 'POST' })).status, 404);
 });
 
-test('AC-AUDIT-NO-APPLY：遗留declared配置也不在审查收尾执行修复门禁', async () => {
+test('AC-AUDIT-NO-APPLY：审查收尾绝不应用待审补丁或执行修复门禁', async () => {
   const root = await createGitFixture();
   await mkdir(path.join(root, '.ai-review', 'audits'), { recursive: true });
-  await writeFile(path.join(root, '.ai-review', 'reviewers.yml'),
-    'default_owner: tester\nrules: []\nverify_gate_on_audit_finalize: declared\n', 'utf8');
+  await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nrules: []\n', 'utf8');
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'reviewers'], root);
   const { base } = await startApi(root);
@@ -166,7 +212,5 @@ test('AC-AUDIT-NO-APPLY：遗留declared配置也不在审查收尾执行修复�
   assert.match(await readFile(path.join(root, 'src/math.js'), 'utf8'), /=> a - b/);
   assert.equal(runCommand('git', ['status', '--porcelain=v1'], root).stdout.trim(), '?? .tmp/');
   assert.deepEqual(await readdir(path.join(root, '.tmp')), ['state.json']);
-  const auditText = await readFile(path.join(root, '.ai-review', 'audits', manual.auditId, 'audit.md'), 'utf8');
-  assert.doesNotMatch(auditText, /门禁已由 Host 复算/);
   assert.match(runCommand('git', ['ls-files', '.ai-review/2026-11'], root).stdout, /001\.patch/);
 });

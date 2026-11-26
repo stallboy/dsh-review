@@ -1,36 +1,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { ApprovalOrchestrator } from '../packages/dsh-plugin/dist/host/approval.js';
+import { runApprovalTransaction } from '../packages/dsh-plugin/dist/host/approval.js';
 import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
 import { createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
+import { GitHeadCandidateSource } from '../packages/dsh-plugin/dist/host/shared-facts.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
+import { writeCandidate as writeSchemaCandidate } from './fixtures/contract.mjs';
 
 const SLUG = '20261110-three-branch';
 
 async function writeCandidate(root, slug = SLUG) {
-  const dir = path.join(root, '.ai-review', '2026-11', slug);
-  await mkdir(dir, { recursive: true });
   const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  await writeFile(path.join(dir, 'review.md'), [
-    '---', 'schema_version: 1', `title: "net: ${slug}"`, 'module: net', 'audit_type: bugfix',
-    'created_at: "2026-11-08T10:00:00+08:00"', 'updated_at: "2026-11-08T10:00:00+08:00"', 'owner: tester',
-    'tags: []', 'status: pending', 'ticket: null', 'target_files: [src/math.js]', 'current_revision: 1',
-    'revisions:', '  - id: 1', `    base_revision: "${base}"`, '    patch: 001.patch', '    author: ai',
-    'gate_checks: ["node --version"]', 'comments: []', 'human_decisions: []', 'approval: null', 'rejection: null',
-    `commit_message: "net: ${slug}"`, '---', '', '# 问题与影响', '', '# 需人工判断项', '- 无', '',
-  ].join('\n'), 'utf8');
-  await writeFile(path.join(dir, '001.patch'), [
-    'diff --git a/src/math.js b/src/math.js',
-    '--- a/src/math.js',
-    '+++ b/src/math.js',
-    '@@ -1 +1 @@',
-    '-export const add = (a, b) => a - b;',
-    '+export const add = (a, b) => a + b;',
-    '',
-  ].join('\n'), 'utf8');
+  await writeSchemaCandidate(root, slug, {
+    review: {
+      baseRevision: base,
+      createdAt: '2026-11-08T10:00:00+08:00',
+      updatedAt: '2026-11-08T10:00:00+08:00',
+    },
+  });
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
 }
@@ -45,37 +35,47 @@ function wrapVcs(real, overrides) {
   });
 }
 
-async function orchestratorFor(root, vcsOverrides) {
+async function runApprove(root, vcsOverrides, jobId) {
   const store = new ReviewStore(root);
   const real = createVcs('git', root);
   const vcs = wrapVcs(real, vcsOverrides);
-  const orchestrator = new ApprovalOrchestrator({
-    store,
-    vcs,
-    settings: { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', runner: 'manual', syncBeforeApprove: false, autoFixOnFailure: false },
-    makeRunner: () => ({ run: async () => ({ success: false, errorMessage: 'not used' }) }),
-  });
   const guard = {
     expectedRevision: 1,
     expectedOwner: 'tester',
     expectedUpdatedAt: '2026-11-08T10:00:00+08:00',
   };
-  return { orchestrator, guard, store };
+  return runApprovalTransaction(
+    {
+      store,
+      vcs,
+      settings: { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', runner: 'manual', syncBeforeApprove: false, autoFixOnFailure: false },
+      jobId,
+      log: () => undefined,
+      sharedSource: async () => (await GitHeadCandidateSource.create(root)) ?? undefined,
+    },
+    {
+      id: `2026-11/${SLUG}`,
+      guard,
+      optionId: 'opt-a',
+      patchId: 1,
+      confirmedDecisions: [],
+      waivedDecisions: [],
+      actor: 'tester',
+    },
+  );
 }
 
 test('AC-RECOVERY-01：提交命令报错但提交已落地且 review.md 为 approved → 按成功继续（COMMITTED）', async () => {
   const root = await createGitFixture();
   await writeCandidate(root);
   const headBefore = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  const { orchestrator, guard } = await orchestratorFor(root, {
+  const outcome = await runApprove(root, {
     async atomicCommit(input) {
-      // 先提交再返回失败，模拟提交落地后命令超时（AC-RECOVERY-01）。
       const result = await createVcs('git', root).atomicCommit(input);
       assert.equal(result.success, true, result.errorOutput);
       return { success: false, commitRevision: null, outOfDate: false, errorOutput: 'simulated timeout' };
     },
-  });
-  const outcome = await orchestrator.approve(`2026-11/${SLUG}`, guard, 'job-three-1', () => undefined);
+  }, 'job-three-1');
   assert.equal(outcome.status, 'COMMITTED', JSON.stringify(outcome));
   const headAfter = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   assert.notEqual(headAfter, headBefore);
@@ -89,18 +89,15 @@ test('AC-RECOVERY-01：提交命令报错但提交已落地且 review.md 为 app
 test('AC-RECOVERY-01：提交命令报错但 HEAD 被并发提交推进且内容不匹配 → RECOVERY_REQUIRED，保留现场', async () => {
   const root = await createGitFixture();
   await writeCandidate(root);
-  const { orchestrator, guard } = await orchestratorFor(root, {
+  const outcome = await runApprove(root, {
     async atomicCommit() {
-      // 用无关的空提交推进 HEAD，模拟探针变化却找不到此次业务提交的情形。
       runCommand('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.com', 'commit', '--allow-empty', '-q', '-m', 'concurrent'], root);
       return { success: false, commitRevision: null, outOfDate: false, errorOutput: 'simulated failure' };
     },
-  });
-  const outcome = await orchestrator.approve(`2026-11/${SLUG}`, guard, 'job-three-2', () => undefined);
+  }, 'job-three-2');
   assert.equal(outcome.status, 'RECOVERY_REQUIRED', JSON.stringify(outcome));
   assert.equal(outcome.reason, 'COMMIT_OUTCOME_UNKNOWN');
   assert.ok(outcome.detail);
-  // 保留工作区里的批准内容，为无法判定提交结果时的人工恢复留证。
   const review = await readFile(path.join(root, '.ai-review', '2026-11', SLUG, 'review.md'), 'utf8');
   assert.match(review, /status: approved/);
   const committedReview = runCommand('git', ['show', `HEAD:.ai-review/2026-11/${SLUG}/review.md`], root).stdout;
@@ -111,12 +108,11 @@ test('AC-RECOVERY-01：提交命令失败且 HEAD 未前进 → COMMIT_FAILED，
   const root = await createGitFixture();
   await writeCandidate(root);
   const headBefore = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  const { orchestrator, guard } = await orchestratorFor(root, {
+  const outcome = await runApprove(root, {
     async atomicCommit() {
       return { success: false, commitRevision: null, outOfDate: false, errorOutput: 'simulated hard failure' };
     },
-  });
-  const outcome = await orchestrator.approve(`2026-11/${SLUG}`, guard, 'job-three-3', () => undefined);
+  }, 'job-three-3');
   assert.equal(outcome.status, 'ABORTED', JSON.stringify(outcome));
   assert.equal(outcome.reason, 'COMMIT_FAILED');
   assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), headBefore, '不得产生提交');
@@ -129,18 +125,16 @@ test('AC-RECOVERY-01：提交命令失败且 HEAD 未前进 → COMMIT_FAILED，
 test('AC-RECOVERY-01：提交失败且提交探针不可读 → RECOVERY_REQUIRED，禁止恢复', async () => {
   const root = await createGitFixture();
   await writeCandidate(root);
-  const { orchestrator, guard } = await orchestratorFor(root, {
+  const outcome = await runApprove(root, {
     async getCommitProbe() {
       return null;
     },
     async atomicCommit() {
       return { success: false, commitRevision: null, outOfDate: false, errorOutput: 'simulated probe failure' };
     },
-  });
-  const outcome = await orchestrator.approve(`2026-11/${SLUG}`, guard, 'job-three-4', () => undefined);
+  }, 'job-three-4');
   assert.equal(outcome.status, 'RECOVERY_REQUIRED', JSON.stringify(outcome));
   assert.equal(outcome.reason, 'COMMIT_OUTCOME_UNKNOWN');
   const review = await readFile(path.join(root, '.ai-review', '2026-11', SLUG, 'review.md'), 'utf8');
   assert.match(review, /status: approved/);
 });
-

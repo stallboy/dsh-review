@@ -1,614 +1,344 @@
-import { existsSync } from 'node:fs';
-import { createHash } from 'node:crypto';
-import { auditFiles } from './audit-files.js';
+/** 本轮审查档案 audit.md 读写与不变量校验（唯一契约 schema_version: 1，纯索引模型）。 */
+
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { readMarkdownFrontmatter, dump } from './yaml.js';
-import { FINDING_ID_PATTERN, isRepoRelativePath, parseTime } from './invariants.js';
-import type { FindingDisposition, FindingEvent } from './finding-decisions.js';
-
-/** 审查档案的读写、校验与审查项投影。档案以 audits/<audit_id>/audit.md 为单位。 */
-
-export class AuditFormatError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'AuditFormatError';
-  }
-}
+import { isRepoRelativePath, MONTH_PATTERN, parseTime, SLUG_PATTERN } from './invariants.js';
+import { isAiReviewPath } from './patch.js';
+import { dump, readMarkdownFrontmatter } from './yaml.js';
 
 export type AuditTrigger = 'manual' | 'scheduled';
-export type AuditItemKind = 'confirm' | 'deferred' | 'repair';
-export type AuditItemStatus = 'pending' | 'converted' | 'dismissed' | 'resolved';
-
-export interface AuditItem {
-  findingId: string;
-  kind: AuditItemKind;
-  title: string;
-  summary: string;
-  targetFiles: string[];
-  dependsOn: string | null;
-  status: AuditItemStatus;
-  candidate: string | null;
-  repairPlan?: string;
-  options?: { candidateId: string; tradeoff: string }[];
-  repairRevisions?: string[];
-  repairAttribution?: string;
-}
 
 export interface AuditFrontmatter {
-  schemaVersion: number;
+  schemaVersion: 1;
   auditId: string;
   createdAt: string;
   baseRevision: string;
   scope: string;
   trigger: AuditTrigger;
   previousAudit: string | null;
-  candidates: string[];
-  items: AuditItem[];
+  /** 本轮新建或有效更新的问题目录 ID 列表（YYYY-MM/<slug>）。 */
+  issues: string[];
+  extra?: Record<string, unknown>;
 }
 
 export interface AuditRecord {
+  auditId: string;
+  dirPath: string;
+  filePath: string;
   meta: AuditFrontmatter;
   body: string;
-  dirName: string;
-  reviewPath: string;
   parseError?: string;
 }
 
-const AUDIT_DIR_PATTERN = /^\d{8}-\d{6}-[a-z0-9][a-z0-9._-]*$/;
-const CANDIDATE_ID_PATTERN = /^\d{4}-\d{2}\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+export interface AuditSource {
+  listAuditDirs(): Promise<string[]>;
+  readAuditText(dirName: string): Promise<string | null>;
 }
 
-function requiredField(doc: Record<string, unknown>, key: string, prefix = ''): unknown {
-    if (!Object.hasOwn(doc, key)) throw new AuditFormatError(`${prefix}${key} 是必填字段，不得缺省`);
-    return doc[key];
+export const AUDIT_ID_PATTERN = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-([a-z0-9][a-z0-9._-]*)$/;
+const REPORT_MARKER_START = '<!-- ai-review:audit-verification -->';
+const REPORT_MARKER_END = '<!-- /ai-review:audit-verification -->';
+
+const KNOWN_AUDIT_KEYS = new Set([
+  'schema_version',
+  'audit_id',
+  'created_at',
+  'base_revision',
+  'scope',
+  'trigger',
+  'previous_audit',
+  'issues',
+]);
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) && !(value instanceof Date);
 }
 
-function asString(value: unknown, field: string): string {
-    if (typeof value !== 'string' || !value.trim()) throw new AuditFormatError(`${field} 必须是非空字符串`);
-    return value;
+/** 判定审查 scope 是否覆盖给定业务路径集合（scope="." 表示全仓）。 */
+export function scopeCovers(scope: string, files: readonly string[]): boolean {
+  const normalizedScope = scope.trim().replaceAll('\\', '/').replace(/\/+$/, '');
+  if (normalizedScope === '.' || normalizedScope === '') return true;
+  if (files.length === 0) return false;
+  return files.every((raw) => {
+    const file = raw.replaceAll('\\', '/').replace(/^\.\//, '');
+    return file === normalizedScope || file.startsWith(`${normalizedScope}/`);
+  });
 }
 
-function asNullableString(value: unknown, field: string): string | null {
-    return value === null ? null : asString(value, field);
+export function isValidIssueDirId(value: string): boolean {
+  const parts = value.split('/');
+  return parts.length === 2 && MONTH_PATTERN.test(parts[0] ?? '') && SLUG_PATTERN.test(parts[1] ?? '');
 }
 
-function asArray(value: unknown, field: string): unknown[] {
-    if (!Array.isArray(value)) throw new AuditFormatError(`${field} 必须是数组`);
-    return value;
-}
-
-function asStringArray(value: unknown, field: string): string[] {
-    return asArray(value, field).map((item, index) => asString(item, `${field}[${String(index)}]`));
-}
-
-export function parseAuditItem(value: unknown, index: number, schemaVersion: number): AuditItem {
-    const name = `items[${String(index)}].`;
-    if (!isRecord(value)) throw new AuditFormatError(`items[${String(index)}] 必须是对象`);
-    const field = (key: string) => requiredField(value, key, name);
-    const kind = asString(field('kind'), `${name}kind`);
-    if (kind !== 'confirm' && kind !== 'deferred' && !(schemaVersion === 2 && kind === 'repair')) {
-        throw new AuditFormatError(`${name}kind 不受当前 schema_version 支持`);
-    }
-    const status = asString(field('status'), `${name}status`);
-    if (!['pending', 'converted', 'dismissed', 'resolved'].includes(status)) {
-        throw new AuditFormatError(`${name}status 非法：${status}`);
-    }
-    const findingId = asString(field('finding_id'), `${name}finding_id`);
-    if (!FINDING_ID_PATTERN.test(findingId)) {
-        throw new AuditFormatError(`${name}finding_id 格式非法：${findingId}`);
-    }
-    const item: AuditItem = {
-        findingId,
-        kind: kind as AuditItemKind,
-        title: asString(field('title'), `${name}title`),
-        summary: asString(field('summary'), `${name}summary`),
-        targetFiles: asStringArray(field('target_files'), `${name}target_files`),
-        dependsOn: asNullableString(field('depends_on'), `${name}depends_on`),
-        status: status as AuditItemStatus,
-        candidate: asNullableString(field('candidate'), `${name}candidate`),
-    };
-    if (schemaVersion === 2) {
-        if (Object.hasOwn(value, 'repair_plan')) item.repairPlan = asString(value['repair_plan'], `${name}repair_plan`);
-        if (Object.hasOwn(value, 'options')) {
-            item.options = asArray(value['options'], `${name}options`).map((option, optionIndex) => {
-                const key = `${name}options[${String(optionIndex)}]`;
-                if (!isRecord(option)) throw new AuditFormatError(`${key} 必须是对象`);
-                return {
-                    candidateId: asString(option['candidate_id'], `${key}.candidate_id`),
-                    tradeoff: asString(option['tradeoff'], `${key}.tradeoff`),
-                };
-            });
-        }
-        if (Object.hasOwn(value, 'repair_revisions')) {
-            item.repairRevisions = asStringArray(value['repair_revisions'], `${name}repair_revisions`);
-        }
-        if (Object.hasOwn(value, 'repair_attribution')) {
-            item.repairAttribution = asString(value['repair_attribution'], `${name}repair_attribution`);
-        }
-    }
-    return item;
+export function auditIdTimestampUtc(auditId: string): string | null {
+  const match = AUDIT_ID_PATTERN.exec(auditId);
+  if (!match) return null;
+  const [, y, mo, d, h, mi, s] = match;
+  const iso = `${y}-${mo}-${d}T${h}:${mi}:${s}.000Z`;
+  const parsed = new Date(iso);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString() !== iso) return null;
+  return iso;
 }
 
 export function parseAuditMarkdown(text: string): { meta: AuditFrontmatter; body: string } {
-    let doc: unknown;
-    let body: string;
-    try {
-        ({ doc, body } = readMarkdownFrontmatter(text, 'audit.md'));
-    } catch (error) {
-        throw new AuditFormatError(error instanceof Error ? error.message : String(error));
-    }
-    if (!isRecord(doc)) throw new AuditFormatError('audit.md Frontmatter 必须是 YAML 对象');
-    const field = (key: string) => requiredField(doc, key);
-    const schemaVersion = field('schema_version');
-    if (schemaVersion !== 1 && schemaVersion !== 2 && schemaVersion !== 3) {
-        throw new AuditFormatError('schema_version 必须是数字 1 或 2；更高版本需要升级插件');
-    }
-    const trigger = asString(field('trigger'), 'trigger');
-    if (trigger !== 'manual' && trigger !== 'scheduled') throw new AuditFormatError('trigger 只能是 manual | scheduled');
-    const scope = asString(field('scope'), 'scope');
-    if (scope !== '.' && !isRepoRelativePath(scope)) throw new AuditFormatError(`scope 非法：${scope}`);
-    const createdAt = field('created_at');
-    return {
-        meta: {
-            schemaVersion,
-            auditId: asString(field('audit_id'), 'audit_id'),
-            createdAt: createdAt instanceof Date ? createdAt.toISOString() : asString(createdAt, 'created_at'),
-            baseRevision: asString(field('base_revision'), 'base_revision'),
-            scope,
-            trigger,
-            previousAudit: asNullableString(field('previous_audit'), 'previous_audit'),
-            candidates: asStringArray(field(schemaVersion === 3 ? 'issues' : 'candidates'), schemaVersion === 3 ? 'issues' : 'candidates'),
-            items: schemaVersion === 3 ? [] : asArray(field('items'), 'items').map((item, index) => parseAuditItem(item, index, schemaVersion)),
-        },
-        body,
-    };
+  const { doc, body } = readMarkdownFrontmatter(text, 'audit.md');
+  if (!isPlainRecord(doc)) throw new Error('audit.md Frontmatter 顶层必须是对象');
+  for (const key of KNOWN_AUDIT_KEYS) {
+    if (!Object.hasOwn(doc, key)) throw new Error(`audit.md 缺少必填顶层字段：${key}`);
+  }
+  if (doc['schema_version'] !== 1) {
+    throw new Error(`audit.md 仅支持 schema_version: 1（当前为 ${String(doc['schema_version'])}）`);
+  }
+  const auditId = doc['audit_id'];
+  if (typeof auditId !== 'string' || !auditId.trim()) throw new Error('audit_id 必须是非空字符串');
+  const rawCreated = doc['created_at'];
+  const createdAt = rawCreated instanceof Date
+    ? rawCreated.toISOString()
+    : typeof rawCreated === 'string'
+      ? rawCreated.trim()
+      : '';
+  if (!createdAt) throw new Error('created_at 必须是非空 ISO-8601 字符串');
+  const baseRevision = doc['base_revision'];
+  if (typeof baseRevision !== 'string' || !baseRevision.trim()) throw new Error('base_revision 必须是非空字符串');
+  const scope = doc['scope'];
+  if (typeof scope !== 'string' || !scope.trim()) throw new Error('scope 必须是非空字符串');
+  const trigger = doc['trigger'];
+  if (trigger !== 'manual' && trigger !== 'scheduled') throw new Error(`trigger 非法：${String(trigger)}`);
+  const previousAudit = doc['previous_audit'];
+  if (previousAudit !== null && typeof previousAudit !== 'string') {
+    throw new Error('previous_audit 必须是字符串或 null');
+  }
+  const rawIssues = doc['issues'];
+  if (!Array.isArray(rawIssues) || rawIssues.some((item) => typeof item !== 'string')) {
+    throw new Error('issues 必须是字符串数组');
+  }
+  const extra: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(doc)) {
+    if (!KNOWN_AUDIT_KEYS.has(k)) extra[k] = v;
+  }
+  const parsedMs = Date.parse(createdAt);
+  const normalizedCreated = Number.isFinite(parsedMs) ? new Date(parsedMs).toISOString() : createdAt;
+
+  return {
+    meta: {
+      schemaVersion: 1,
+      auditId,
+      createdAt: normalizedCreated,
+      baseRevision,
+      scope,
+      trigger,
+      previousAudit,
+      issues: rawIssues as string[],
+      ...(Object.keys(extra).length > 0 ? { extra } : {}),
+    },
+    body,
+  };
 }
 
 export function serializeAuditMarkdown(meta: AuditFrontmatter, body: string): string {
-  const doc: Record<string, unknown> = {
-    schema_version: meta.schemaVersion,
+  const ordered: Record<string, unknown> = {
+    schema_version: 1,
     audit_id: meta.auditId,
     created_at: meta.createdAt,
     base_revision: meta.baseRevision,
     scope: meta.scope,
     trigger: meta.trigger,
     previous_audit: meta.previousAudit,
-    candidates: meta.candidates,
-    items: meta.items.map((item) => ({
-      finding_id: item.findingId,
-      kind: item.kind,
-      title: item.title,
-      summary: item.summary,
-      target_files: item.targetFiles,
-      depends_on: item.dependsOn,
-      status: item.status,
-      candidate: item.candidate,
-      ...(item.repairPlan !== undefined ? { repair_plan: item.repairPlan } : {}),
-      ...(item.options !== undefined ? {
-        options: item.options.map(({ candidateId, tradeoff }) => ({ candidate_id: candidateId, tradeoff })),
-      } : {}),
-      ...(item.repairRevisions !== undefined ? { repair_revisions: item.repairRevisions } : {}),
-      ...(item.repairAttribution !== undefined ? { repair_attribution: item.repairAttribution } : {}),
-    })),
+    issues: meta.issues,
+    ...(meta.extra ?? {}),
   };
-  if (meta.schemaVersion === 3) {
-    doc.issues = meta.candidates;
-    delete doc.candidates;
-    delete doc.items;
-  }
-  const yamlText = dump(doc, { lineWidth: -1, noRefs: true, sortKeys: false }).replace(/\n$/, '');
-  return `---\n${yamlText}\n---\n${body.startsWith('\n') ? body : `\n${body}`}`;
+  const yamlText = dump(ordered, { lineWidth: -1, noRefs: true, sortKeys: false });
+  const normalizedBody = body.replace(/\r\n/g, '\n').replace(/^\n+/, '').replace(/\s*$/, '');
+  return `---\n${yamlText}---\n\n${normalizedBody}\n`;
 }
 
-export function auditInvariantErrors(meta: AuditFrontmatter, dirName: string): string[] {
+/** I2 / I13 / I15：校验 audit.md 结构、时间戳一致性、scope 合法性与纯索引约束。 */
+export function auditInvariantErrors(meta: AuditFrontmatter, dirName: string, body?: string): string[] {
   const errors: string[] = [];
-  if (!AUDIT_DIR_PATTERN.test(dirName)) errors.push(`I1: audit 目录名非法：${dirName}`);
-  if (meta.auditId !== dirName) errors.push(`I1: audit_id=${meta.auditId} 与目录名 ${dirName} 不一致`);
-  if (meta.schemaVersion !== 1 && meta.schemaVersion !== 2 && meta.schemaVersion !== 3) errors.push('I2: 档案 schema_version 无效');
-  if (meta.schemaVersion === 3 && meta.items.length) errors.push('新版审查索引不得内嵌可编辑问题');
-  const findingIds = new Set<string>();
-  const optionIds = new Set<string>();
-  const publishedIds = new Set(meta.candidates);
-  for (const item of meta.items) {
-    const at = `items[${item.findingId}]`;
-    if (!FINDING_ID_PATTERN.test(item.findingId)) errors.push(`I1: ${at} finding_id 非法`);
-    if (findingIds.has(item.findingId)) errors.push(`I1: ${at} finding_id 在同一档案内重复`);
-    findingIds.add(item.findingId);
-    for (const target of item.targetFiles) {
-      if (!isRepoRelativePath(target) || (meta.schemaVersion === 2 && path.win32.parse(target).root)) {
-        errors.push(`I12: ${at} target_files 含非法路径：${target}`);
-      }
-    }
-    if (item.status === 'converted' && !item.candidate) errors.push(`I9: ${at} converted 但 candidate 为空`);
-    if (item.status !== 'converted' && item.candidate) errors.push(`I9: ${at} 非 converted 但 candidate 非空`);
-    if (item.kind === 'deferred' && !item.dependsOn) errors.push(`I10: ${at} deferred 缺少 depends_on`);
-    if (item.kind === 'deferred' && item.dependsOn === item.findingId) errors.push(`I10: ${at} deferred 不得自依赖`);
-    if (item.kind !== 'deferred' && item.dependsOn) errors.push(`I10: ${at} 非 deferred 不应有 depends_on`);
-    if (meta.schemaVersion === 2) {
-      if (item.kind === 'repair' && item.repairPlan !== undefined && item.status === 'pending' && item.options === undefined) {
-        errors.push(`I2: ${at} 发布修复方案时必须提供选项`);
-      }
-      if (item.options !== undefined) {
-        if (item.kind !== 'repair' || item.status !== 'pending' || !item.repairPlan?.trim()
-          || item.options.length < 1 || item.options.length > 3) {
-          errors.push(`I2: ${at} 修复选项必须属于待审核修复方案，且为一至三项`);
-        }
-        for (const option of item.options) {
-          if (!CANDIDATE_ID_PATTERN.test(option.candidateId) || !publishedIds.has(option.candidateId)
-            || optionIds.has(option.candidateId) || !option.tradeoff.trim()) {
-            errors.push(`I2: ${at} 修复选项无效或重复：${option.candidateId}`);
-          }
-          optionIds.add(option.candidateId);
-        }
-      }
-      if (item.repairRevisions !== undefined || item.repairAttribution !== undefined) {
-        const revisions = item.repairRevisions ?? [];
-        if (item.status !== 'resolved' || !item.repairAttribution?.trim() || revisions.length === 0
-          || new Set(revisions).size !== revisions.length) {
-          errors.push(`I2: ${at} 修复归因须对应已解决观察，并含有效版本和归因说明`);
-        }
-      }
+  if (meta.schemaVersion !== 1) errors.push(`audit.md 仅支持 schema_version: 1`);
+  if (!AUDIT_ID_PATTERN.test(dirName)) errors.push(`审查档案目录名格式非法：${dirName}`);
+  if (meta.auditId !== dirName) errors.push(`audit_id（${meta.auditId}）与目录名（${dirName}）不一致`);
+
+  const createdMs = parseTime(meta.createdAt, 'created_at', errors);
+  const idUtc = auditIdTimestampUtc(meta.auditId);
+  if (!idUtc) {
+    errors.push(`audit_id 的时间戳部分无效：${meta.auditId}`);
+  } else if (createdMs !== null) {
+    const createdSecond = new Date(Math.floor(createdMs / 1000) * 1000).toISOString();
+    if (createdSecond !== idUtc) {
+      errors.push(`created_at 的 UTC 秒级时刻（${createdSecond}）必须与 audit_id（${idUtc}）一致`);
     }
   }
-  if (meta.schemaVersion === 2 && publishedIds.size !== meta.candidates.length) {
-    errors.push('I2: v2 档案的候选清单不得重复');
-  }
-  const pendingDeps = new Map<string, string>();
-  for (const item of meta.items) {
-    if (item.kind === 'deferred' && item.status === 'pending' && item.dependsOn) {
-      pendingDeps.set(item.findingId, item.dependsOn);
+
+  if (!meta.baseRevision.trim()) errors.push('base_revision 不能为空');
+  if (meta.scope !== '.') {
+    if (!isRepoRelativePath(meta.scope) || isAiReviewPath(meta.scope) || meta.scope.startsWith('./') || meta.scope.endsWith('/')) {
+      errors.push(`scope 非法：${meta.scope}`);
     }
   }
-  const reportedCycles = new Set<string>();
-  for (const start of pendingDeps.keys()) {
-    const pathSeen = new Set<string>();
-    let current: string | undefined = start;
-    while (current !== undefined) {
-      if (pathSeen.has(current)) {
-        if (!reportedCycles.has(current)) {
-          reportedCycles.add(current);
-          errors.push(`I10: pending 依赖形成环：${[...pathSeen, current].join(' → ')}`);
-        }
-        break;
-      }
-      pathSeen.add(current);
-      current = pendingDeps.get(current);
+  if (meta.previousAudit !== null && !AUDIT_ID_PATTERN.test(meta.previousAudit)) {
+    errors.push(`previous_audit 格式非法：${meta.previousAudit}`);
+  }
+
+  const seen = new Set<string>();
+  for (const id of meta.issues) {
+    if (!isValidIssueDirId(id)) {
+      errors.push(`issues 包含非法的问题目录 ID：${id}`);
+      continue;
+    }
+    if (seen.has(id)) errors.push(`issues 存在重复问题 ID：${id}`);
+    seen.add(id);
+  }
+
+  if (body !== undefined) {
+    const startMatches = body.match(new RegExp(REPORT_MARKER_START, 'g')) ?? [];
+    const endMatches = body.match(new RegExp(REPORT_MARKER_END, 'g')) ?? [];
+    if (startMatches.length > 1 || endMatches.length > 1 || startMatches.length !== endMatches.length) {
+      errors.push('audit.md 正文中的插件核验标记块必须至多出现一次且成对闭合');
     }
   }
-  // 用 UTC 比较档案编号与创建时间，避免跨时区读取时误报。
-  const stamp = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/.exec(meta.auditId);
-  const created = parseTime(meta.createdAt, 'created_at', errors);
-  if (stamp && created) {
-    const compact = created.toISOString().replace(/[-:T]/g, '').slice(0, 14);
-    if (compact !== stamp.slice(1).join('')) errors.push(`I13: audit_id 时间戳与 created_at 不一致：${meta.auditId} vs ${meta.createdAt}`);
-  }
+
   return errors;
 }
 
-export interface AuditSnapshotSource {
-  listAuditDirs(): Promise<string[]>;
-  readAuditText(dirName: string): Promise<string | null>;
+export function upsertAuditVerificationBlock(text: string, block: string): string {
+  const pattern = new RegExp(`${REPORT_MARKER_START}[\\s\\S]*?${REPORT_MARKER_END}`);
+  const wrapped = `${REPORT_MARKER_START}\n${block.trim()}\n${REPORT_MARKER_END}`;
+  if (pattern.test(text)) return text.replace(pattern, wrapped);
+  return `${text.replace(/\s+$/, '')}\n\n${wrapped}\n`;
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, '0');
+}
+
+export function slugifyAuditScope(targetPath: string): string {
+  const cleaned = (targetPath || 'repo')
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[._-]+|[._-]+$/g, '')
+    .slice(0, 40);
+  return cleaned && SLUG_PATTERN.test(cleaned) ? cleaned : 'repo';
 }
 
 export class AuditArchive {
-  constructor(readonly repoRoot: string) {}
+  readonly auditsDir: string;
 
-  private get auditsRoot(): string {
-    return path.join(this.repoRoot, '.ai-review', 'audits');
+  constructor(readonly repoRoot: string) {
+    this.auditsDir = path.join(repoRoot, '.ai-review', 'audits');
   }
 
-  async readDraft(dirName: string): Promise<string | null> {
-    if (!AUDIT_DIR_PATTERN.test(dirName)) throw new AuditFormatError(`审查目录名非法：${dirName}`);
-    const result = await auditFiles(this.repoRoot, { op: 'read', paths: [`.ai-review/audits/${dirName}/audit.md`] });
-    return result.bytes?.toString('utf8') ?? null;
+  auditFilePath(auditId: string): string {
+    return path.join(this.auditsDir, auditId, 'audit.md');
   }
 
-  /** 写路径可省略 source 检查工作区。共享读路径须传入快照，而且不会扫描旧的扁平报告。 */
-  async list(source?: AuditSnapshotSource): Promise<AuditRecord[]> {
-    const records: AuditRecord[] = [];
-    let dirs: string[] = [];
-    if (source) {
-      try {
-        dirs = (await source.listAuditDirs()).filter((name) => AUDIT_DIR_PATTERN.test(name));
-      } catch {
-        return records;
-      }
-      dirs.sort();
-      for (const dirName of dirs) {
-        const text = await source.readAuditText(dirName).catch(() => null);
-        if (text === null) continue;
-        records.push(this.recordFromText(dirName, path.join(this.auditsRoot, dirName, 'audit.md'), text));
-      }
-      return records;
+  async nextAuditId(targetPath: string, now: Date = new Date()): Promise<string> {
+    const slug = slugifyAuditScope(targetPath);
+    const stamp = `${String(now.getUTCFullYear())}${pad2(now.getUTCMonth() + 1)}${pad2(now.getUTCDate())}-${pad2(now.getUTCHours())}${pad2(now.getUTCMinutes())}${pad2(now.getUTCSeconds())}`;
+    const base = `${stamp}-${slug}`;
+    const existing = new Set(await this.listDirsFromFs());
+    if (!existing.has(base)) return base;
+    for (let suffix = 2; suffix < 1000; suffix += 1) {
+      const candidate = `${base}-${String(suffix)}`;
+      if (!existing.has(candidate)) return candidate;
     }
+    throw new Error(`同秒审查档案数量超限：${base}`);
+  }
+
+  private async listDirsFromFs(): Promise<string[]> {
     try {
-      const result = await auditFiles(this.repoRoot, { op: 'list', paths: ['.ai-review/audits'] });
-      dirs = (result.names ?? []).filter(name => AUDIT_DIR_PATTERN.test(name));
-    } catch {
-      return records;
+      const entries = await readdir(this.auditsDir, { withFileTypes: true });
+      return entries.filter((e) => e.isDirectory()).map((e) => e.name);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
     }
-    dirs.sort();
-    for (const dirName of dirs) {
-      const record = await this.read(dirName).catch(() => null);
-      if (record) records.push(record);
+  }
+
+  async readDraft(auditId: string): Promise<string | null> {
+    try {
+      return await readFile(this.auditFilePath(auditId), 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
+  async writeAudit(meta: AuditFrontmatter, body: string): Promise<void> {
+    const errors = auditInvariantErrors(meta, meta.auditId, body);
+    if (errors.length > 0) throw new Error(`审查档案不变量失败：${errors.join('；')}`);
+    const dir = path.join(this.auditsDir, meta.auditId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, 'audit.md'), serializeAuditMarkdown(meta, body), 'utf8');
+  }
+
+  async list(source?: AuditSource): Promise<AuditRecord[]> {
+    const dirs = source ? await source.listAuditDirs() : await this.listDirsFromFs();
+    const records: AuditRecord[] = [];
+    for (const dirName of [...dirs].sort().reverse()) {
+      const dirPath = path.join(this.auditsDir, dirName);
+      const filePath = path.join(dirPath, 'audit.md');
+      try {
+        const text = source
+          ? await source.readAuditText(dirName)
+          : await readFile(filePath, 'utf8').catch((err: NodeJS.ErrnoException) => (err.code === 'ENOENT' ? null : Promise.reject(err)));
+        if (text === null) continue;
+        const { meta, body } = parseAuditMarkdown(text);
+        const errors = auditInvariantErrors(meta, dirName, body);
+        records.push({
+          auditId: dirName,
+          dirPath,
+          filePath,
+          meta,
+          body,
+          ...(errors.length > 0 ? { parseError: errors.join('；') } : {}),
+        });
+      } catch (error) {
+        records.push({
+          auditId: dirName,
+          dirPath,
+          filePath,
+          meta: {
+            schemaVersion: 1,
+            auditId: dirName,
+            createdAt: '',
+            baseRevision: '',
+            scope: '.',
+            trigger: 'manual',
+            previousAudit: null,
+            issues: [],
+          },
+          body: '',
+          parseError: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
     return records;
   }
 
-  async read(dirName: string, source?: AuditSnapshotSource): Promise<AuditRecord> {
-    const reviewPath = path.join(this.auditsRoot, dirName, 'audit.md');
+  async get(auditId: string, source?: AuditSource): Promise<AuditRecord | null> {
     const text = source
-      ? await source.readAuditText(dirName).catch(() => null)
-      : await this.readDraft(dirName);
-    if (text === null) throw new Error(`审查档案不存在：${dirName}`);
-    return this.recordFromText(dirName, reviewPath, text);
+      ? await source.readAuditText(auditId)
+      : await readFile(this.auditFilePath(auditId), 'utf8').catch((err: NodeJS.ErrnoException) => (err.code === 'ENOENT' ? null : Promise.reject(err)));
+    if (text === null) return null;
+    const dirPath = path.join(this.auditsDir, auditId);
+    const filePath = path.join(dirPath, 'audit.md');
+    const { meta, body } = parseAuditMarkdown(text);
+    const errors = auditInvariantErrors(meta, auditId, body);
+    return {
+      auditId,
+      dirPath,
+      filePath,
+      meta,
+      body,
+      ...(errors.length > 0 ? { parseError: errors.join('；') } : {}),
+    };
   }
 
-  private recordFromText(dirName: string, reviewPath: string, text: string): AuditRecord {
-    try {
-      const parsed = parseAuditMarkdown(text);
-      const errors = auditInvariantErrors(parsed.meta, dirName);
-      if (errors.length > 0) {
-        return { meta: parsed.meta, body: parsed.body, dirName, reviewPath, parseError: errors.join('；') };
-      }
-      return { meta: parsed.meta, body: parsed.body, dirName, reviewPath };
-    } catch (error) {
-      if (!(error instanceof AuditFormatError)) throw error;
-      return {
-        meta: {
-          schemaVersion: 1, auditId: dirName, createdAt: '', baseRevision: '', scope: '.',
-          trigger: 'manual', previousAudit: null, candidates: [], items: [],
-        },
-        body: '',
-        dirName,
-        reviewPath,
-        parseError: error.message,
-      };
-    }
+  async read(auditId: string, source?: AuditSource): Promise<AuditRecord> {
+    const record = await this.get(auditId, source);
+    if (!record) throw new Error(`审查档案不存在：${auditId}`);
+    return record;
   }
-
-  async write(meta: AuditFrontmatter, body: string): Promise<AuditRecord> {
-    return this.writeArchive(meta, body, true);
-  }
-
-  async writeExisting(meta: AuditFrontmatter, body: string): Promise<AuditRecord> {
-    return this.writeArchive(meta, body, false);
-  }
-
-  private async writeArchive(meta: AuditFrontmatter, body: string, createOnly: boolean): Promise<AuditRecord> {
-    const errors = auditInvariantErrors(meta, meta.auditId);
-    if (errors.length > 0) throw new AuditFormatError(errors.join('；'));
-    const file = `.ai-review/audits/${meta.auditId}/audit.md`;
-    await auditFiles(this.repoRoot, { op: 'write', paths: [file], text: serializeAuditMarkdown(meta, body), createOnly });
-    return { meta, body, dirName: meta.auditId, reviewPath: path.join(this.repoRoot, file) };
-  }
-
-  async nextAuditId(scope: string, now: Date): Promise<string> {
-    const stamp = now.toISOString().replace(/[-:T]/g, '').slice(0, 15).replace(/^(\d{14})(\d)$/, '$1');
-    const compact = `${stamp.slice(0, 8)}-${stamp.slice(8, 14)}`;
-    const slug = (scope || 'repo')
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, '-')
-      .replace(/-+/g, '-')
-      .replace(/^-|-$/g, '')
-      .slice(0, 40) || 'repo';
-    let auditId = `${compact}-${slug}`;
-    let suffix = 2;
-    while (existsSync(path.join(this.auditsRoot, auditId))) {
-      auditId = `${compact}-${slug}-${String(suffix)}`;
-      suffix += 1;
-    }
-    return auditId;
-  }
-
-  async updateItem(
-    dirName: string,
-    findingId: string,
-    status: AuditItemStatus,
-    candidate: string | null,
-    note?: string,
-  ): Promise<AuditRecord> {
-    const record = await this.read(dirName);
-    if (record.parseError) throw new AuditFormatError(record.parseError);
-    const item = record.meta.items.find((entry) => entry.findingId === findingId);
-    if (!item) throw new AuditFormatError(`finding 不存在：${findingId}`);
-    item.status = status;
-    item.candidate = candidate;
-    const errors = auditInvariantErrors(record.meta, dirName);
-    if (errors.length > 0) throw new AuditFormatError(errors.join('；'));
-    const body = note
-      ? `${record.body.replace(/\s+$/, '')}\n\n# 审查项处理记录\n\n- ${note}\n`
-      : record.body;
-    return this.writeExisting(record.meta, body);
-  }
-}
-
-
-export type ProjectedState = 'open' | 'closed' | 'dismissed' | 'reopened';
-
-export interface CandidateChainInfo {
-  status: import('./types.js').ReviewStatus;
-  reopenedFrom: string | null;
-  broken?: boolean;
-  findingId?: string;
-}
-
-export interface FindingProjection {
-  findingId: string;
-  title: string;
-  summary: string;
-  targetFiles: string[];
-  kind: AuditItemKind;
-  dependsOn: string | null;
-  state: ProjectedState;
-  lastStatus: AuditItemStatus;
-  lastObservedAudit: string;
-  lastObservedAt: string;
-  candidateStatus?: import('./types.js').ReviewStatus;
-  candidate?: string;
-  findingVersion?: string;
-  disposition?: FindingDisposition;
-  decision?: FindingEvent;
-  repairHints?: string[];
-  repairPlan?: string;
-  baseRevision?: string;
-  repairRevisions?: string[];
-  repairAttribution?: string;
-  options?: { candidateId: string; tradeoff: string; status: CandidateChainInfo['status']; optionId?: string; patchId?: number; title?: string; confidence?: number }[];
-  reviewId?: string;
-  issueStatus?: import('./types.js').ReviewStatus;
-  schemaVersion?: number;
-}
-
-export function scopeCovers(scope: string, targetFiles: string[]): boolean {
-  if (scope === '.') return true;
-  const prefix = scope.endsWith('/') ? scope : `${scope}/`;
-  if (targetFiles.length === 0) return false;
-  return targetFiles.every((file) => file === scope || file.startsWith(prefix));
-}
-
-/** 审查项被拒绝的旧候选可能已有替代者。只有能确定唯一有效重开链时，投影才可沿链定位当前候选。 */
-export function projectFindings(
-  audits: AuditRecord[],
-  candidateInfoById: (candidateId: string) => CandidateChainInfo | null,
-  candidateIds: string[] = [],
-  v2?: {
-    candidateInfo: (id: string) => CandidateChainInfo | null;
-    events: ReadonlyMap<string, FindingEvent[] | Error>;
-  },
-): { findings: FindingProjection[]; errors: string[] } {
-  const errors: string[] = [];
-  const valid = audits.filter((audit) => !audit.parseError);
-  // 观察时间相同时用档案编号打破平局，使最新观察的选择不依赖枚举顺序。
-  const latest = new Map<string, { audit: AuditRecord; item: AuditItem }>();
-  const versioned = new Map<string, { audit: AuditRecord; item: AuditItem }[]>();
-  for (const audit of valid) {
-    for (const item of audit.meta.items) {
-      if (!scopeCovers(audit.meta.scope, item.targetFiles)) continue;
-      if (audit.meta.schemaVersion === 2) {
-        const observations = versioned.get(item.findingId) ?? [];
-        observations.push({ audit, item });
-        versioned.set(item.findingId, observations);
-      }
-      const current = latest.get(item.findingId);
-      if (!current) {
-        latest.set(item.findingId, { audit, item });
-        continue;
-      }
-      const currentTime = new Date(current.audit.meta.createdAt).getTime();
-      const nextTime = new Date(audit.meta.createdAt).getTime();
-      if (nextTime > currentTime || (nextTime === currentTime && audit.meta.auditId > current.audit.meta.auditId)) {
-        latest.set(item.findingId, { audit, item });
-      }
-    }
-  }
-  const projections: FindingProjection[] = [];
-  const pushBase = (findingId: string, entry: { audit: AuditRecord; item: AuditItem }, state: ProjectedState, chain?: { id: string; status: CandidateChainInfo['status'] }, details?: Partial<FindingProjection>): void => {
-    projections.push({
-      findingId,
-      title: entry.item.title,
-      summary: entry.item.summary,
-      targetFiles: entry.item.targetFiles,
-      kind: entry.item.kind,
-      dependsOn: entry.item.dependsOn,
-      state,
-      lastStatus: entry.item.status,
-      lastObservedAudit: entry.audit.meta.auditId,
-      lastObservedAt: entry.audit.meta.createdAt,
-      ...(chain ? { candidate: chain.id, candidateStatus: chain.status } : {}),
-      ...details,
-    });
-  };
-  for (const [findingId, entry] of latest) {
-    const observations = versioned.get(findingId);
-    if (observations?.some(({ item }) => item.repairPlan !== undefined || item.kind === 'repair'
-      || item.repairRevisions !== undefined)) {
-      if (!v2) continue;
-      observations.sort((a, b) => new Date(b.audit.meta.createdAt).getTime() - new Date(a.audit.meta.createdAt).getTime()
-        || b.audit.meta.auditId.localeCompare(a.audit.meta.auditId));
-      const current = observations[0] ?? entry;
-      const plan = observations.find(({ item }) => item.repairPlan !== undefined);
-      const events = v2.events.get(findingId) ?? [];
-      const optionIds = new Set(observations.flatMap(({ item }) => item.options?.map((option) => option.candidateId) ?? []));
-      const optionInfo = new Map([...optionIds].map((id) => [id, v2.candidateInfo(id)]));
-      const unavailable = [...optionInfo].find(([, info]) => !info || info.broken || info.findingId !== findingId);
-      const approved = [...optionInfo].filter(([, info]) => info?.status === 'approved');
-      if (!plan || unavailable || approved.length > 1 || events instanceof Error) {
-        const reason = events instanceof Error ? events.message : unavailable
-          ? `候选 ${unavailable[0]} 缺失、无效或关联不一致` : !plan ? '缺少原始方案' : '同一发现存在多条批准';
-        errors.push(`finding ${findingId}：${reason}`);
-        continue;
-      }
-      const currentAuditIds = new Set(observations.map(({ audit }) => audit.meta.auditId));
-      if (events.some((event) => !currentAuditIds.has(event.auditId))) {
-        errors.push(`finding ${findingId}：处置指向不存在或范围不符的观察`);
-        continue;
-      }
-      const decision = events.filter((event) => event.action !== 'add_repair_hint').at(-1);
-      const winningId = approved[0]?.[0];
-      const disposition: FindingDisposition = current.item.status === 'resolved' ? 'resolved' : winningId ? 'applied'
-        : decision && decision.action !== 'resume_review' ? decision.action === 'external_completed' ? 'human_takeover' : decision.action : 'undecided';
-      const options = (plan.item.options ?? []).flatMap((option) => {
-        const info = optionInfo.get(option.candidateId);
-        return info ? [{ ...option, status: info.status }] : [];
-      });
-      const findingVersion = createHash('sha256').update(JSON.stringify({
-        observation: current.audit.meta.auditId, item: current.item,
-        plan: plan.audit.meta.auditId, options: plan.item.options, winningId, events,
-      })).digest('hex');
-      pushBase(findingId, current, disposition === 'resolved' || disposition === 'applied' ? 'closed' : 'open',
-        winningId ? { id: winningId, status: 'approved' } : undefined, {
-          findingVersion, disposition, options,
-          baseRevision: plan.audit.meta.baseRevision,
-          ...(decision ? { decision } : {}),
-          ...(plan.item.repairPlan !== undefined ? { repairPlan: plan.item.repairPlan } : {}),
-          ...(current.item.repairRevisions ? { repairRevisions: current.item.repairRevisions } : {}),
-          ...(current.item.repairAttribution ? { repairAttribution: current.item.repairAttribution } : {}),
-          repairHints: events.flatMap((event) => event.action === 'add_repair_hint' ? [event.hint] : []),
-        });
-      continue;
-    }
-    const { item } = entry;
-    if (item.status === 'dismissed') { pushBase(findingId, entry, 'dismissed'); continue; }
-    if (item.status === 'resolved') { pushBase(findingId, entry, 'closed'); continue; }
-    if (item.status !== 'converted') { pushBase(findingId, entry, 'open'); continue; }
-    if (!item.candidate) { pushBase(findingId, entry, 'open'); continue; }
-    const start = candidateInfoById(item.candidate);
-    if (start === null || start.broken) {
-      errors.push(`finding ${findingId}：converted 候选 ${item.candidate} 缺失、broken 或状态不可读，不参与正常投影`);
-      continue;
-    }
-    let currentId = item.candidate;
-    let current = start;
-    const visited = new Set<string>([currentId]);
-    for (;;) {
-      if (current.status === 'approved') { pushBase(findingId, entry, 'closed', { id: currentId, status: current.status }); break; }
-      if (current.status === 'pending' || current.status === 'changes_requested') { pushBase(findingId, entry, 'open', { id: currentId, status: current.status }); break; }
-      const replacements = candidateIds
-        .map((id) => ({ id, info: candidateInfoById(id) }))
-        .filter((next): next is { id: string; info: CandidateChainInfo } => next.info !== null && next.info.reopenedFrom === currentId);
-      if (replacements.length === 0) { pushBase(findingId, entry, 'reopened', { id: currentId, status: current.status }); break; }
-      if (replacements.length > 1) {
-        errors.push(`finding ${findingId}：rejected 候选 ${currentId} 有 ${String(replacements.length)} 个直接替代候选（应最多 1 个），不参与正常投影`);
-        break;
-      }
-      const next = replacements[0];
-      if (!next) break;
-      if (next.info.broken) {
-        errors.push(`finding ${findingId}：重开替代候选 ${next.id} 为 broken，不参与正常投影`);
-        break;
-      }
-      if (visited.has(next.id)) {
-        errors.push(`finding ${findingId}：重开链在 ${currentId} 与 ${next.id} 之间形成环，不参与正常投影`);
-        break;
-      }
-      visited.add(next.id);
-      currentId = next.id;
-      current = next.info;
-    }
-  }
-  return { findings: projections.sort((left, right) => left.findingId.localeCompare(right.findingId)), errors };
 }

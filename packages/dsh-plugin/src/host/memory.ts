@@ -1,144 +1,170 @@
-import type { ReviewFrontmatter } from './types.js';
+/**
+ * 负向记忆（SPEC §4.6 / AC-MEMORY-01）：
+ * 完全由共享事实中各问题的 rejection 与 decisions[] 的 accept_as_is 实时计算，无独立持久化记忆文件。
+ */
 
-/** 从拒绝记录派生重复判定和提示词摘要。负向记忆没有单独的持久化数据源。 */
+import type { ReviewCandidate, ReviewFrontmatter } from './types.js';
 
-export function normalizeTitle(title: string): string {
-  return title.trim().replace(/\s+/g, ' ').replace(/[A-Z]/g, (char) => char.toLowerCase());
-}
+export const KNOWN_REJECTION_CATEGORIES = new Set([
+  'false_positive',
+  'intentional_design',
+  'high_risk',
+  'out_of_scope',
+]);
 
-/** 限制为 ASCII，避免 Unicode 大小写折叠合并原本独立的标识。 */
-export function asciiLower(value: string): string {
-  return value.replace(/[A-Z]/g, (char) => char.toLowerCase());
-}
-
-function sortByUtf8Bytes(files: string[]): string[] {
-  return [...files].sort((left, right) => Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8')));
-}
-
-/** JSON 数组的边界和转义可防止字段中含分隔符时产生指纹碰撞。 */
-export function fingerprintOf(
-  meta: Pick<ReviewFrontmatter, 'module' | 'targetFiles' | 'auditType' | 'title'>,
-): string {
-  return JSON.stringify([
-    asciiLower(meta.module),
-    sortByUtf8Bytes(meta.targetFiles),
-    meta.auditType,
-    normalizeTitle(meta.title),
-  ]);
-}
-
-export interface RejectionMemoryEntry {
+export interface NegativeMemoryEntry {
   candidateId: string;
+  findingId: string;
   module: string;
   title: string;
   targetFiles: string[];
   auditType: string;
+  fingerprint: string;
   rejectedAt: string;
   rejectedAtMs: number;
   reason: string;
-  category?: string;
-  /** 用于说明拒绝记录涉及的符号，不参与重复指纹。 */
-  relatedSymbols?: string[];
-  /** 超时归档只表示长期未更新，提示词须把它标成弱信号。 */
-  staleArchived?: boolean;
-  fingerprint: string;
+  category: string;
+  relatedSymbols: string[];
 }
 
-export interface RejectionMemoryInput {
-  candidateId: string;
-  meta: ReviewFrontmatter;
+function utf8Compare(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
 }
 
-export function entryFromCandidate(input: RejectionMemoryInput): RejectionMemoryEntry | null {
-  const { meta } = input;
-  if (meta.status !== 'rejected' || !meta.rejection) return null;
-  const rejectedAtMs = new Date(meta.rejection.rejectedAt).getTime();
-  if (Number.isNaN(rejectedAtMs)) return null;
-  const category = (meta.rejection.extra?.['category'] as string | undefined) ?? undefined;
-  const relatedRaw = meta.rejection.extra?.['related_symbols'];
-  const rejectedBy = meta.rejection.rejectedBy;
+export function normalizeTitleForFingerprint(title: string): string {
+  return title.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+/** AC-MEMORY-01：规范 JSON 数组指纹，target_files 按 UTF-8 字节序排序，杜绝拼接碰撞。 */
+export function computeRejectionFingerprint(meta: Pick<ReviewFrontmatter, 'module' | 'targetFiles' | 'auditType' | 'title'>): string {
+  const sortedFiles = [...new Set(meta.targetFiles)].sort(utf8Compare);
+  return JSON.stringify([
+    meta.module.trim().toLowerCase(),
+    sortedFiles,
+    meta.auditType,
+    normalizeTitleForFingerprint(meta.title),
+  ]);
+}
+
+export function normalizeCategory(raw: string | undefined): string {
+  const trimmed = raw?.trim().toLowerCase();
+  if (!trimmed || !KNOWN_REJECTION_CATEGORIES.has(trimmed)) return 'unspecified';
+  return trimmed;
+}
+
+/** 从单个共享问题中提取其最近一次有效拒绝记忆（来自当前 rejection 或历史 accept_as_is 决定）。 */
+export function entryFromCandidate(input: { candidateId: string; meta: ReviewFrontmatter }): NegativeMemoryEntry | null {
+  const { candidateId, meta } = input;
+  let rejectedAt = '';
+  let reason = '';
+  let category: string | undefined;
+  let relatedSymbols: string[] = [];
+
+  if (meta.rejection !== null) {
+    rejectedAt = meta.rejection.rejectedAt;
+    reason = meta.rejection.reason;
+    category = meta.rejection.category;
+    relatedSymbols = meta.rejection.relatedSymbols ?? [];
+  } else {
+    const latestAcceptAsIs = [...meta.decisions].reverse().find((d) => d.action === 'accept_as_is');
+    if (!latestAcceptAsIs) return null;
+    rejectedAt = latestAcceptAsIs.at;
+    reason = latestAcceptAsIs.reason;
+    category = latestAcceptAsIs.category;
+    relatedSymbols = latestAcceptAsIs.relatedSymbols ?? [];
+  }
+
+  const rejectedAtMs = Date.parse(rejectedAt);
+  if (!Number.isFinite(rejectedAtMs)) return null;
+
   return {
-    candidateId: input.candidateId,
-    module: meta.module,
+    candidateId,
+    findingId: meta.findingId,
+    module: meta.module.trim().toLowerCase(),
     title: meta.title,
-    targetFiles: meta.targetFiles,
+    targetFiles: [...meta.targetFiles],
     auditType: meta.auditType,
-    rejectedAt: meta.rejection.rejectedAt,
+    fingerprint: computeRejectionFingerprint(meta),
+    rejectedAt,
     rejectedAtMs,
-    reason: meta.rejection.reason,
-    ...(category !== undefined ? { category } : {}),
-    ...(Array.isArray(relatedRaw) ? { relatedSymbols: relatedRaw.map((item) => String(item)) } : {}),
-    ...(rejectedBy === 'system:stale' ? { staleArchived: true } : {}),
-    fingerprint: fingerprintOf(meta),
+    reason,
+    category: normalizeCategory(category),
+    relatedSymbols,
   };
 }
 
-/** 窗口外的拒绝记录仍可供提示词参考，但不能阻止新候选。 */
-export function withinWindow(entry: RejectionMemoryEntry, windowDays: number, now = Date.now()): boolean {
-  return now - entry.rejectedAtMs <= windowDays * 86_400_000;
+export function withinWindow(entry: NegativeMemoryEntry, windowDays: number, nowMs: number = Date.now()): boolean {
+  const windowMs = Math.max(1, windowDays) * 24 * 60 * 60 * 1000;
+  return nowMs - entry.rejectedAtMs <= windowMs;
 }
 
-/** 只豁免调用方证明属于重开链的祖先，链外的同指纹拒绝记录仍能阻止候选。 */
-export function findDuplicate(
-  active: { candidateId: string; meta: ReviewFrontmatter },
-  memory: RejectionMemoryEntry[],
+/**
+ * AC-MEMORY-01：在窗口内查找同指纹拒绝记录。
+ * 自问题合法恢复豁免：同一问题（相同 candidateId 或 findingId）自身历史 accept_as_is 不阻断自己恢复后的审批，
+ * 但若存在其他问题的窗口内同指纹拒绝记录，仍照常拦截。
+ */
+export function findDuplicateRejection(
+  target: Pick<ReviewCandidate, 'id' | 'meta'>,
+  allCandidates: readonly Pick<ReviewCandidate, 'id' | 'meta' | 'parseError'>[],
   windowDays: number,
-  now = Date.now(),
-): RejectionMemoryEntry | null {
-  if (active.meta.status === 'rejected' || active.meta.status === 'approved') return null;
-  const fp = fingerprintOf(active.meta);
-  return memory
-    .filter((entry) => entry.fingerprint === fp && withinWindow(entry, windowDays, now))
-    .sort((left, right) => right.rejectedAtMs - left.rejectedAtMs)[0] ?? null;
+  nowMs: number = Date.now(),
+): NegativeMemoryEntry | null {
+  const targetFingerprint = computeRejectionFingerprint(target.meta);
+  let match: NegativeMemoryEntry | null = null;
+  for (const other of allCandidates) {
+    if (other.parseError) continue;
+    if (other.id === target.id || other.meta.findingId === target.meta.findingId) continue;
+    const entry = entryFromCandidate({ candidateId: other.id, meta: other.meta });
+    if (!entry || entry.fingerprint !== targetFingerprint) continue;
+    if (!withinWindow(entry, windowDays, nowMs)) continue;
+    if (!match || entry.rejectedAtMs > match.rejectedAtMs) {
+      match = entry;
+    }
+  }
+  return match;
 }
 
-export function topPerModule(memory: RejectionMemoryEntry[], max: number): RejectionMemoryEntry[] {
-  const byModule = new Map<string, RejectionMemoryEntry[]>();
-  for (const entry of memory) {
+/** 按模块分组、按拒绝时间倒序各保留最多 maxPerModule 条。 */
+export function topPerModule(entries: readonly NegativeMemoryEntry[], maxPerModule: number): NegativeMemoryEntry[] {
+  const limit = Math.max(1, maxPerModule);
+  const byModule = new Map<string, NegativeMemoryEntry[]>();
+  for (const entry of entries) {
     const list = byModule.get(entry.module) ?? [];
     list.push(entry);
     byModule.set(entry.module, list);
   }
-  const picked: RejectionMemoryEntry[] = [];
-  for (const list of byModule.values()) {
-    list.sort((left, right) => right.rejectedAtMs - left.rejectedAtMs);
-    picked.push(...list.slice(0, max));
+  const result: NegativeMemoryEntry[] = [];
+  for (const [, list] of [...byModule.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    list.sort((left, right) => right.rejectedAtMs - left.rejectedAtMs || left.candidateId.localeCompare(right.candidateId));
+    result.push(...list.slice(0, limit));
   }
-  return picked;
+  return result;
 }
 
-export function formatMemorySummary(entries: RejectionMemoryEntry[]): string {
+/** 按 module -> category 分组生成紧凑提示词负向记忆摘要（不含大段正文）。 */
+export function formatMemorySummary(entries: readonly NegativeMemoryEntry[]): string {
   if (entries.length === 0) return '- 无（近期没有被拒绝的方案）。';
-  const knownCategories = new Set(['false_positive', 'intentional_design', 'high_risk', 'out_of_scope', 'stale']);
-  const groups = new Map<string, RejectionMemoryEntry[]>();
+  const byModule = new Map<string, Map<string, NegativeMemoryEntry[]>>();
   for (const entry of entries) {
-    const hasCategory = typeof entry.category === 'string' && entry.category.trim().length > 0;
-    const key = entry.staleArchived
-      ? 'stale'
-      : hasCategory && knownCategories.has(entry.category ?? '')
-        ? String(entry.category)
-        : 'unspecified';
-    const list = groups.get(key) ?? [];
+    let categories = byModule.get(entry.module);
+    if (!categories) {
+      categories = new Map();
+      byModule.set(entry.module, categories);
+    }
+    const list = categories.get(entry.category) ?? [];
     list.push(entry);
-    groups.set(key, list);
+    categories.set(entry.category, list);
   }
-  const groupTitles: Record<string, string> = {
-    stale: '超时归档（弱信号——不代表方案被拒绝，仍禁止逐字重复）',
-    false_positive: '误报（false_positive）',
-    intentional_design: '有意设计（intentional_design）',
-    high_risk: '高风险（high_risk）',
-    out_of_scope: '超范围（out_of_scope）',
-    unspecified: '未分类',
-  };
   const lines: string[] = [];
-  for (const [key, list] of groups) {
-    lines.push(`### ${groupTitles[key] ?? key}`);
-    for (const entry of list) {
-      const symbols = entry.relatedSymbols && entry.relatedSymbols.length > 0 ? `，相关符号 ${entry.relatedSymbols.join('/')}` : '';
-      const category = entry.category && !knownCategories.has(entry.category) ? `，分类 ${entry.category}` : '';
-      lines.push(
-        `- [${entry.module || '?'}] ${entry.title}（审查类型 ${entry.auditType || '?'}；目标文件 ${entry.targetFiles.length > 0 ? entry.targetFiles.join(', ') : '—'}；被拒于 ${entry.rejectedAt}${category}${symbols}）：${entry.reason}`,
-      );
+  for (const [mod, categories] of [...byModule.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    lines.push(`### 模块 \`${mod}\``);
+    for (const [cat, list] of [...categories.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      lines.push(`- 分类 \`${cat}\`：`);
+      for (const item of list) {
+        const files = item.targetFiles.join(', ');
+        const symbols = item.relatedSymbols.length > 0 ? `；相关符号：${item.relatedSymbols.join(', ')}` : '';
+        lines.push(`  - \`${item.candidateId}\`（${item.auditType}）${item.title} — 文件：${files}；拒绝理由：${item.reason}${symbols}`);
+      }
     }
   }
   return lines.join('\n');

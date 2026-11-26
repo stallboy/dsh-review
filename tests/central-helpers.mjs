@@ -28,7 +28,7 @@ export async function setupCentral(t, options = {}) {
     return { app, dataDir, headers, createCentralApp };
 }
 
-export async function registerNode(app, name = 'node-a', workspaceId = 'workspace-a', capabilities = { issueWorkflow: true }) {
+export async function registerNode(app, name = 'node-a', workspaceId = 'workspace-a', capabilities = { auditSelfTest: true }) {
     const credential = app.database.createNode(name);
     const headers = { authorization: `Bearer ${credential.token}` };
     const instanceId = `instance-${name}`;
@@ -48,6 +48,6 @@ export async function bindProject(app, headers, node, name = '示例项目') {
 }
 
 export function approvePayload(key = 'approve-1') {
-    return { operation: 'approve', idempotencyKey: key, payload: { id: '2026-11/fix-retry' },
+    return { operation: 'approve', idempotencyKey: key, payload: { id: '2026-11/fix-retry', optionId: 'opt-a', patchId: 1 },
         guard: { expectedRevision: 1, expectedOwner: '审核者甲', expectedUpdatedAt: '2026-11-16T06:00:00.000Z' } };
 }

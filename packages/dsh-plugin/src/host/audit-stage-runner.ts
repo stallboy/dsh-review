@@ -1,262 +1,262 @@
-import { addAbortListener } from 'node:events';
-import { readFile, writeFile } from 'node:fs/promises';
+/**
+ * 分阶段审查执行器与多执行器降级策略（SPEC §5.4 / D11）：
+ * - 支持外部专业执行器（codex / claude）优先调用以增强多模型分工；
+ * - 遵循「软引导 + Host 强还原」策略，不再通过沙箱硬拦截项目目录写入；
+ * - 外部执行器不可用、未配置、鉴权失败或启动失败时，优雅降级为本 Harness 独立子代理（dsh-subagent），绝不硬阻塞。
+ */
+
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
-import process from 'node:process';
-import { dshHome } from './settings.js';
-import { runProcess } from './shell.js';
+import type { AuditStage } from './audit-prompts.js';
+import { commandExists, runProcess } from './shell.js';
 
-export const AUDIT_EXECUTORS = ['codex', 'claude-code'] as const;
-export type AuditExecutor = typeof AUDIT_EXECUTORS[number];
+export type AuditExecutor = 'codex' | 'claude' | 'claude-code' | 'dsh-subagent';
 
-type Schema =
-    | { type: 'string'; enum?: readonly string[] }
-    | { type: 'integer' }
-    | { type: 'array'; items: Schema }
-    | { type: 'object'; additionalProperties: false; required: string[]; properties: Record<string, Schema> };
-
-export const stringSchema = { type: 'string' } as const;
-export const integerSchema = { type: 'integer' } as const;
-export const arraySchema = (items: Schema): Schema => ({ type: 'array', items });
-export const enumSchema = (...values: string[]): Schema => ({ type: 'string', enum: values });
-export const objectSchema = (properties: Record<string, Schema>): Schema => ({
-    type: 'object', additionalProperties: false, required: Object.keys(properties), properties,
-});
-
-export function auditObject(value: unknown): Record<string, unknown> {
-    if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('需要 JSON 对象');
-    return value as Record<string, unknown>;
+export interface ExecutorProbeStatus {
+  name: string;
+  status: 'available' | 'unavailable' | 'degraded';
+  reason?: string;
 }
 
-export function validateAuditValue(schema: Schema, value: unknown, field = 'result'): void {
-    switch (schema.type) {
-        case 'string':
-            if (typeof value !== 'string' || (schema.enum && !schema.enum.includes(value))) throw new Error('无效字段 ' + field);
-            return;
-        case 'integer':
-            if (!Number.isSafeInteger(value)) throw new Error('无效字段 ' + field);
-            return;
-        case 'array':
-            if (!Array.isArray(value) || value.length > 100) throw new Error('无效数组 ' + field);
-            for (const entry of value) validateAuditValue(schema.items, entry, field + '[]');
-            return;
-        case 'object': {
-            const record = auditObject(value);
-            if (Object.keys(record).length !== schema.required.length) throw new Error('字段不完整或越界 ' + field);
-            for (const name of schema.required) {
-                if (!Object.hasOwn(record, name)) throw new Error('缺少字段 ' + field + '.' + name);
-                validateAuditValue(schema.properties[name]!, record[name], field + '.' + name);
-            }
-        }
-    }
+export interface StageRunRequest {
+  stage: AuditStage;
+  runner: AuditExecutor;
+  cwd: string;
+  artifactDir?: string;
+  prompt: string;
+  schema: Record<string, unknown>;
+  timeoutMs: number;
+  signal: AbortSignal;
+  dshCommand?: string;
+  onLog?: (line: string) => void;
 }
 
-export interface AuditExecution {
-    executor: AuditExecutor;
-    location: string;
-    repoRoot?: string;
-    forensicPaths?: string[];
-    prompt: string;
-    schema: Schema;
-    timeoutMs: number;
-    signal: AbortSignal;
-    logProcessExit?: (line: string) => void;
-    onTimeout?: () => void;
-    onProcessTreeStopped?: (stopped: boolean) => void;
+export interface StageRunOutcome {
+  ok: boolean;
+  output?: unknown;
+  executorUsed?: AuditExecutor;
+  degradedFrom?: AuditExecutor;
+  diagnostic?: string;
+  reason?: 'auth' | 'unavailable' | 'timeout' | 'aborted' | 'invalid_output' | 'failed';
 }
 
-export type ExecuteAuditStage = (input: AuditExecution) => Promise<unknown>;
+export type ExecuteAuditStage = (request: StageRunRequest) => Promise<StageRunOutcome>;
 
 export class AuditStopUnknown extends Error {
-    constructor(message: string, readonly processTreeStopped = false) { super(message); }
+  constructor(message: string) {
+    super(message);
+    this.name = 'AuditStopUnknown';
+  }
 }
 
-export class AuditStageTimedOut extends AuditStopUnknown {
-    constructor(executor: AuditExecutor, processTreeStopped: boolean) {
-        super(executor + ' 执行器超时', processTreeStopped);
-    }
+export function normalizeExecutorName(raw: string): AuditExecutor {
+  const lower = raw.trim().toLowerCase();
+  if (lower === 'codex') return 'codex';
+  if (lower === 'claude' || lower === 'claude-code') return 'claude';
+  return 'dsh-subagent';
 }
 
-export class AuditExecutorAuthenticationError extends Error {
-    constructor(executor: AuditExecutor, code?: number | null) {
-        super(executor + ' 执行器报告认证失败' + (code == null ? '' : '（退出码 ' + String(code) + '）'));
-    }
-}
+/** 探测已配置的外部专业执行器与本 Harness 子代理的实时可用状态。 */
+export function probeStageExecutors(configured: readonly string[], dshCommand = ''): {
+  executors: ExecutorProbeStatus[];
+  availableRunners: AuditExecutor[];
+} {
+  const executors: ExecutorProbeStatus[] = [];
+  const availableRunners: AuditExecutor[] = [];
+  const seen = new Set<string>();
 
-const MAX_OUTPUT = 1024 * 1024;
-
-const AUTHENTICATION_FAILURE = /unauthorized|not logged in|invalid api key|authentication failed/i;
-
-const AUTHENTICATION_MESSAGE = /^(?:Error:\s*)?(?:Not logged in\b|Unauthorized\b|Invalid API key\b|Authentication failed\b|(?:unexpected status |API Error:\s*)?401\b)/i;
-
-function diagnosticObject(text: string): Record<string, unknown> | undefined {
-    try { return auditObject(JSON.parse(text)); } catch { return undefined; }
-}
-
-function isAuthenticationMessage(message: unknown): boolean {
-    return typeof message === 'string' && AUTHENTICATION_MESSAGE.test(message.trim());
-}
-
-export function isAuditAuthenticationFailure(executor: AuditExecutor, stdout: string, stderr: string): boolean {
-    if (stderr.split(/\r?\n/).some(isAuthenticationMessage)) return true;
-    if (executor === 'claude-code') {
-        const result = diagnosticObject(stdout);
-        return result?.['type'] === 'result' && result['is_error'] === true
-            && (result['api_error_status'] === 401 || isAuthenticationMessage(result['result']));
-    }
-    return stdout.split(/\r?\n/).some(line => {
-        const event = diagnosticObject(line);
-        if (event?.['type'] === 'error') return isAuthenticationMessage(event['message']);
-        if (event?.['type'] === 'turn.failed' && typeof event['error'] === 'object' && event['error'] !== null) {
-            return isAuthenticationMessage((event['error'] as Record<string, unknown>)['message']);
-        }
-        return false;
-    });
-}
-
-export function auditCliDiagnostic(output: string, includeAuthentication = true): string {
-    if (/sandbox|沙箱/i.test(output) && /denied|failed|requires|blocked|error|拒绝|失败|阻止/i.test(output)) return '执行器报告沙箱错误';
-    if (/EACCES|EPERM|permission denied|access is denied|operation not permitted|权限不足|拒绝访问/i.test(output)) return '执行器报告权限不足';
-    if (/ENOENT|command not found|找不到命令/i.test(output)) return '找不到执行命令或所需文件';
-    if (includeAuthentication && AUTHENTICATION_FAILURE.test(output)) return '执行器报告认证失败';
-    return '';
-}
-
-const CLAUDE_AUTH_ENV = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY'] as const;
-const CLAUDE_CONNECTION_ENV = [...CLAUDE_AUTH_ENV, 'ANTHROPIC_BASE_URL'] as const;
-const CLAUDE_LAUNCH_OVERRIDES = [...CLAUDE_CONNECTION_ENV, 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_CUSTOM_HEADERS',
-    'ANTHROPIC_PROFILE', 'ANTHROPIC_FEDERATION_RULE_ID', 'ANTHROPIC_ORGANIZATION_ID', 'CLAUDE_CODE_USE_BEDROCK',
-    'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY', 'CLAUDE_CODE_USE_ANTHROPIC_AWS',
-    'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD', 'CLAUDE_CODE_USE_MANTLE', 'CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST'] as const;
-const CLAUDE_SETTINGS_ENV = [...CLAUDE_CONNECTION_ENV, 'ANTHROPIC_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-    'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL'] as const;
-
-async function readExecutorSettings(file: string, diagnostic: string, signal: AbortSignal, optional = false): Promise<unknown> {
-    let listener: ReturnType<typeof addAbortListener> | undefined;
-    try {
-        signal.throwIfAborted();
-        const aborted = new Promise<never>((_, reject) => {
-            listener = addAbortListener(signal, () => reject(signal.reason));
-        });
-        const contents = await Promise.race([readFile(file, { encoding: 'utf8', signal }), aborted]);
-        signal.throwIfAborted();
-        return JSON.parse(contents);
-    } catch (error) {
-        signal.throwIfAborted();
-        if (optional && (error as NodeJS.ErrnoException).code === 'ENOENT') return {};
-        throw new Error(diagnostic);
-    } finally {
-        listener?.[Symbol.dispose]();
-    }
-}
-
-export async function resolveAuditCliLaunch(executor: AuditExecutor, signal = new AbortController().signal):
-    Promise<{ exe: string; env: Record<string, string> }> {
-    signal.throwIfAborted();
-    const codex = executor === 'codex';
-    const override = process.env[codex ? 'DSH_AUDIT_CODEX' : 'DSH_AUDIT_CLAUDE'];
-    const defaultExe = (codex ? 'codex' : 'claude') + (process.platform === 'win32' ? '.exe' : '');
-    if (codex ? override : CLAUDE_LAUNCH_OVERRIDES.some(key => process.env[key])) {
-        return { exe: override || defaultExe, env: {} };
-    }
-
-    const config = auditObject(await readExecutorSettings(path.join(dshHome(), 'dsh-code-review', 'audit-executors.json'),
-        '无法读取审查执行器启动配置', signal, true));
-    const key = codex ? 'codexPath' : 'claudeSettingsPath';
-    const configuredPath = config[key];
-    if (configuredPath === undefined) return { exe: override || defaultExe, env: {} };
-    if (typeof configuredPath !== 'string' || !path.isAbsolute(configuredPath)) throw new Error(key + ' 必须是绝对路径');
-    if (codex) return { exe: configuredPath, env: {} };
-
-    const settings = auditObject(await readExecutorSettings(configuredPath, '无法读取配置的 Claude Code 用户设置', signal));
-    const configuredEnv = auditObject(settings['env']);
-    if (!CLAUDE_AUTH_ENV.some(name => typeof configuredEnv[name] === 'string' && configuredEnv[name].trim())) {
-        throw new Error('配置的 Claude Code 用户设置缺少认证环境变量');
-    }
-    const env: Record<string, string> = {};
-    for (const name of CLAUDE_SETTINGS_ENV) {
-        const value = configuredEnv[name];
-        if (!process.env[name] && typeof value === 'string' && value.trim()) env[name] = value;
-    }
-    return { exe: override || defaultExe, env };
-}
-
-export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, repoRoot = location, forensicPaths = [], prompt, schema, timeoutMs, signal, logProcessExit, onTimeout, onProcessTreeStopped }) => {
-    const resultPath = path.join(location, 'result.json');
-    const schemaPath = path.join(location, 'schema.json');
-    const schemaText = JSON.stringify(schema);
-    await writeFile(schemaPath, schemaText, { flag: 'wx' });
-    const codex = executor === 'codex';
-    const now = Date.now();
-    const launchDeadline = AbortSignal.timeout(timeoutMs);
-    let { exe, env } = await resolveAuditCliLaunch(executor, AbortSignal.any([signal, launchDeadline])).catch(error => {
-        onProcessTreeStopped?.(true);
-        if (launchDeadline.aborted && !signal.aborted) throw new AuditStageTimedOut(executor, true);
-        throw error;
-    });
-    const roots = [path.join(repoRoot, '.ai-review'), ...forensicPaths.map(file => path.resolve(repoRoot, file))];
-    const policy = 'permissions.dsh-audit=' + '{extends=":read-only",filesystem={'
-        + roots.map(root => JSON.stringify(root.replaceAll('\\', '/')) + '="write"').join(',') + '},network={enabled=true}}';
-    const platformPolicy = process.platform === 'win32' ? ['-c', 'windows.sandbox="unelevated"'] : [];
-    const args = codex ? [
-        '--ask-for-approval', 'never', 'exec', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check',
-        '-c', 'default_permissions="dsh-audit"', '-c', policy,
-        '--json', '--output-schema', schemaPath, '--output-last-message', resultPath, '-',
-    ] : [
-        '--print', '--no-session-persistence', '--permission-mode', 'bypassPermissions',
-        '--output-format', 'stream-json', '--verbose', '--json-schema', schemaText,
-    ];
-    if (!codex) {
-        const sandbox = (await resolveAuditCliLaunch('codex', signal)).exe;
-        args.unshift('sandbox', '-P', 'dsh-audit', '-c', policy, ...platformPolicy, '-C', repoRoot, '--', exe);
-        exe = sandbox;
-    }
-    let authenticationFailure = false;
-    let claudeResult: Record<string, unknown> | undefined;
-    const result = await runProcess(exe, args, {
-        cwd: repoRoot, timeoutMs: Math.max(1, timeoutMs - (Date.now() - now)), signal, input: prompt, killTreeOnExit: true, maxBytes: MAX_OUTPUT,
-        onLine: (line, stream) => {
-            if (isAuditAuthenticationFailure(executor, stream === 'stdout' ? line : '', stream === 'stderr' ? line : '')) authenticationFailure = true;
-            if (stream === 'stdout' && codex) {
-                const event = diagnosticObject(line);
-                const item = event?.['item'] as Record<string, unknown> | undefined;
-                if (item && typeof item['type'] === 'string') logProcessExit?.('Harness 事件：' + item['type']);
-            } else if (stream === 'stdout') {
-                const event = diagnosticObject(line);
-                if (event?.['type'] === 'result') claudeResult = event;
-            }
-        }, ...(onTimeout ? { onTimeout } : {}),
-        env: { ...env, CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1' },
-    });
-    onProcessTreeStopped?.(result.processTreeStopped === true || Boolean(result.error) && result.code === null);
-    logProcessExit?.([
-        '执行器进程结束', '退出码=' + String(result.code),
-        ...(result.signal ? ['信号=' + result.signal] : []),
-        ...(result.stdinError ? ['输入管道=' + result.stdinError] : []),
-        ...(result.error ? ['启动失败'] : []),
-        ...(result.timedOut ? ['超时'] : []),
-        ...(result.aborted ? ['已取消'] : []),
-    ].join(' '));
-    if (result.timedOut) throw new AuditStageTimedOut(executor, result.processTreeStopped === true);
-    if (result.aborted) throw new AuditStopUnknown(executor + ' 执行器已取消，需确认子进程已经停止', result.processTreeStopped === true);
-    const diagnostic = auditCliDiagnostic([result.error, result.stderr, result.stdout].filter(Boolean).join('\n'), false);
-    if (result.error) throw new Error(executor + ' 无法启动' + (diagnostic ? '：' + diagnostic : ''));
-    if (result.code !== 0) {
-        if (authenticationFailure || isAuditAuthenticationFailure(executor, result.stdout, result.stderr)) throw new AuditExecutorAuthenticationError(executor, result.code);
-        throw new Error(executor + ' 阶段执行失败（退出码 ' + String(result.code) + '）' + (diagnostic ? '：' + diagnostic : ''));
-    }
-    if (result.stdinError) throw new Error(executor + ' 执行器未接收完整提示词（' + result.stdinError + '）');
-    if (!result.processTreeStopped) throw new AuditStopUnknown(executor + ' 执行器进程树停止状态无法核验');
-    let value: unknown;
-    if (codex) {
-        const output = await readFile(resultPath, 'utf8');
-        if (Buffer.byteLength(output) >= MAX_OUTPUT) throw new Error('Codex 阶段结果过长');
-        value = JSON.parse(output);
+  for (const raw of configured) {
+    const name = normalizeExecutorName(raw);
+    if (name === 'dsh-subagent' || seen.has(name)) continue;
+    seen.add(name);
+    const bin = name === 'codex' ? 'codex' : 'claude';
+    if (commandExists(bin)) {
+      executors.push({ name, status: 'available' });
+      availableRunners.push(name);
     } else {
-        const response = claudeResult ?? auditObject(JSON.parse(result.stdout));
-        if (Buffer.byteLength(JSON.stringify(response)) >= MAX_OUTPUT) throw new Error('Claude Code 最终结果过长');
-        if (response['is_error'] === true || response['subtype'] !== 'success') throw new Error('Claude Code 未返回成功结果');
-        value = response['structured_output'];
+      executors.push({ name, status: 'unavailable', reason: `未检测到 ${bin} 可执行文件，将自动降级为本 Harness 独立子代理` });
     }
-    validateAuditValue(schema, value);
-    return value;
-};
+  }
+
+  const dshBin = dshCommand.trim().split(/\s+/)[0] || 'dsh';
+  if (commandExists(dshBin)) {
+    executors.push({ name: 'dsh-subagent', status: 'available' });
+    availableRunners.push('dsh-subagent');
+  } else {
+    executors.push({ name: 'dsh-subagent', status: 'degraded', reason: `未在 PATH 检测到 ${dshBin}（若在 DSH 宿主内运行仍由宿主提供子代理能力）` });
+    availableRunners.push('dsh-subagent');
+  }
+
+  return { executors, availableRunners };
+}
+
+function parseJsonPayload(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  const fenced = [...trimmed.matchAll(/```(?:json)?\s*\r?\n([\s\S]*?)```/gi)];
+  for (let i = fenced.length - 1; i >= 0; i -= 1) {
+    try { return JSON.parse((fenced[i]?.[1] ?? '').trim()); } catch { }
+  }
+  try { return JSON.parse(trimmed); } catch { }
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (lastBrace >= 0) {
+    for (let pos = trimmed.lastIndexOf('{', lastBrace); pos >= 0; pos = trimmed.lastIndexOf('{', pos - 1)) {
+      try { return JSON.parse(trimmed.slice(pos, lastBrace + 1)); } catch { }
+    }
+  }
+  return undefined;
+}
+
+function extractDshStreamOutput(stdout: string): unknown {
+  const assistantChunks: string[] = [];
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    try {
+      const obj = JSON.parse(line) as Record<string, unknown>;
+      if (obj['structured_output'] !== undefined) return obj['structured_output'];
+      if (typeof obj['result'] === 'string') assistantChunks.push(obj['result']);
+      else if (typeof obj['text'] === 'string') assistantChunks.push(obj['text']);
+      else if (typeof obj['delta'] === 'string') assistantChunks.push(obj['delta']);
+      else if (typeof obj['content'] === 'string') assistantChunks.push(obj['content']);
+    } catch {
+      assistantChunks.push(line);
+    }
+  }
+  return parseJsonPayload(assistantChunks.join('\n') || stdout);
+}
+
+async function runExternalExecutor(
+  executor: 'codex' | 'claude',
+  request: StageRunRequest,
+): Promise<StageRunOutcome> {
+  const bin = executor === 'codex' ? 'codex' : 'claude';
+  if (!commandExists(bin)) {
+    return { ok: false, reason: 'unavailable', diagnostic: `未安装外部执行器 ${bin}` };
+  }
+
+  const tempDir = await mkdtemp(path.join(tmpdir(), `dcr-stage-${executor}-`));
+  try {
+    const schemaPath = path.join(tempDir, 'schema.json');
+    const outputPath = path.join(tempDir, 'output.json');
+    await writeFile(schemaPath, JSON.stringify(request.schema, null, 2), 'utf8');
+
+    // I18 / D11：不施加硬写拦截沙箱（采用软引导 + Host 子阶段交接强还原）
+    const args = executor === 'codex'
+      ? ['exec', '--output-schema', schemaPath, '-o', outputPath, '-']
+      : ['-p', '--output-format', 'json', '--json-schema', JSON.stringify(request.schema), '-'];
+
+    const result = await runProcess(bin, args, {
+      cwd: request.cwd,
+      input: request.prompt,
+      timeoutMs: request.timeoutMs,
+      signal: request.signal,
+      maxBytes: 16 * 1024 * 1024,
+      killTreeOnExit: true,
+      onLine: (line) => request.onLog?.(`[${executor}] ${line.slice(0, 400)}`),
+    });
+
+    if (result.processTreeStopped === false) {
+      throw new AuditStopUnknown(`${executor} 阶段退出后无法确认后代进程树已停止`);
+    }
+    if (result.aborted) return { ok: false, reason: 'aborted', diagnostic: `${executor} 阶段已取消` };
+    if (result.timedOut) return { ok: false, reason: 'timeout', diagnostic: `${executor} 阶段超时` };
+
+    const combined = `${result.stdout}\n${result.stderr}`;
+    if (result.code !== 0) {
+      if (/unauthorized|auth|api[_ -]?key|login|token|credential|401|403/i.test(combined)) {
+        return { ok: false, reason: 'auth', diagnostic: `${executor} 鉴权不可用：${combined.trim().slice(0, 300)}` };
+      }
+      return { ok: false, reason: 'failed', diagnostic: `${executor} 退出码 ${String(result.code)}：${combined.trim().slice(0, 300)}` };
+    }
+
+    let parsed: unknown;
+    if (executor === 'codex') {
+      const fromFile = await readFile(outputPath, 'utf8').catch(() => '');
+      parsed = parseJsonPayload(fromFile) ?? parseJsonPayload(result.stdout);
+    } else {
+      parsed = extractDshStreamOutput(result.stdout);
+    }
+    if (parsed === undefined) {
+      return { ok: false, reason: 'invalid_output', diagnostic: `${executor} 未输出合法结构化 JSON` };
+    }
+    return { ok: true, output: parsed, executorUsed: executor };
+  } finally {
+    await rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+async function runNativeHarnessSubagent(request: StageRunRequest): Promise<StageRunOutcome> {
+  const tokens = (request.dshCommand?.trim() || 'dsh').split(/\s+/).filter(Boolean);
+  const bin = tokens[0] ?? 'dsh';
+  if (!commandExists(bin)) {
+    return { ok: false, reason: 'unavailable', diagnostic: `未检测到本 Harness 子代理入口：${bin}` };
+  }
+  const promptWithSchema = [
+    request.prompt,
+    '',
+    '## 输出 JSON Schema（必须严格满足并输出合法 JSON）',
+    '```json',
+    JSON.stringify(request.schema, null, 2),
+    '```',
+  ].join('\n');
+
+  const args = [...tokens.slice(1), '--profile', 'headless', '--json', '-'];
+  const result = await runProcess(bin, args, {
+    cwd: request.cwd,
+    input: promptWithSchema,
+    timeoutMs: request.timeoutMs,
+    signal: request.signal,
+    maxBytes: 16 * 1024 * 1024,
+    killTreeOnExit: true,
+    onLine: (line) => request.onLog?.(`[dsh-subagent] ${line.slice(0, 400)}`),
+  });
+
+  if (result.processTreeStopped === false) {
+    throw new AuditStopUnknown('dsh-subagent 阶段退出后无法确认后代进程树已停止');
+  }
+  if (result.aborted) return { ok: false, reason: 'aborted', diagnostic: '子代理阶段已取消' };
+  if (result.timedOut) return { ok: false, reason: 'timeout', diagnostic: '子代理阶段超时' };
+  if (result.code !== 0) {
+    return {
+      ok: false,
+      reason: 'failed',
+      diagnostic: `dsh-subagent 退出码 ${String(result.code)}：${(result.stderr || result.stdout).trim().slice(0, 300)}`,
+    };
+  }
+  const parsed = extractDshStreamOutput(result.stdout);
+  if (parsed === undefined) {
+    return { ok: false, reason: 'invalid_output', diagnostic: 'dsh-subagent 未输出合法结构化 JSON' };
+  }
+  return { ok: true, output: parsed, executorUsed: 'dsh-subagent' };
+}
+
+/**
+ * 默认分阶段执行器：
+ * 优先调用请求指定的外部专业执行器（codex / claude）；
+ * 若不可用、鉴权失败或拉起失败，自动优雅降级至本 Harness 独立子代理（dsh-subagent）。
+ */
+export async function executeAuditCli(request: StageRunRequest): Promise<StageRunOutcome> {
+  const normalized = normalizeExecutorName(request.runner);
+  if (normalized === 'dsh-subagent') {
+    return runNativeHarnessSubagent(request);
+  }
+
+  const externalKind: 'codex' | 'claude' = normalized === 'claude-code' ? 'claude' : normalized;
+  const primary = await runExternalExecutor(externalKind, request);
+  if (primary.ok || primary.reason === 'aborted' || primary.reason === 'timeout') {
+    return primary;
+  }
+
+  // 外部专业执行器不可用 / 鉴权失败 / 异常时，优雅降级至本 Harness 独立子代理。
+  request.onLog?.(`[降级] 外部执行器 ${normalized} 不可用（${primary.diagnostic ?? primary.reason ?? 'unknown'}），降级使用本 Harness 独立子代理`);
+  const fallback = await runNativeHarnessSubagent({ ...request, runner: 'dsh-subagent' });
+  return {
+    ...fallback,
+    degradedFrom: normalized,
+    diagnostic: fallback.ok
+      ? `由 ${normalized} 自动降级至 dsh-subagent 完成（原原因：${primary.diagnostic ?? primary.reason ?? 'unavailable'}）`
+      : `外部执行器 ${normalized} 失败（${primary.diagnostic ?? ''}），且降级 dsh-subagent 失败（${fallback.diagnostic ?? ''}）`,
+  };
+}

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
+import { reviewFixture, writeCandidate as writeSchemaCandidate } from './fixtures/contract.mjs';
 
 const servers = [];
 after(async () => {
@@ -25,21 +26,11 @@ async function startApi(root, owner = 'tester') {
 }
 
 function candidateFm(slug, updatedAt = '2026-11-01T10:00:00+08:00') {
-  return [
-    '---', 'schema_version: 1', `title: "net: ${slug}"`, 'module: net', 'audit_type: bugfix',
-    'created_at: "2026-11-01T10:00:00+08:00"', `updated_at: "${updatedAt}"`, 'owner: tester',
-    'tags: []', 'status: pending', 'ticket: null', 'target_files: [src/math.js]', 'current_revision: 1',
-    'revisions:', '  - id: 1', '    base_revision: "1"', '    patch: 001.patch', '    author: ai',
-    'gate_checks: ["node --version"]', 'comments: []', 'human_decisions: []', 'approval: null', 'rejection: null',
-    'commit_message: "net: x"', '---', '', '# 问题与影响', '',
-  ].join('\n');
+  return reviewFixture(slug, { title: `net: ${slug}`, updatedAt });
 }
 
 async function writeCandidate(root, slug) {
-  const dir = path.join(root, '.ai-review', '2026-11', slug);
-  await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, 'review.md'), candidateFm(slug), 'utf8');
-  await writeFile(path.join(dir, '001.patch'), 'diff --git a/src/math.js b/src/math.js\n', 'utf8');
+  await writeSchemaCandidate(root, slug, { review: { title: `net: ${slug}` } });
 }
 
 function commitAll(root, message) {

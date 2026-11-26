@@ -1,215 +1,431 @@
+/** 问题生命周期领域逻辑：8 状态转移、补丁永久封禁、延期暂停、人工处置与视图投影。 */
+
 import { createHash } from 'node:crypto';
-import type { IssueReview, IssueSelection, RepairOption, ReviewCandidate, ReviewFrontmatter, RevisionEntry } from './types.js';
-import type { FindingProjection } from './audit-archive.js';
-import { isRepoRelativePath } from './patch.js';
-import path from 'node:path';
+import type {
+  FindingDisposition,
+  IssueDecision,
+  IssueDecisionAction,
+  IssueFindingView,
+  IssueSelection,
+  PatchEntry,
+  RepairOption,
+  ReviewCandidate,
+  ReviewFrontmatter,
+  ReviewStatus,
+} from './types.js';
 import { ApiError } from './types.js';
 
-const ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
-const STATUSES = ['pending', 'changes_requested', 'approved', 'rejected', 'repair_failed', 'human_takeover', 'awaiting_verification', 'resolved'];
+export type IssueDecisionRequest =
+  | { action: 'accept_as_is'; reason: string; category?: string }
+  | { action: 'defer'; reason: string; reviewAfter?: string; reviewWhen?: string }
+  | { action: 'human_takeover'; reason?: string }
+  | { action: 'add_repair_hint'; hint: string }
+  | { action: 'external_completed'; reason: string }
+  | { action: 'resume_review'; reason: string };
 
-function object(value: unknown, field: string): Record<string, unknown> {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${field} 必须是对象`);
-    return value as Record<string, unknown>;
+export const COMMENTABLE_STATUSES: ReadonlySet<ReviewStatus> = new Set([
+  'pending',
+  'changes_requested',
+  'repair_failed',
+]);
+
+export function sha256Hex(content: Buffer | Uint8Array | string): string {
+  return createHash('sha256').update(content).digest('hex');
 }
 
-function string(value: unknown, field: string, empty = false): string {
-    if (typeof value !== 'string' || (!empty && !value.trim())) throw new Error(`${field} 必须是${empty ? '' : '非空'}字符串`);
-    return value;
+export function formatPatchFilename(patchId: number): string {
+  return `${String(patchId).padStart(3, '0')}.patch`;
 }
 
-function array(value: unknown, field: string): unknown[] {
-    if (!Array.isArray(value)) throw new Error(`${field} 必须是数组`);
-    return value;
+/** AC-LOCK-01 / I13：所有共享写入（含审查发布）严格递增 updated_at，毫秒级防时钟回拨并规范化 UTC Z。 */
+export function nextUpdatedAt(previous: string, now: Date = new Date()): string {
+  const prevMs = Date.parse(previous);
+  const nowMs = now.getTime();
+  const nextMs = Number.isFinite(prevMs) && nowMs <= prevMs ? prevMs + 1 : nowMs;
+  return new Date(nextMs).toISOString();
 }
 
-function number(value: unknown, field: string, minimum = 1): number {
-    if (!Number.isSafeInteger(value) || Number(value) < minimum) throw new Error(`${field} 必须是大于等于 ${minimum} 的整数`);
-    return Number(value);
+function patchKey(optionId: string, patchId: number): string {
+  return `${optionId}#${String(patchId)}`;
 }
 
-function extra(value: Record<string, unknown>, keys: string[]): { extra?: Record<string, unknown> } {
-    const unknown = Object.fromEntries(Object.entries(value).filter(([key]) => !keys.includes(key)));
-    return Object.keys(unknown).length ? { extra: unknown } : {};
-}
-
-function timestamp(value: unknown, field: string): string {
-    const text = string(value, field);
-    if (!Number.isFinite(Date.parse(text))) throw new Error(field + ' 必须是有效时间');
-    return text;
-}
-
-export function parseIssueReview(doc: Record<string, unknown>): IssueReview {
-    const priority = string(doc['priority'], 'priority');
-    if (!['P0', 'P1', 'P2', 'P3'].includes(priority)) throw new Error('priority 必须为 P0–P3');
-    if (!STATUSES.includes(String(doc['status']))) throw new Error('问题状态无效');
-    const options = array(doc['options'], 'options').map((value): RepairOption => {
-        const item = object(value, 'option');
-        const id = string(item['id'], 'option.id');
-        if (!ID.test(id)) throw new Error('方案编号无效');
-        const confidence = item['confidence'];
-        if (typeof confidence !== 'number' || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) throw new Error('方案置信度须在 0 到 1 之间');
-        return {
-            ...extra(item, ['id', 'title', 'tradeoff', 'confidence', 'current_patch', 'gate_checks']),
-            id, title: string(item['title'], 'option.title'), tradeoff: string(item['tradeoff'], 'option.tradeoff'), confidence,
-            currentPatch: number(item['current_patch'], 'option.current_patch'),
-            gateChecks: array(item['gate_checks'], 'option.gate_checks').map(command => string(command, 'gate_check')),
-        };
-    });
-    if (options.length > 2 || new Set(options.map(item => item.id)).size !== options.length) throw new Error('有效方案必须不超过两个且编号唯一');
-    return {
-        priority: priority as IssueReview['priority'], baseRevision: string(doc['base_revision'], 'base_revision'), options,
-        observations: array(doc['observations'], 'observations').map(value => {
-            const item = object(value, 'observation');
-            const verdict = string(item['verdict'], 'observation.verdict');
-            if (!['confirmed', 'resolved', 'unverified'].includes(verdict)) throw new Error('观察结论无效');
-            return {
-                ...extra(item, ['audit_id', 'base_revision', 'at', 'verdict', 'reason', 'evidence']),
-                auditId: string(item['audit_id'], 'observation.audit_id'), baseRevision: string(item['base_revision'], 'observation.base_revision'),
-                at: timestamp(item['at'], 'observation.at'), verdict: verdict as 'confirmed' | 'resolved' | 'unverified', reason: string(item['reason'], 'observation.reason'),
-                evidence: array(item['evidence'], 'observation.evidence').map(value => {
-                    const evidence = object(value, 'evidence');
-                    const file = string(evidence['path'], 'evidence.path');
-                    if (!isRepoRelativePath(file) || path.win32.parse(file).root) throw new Error('证据路径必须在项目内');
-                    return { ...extra(evidence, ['path', 'line', 'excerpt', 'reason']), path: file, line: number(evidence['line'], 'evidence.line'),
-                        excerpt: string(evidence['excerpt'], 'evidence.excerpt'), reason: string(evidence['reason'], 'evidence.reason') };
-                }),
-            };
-        }),
-        decisions: array(doc['decisions'], 'decisions').map(value => {
-            const item = object(value, 'decision');
-            const action = string(item['action'], 'decision.action');
-            if (!['accept_as_is', 'defer', 'human_takeover', 'external_completed', 'add_repair_hint', 'resume_review'].includes(action)) throw new Error('问题处置动作无效');
-            return { ...extra(item, ['action', 'actor', 'at', 'reason', 'review_after', 'review_when']), action: action as IssueReview['decisions'][number]['action'], actor: string(item['actor'], 'decision.actor'),
-                at: timestamp(item['at'], 'decision.at'), reason: string(item['reason'], 'decision.reason', true),
-                ...(item['review_after'] !== undefined ? { reviewAfter: string(item['review_after'], 'decision.review_after') } : {}),
-                ...(item['review_when'] !== undefined ? { reviewWhen: string(item['review_when'], 'decision.review_when') } : {}) };
-        }),
-        repairAttempts: array(doc['repair_attempts'], 'repair_attempts').map(value => {
-            const item = object(value, 'repair_attempt');
-            if (!['applied', 'verification_failed'].includes(String(item['result'])) || typeof item['restored'] !== 'boolean') throw new Error('修复结果无效');
-            return { ...extra(item, ['option_id', 'patch_id', 'base_revision', 'at', 'actor', 'result', 'restored', 'evidence']), optionId: string(item['option_id'], 'repair_attempt.option_id'), patchId: number(item['patch_id'], 'repair_attempt.patch_id'),
-                baseRevision: string(item['base_revision'], 'repair_attempt.base_revision'), at: timestamp(item['at'], 'repair_attempt.at'),
-                actor: string(item['actor'], 'repair_attempt.actor'), result: item['result'] as 'applied' | 'verification_failed',
-                restored: item['restored'], evidence: string(item['evidence'], 'repair_attempt.evidence') };
-        }),
-    };
-}
-
-export function issueReviewFields(issue: IssueReview): Record<string, unknown> {
-    return {
-        priority: issue.priority, base_revision: issue.baseRevision,
-        options: issue.options.map(option => ({ ...option.extra, id: option.id, title: option.title, tradeoff: option.tradeoff,
-            confidence: option.confidence, current_patch: option.currentPatch, gate_checks: option.gateChecks })),
-        observations: issue.observations.map(observation => ({ ...observation.extra, audit_id: observation.auditId, base_revision: observation.baseRevision,
-            at: observation.at, verdict: observation.verdict, reason: observation.reason, evidence: observation.evidence.map(({ extra, ...item }) => ({ ...extra, ...item })) })),
-        decisions: issue.decisions.map(decision => ({ ...decision.extra, action: decision.action, actor: decision.actor, at: decision.at, reason: decision.reason,
-            ...(decision.reviewAfter ? { review_after: decision.reviewAfter } : {}), ...(decision.reviewWhen ? { review_when: decision.reviewWhen } : {}) })),
-        repair_attempts: issue.repairAttempts.map(attempt => ({ ...attempt.extra, option_id: attempt.optionId, patch_id: attempt.patchId,
-            base_revision: attempt.baseRevision, at: attempt.at, actor: attempt.actor, result: attempt.result, restored: attempt.restored, evidence: attempt.evidence })),
-    };
-}
-
-export function selectIssuePatch(meta: ReviewFrontmatter, selection: IssueSelection): { option: RepairOption; revision: RevisionEntry } {
-    const option = meta.issue?.options.find(item => item.id === selection.optionId);
-    const revision = meta.revisions.find(item => item.id === selection.patchId);
-    if (meta.schemaVersion !== 3 || !option || option.currentPatch !== selection.patchId || !revision
-        || revision.extra?.['option_id'] !== option.id) throw new ApiError(409, 'stale', '所选方案或补丁已更新，请重新选择');
-    return { option, revision };
-}
-
-export function issueSelection(value: Record<string, unknown>): IssueSelection | undefined {
-    if (value['optionId'] === undefined && value['patchId'] === undefined) return undefined;
-    const optionId = value['optionId'];
-    const patchId = Number(value['patchId']);
-    if (typeof optionId !== 'string' || !ID.test(optionId) || !Number.isSafeInteger(patchId) || patchId < 1) throw new ApiError(422, 'bad_request', '方案与补丁编号无效');
-    return { optionId, patchId };
-}
-
-export function requireIssueSelection(meta: ReviewFrontmatter, selection?: IssueSelection): IssueSelection | undefined {
-    if (meta.schemaVersion !== 3) return undefined;
-    if (!selection) throw new ApiError(422, 'bad_request', '请显式选择修复方案和当前补丁');
-    selectIssuePatch(meta, selection);
-    return selection;
-}
-
-export function defaultIssueSelection(meta: ReviewFrontmatter): IssueSelection | undefined {
-    if (meta.approval?.extra?.['option_id'] && meta.approval.extra['patch_id']) {
-        return { optionId: String(meta.approval.extra['option_id']), patchId: Number(meta.approval.extra['patch_id']) };
+/** I16：凡在 repair_attempts[] 中记录过 verification_failed 的 (option_id, patch_id) 永久禁止直接批准。 */
+export function bannedOptionPatches(meta: ReviewFrontmatter): Set<string> {
+  const banned = new Set<string>();
+  for (const attempt of meta.repairAttempts) {
+    if (attempt.result === 'verification_failed') {
+      banned.add(patchKey(attempt.optionId, attempt.patchId));
     }
-    const option = meta.issue?.options[0];
-    return option ? { optionId: option.id, patchId: option.currentPatch } : undefined;
+  }
+  return banned;
 }
 
-export function currentReviewPatch(meta: ReviewFrontmatter, selection?: IssueSelection): RevisionEntry | undefined {
-    if (meta.schemaVersion !== 3) return meta.revisions.find(item => item.id === meta.currentRevision);
-    const selected = selection ?? defaultIssueSelection(meta);
-    return selected ? selectIssuePatch(meta, selected).revision : undefined;
+export function isPatchBanned(meta: ReviewFrontmatter, optionId: string, patchId: number): boolean {
+  return bannedOptionPatches(meta).has(patchKey(optionId, patchId));
 }
 
-export function issueVersion(meta: ReviewFrontmatter): string {
-    return createHash('sha256').update(JSON.stringify(meta)).digest('hex');
+/** 所有曾经使用过、且当前已不在 options[] 中的 option_id（含历史批准方案）均视为退役，不得复用。 */
+export function retiredOptionIds(meta: ReviewFrontmatter): Set<string> {
+  const active = new Set(meta.options.map((o) => o.id));
+  const retired = new Set<string>();
+  for (const patch of meta.patches) {
+    if (!active.has(patch.optionId)) retired.add(patch.optionId);
+  }
+  for (const historic of meta.approvalHistory) {
+    if (!active.has(historic.optionId)) retired.add(historic.optionId);
+  }
+  return retired;
 }
 
-export function projectIssue(candidate: ReviewCandidate): FindingProjection {
-    const { meta } = candidate;
-    const issue = meta.issue!;
-    const last = issue.observations.at(-1);
-    const decision = issue.decisions.filter(item => item.action !== 'add_repair_hint').at(-1);
-    const closed = meta.status === 'approved' || meta.status === 'resolved';
-    const disposition = closed ? meta.status === 'approved' ? 'applied' : 'resolved'
-        : meta.status === 'human_takeover' || meta.status === 'awaiting_verification' || meta.status === 'repair_failed' ? 'human_takeover'
-        : decision?.action === 'accept_as_is' || decision?.action === 'defer' ? decision.action : 'undecided';
-    return {
-        findingId: meta.findingId!, title: meta.title, summary: candidate.sections.problem,
-        targetFiles: [...meta.targetFiles], kind: issue.options.length ? 'repair' : 'confirm', dependsOn: null,
-        state: closed ? 'closed' : disposition === 'accept_as_is' ? 'dismissed' : 'open',
-        lastStatus: closed ? 'resolved' : 'pending', lastObservedAudit: last?.auditId ?? '', lastObservedAt: last?.at ?? meta.updatedAt,
-        candidateStatus: meta.status, candidate: candidate.id, findingVersion: issueVersion(meta), disposition,
-        repairPlan: candidate.sections.solution, baseRevision: issue.baseRevision, reviewId: candidate.id,
-        schemaVersion: 3, issueStatus: meta.status,
-        ...(decision ? { decision: { ...decision, revision: issue.decisions.indexOf(decision) + 1, auditId: last?.auditId ?? '' } as import('./finding-decisions.js').FindingEvent } : {}),
-        repairHints: issue.decisions.filter(item => item.action === 'add_repair_hint').map(item => item.reason),
-        options: issue.options.map(option => ({ candidateId: candidate.id, optionId: option.id, patchId: option.currentPatch,
-            title: option.title, tradeoff: option.tradeoff, confidence: option.confidence, status: meta.status })),
-    };
+/**
+ * SPEC §4.1 defer 暂停态判定（无时钟漂移）：
+ * 扫描 decisions[] 最后一条影响暂停态的记录；绝不因服务器时钟跨过 review_after 自动解除。
+ */
+export function isDeferred(meta: ReviewFrontmatter): boolean {
+  if (!COMMENTABLE_STATUSES.has(meta.status)) return false;
+  for (let index = meta.decisions.length - 1; index >= 0; index -= 1) {
+    const decision = meta.decisions[index];
+    if (!decision) continue;
+    if (decision.action === 'add_repair_hint') continue;
+    return decision.action === 'defer';
+  }
+  return false;
 }
 
-export function readIssueSelection(meta: ReviewFrontmatter, query: Record<string, unknown>): IssueSelection | undefined {
-    if (meta.schemaVersion === 3 && typeof query['optionId'] === 'string' && query['patchId'] === undefined) {
-        const option = meta.issue?.options.find(item => item.id === query['optionId']);
-        if (!option) throw new ApiError(409, 'conflict', '方案已变化，请重新选择');
-        return { optionId: option.id, patchId: option.currentPatch };
+export function latestDeferDecision(meta: ReviewFrontmatter): IssueDecision | undefined {
+  if (!isDeferred(meta)) return undefined;
+  for (let index = meta.decisions.length - 1; index >= 0; index -= 1) {
+    if (meta.decisions[index]?.action === 'defer') return meta.decisions[index];
+  }
+  return undefined;
+}
+
+export function hasUnbannedOption(meta: ReviewFrontmatter): boolean {
+  if (meta.options.length === 0) return false;
+  const banned = bannedOptionPatches(meta);
+  return meta.options.some((option) => !banned.has(patchKey(option.id, option.currentPatch)));
+}
+
+/** 非延期 repair_failed 仅当存在另一未失败的当前方案时，才允许 resume_review 解锁改选。 */
+export function canResumeRepairFailed(meta: ReviewFrontmatter): boolean {
+  return meta.status === 'repair_failed' && !isDeferred(meta) && hasUnbannedOption(meta);
+}
+
+export function findOption(meta: ReviewFrontmatter, optionId: string): RepairOption | undefined {
+  return meta.options.find((option) => option.id === optionId);
+}
+
+export function findPatch(meta: ReviewFrontmatter, patchId: number): PatchEntry | undefined {
+  return meta.patches.find((patch) => patch.id === patchId);
+}
+
+export function resolveOptionSelection(
+  meta: ReviewFrontmatter,
+  requested?: { optionId?: string; patchId?: number },
+): { option: RepairOption; patch: PatchEntry; selection: IssueSelection } | null {
+  if (meta.options.length === 0) {
+    if (requested?.optionId || requested?.patchId !== undefined) {
+      throw new ApiError(409, 'conflict', '纯文字问题没有可应用的修复方案与补丁');
     }
-    return issueSelection(query);
+    return null;
+  }
+  const option = requested?.optionId
+    ? meta.options.find((item) => item.id === requested.optionId)
+    : meta.options[0];
+  if (!option) {
+    throw new ApiError(409, 'conflict', `所选方案不存在或已失效：${requested?.optionId ?? ''}`);
+  }
+  const targetPatchId = requested?.patchId ?? option.currentPatch;
+  if (requested?.patchId !== undefined && requested.patchId !== option.currentPatch) {
+    throw new ApiError(
+      409,
+      'conflict',
+      `方案 ${option.id} 的当前补丁已更新为 #${String(option.currentPatch)}（请求为 #${String(requested.patchId)}），请刷新后再操作`,
+    );
+  }
+  const patch = meta.patches.find((item) => item.id === targetPatchId && item.optionId === option.id);
+  if (!patch) {
+    throw new ApiError(409, 'conflict', `方案 ${option.id} 指向的补丁 #${String(targetPatchId)} 不存在或归属不符`);
+  }
+  return { option, patch, selection: { optionId: option.id, patchId: patch.id } };
 }
 
-export function issueInvariantErrors(meta: ReviewFrontmatter): string[] {
-    const errors: string[] = [];
-    const issue = meta.issue;
-    if (meta.schemaVersion !== 3 || !issue) return ['问题缺少 schema3 数据'];
-    if (!ID.test(meta.findingId ?? '')) errors.push('问题编号无效');
-    if (!Number.isSafeInteger(meta.currentRevision) || meta.currentRevision < 1) errors.push('问题记录版本必须为正整数');
-    if (issue.options.length > 2 || new Set(issue.options.map(item => item.id)).size !== issue.options.length) errors.push('最多两个唯一有效方案');
-    for (const [index, revision] of meta.revisions.entries()) {
-        if (revision.id !== index + 1 || revision.patch !== `${String(revision.id).padStart(3, '0')}.patch`
-            || !ID.test(String(revision.extra?.['option_id'] ?? ''))) errors.push('补丁账本必须按独立编号递增并保留所属方案');
+export function requireExplicitSelection(
+  meta: ReviewFrontmatter,
+  requested?: { optionId?: string; patchId?: number },
+): { option: RepairOption; patch: PatchEntry; selection: IssueSelection } {
+  if (!requested?.optionId || typeof requested.patchId !== 'number' || !Number.isInteger(requested.patchId) || requested.patchId <= 0) {
+    throw new ApiError(400, 'bad_request', '必须显式指定有效的 optionId 与 patchId');
+  }
+  const resolved = resolveOptionSelection(meta, requested);
+  if (!resolved) {
+    throw new ApiError(409, 'conflict', '纯文字问题不支持基于补丁的操作');
+  }
+  return resolved;
+}
+
+export function parseDecisionRequest(body: Record<string, unknown>): IssueDecisionRequest {
+  const action = body['action'];
+  const nonEmpty = (value: unknown, field: string): string => {
+    if (typeof value !== 'string' || !value.trim()) {
+      throw new ApiError(422, 'bad_request', `${field} 必须是非空字符串`);
     }
-    for (const option of issue.options) {
-        try { selectIssuePatch(meta, { optionId: option.id, patchId: option.currentPatch }); }
-        catch { errors.push(`方案 ${option.id} 引用的当前补丁无效`); }
-        if (!option.gateChecks.length) errors.push(`方案 ${option.id} 缺少修复阶段门禁`);
+    return value.trim();
+  };
+  switch (action) {
+    case 'accept_as_is': {
+      const reason = nonEmpty(body['reason'], 'reason');
+      const rawCategory = body['category'];
+      if (rawCategory !== undefined && typeof rawCategory !== 'string') {
+        throw new ApiError(422, 'bad_request', 'category 必须是字符串');
+      }
+      const category = typeof rawCategory === 'string' && rawCategory.trim() ? rawCategory.trim() : undefined;
+      return { action, reason, ...(category ? { category } : {}) };
     }
-    if (meta.status === 'approved' && !meta.approval) errors.push('已解决问题缺少批准证据');
-    if (meta.status === 'approved' && meta.approval) {
-        const approval = meta.approval.extra;
-        try { selectIssuePatch(meta, { optionId: String(approval?.['option_id'] ?? ''), patchId: Number(approval?.['patch_id']) }); }
-        catch { errors.push('批准证据必须绑定有效方案和补丁'); }
-        if (!Number.isSafeInteger(approval?.['record_revision']) || Number(approval?.['record_revision']) >= meta.currentRevision
-            || !/^[a-f0-9]{64}$/.test(String(approval?.['patch_sha256'] ?? '')) || !approval?.['base_revision']) errors.push('批准证据缺少问题版本、补丁摘要或应用基线');
+    case 'defer': {
+      const reason = nonEmpty(body['reason'], 'reason');
+      let reviewAfter: string | undefined;
+      if (body['reviewAfter'] !== undefined && body['reviewAfter'] !== '') {
+        reviewAfter = nonEmpty(body['reviewAfter'], 'reviewAfter');
+        const parsed = new Date(`${reviewAfter}T00:00:00.000Z`);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(reviewAfter) || !Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== reviewAfter) {
+          throw new ApiError(422, 'bad_request', 'reviewAfter 必须是有效的 UTC 日期（YYYY-MM-DD）');
+        }
+      }
+      let reviewWhen: string | undefined;
+      if (body['reviewWhen'] !== undefined && body['reviewWhen'] !== '') {
+        reviewWhen = nonEmpty(body['reviewWhen'], 'reviewWhen');
+      }
+      return {
+        action,
+        reason,
+        ...(reviewAfter ? { reviewAfter } : {}),
+        ...(reviewWhen ? { reviewWhen } : {}),
+      };
     }
-    if (meta.status === 'resolved' && (issue.observations.at(-1)?.verdict !== 'resolved'
-        || !issue.decisions.some(item => item.action === 'external_completed'))) errors.push('外部解决必须有完成反馈及复查证据');
-    if (meta.status === 'repair_failed' && !issue.repairAttempts.some(item => item.result === 'verification_failed')) errors.push('修复失败问题缺少失败记录');
-    return errors;
+    case 'human_takeover': {
+      if (body['reason'] !== undefined && typeof body['reason'] !== 'string') {
+        throw new ApiError(422, 'bad_request', 'reason 必须是字符串');
+      }
+      const reason = typeof body['reason'] === 'string' ? body['reason'].trim() : undefined;
+      return { action, ...(reason !== undefined ? { reason } : {}) };
+    }
+    case 'add_repair_hint':
+      return { action, hint: nonEmpty(body['hint'], 'hint') };
+    case 'external_completed':
+      return { action, reason: nonEmpty(body['reason'], 'reason') };
+    case 'resume_review':
+      return { action, reason: nonEmpty(body['reason'], 'reason') };
+    default:
+      throw new ApiError(422, 'bad_request', `不支持的处置动作：${String(action ?? '')}`);
+  }
+}
+
+/**
+ * AC-STATE-01 / I16 / I20：严格按 SPEC §4.1–§4.2 状态转移矩阵应用人工处置，
+ * 就地返回新 ReviewFrontmatter（不修改入参对象）。
+ */
+export function applyIssueDecision(
+  meta: ReviewFrontmatter,
+  request: IssueDecisionRequest,
+  actor: string,
+  now: Date = new Date(),
+  relatedSymbols?: string[],
+): ReviewFrontmatter {
+  const at = nextUpdatedAt(meta.updatedAt, now);
+  const deferred = isDeferred(meta);
+  let nextStatus: ReviewStatus = meta.status;
+  let nextRejection = meta.rejection;
+  let entry: IssueDecision;
+
+  switch (request.action) {
+    case 'accept_as_is': {
+      if (!['pending', 'changes_requested', 'repair_failed', 'human_takeover'].includes(meta.status)) {
+        throw new ApiError(409, 'conflict', `当前状态 ${meta.status} 不允许执行 accept_as_is`);
+      }
+      const symbols = relatedSymbols && relatedSymbols.length > 0 ? relatedSymbols : undefined;
+      entry = {
+        action: 'accept_as_is',
+        actor,
+        at,
+        reason: request.reason,
+        ...(request.category ? { category: request.category } : {}),
+        ...(symbols ? { relatedSymbols: symbols } : {}),
+      };
+      nextStatus = 'rejected';
+      nextRejection = {
+        rejectedBy: actor,
+        rejectedAt: at,
+        reason: request.reason,
+        ...(request.category ? { category: request.category } : {}),
+        ...(symbols ? { relatedSymbols: symbols } : {}),
+      };
+      break;
+    }
+    case 'defer': {
+      if (!COMMENTABLE_STATUSES.has(meta.status)) {
+        throw new ApiError(409, 'conflict', `当前状态 ${meta.status} 不允许执行 defer`);
+      }
+      entry = {
+        action: 'defer',
+        actor,
+        at,
+        reason: request.reason,
+        ...(request.reviewAfter ? { reviewAfter: request.reviewAfter } : {}),
+        ...(request.reviewWhen ? { reviewWhen: request.reviewWhen } : {}),
+      };
+      nextStatus = meta.status;
+      break;
+    }
+    case 'human_takeover': {
+      if (!['pending', 'changes_requested', 'repair_failed', 'awaiting_verification'].includes(meta.status)) {
+        throw new ApiError(409, 'conflict', `当前状态 ${meta.status} 不允许执行 human_takeover`);
+      }
+      if (meta.status === 'awaiting_verification' && (!request.reason || !request.reason.trim())) {
+        throw new ApiError(422, 'bad_request', '从 awaiting_verification 撤回外部完成时必须填写非空 reason');
+      }
+      entry = {
+        action: 'human_takeover',
+        actor,
+        at,
+        reason: request.reason?.trim() ?? '',
+      };
+      nextStatus = 'human_takeover';
+      break;
+    }
+    case 'add_repair_hint': {
+      if (meta.status !== 'human_takeover') {
+        throw new ApiError(409, 'conflict', `只有 human_takeover 状态允许补充修复线索（当前为 ${meta.status}）`);
+      }
+      entry = {
+        action: 'add_repair_hint',
+        actor,
+        at,
+        reason: request.hint,
+      };
+      nextStatus = 'human_takeover';
+      break;
+    }
+    case 'external_completed': {
+      if (meta.status !== 'human_takeover') {
+        throw new ApiError(409, 'conflict', `只有 human_takeover 状态允许反馈外部完成（当前为 ${meta.status}）`);
+      }
+      entry = {
+        action: 'external_completed',
+        actor,
+        at,
+        reason: request.reason,
+      };
+      nextStatus = 'awaiting_verification';
+      break;
+    }
+    case 'resume_review': {
+      if (deferred) {
+        // 解除 defer 暂停时严格保留原状态（repair_failed 仍为 repair_failed，不可洗白为 pending）。
+        nextStatus = meta.status;
+      } else if (meta.status === 'rejected' || meta.status === 'human_takeover') {
+        nextRejection = null;
+        if (meta.options.length === 0 || hasUnbannedOption(meta)) {
+          nextStatus = 'pending';
+        } else {
+          nextStatus = 'repair_failed';
+        }
+      } else if (meta.status === 'repair_failed') {
+        if (!hasUnbannedOption(meta)) {
+          throw new ApiError(
+            409,
+            'conflict',
+            '当前所有方案的补丁均已因验证失败被永久封禁，不能直接 resume_review 回到 pending；请评论并生成新补丁、或转人工接手/本次不修改',
+          );
+        }
+        nextStatus = 'pending';
+      } else {
+        throw new ApiError(409, 'conflict', `当前状态 ${meta.status}（未处于延期）不允许执行 resume_review`);
+      }
+      entry = {
+        action: 'resume_review',
+        actor,
+        at,
+        reason: request.reason,
+      };
+      break;
+    }
+  }
+
+  return {
+    ...meta,
+    status: nextStatus,
+    rejection: nextRejection,
+    recordRevision: meta.recordRevision + 1,
+    updatedAt: at,
+    decisions: [...meta.decisions, entry],
+  };
+}
+
+export function deriveIssueDisposition(meta: ReviewFrontmatter): FindingDisposition {
+  if (meta.status === 'approved') return 'applied';
+  if (meta.status === 'resolved') return 'resolved';
+  if (meta.status === 'rejected') return 'accept_as_is';
+  if (meta.status === 'human_takeover' || meta.status === 'awaiting_verification') return 'human_takeover';
+  if (isDeferred(meta)) return 'defer';
+  return 'undecided';
+}
+
+export function buildFindingView(candidate: ReviewCandidate): IssueFindingView {
+  const { meta, sections } = candidate;
+  const banned = bannedOptionPatches(meta);
+  const deferred = isDeferred(meta);
+  const disposition = deriveIssueDisposition(meta);
+  const latestDecision = [...meta.decisions].reverse().find((d) => d.action !== 'add_repair_hint');
+  const repairHints = meta.decisions
+    .filter((d) => d.action === 'add_repair_hint' && d.reason.trim().length > 0)
+    .map((d) => d.reason);
+  const summary = meta.observations[meta.observations.length - 1]?.reason
+    || sections.problem.split('\n')[0]?.trim()
+    || meta.title;
+
+  return {
+    id: candidate.id,
+    findingId: meta.findingId,
+    recordRevision: meta.recordRevision,
+    owner: meta.owner,
+    updatedAt: meta.updatedAt,
+    title: meta.title,
+    summary,
+    module: meta.module,
+    auditType: meta.auditType,
+    priority: meta.priority,
+    issueStatus: meta.status,
+    issueKind: meta.issueKind,
+    dependsOn: meta.dependsOn,
+    deferred,
+    disposition,
+    baseRevision: meta.baseRevision,
+    targetFiles: [...meta.targetFiles],
+    repairPlan: sections.solution || '',
+    options: meta.options.map((option) => ({
+      optionId: option.id,
+      title: option.title,
+      tradeoff: option.tradeoff,
+      confidence: option.confidence,
+      patchId: option.currentPatch,
+      banned: banned.has(patchKey(option.id, option.currentPatch)),
+      gateChecks: [...option.gateChecks],
+    })),
+    ...(latestDecision
+      ? {
+        decision: {
+          action: latestDecision.action,
+          actor: latestDecision.actor,
+          at: latestDecision.at,
+          reason: latestDecision.reason,
+          ...(latestDecision.reviewAfter ? { reviewAfter: latestDecision.reviewAfter } : {}),
+          ...(latestDecision.reviewWhen ? { reviewWhen: latestDecision.reviewWhen } : {}),
+          ...(latestDecision.category ? { category: latestDecision.category } : {}),
+        },
+      }
+      : {}),
+    repairHints,
+    repairAttempts: [...meta.repairAttempts],
+  };
 }

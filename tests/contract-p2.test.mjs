@@ -1,11 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
-import os from 'node:os';
+import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { quickReviewInvariants, fullReviewInvariants } from '../packages/dsh-plugin/dist/host/invariants.js';
 import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
 import { createGitFixture } from './helpers.mjs';
+import { patchFixture, reviewFixture, sha256Hex, writeCandidate } from './fixtures/contract.mjs';
+
+const PATCH_TEXT = patchFixture();
+const PATCH_BYTES = Buffer.from(PATCH_TEXT, 'utf8');
+const PATCH_SHA = sha256Hex(PATCH_TEXT);
 
 function makeCandidate(overrides = {}) {
   return {
@@ -14,172 +18,165 @@ function makeCandidate(overrides = {}) {
     slug: '20261104-net-fix',
     meta: {
       schemaVersion: 1,
+      findingId: 'net-fix',
       title: 'net: 修复',
       module: 'net',
       auditType: 'bugfix',
+      issueKind: 'repair',
+      dependsOn: null,
+      priority: 'P1',
+      baseRevision: 'abc',
       createdAt: '2026-11-04T10:00:00+08:00',
       updatedAt: '2026-11-04T10:00:00+08:00',
       owner: 'tester',
       tags: [],
-      status: 'pending',
       ticket: null,
-      targetFiles: ['src/a.js'],
-      currentRevision: 1,
-      revisions: [{ id: 1, baseRevision: 'abc', patch: '001.patch', author: 'ai' }],
-      gateChecks: ['node --version'],
+      status: 'pending',
+      targetFiles: ['src/math.js'],
+      recordRevision: 1,
+      patches: [{ id: 1, patch: '001.patch', optionId: 'opt-a', baseRevision: 'abc', author: 'ai', sha256: PATCH_SHA }],
+      options: [{ id: 'opt-a', title: '方案 A', tradeoff: '改动小', confidence: 0.9, currentPatch: 1, gateChecks: ['node --version'] }],
+      observations: [],
+      decisions: [],
+      repairAttempts: [],
       comments: [],
       humanDecisions: [],
       approval: null,
+      approvalHistory: [],
       rejection: null,
       commitMessage: 'net: 修复',
-      extra: {},
       ...(overrides.meta ?? {}),
     },
     ...(overrides.top ?? {}),
   };
 }
 
-test('P2: 合法候选零错误（正例）', () => {
+test('P2: 合法候选零错误（正例）', async () => {
   assert.deepEqual(quickReviewInvariants(makeCandidate()), []);
-  assert.deepEqual(fullReviewInvariants({
-    candidate: makeCandidate(),
-    patchExists: () => true,
-    currentPatchPaths: ['src/a.js'],
+  assert.deepEqual(await fullReviewInvariants({
+    ...makeCandidate(),
+    patchFilesOnDisk: ['001.patch'],
+    readPatchBytes: async () => PATCH_BYTES,
   }), []);
 });
 
-test('P2: I3 反例——版本号不连续 / current_revision 非最高', () => {
-  const bad1 = makeCandidate({ meta: { revisions: [
-    { id: 1, baseRevision: 'a', patch: '001.patch' },
-    { id: 3, baseRevision: 'a', patch: '003.patch' },
-  ], currentRevision: 3 } });
-  assert.ok(quickReviewInvariants(bad1).some((e) => e.startsWith('I3')));
-  const bad2 = makeCandidate({ meta: { currentRevision: 1, revisions: [
-    { id: 1, baseRevision: 'a', patch: '001.patch' },
-    { id: 2, baseRevision: 'a', patch: '002.patch' },
-  ] } });
-  assert.ok(quickReviewInvariants(bad2).some((e) => e.startsWith('I3')));
+test('P2: I3 反例——patches[].id 不连续 / record_revision 非正整数', () => {
+  const bad1 = makeCandidate({
+    meta: {
+      patches: [
+        { id: 1, patch: '001.patch', optionId: 'opt-a', baseRevision: 'a', author: 'ai', sha256: PATCH_SHA },
+        { id: 3, patch: '003.patch', optionId: 'opt-a', baseRevision: 'a', author: 'ai', sha256: PATCH_SHA },
+      ],
+    },
+  });
+  assert.ok(quickReviewInvariants(bad1).some((e) => e.includes('连续递增')));
+  const bad2 = makeCandidate({ meta: { recordRevision: 0 } });
+  assert.ok(quickReviewInvariants(bad2).some((e) => e.includes('record_revision')));
 });
 
-test('P2: I6 反例——approved 无 approval / rejection 缺 reason', () => {
+test('P2: I8 反例——approved 无 approval / rejected 缺 rejection.reason', () => {
   const bad = makeCandidate({ meta: { status: 'approved', approval: null } });
-  assert.ok(quickReviewInvariants(bad).some((e) => e.startsWith('I6')));
-  const bad2 = makeCandidate({ meta: {
-    status: 'rejected',
-    rejection: { rejectedBy: 'tester', rejectedAt: '2026-11-04T11:00:00+08:00', reason: '  ' },
-  } });
-  assert.ok(quickReviewInvariants(bad2).some((e) => e.startsWith('I6') && e.includes('reason')));
+  assert.ok(quickReviewInvariants(bad).some((e) => e.includes('approval')));
+  const bad2 = makeCandidate({
+    meta: {
+      status: 'rejected',
+      rejection: { rejectedBy: 'tester', rejectedAt: '2026-11-04T11:00:00+08:00', reason: '  ' },
+    },
+  });
+  assert.ok(quickReviewInvariants(bad2).some((e) => e.includes('rejection.reason')));
 });
 
-test('P2: I11 反例——行内评论缺 side / 指向不存在版本；正例通过', () => {
-  const inlineNoSide = makeCandidate({ meta: { comments: [{
-    id: 'c1', revision: 1, file: 'src/a.js', line: 5, author: 't', content: 'x', status: 'unresolved',
-  }] } });
-  assert.ok(quickReviewInvariants(inlineNoSide).some((e) => e.startsWith('I11')));
-  const badRevision = makeCandidate({ meta: { comments: [{
-    id: 'c1', revision: 9, file: 'src/a.js', line: 5, side: 'RIGHT', author: 't', content: 'x', status: 'unresolved',
-  }] } });
-  assert.ok(quickReviewInvariants(badRevision).some((e) => e.startsWith('I11') && e.includes('不存在')));
-  const okInline = makeCandidate({ meta: { comments: [{
-    id: 'c1', revision: 1, file: 'src/a.js', line: 5, side: 'RIGHT', author: 't', content: 'x', status: 'unresolved',
-  }] } });
-  assert.ok(!quickReviewInvariants(okInline).some((e) => e.startsWith('I11')));
+test('P2: I11 反例——行内评论缺 side / 缺 option_id / revision 越界；正例通过', () => {
+  const inlineNoSide = makeCandidate({
+    meta: {
+      comments: [{
+        id: 'c1', revision: 1, optionId: 'opt-a', patchId: 1, file: 'src/math.js', line: 5, author: 't', content: 'x', status: 'unresolved',
+      }],
+    },
+  });
+  assert.ok(quickReviewInvariants(inlineNoSide).some((e) => e.includes('side')));
+  const badRevision = makeCandidate({
+    meta: {
+      comments: [{
+        id: 'c1', revision: 9, optionId: 'opt-a', patchId: 1, file: 'src/math.js', line: 5, side: 'RIGHT', author: 't', content: 'x', status: 'unresolved',
+      }],
+    },
+  });
+  assert.ok(quickReviewInvariants(badRevision).some((e) => e.includes('revision')));
+  const okInline = makeCandidate({
+    meta: {
+      comments: [{
+        id: 'c1', revision: 1, optionId: 'opt-a', patchId: 1, file: 'src/math.js', line: 5, side: 'RIGHT', author: 't', content: 'x', status: 'unresolved',
+      }],
+    },
+  });
+  assert.deepEqual(quickReviewInvariants(okInline), []);
 });
 
-test('P2: I12 反例——target_files 含 .. 与绝对路径', () => {
-  const bad = makeCandidate({ meta: { targetFiles: ['../outside.js', '/abs/path.js', 'ok.js'] } });
-  const errors = quickReviewInvariants(bad).filter((e) => e.startsWith('I12'));
-  assert.equal(errors.length, 2);
+test('P2: I12 反例——target_files 含 .. 与绝对路径与 .ai-review', () => {
+  const bad = makeCandidate({ meta: { targetFiles: ['../outside.js', '/abs/path.js', '.ai-review/x.md', 'ok.js'] } });
+  const errors = quickReviewInvariants(bad).filter((e) => e.includes('非法或禁止路径'));
+  assert.equal(errors.length, 3);
 });
 
 test('P2: I13 反例——时间缺时区偏移', () => {
   const bad = makeCandidate({ meta: { createdAt: '2026-11-04T10:00:00' } });
-  assert.ok(quickReviewInvariants(bad).some((e) => e.startsWith('I13')));
+  assert.ok(quickReviewInvariants(bad).some((e) => e.includes('时区')));
 });
 
-test('P2: I16 反例——重开字段只出现一个 / 指向非 rejected；正例通过', () => {
-  const half = makeCandidate({ meta: { reopenedFrom: '2026-10/20261031-old', reopenedReason: null } });
-  assert.ok(quickReviewInvariants(half).some((e) => e.startsWith('I16')));
-  const ok = makeCandidate({ meta: {
-    reopenedFrom: '2026-10/20261031-old', reopenedReason: '此前为误判',
-  } });
-  assert.ok(!quickReviewInvariants(ok).some((e) => e.startsWith('I16')));
-  const badTarget = fullReviewInvariants({
-    candidate: ok,
-    patchExists: () => true,
-    currentPatchPaths: null,
-    reopenedTargetRejected: () => false,
-  });
-  assert.ok(badTarget.some((e) => e.startsWith('I16') && e.includes('不是 rejected')));
+test('P2: I7 反例——deferred 缺 depends_on 或自指；非 deferred 携带 depends_on', () => {
+  const missingDep = makeCandidate({ meta: { issueKind: 'deferred', options: [], dependsOn: null } });
+  assert.ok(quickReviewInvariants(missingDep).some((e) => e.includes('depends_on')));
+  const selfDep = makeCandidate({ meta: { issueKind: 'deferred', options: [], dependsOn: 'net-fix' } });
+  assert.ok(quickReviewInvariants(selfDep).some((e) => e.includes('自身')));
+  const extraDep = makeCandidate({ meta: { issueKind: 'repair', dependsOn: 'other-id' } });
+  assert.ok(quickReviewInvariants(extraDep).some((e) => e.includes('必须为 null')));
+  const okDeferred = makeCandidate({ meta: { issueKind: 'deferred', options: [], dependsOn: 'other-id', commitMessage: null } });
+  assert.deepEqual(quickReviewInvariants(okDeferred), []);
 });
 
-test('P2: I4/I5 反例——补丁缺失 / target_files 与补丁路径不一致', () => {
-  const missing = fullReviewInvariants({
-    candidate: makeCandidate(),
-    patchExists: () => false,
-    currentPatchPaths: null,
+test('P2: I4/I5 反例——补丁缺失 / SHA-256 篡改 / target_files 未覆盖补丁路径 / 孤立补丁', async () => {
+  const missing = await fullReviewInvariants({
+    ...makeCandidate(),
+    patchFilesOnDisk: [],
+    readPatchBytes: async () => null,
   });
-  assert.ok(missing.some((e) => e.startsWith('I4')));
-  const mismatch = fullReviewInvariants({
-    candidate: makeCandidate(),
-    patchExists: () => true,
-    currentPatchPaths: ['src/other.js'],
+  assert.ok(missing.some((e) => e.includes('缺失')));
+
+  const tampered = await fullReviewInvariants({
+    ...makeCandidate(),
+    patchFilesOnDisk: ['001.patch'],
+    readPatchBytes: async () => Buffer.from(`${PATCH_TEXT}\n`, 'utf8'),
   });
-  assert.ok(mismatch.some((e) => e.startsWith('I5')));
+  assert.ok(tampered.some((e) => e.includes('SHA-256')));
+
+  const mismatch = await fullReviewInvariants({
+    ...makeCandidate({ meta: { targetFiles: ['src/other.js'] } }),
+    patchFilesOnDisk: ['001.patch'],
+    readPatchBytes: async () => PATCH_BYTES,
+  });
+  assert.ok(mismatch.some((e) => e.includes('target_files 未覆盖')));
+
+  const orphan = await fullReviewInvariants({
+    ...makeCandidate(),
+    patchFilesOnDisk: ['001.patch', '002.patch'],
+    readPatchBytes: async () => PATCH_BYTES,
+  });
+  assert.ok(orphan.some((e) => e.includes('孤立补丁')));
 });
 
 test('P2: 队列 broken 隔离——违反不变量的候选标记 broken 且不崩溃', async () => {
   const root = await createGitFixture();
   const store = new ReviewStore(root);
-  const goodDir = path.join(root, '.ai-review', '2026-11', '20261104-net-good');
+  await writeCandidate(root, '20261104-net-good');
   const badDir = path.join(root, '.ai-review', '2026-11', '20261104-net-bad');
-  await mkdir(goodDir, { recursive: true });
   await mkdir(badDir, { recursive: true });
-  const fm = (status, approval) => [
-    '---',
-    'schema_version: 1',
-    `title: "net: ${status}"`,
-    'module: net',
-    'audit_type: bugfix',
-    'created_at: "2026-11-04T10:00:00+08:00"',
-    'updated_at: "2026-11-04T10:00:00+08:00"',
-    'owner: tester',
-    'tags: []',
-    `status: ${status}`,
-    'ticket: null',
-    'target_files: []',
-    'current_revision: 1',
-    'revisions:',
-    '  - id: 1',
-    '    base_revision: "1"',
-    '    patch: 001.patch',
-    '    author: ai',
-    'gate_checks: []',
-    'comments: []',
-    'human_decisions: []',
-    `approval: ${approval}`,
-    'rejection: null',
-    `commit_message: "net: ${status}"`,
-    '---',
-    '',
-    '# 问题与影响',
-    '',
-  ].join('\n');
-  await writeFile(path.join(goodDir, 'review.md'), fm('pending', 'null').replace('target_files: []', 'target_files: [src/math.js]'), 'utf8');
-  await writeFile(path.join(goodDir, '001.patch'), [
-    'diff --git a/src/math.js b/src/math.js',
-    '--- a/src/math.js',
-    '+++ b/src/math.js',
-    '@@ -1 +1 @@',
-    '-export const add = (a, b) => a - b;',
-    '+export const add = (a, b) => a + b;',
-    '',
-  ].join('\n'), 'utf8');
-  await writeFile(path.join(badDir, 'review.md'), fm('approved', 'null'), 'utf8');
-  const { items, errors } = await store.list({}, null);
-  assert.equal(errors.length, 0, errors.join('|'));
+  await writeFile(path.join(badDir, 'review.md'), reviewFixture('20261104-net-bad', { status: 'approved', approval: ' null' }), 'utf8');
+  await writeFile(path.join(badDir, '001.patch'), PATCH_TEXT, 'utf8');
+
+  const { items } = await store.list({}, null);
   const good = items.find((item) => item.id.endsWith('net-good'));
   const bad = items.find((item) => item.id.endsWith('net-bad'));
   assert.equal(good?.parseError, undefined);
-  assert.ok(bad?.parseError?.includes('I6'), bad?.parseError);
+  assert.ok(bad?.parseError?.includes('approval'), bad?.parseError);
 });

@@ -1,126 +1,259 @@
-import type { ApiRequest, ApiResponse } from './api-context.js';
-import { Runner, loadSystemPrompt, toSessionFixPrompt } from './runner.js';
-import { issueSelection, requireIssueSelection } from './issue-review.js';
-import { ApiError, type ReviewCandidate } from './types.js';
+/**
+ * 交互式 Mode B 提案会话（POST /fix-session）与持久化工作副本占用（SPEC §5.4 / D06）：
+ * - 受理前强制校验完整 ConcurrencyGuard、显式 optionId/patchId、Owner、合法状态、总体/本方案未解决评论与干净工作区；
+ * - 占用记录持久化到 DSH_HOME 状态目录（重启后仍阻塞并发写，绝不靠 1 小时盲超时自动释放）；
+ * - 仅在核验会话停止且业务工作区干净还原后才释放占用。
+ */
+
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import {
+  guardFrom,
   readJson,
+  requireSelectionFrom,
   sendJson,
   sharedSourceFor,
   stringField,
   type ApiHost,
+  type ApiRequest,
+  type ApiResponse,
+  type FixSessionOccupancy,
   type Runtime,
 } from './api-context.js';
+import { COMMENTABLE_STATUSES, requireExplicitSelection } from './issue-review.js';
+import { buildModeBPrompt, loadProposalSystemPrompt, unresolvedCommentsForOption, wrapAgentPrompt } from './runner.js';
+import { dshHome } from './settings.js';
+import { ApiError } from './types.js';
 
-/** 面板在交互式 DSH 会话里投递修复任务的适配层。会话产出的候选由 Host 收尾提交。 */
-export class FixSessions {
-  constructor(private readonly host: ApiHost) {}
+export class FixSessionRegistry {
+  private readonly filePath: string;
+  private entries = new Map<string, FixSessionOccupancy>();
+  private unsubscribes = new Map<string, () => void>();
+  private loaded = false;
 
-  /** 修复会话会写工作区，需持续占用以免并发任务覆盖补丁。等待宿主创建和投递时也不用长期占住仓库写锁。 */
-  private readonly inFlight = new Map<string, { candidateId: string; sessionId: string; release: () => void }>();
-
-  activeFor(root: string): { candidateId: string; sessionId: string } | undefined {
-    const entry = this.inFlight.get(root);
-    return entry ? { candidateId: entry.candidateId, sessionId: entry.sessionId } : undefined;
+  constructor(statePath?: string) {
+    const dir = statePath ? path.dirname(statePath) : path.join(dshHome(), 'dsh-code-review');
+    this.filePath = path.join(dir, 'fix-sessions.json');
   }
 
-  private release(root: string, sessionId: string): void {
-    const entry = this.inFlight.get(root);
-    if (entry && entry.sessionId === sessionId) {
-      this.inFlight.delete(root);
-      entry.release();
-    }
-  }
-
-  async fixPrompt(runtime: Runtime, candidate: ReviewCandidate, selection?: import('./types.js').IssueSelection): Promise<string> {
-    requireIssueSelection(candidate.meta, selection);
-    const comments = candidate.meta.comments.filter((comment) => comment.status !== 'resolved');
-    const runner = new Runner({
-      kind: 'manual',
-      settings: this.host.currentSettings(),
-      store: runtime.store,
-      candidate,
-      mode: 'ADDRESS_FEEDBACK',
-      ...(selection ? { selection } : {}),
-      comments,
-      log: () => undefined,
-    });
-    const result = await runner.run();
-    const manualPrompt = result.prompt ?? result.errorMessage;
-    if (!manualPrompt) throw new ApiError(500, 'internal', '无法生成修复提示词');
-    return toSessionFixPrompt(manualPrompt, await loadSystemPrompt(candidate.meta.schemaVersion));
-  }
-
-  async create(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
-    const runtime = await this.host.runtimeFor(url);
-    if (!this.host.deps.createFixSession) {
-      throw new ApiError(500, 'internal', '当前 Host 不支持创建 DSH 会话（sessionController 未挂载）；可用「导出修复提示词」手动执行。');
-    }
-    const body = await readJson(req);
-    const id = stringField(body, 'id');
-    if (!id) throw new ApiError(400, 'bad_request', '缺少候选 id');
-    const source = await sharedSourceFor(runtime);
-    const detail = await runtime.store.get(id, null, source);
-    const candidate = detail.candidate;
-    if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
-    const me = await this.host.ownerFor(runtime.store.repoRoot);
-    if (candidate.meta.owner !== me) {
-      throw new ApiError(403, 'forbidden', `当前操作者 ${me} 不是候选 Owner`);
-    }
-    if (candidate.meta.status === 'approved' || candidate.meta.status === 'rejected' || candidate.meta.status === 'resolved') {
-      throw new ApiError(409, 'conflict', '已归档的候选不能再启动修复会话');
-    }
-    if (candidate.meta.comments.filter((comment) => comment.status !== 'resolved').length === 0) {
-      throw new ApiError(409, 'conflict', '没有未解决的评论可交给修复会话；请先提出具体意见');
-    }
-    // 已有工作区改动可能被误收进会话生成的补丁。
-    const clean = await runtime.vcs.ensureCleanWorkspace();
-    if (!clean.clean) throw new ApiError(409, 'conflict', `启动修复会话要求业务工作区干净。\n${clean.message}`);
-    const prompt = await this.fixPrompt(runtime, candidate, issueSelection(body));
-    const title = `AI 修复 · ${candidate.meta.title}`.replace(/\s+/g, ' ').slice(0, 60);
-    const ownerSessionId = url.searchParams.get('sessionId') ?? '';
-    // 检查与占位之间不能让出执行权，否则并发请求都可能通过检查。
-    const busy = this.inFlight.get(runtime.store.repoRoot);
-    if (busy) {
-      throw new ApiError(409, 'conflict', `已有修复会话在执行（${busy.candidateId} · ${busy.sessionId}）；请等待其结束后再启动新会话。`);
-    }
-    const root = runtime.store.repoRoot;
-    const timer = setTimeout(() => { this.release(root, created.sessionId); }, 60 * 60 * 1000);
-    timer.unref?.();
-    let off: (() => void) | undefined;
-    const placeholder = {
-      candidateId: candidate.id,
-      sessionId: '(creating)',
-      release: () => { clearTimeout(timer); off?.(); },
-    };
-    this.inFlight.set(root, placeholder);
-    let created: { sessionId: string };
+  async load(): Promise<void> {
+    if (this.loaded) return;
+    let text: string;
     try {
-      created = await this.host.deps.createFixSession({
-        cwd: root,
-        title,
-        prompt,
-        ...(ownerSessionId ? { ownerSessionId } : {}),
-      });
+      text = await readFile(this.filePath, 'utf8');
     } catch (error) {
-      if (this.inFlight.get(root) === placeholder) {
-        this.inFlight.delete(root);
-        clearTimeout(timer);
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        this.loaded = true;
+        return;
       }
       throw error;
     }
-    placeholder.sessionId = created.sessionId;
-    const subscribe = this.host.deps.onAuditTurnEnd;
-    if (subscribe) {
-      const unsubscribe = subscribe(created.sessionId, () => { this.release(root, created.sessionId); });
-      if (this.inFlight.get(root) === placeholder) off = unsubscribe;
-      else unsubscribe();
+    const raw = JSON.parse(text) as unknown;
+    if (!Array.isArray(raw)) {
+      throw new Error(`持久化提案会话占用状态格式无效：${this.filePath}`);
     }
-    sendJson(res, 202, {
-      sessionId: created.sessionId,
-      title,
-      candidateId: candidate.id,
-      revision: candidate.meta.currentRevision,
-      prompt,
-    });
+    for (const item of raw) {
+      if (item && typeof item === 'object' && typeof (item as FixSessionOccupancy).root === 'string') {
+        const entry = item as FixSessionOccupancy;
+        this.entries.set(entry.root, entry);
+      }
+    }
+    this.loaded = true;
   }
+
+  private async persist(): Promise<void> {
+    await mkdir(path.dirname(this.filePath), { recursive: true });
+    const temp = `${this.filePath}.${String(process.pid)}.${String(Date.now())}.tmp`;
+    await writeFile(temp, `${JSON.stringify([...this.entries.values()], null, 2)}\n`, 'utf8');
+    await rename(temp, this.filePath);
+  }
+
+  activeFor(root: string): FixSessionOccupancy | undefined {
+    return this.entries.get(root);
+  }
+
+  async acquire(entry: FixSessionOccupancy): Promise<void> {
+    await this.load();
+    if (this.entries.has(entry.root)) {
+      const current = this.entries.get(entry.root)!;
+      throw new ApiError(
+        409,
+        'conflict',
+        `工作副本正被交互式提案会话占用（${current.candidateId} / session ${current.sessionId || '启动中'}），须先确认停止并收尾或清理后再操作`,
+      );
+    }
+    this.entries.set(entry.root, entry);
+    await this.persist();
+  }
+
+  async updateSessionId(root: string, sessionId: string): Promise<void> {
+    const entry = this.entries.get(root);
+    if (!entry) return;
+    entry.sessionId = sessionId;
+    entry.state = 'active';
+    await this.persist();
+  }
+
+  attachTurnListener(root: string, unsubscribe: () => void): void {
+    this.unsubscribes.get(root)?.();
+    this.unsubscribes.set(root, unsubscribe);
+  }
+
+  /**
+   * 仅当根会话已确认停止（若宿主提供 stopAuditSession）且业务工作区经还原后确认干净时，才释放持久化占用。
+   * 无法核验时保留占用，绝不盲目清除！
+   */
+  async releaseVerified(
+    root: string,
+    runtime: Runtime,
+    stopSession?: (sessionId: string, signal: AbortSignal, processStopped: Promise<boolean>) => Promise<boolean>,
+  ): Promise<boolean> {
+    await this.load();
+    const entry = this.entries.get(root);
+    if (!entry) return true;
+    entry.state = 'verifying';
+    await this.persist().catch(() => undefined);
+
+    if (entry.sessionId && stopSession) {
+      const stopped = await stopSession(entry.sessionId, AbortSignal.timeout(15_000), Promise.resolve(true)).catch(() => false);
+      if (!stopped) return false;
+    }
+
+    await runtime.vcs.revertBusinessWorkspace().catch(() => undefined);
+    const clean = await runtime.vcs.ensureCleanWorkspace().catch(() => null);
+    if (!clean?.clean) return false;
+
+    this.unsubscribes.get(root)?.();
+    this.unsubscribes.delete(root);
+    this.entries.delete(root);
+    await this.persist();
+    return true;
+  }
+
+  /** 仅在 createFixSession 尚未创建出任何会话且工作区未动时同步回滚占位。 */
+  async abortUncreated(root: string): Promise<void> {
+    this.unsubscribes.get(root)?.();
+    this.unsubscribes.delete(root);
+    this.entries.delete(root);
+    await this.persist().catch(() => undefined);
+  }
+}
+
+export async function handleCreateFixSession(
+  host: ApiHost,
+  req: ApiRequest,
+  res: ApiResponse,
+  url: URL,
+  registry: FixSessionRegistry,
+): Promise<void> {
+  if (!host.deps.createFixSession) {
+    throw new ApiError(501 as unknown as number, 'internal', '当前宿主环境未提供交互式 DSH 会话能力（createFixSession）');
+  }
+  const body = await readJson(req);
+  const id = stringField(body, 'id');
+  if (!id) throw new ApiError(400, 'bad_request', '缺少问题 id');
+  const guard = guardFrom(body);
+  const requestedSelection = requireSelectionFrom(body);
+
+  const runtime = await host.runtimeFor(url);
+  host.ensureNoAuditRunning(runtime.root);
+  const actor = await host.ownerFor(runtime.root);
+
+  // 在 repo 锁内完成前置核验与持久占用登记，不在等待会话投递期间长期占用 repo 锁。
+  const prepared = await host.withWriteLock(runtime.root, async () => {
+    host.ensureNoAuditRunning(runtime.root);
+    const source = await sharedSourceFor(runtime);
+    const base = await runtime.vcs.getCurrentBase();
+    if (!base) throw new ApiError(412, 'not_configured', '当前仓库没有可用的基线提交');
+    const detail = await runtime.store.get(id, base, source, undefined, requestedSelection);
+    const candidate = detail.candidate;
+    if (candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${candidate.parseError}`);
+    const meta = candidate.meta;
+
+    runtime.store.checkGuard(meta, guard);
+    if (meta.owner !== actor) {
+      throw new ApiError(403, 'forbidden', `仅当前共享负责人 ${meta.owner} 可发起交互式提案修订`);
+    }
+    if (!COMMENTABLE_STATUSES.has(meta.status)) {
+      throw new ApiError(409, 'conflict', `当前状态 ${meta.status} 不允许发起 Mode B 提案修订会话`);
+    }
+
+    const { option, patch } = requireExplicitSelection(meta, requestedSelection);
+    const unresolved = unresolvedCommentsForOption(meta.comments, option.id);
+    if (unresolved.length === 0) {
+      throw new ApiError(409, 'conflict', `方案 ${option.id} 及总体意见中没有未解决评论，无需启动修订会话`);
+    }
+
+    const clean = await runtime.vcs.ensureCleanWorkspace();
+    if (!clean.clean) {
+      throw new ApiError(409, 'conflict', `启动提案修订会话前业务工作区必须干净：${clean.message}`);
+    }
+
+    const systemPrompt = await loadProposalSystemPrompt();
+    const userPrompt = buildModeBPrompt({
+      candidate,
+      option,
+      patchEntry: patch,
+      patchText: detail.patchText,
+      targetBase: base,
+      vcsType: runtime.vcsType,
+      intent: 'revise',
+      mode: 'session',
+    });
+    const prompt = wrapAgentPrompt(systemPrompt, userPrompt);
+    const title = `提案修订：${meta.title}（${option.id}）`;
+
+    await registry.acquire({
+      root: runtime.root,
+      candidateId: candidate.id,
+      optionId: option.id,
+      patchId: patch.id,
+      sessionId: '',
+      owner: actor,
+      createdAt: new Date().toISOString(),
+      state: 'creating',
+    });
+
+    return { candidate, option, patch, prompt, title };
+  });
+
+  const ownerSessionId = url.searchParams.get('sessionId') ?? undefined;
+  let sessionId = '';
+  try {
+    const created = await host.deps.createFixSession({
+      cwd: runtime.root,
+      title: prepared.title,
+      prompt: prepared.prompt,
+      ...(ownerSessionId ? { ownerSessionId } : {}),
+    });
+    sessionId = created.sessionId;
+    await registry.updateSessionId(runtime.root, sessionId);
+  } catch (error) {
+    // 若创建失败，仅在确认工作区仍干净且未留下会话时释放占位；否则保留占用等待核验。
+    const clean = await runtime.vcs.ensureCleanWorkspace().catch(() => null);
+    if (clean?.clean && !sessionId) {
+      await registry.abortUncreated(runtime.root);
+    }
+    throw error;
+  }
+
+  // 回合结束时必须核验停止并还原清理工作区后才释放占用（绝不盲目释放或按固定时钟超时清除）。
+  if (host.deps.onAuditTurnEnd) {
+    const unsubscribe = host.deps.onAuditTurnEnd(sessionId, () => {
+      void host.withWriteLock(runtime.root, async () => {
+        await registry.releaseVerified(runtime.root, runtime, host.deps.stopAuditSession);
+      }).catch(() => undefined);
+    });
+    registry.attachTurnListener(runtime.root, unsubscribe);
+  }
+
+  sendJson(res, 202, {
+    sessionId,
+    title: prepared.title,
+    candidateId: prepared.candidate.id,
+    revision: prepared.candidate.meta.recordRevision,
+    optionId: prepared.option.id,
+    patchId: prepared.patch.id,
+    prompt: prepared.prompt,
+  });
 }

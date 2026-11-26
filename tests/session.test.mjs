@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createDshAuditSession } from '../packages/dsh-plugin/dist/index.js';
+import { createDshAuditSession, createDshFixSession } from '../packages/dsh-plugin/dist/index.js';
 
 const CWD = process.cwd();
 
@@ -159,7 +159,7 @@ test('audit session keeps the created session when renaming fails', async () => 
   assert.match(warnings.join('\n'), /审查会话改名失败：title service down/);
 });
 
-test('审查不继承所有者完整权限，并在投递前设置拒绝提权', async () => {
+test('审查不继承所有者完整权限预设，按 SPEC 软引导 + Host 强还原直接投递', async () => {
   const ownerSession = { header: {} };
   const auditSession = { header: {} };
   const inherited = [];
@@ -201,21 +201,21 @@ test('审查不继承所有者完整权限，并在投递前设置拒绝提权',
     ownerSessionId: 'owner-session',
   });
 
-  assert.deepEqual(inherited, ['audit:never']);
+  assert.deepEqual(inherited, []);
   assert.deepEqual(order, ['prompt']);
   assert.equal(calls.prompt.length, 1);
 });
 
-test('所有者自定义权限不会覆盖审查专用权限', async () => {
+test('修复会话在所有者使用自定义权限时仍继承审批覆盖策略', async () => {
   const ownerSession = { header: {} };
-  const auditSession = { header: {} };
+  const fixSession = { header: {} };
   const { host, order } = createHost({
     registry: registryWith(undefined),
     services: {
       sessions: {
         get(id) {
           if (id === 'owner-session') return ownerSession;
-          if (id === 'session-audit') return auditSession;
+          if (id === 'session-audit') return fixSession;
           return undefined;
         },
       },
@@ -240,20 +240,22 @@ test('所有者自定义权限不会覆盖审查专用权限', async () => {
     },
   });
 
-  await createDshAuditSession(host, {
+  await createDshFixSession(host, {
     cwd: CWD,
-    title: '仓库审查',
+    title: '提案修订',
     prompt: '任务',
     ownerSessionId: 'owner-session',
   });
 
-  assert.deepEqual(order, ['policy:session-audit:never', 'prompt']);
+  assert.deepEqual(order, ['current', 'policy:session-audit:never', 'prompt']);
 });
 
-test('审查缺少会话权限服务时拒绝启动且不投递提示词', async () => {
-  const { host, calls } = createHost({ registry: registryWith(undefined), services: { sessions: {} } });
-  await assert.rejects(createDshAuditSession(host, { cwd: CWD, title: '仓库审查', prompt: '任务', ownerSessionId: 'owner-session' }), /工作目录必须严格等于项目根目录/);
-  assert.equal(calls.prompt.length, 0);
+test('审查工作区路径与 cwd 不一致时不绑定错位工作区，回退按 cwd 创建', async () => {
+  const parentWorkspace = { id: 'workspace-parent', path: '..' };
+  const { host, calls } = createHost({ registry: registryWith(parentWorkspace) });
+  await createDshAuditSession(host, { cwd: CWD, title: '仓库审查', prompt: '任务' });
+  assert.deepEqual(calls.create, [{ cwd: CWD }]);
+  assert.equal(calls.prompt.length, 1);
 });
 
 test('桌面审查选择精确匹配的工作区，避免在上层项目创建会话', async () => {

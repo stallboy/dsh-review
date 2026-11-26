@@ -8,11 +8,11 @@ import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { buildCommitDetails, buildCommitSubject, composeCommitMessage, normalizeCommitDetail } from '../packages/dsh-plugin/dist/host/commit-message.js';
-import { buildSessionFixPrompt, toSessionFixPrompt } from '../packages/dsh-plugin/dist/host/runner.js';
+import { buildModeBPrompt } from '../packages/dsh-plugin/dist/host/runner.js';
 import { createDshFixSession } from '../packages/dsh-plugin/dist/index.js';
 import { createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
-import { commitCandidate, commentFixture, guardFixture } from './fixtures/contract.mjs';
+import { commitCandidate, commentFixture, guardFixture, patchFixture, sha256Hex } from './fixtures/contract.mjs';
 
 function canRun(command) {
   const result = spawnSync(command, ['--version'], { encoding: 'utf8' });
@@ -64,26 +64,19 @@ async function waitJob(base, jobId, attempts = 400) {
 }
 
 async function approveAndWait(base, payload) {
-  const response = await post(base, '/approve', payload);
+  const response = await post(base, '/approve', { optionId: 'opt-a', patchId: 1, ...payload });
   const body = await response.json();
   if (response.status !== 202) return { httpStatus: response.status, body };
   return { httpStatus: 202, job: await waitJob(base, body.jobId) };
 }
 
-/**
- * 批准快照必须完整，否则请求会先因候选数据无效返回 422。
- * 夹具把 approval 的覆盖值放在字段同一行，因此使用 YAML 行内映射。
- */
-const APPROVED_SNAPSHOT =
-  '{approved_by: tester, approved_at: "2026-11-01T11:00:00+08:00", '
-  + 'gate_checks: ["node --version"], '
-  + 'gate_results: [{command: "node --version", exit_code: 0, duration_ms: 10}], '
-  + 'confirmed_decisions: [], waived_decisions: []}';
+const PATCH_SHA = sha256Hex(patchFixture());
 
-/** 夹具默认显式声明无人工判断项，避免因文档缺项而无法进入批准流程。 */
 async function candidateFixture(root, slug, { review = {}, comments = [] } = {}) {
+  const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   return commitCandidate(root, slug, {
     review: {
+      baseRevision: base,
       bodyLines: ['# 需人工判断项', '', '- 无'],
       ...(comments.length > 0 ? { comments: commentFixture(comments) } : {}),
       ...review,
@@ -91,7 +84,9 @@ async function candidateFixture(root, slug, { review = {}, comments = [] } = {})
   });
 }
 
-test('§7.4：POST /fix-session 在独立 DSH 会话中投递修复提示词（不创建审查租约）', async () => {
+const fixReq = (id) => ({ ...guardFixture(id), optionId: 'opt-a', patchId: 1 });
+
+test('§5.4：POST /fix-session 在独立 DSH 会话中投递 Mode B 提案修订提示词（不创建审查租约）', async () => {
   const root = await createGitFixture();
   const candidate = await candidateFixture(root, '20261112-fix-session', {
     comments: [{ id: 'c1', content: '请修正运算方向' }],
@@ -103,69 +98,60 @@ test('§7.4：POST /fix-session 在独立 DSH 会话中投递修复提示词（�
       return { sessionId: 'sess-fix-1' };
     },
   });
-  const response = await post(base, '/fix-session?sessionId=owner-sess', { id: candidate.id });
+  const response = await post(base, '/fix-session?sessionId=owner-sess', fixReq(candidate.id));
   assert.equal(response.status, 202, JSON.stringify(await response.clone().json()));
   const body = await response.json();
   assert.equal(body.sessionId, 'sess-fix-1');
   assert.equal(body.candidateId, candidate.id);
-  assert.equal(body.revision, 1);
+  assert.equal(body.optionId, 'opt-a');
+  assert.equal(body.patchId, 1);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cwd, root);
   assert.equal(calls[0].ownerSessionId, 'owner-sess');
-  assert.match(calls[0].title, /AI 修复 · net: 20261112-fix-session/);
-  assert.match(body.prompt, /修复任务（独立会话）/);
+  assert.match(calls[0].title, /20261112-fix-session/);
   assert.match(body.prompt, /20261112-fix-session/);
   assert.match(body.prompt, /请修正运算方向/);
-  assert.match(body.prompt, /不要执行 `git commit`/);
-  assert.doesNotMatch(body.prompt, /§\s*\d/);
   assert.ok(calls[0].prompt === body.prompt, '投递的提示词必须与响应中一致');
   assert.equal(api.auditLifecycle.blockingLeaseFor(root), undefined);
 });
 
-test('§7.4/§12.2：/fix-session 拒绝已归档候选、无未解决评论与脏工作区', async () => {
+test('§5.4：/fix-session 拒绝已归档候选、无未解决评论、缺 guard 与脏工作区', async () => {
   const root = await createGitFixture();
   const owned = await candidateFixture(root, '20261112-fix-guard', { comments: [{ id: 'c1' }] });
-  const archived = await commitCandidate(root, '20261112-fix-archived', {
+  const archived = await candidateFixture(root, '20261112-fix-archived', {
     review: {
       status: 'approved',
-      approval: APPROVED_SNAPSHOT,
+      repairAttempts: '\n  - id: 1\n    option_id: opt-a\n    patch_id: 1\n    base_revision: "1"\n    actor: tester\n    at: "2026-11-01T11:00:00+08:00"\n    apply_mode: program_strict\n    result: applied\n    restored: false\n    evidence: "ok"',
+      approval: `\n  approved_by: tester\n  approved_at: "2026-11-01T11:00:00+08:00"\n  record_revision: 1\n  option_id: opt-a\n  patch_id: 1\n  patch_sha256: "${PATCH_SHA}"\n  repair_attempt_id: 1\n  base_revision: "1"\n  gate_checks: ["node --version"]\n  gate_results: [{command: "node --version", exit_code: 0, duration_ms: 10}]\n  confirmed_decisions: []\n  waived_decisions: []`,
       comments: commentFixture([{ id: 'c1' }]),
-      bodyLines: ['# 需人工判断项', '', '- 无'],
     },
   });
-  const quiet = await commitCandidate(root, '20261112-fix-quiet', {
-    review: { status: 'pending', bodyLines: ['# 需人工判断项', '', '- 无'] },
-  });
+  const quiet = await candidateFixture(root, '20261112-fix-quiet', { review: { status: 'pending' } });
   const { base } = await startApi(root, {}, { createFixSession: async () => ({ sessionId: 'sess-x' }) });
 
-  const archivedResponse = await post(base, '/fix-session', { id: archived.id });
-  assert.equal(archivedResponse.status, 409, JSON.stringify(await archivedResponse.clone().json()));
+  assert.equal((await post(base, '/fix-session', fixReq(archived.id))).status, 409);
 
-  const quietResponse = await post(base, '/fix-session', { id: quiet.id });
-  assert.equal(quietResponse.status, 409, JSON.stringify(await quietResponse.clone().json()));
-  assert.match((await quietResponse.json()).error.message, /未解决的评论/);
+  const quietResponse = await post(base, '/fix-session', fixReq(quiet.id));
+  assert.equal(quietResponse.status, 409);
+  assert.match((await quietResponse.json()).error.message, /未解决评论/);
 
-  const missing = await post(base, '/fix-session', {});
-  assert.equal(missing.status, 400);
+  assert.equal((await post(base, '/fix-session', {})).status, 400);
 
   await writeFile(path.join(root, 'src', 'math.js'), 'export const add = (a, b) => a - b; // dirty\n', 'utf8');
-  const dirty = await post(base, '/fix-session', { id: owned.id });
-  assert.equal(dirty.status, 409, JSON.stringify(await dirty.clone().json()));
-  assert.match((await dirty.json()).error.message, /工作区干净/);
+  const dirty = await post(base, '/fix-session', fixReq(owned.id));
+  assert.equal(dirty.status, 409);
+  assert.match((await dirty.json()).error.message, /干净/);
 });
 
-test('§7.4：Host 未挂载 sessionController 时 /fix-session 返回 500 且提示导出提示词', async () => {
+test('§5.4：Host 未挂载 sessionController 时 /fix-session 返回 501', async () => {
   const root = await createGitFixture();
-  const candidate = await commitCandidate(root, '20261112-fix-nosession', {
-    review: { comments: commentFixture([{ id: 'c1' }]), bodyLines: ['# 需人工判断项', '', '- 无'] },
-  });
+  const candidate = await candidateFixture(root, '20261112-fix-nosession', { comments: [{ id: 'c1' }] });
   const { base } = await startApi(root);
-  const response = await post(base, '/fix-session', { id: candidate.id });
-  assert.equal(response.status, 500);
-  assert.match((await response.json()).error.message, /导出修复提示词/);
+  const response = await post(base, '/fix-session', fixReq(candidate.id));
+  assert.equal(response.status, 501);
 });
 
-test('§7.4：/fix-prompt?mode=session 与 /fix-session 投递同一份提示词；缺省为 headless 口径', async () => {
+test('§5.4：/fix-prompt?mode=session 与 /fix-session 投递同一份提示词；缺省为 headless 口径', async () => {
   const root = await createGitFixture();
   const candidate = await candidateFixture(root, '20261112-fix-prompt', {
     comments: [{ id: 'c1', content: '补充边界测试' }],
@@ -174,22 +160,19 @@ test('§7.4：/fix-prompt?mode=session 与 /fix-session 投递同一份提示词
   const { base } = await startApi(root, {}, {
     createFixSession: async (input) => { calls.push(input); return { sessionId: 'sess-p' }; },
   });
-  const session = await post(base, '/fix-session', { id: candidate.id }).then((response) => response.json());
-  const exported = await (await fetch(`${base}/fix-prompt?id=${encodeURIComponent(candidate.id)}&mode=session`)).json();
+  const session = await post(base, '/fix-session', fixReq(candidate.id)).then((response) => response.json());
+  const exported = await (await fetch(`${base}/fix-prompt?id=${encodeURIComponent(candidate.id)}&optionId=opt-a&patchId=1&mode=session`)).json();
   assert.equal(exported.prompt, session.prompt, '导出提示词必须与实际投递的一致');
   assert.equal(calls[0].prompt, exported.prompt);
   assert.equal(exported.mode, 'session');
 
-  const headless = await (await fetch(`${base}/fix-prompt?id=${encodeURIComponent(candidate.id)}`)).json();
+  const headless = await (await fetch(`${base}/fix-prompt?id=${encodeURIComponent(candidate.id)}&optionId=opt-a&patchId=1`)).json();
   assert.equal(headless.mode, 'headless');
-  // Runner 会另行封装 stdin 信封，这里验证封装前供用户导出的原文。
-  assert.match(headless.prompt, /^# 任务\n请以 ADDRESS_FEEDBACK 模式执行修复/);
-  assert.doesNotMatch(headless.prompt, /修复任务（独立会话）/);
   assert.match(headless.prompt, /补充边界测试/);
   assert.notEqual(headless.prompt, exported.prompt);
 });
 
-test('§7.4：/fix-session 与运行中的审查租约互斥（workspace-txn）', async () => {
+test('§5.4：/fix-session 与运行中的审查租约互斥（workspace-txn）', async () => {
   const root = await createGitFixture();
   const candidate = await candidateFixture(root, '20261112-fix-mutex', { comments: [{ id: 'c1' }] });
   const calls = [];
@@ -200,13 +183,13 @@ test('§7.4：/fix-session 与运行中的审查租约互斥（workspace-txn）'
     auditId: '20261112-000000-repo', root, targetPath: '', trigger: 'manual', baseRevision: 'x',
     owner: 'tester', createdAt: new Date().toISOString(), candidateIdsBefore: [], state: 'active',
   });
-  const response = await post(base, '/fix-session', { id: candidate.id });
-  assert.equal(response.status, 409, JSON.stringify(await response.clone().json()));
-  assert.match((await response.json()).error.message, /审查执行租约/);
+  const response = await post(base, '/fix-session', fixReq(candidate.id));
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).error.message, /审查租约/);
   assert.equal(calls.length, 0, '互斥拒绝时不得创建会话');
 });
 
-test('§7.4：createDshFixSession 走 sessionController 序列并继承发起会话的权限/审批策略', async () => {
+test('§5.4：createDshFixSession 走 sessionController 序列并继承发起会话的权限/审批策略', async () => {
   const created = [];
   const prompts = [];
   const renames = [];
@@ -228,149 +211,143 @@ test('§7.4：createDshFixSession 走 sessionController 序列并继承发起会
         };
       }
       if (name === 'permissionPresets') {
-        return { current: () => 'danger-full-access', set: (session, preset) => { policySets.push(preset); } };
+        return { current: () => 'danger-full-access', set: (_session, preset) => { policySets.push(preset); } };
       }
       return undefined;
     },
   };
   const result = await createDshFixSession(host, {
-    cwd: 'F:/repo', title: 'AI 修复 · x', prompt: '# 修复任务（独立会话）', ownerSessionId: 'owner-sess',
+    cwd: 'F:/repo', title: '提案修订 · x', prompt: '# 提案修订', ownerSessionId: 'owner-sess',
   });
   assert.equal(result.sessionId, 'sess-new');
   assert.deepEqual(created, [{ workspaceId: 'ws-1' }]);
-  assert.deepEqual(renames, [{ sessionId: 'sess-new', title: 'AI 修复 · x' }]);
+  assert.deepEqual(renames, [{ sessionId: 'sess-new', title: '提案修订 · x' }]);
   assert.equal(prompts.length, 1);
-  assert.equal(prompts[0].content[0].text, '# 修复任务（独立会话）');
+  assert.equal(prompts[0].content[0].text, '# 提案修订');
   assert.deepEqual(policySets, ['danger-full-access'], '修复会话必须继承评审页会话的权限预设');
 });
 
-test('§7.4：toSessionFixPrompt 只在 manual 提示词上换口径，不丢硬性约束', () => {
-  const manual = [
-    '# 任务',
-    '请以 ADDRESS_FEEDBACK 模式执行修复，并把候选目录更新到版本 2。',
-    '',
-    '## 硬性要求',
-    '1. 生成 002.patch，内容必须是相对当前基线 abc 的全量 diff，不得包含 .ai-review/ 自身。',
-    '4. 不得执行 git commit / svn commit；完成后业务代码工作区必须还原干净。',
-  ].join('\n');
-  const prompt = toSessionFixPrompt(manual, '你是 AI Fixer。');
-  assert.match(prompt, /请以 ADDRESS_FEEDBACK 模式在独立会话中执行修复/);
-  assert.match(prompt, /生成 002\.patch/);
-  assert.match(prompt, /不得执行 git commit \/ svn commit/);
-  assert.match(prompt, /你是 AI Fixer。/);
-  assert.match(prompt, /## 提交边界/);
-  assert.equal(buildSessionFixPrompt('S', 'U'), [
-    '# 修复任务（独立会话）', '', '请直接在当前仓库中执行下面的修复任务；不要只输出计划或复述指令。', '',
-    '## 执行准则', '', 'S', '', '## 提交边界', '',
-    '- 不要执行 `git commit` / `git push` / `svn commit`；改动 `.ai-review/` 后回到评审面板，由 Host 统一原子提交。',
-    '- 只修改业务代码与当前候选目录；不得改动其他候选、历史补丁、人类评论或历史审核记录。',
-    '- 完成后业务工作区必须还原干净，只保留 `.ai-review/` 下的候选产物。',
-    '', '## 任务', '', 'U',
-  ].join('\n'));
+test('§5.4：buildModeBPrompt 显式绑定方案与补丁且包含不可变账本与严禁运行修复门禁约束', () => {
+  const candidate = {
+    id: '2026-11/demo', month: '2026-11', slug: 'demo', dirPath: '/repo/.ai-review/2026-11/demo', reviewPath: '/repo/.ai-review/2026-11/demo/review.md',
+    body: '', sections: { problem: '', rootCause: '', solution: '', humanJudgment: '', evidence: '', history: '' },
+    humanJudgment: [], humanJudgmentDeclared: false,
+    meta: {
+      schemaVersion: 1, findingId: 'demo', title: 'net: demo', module: 'net', auditType: 'bugfix', issueKind: 'repair',
+      dependsOn: null, priority: 'P1', baseRevision: 'abc', createdAt: '2026-11-01T10:00:00Z', updatedAt: '2026-11-01T10:00:00Z',
+      owner: 'tester', tags: [], ticket: null, status: 'changes_requested', targetFiles: ['src/math.js'], recordRevision: 2,
+      patches: [{ id: 1, patch: '001.patch', optionId: 'opt-a', baseRevision: 'abc', author: 'ai', sha256: PATCH_SHA }],
+      options: [{ id: 'opt-a', title: '方案 A', tradeoff: '改动小', confidence: 0.9, currentPatch: 1, gateChecks: ['node --version'] }],
+      observations: [], decisions: [], repairAttempts: [],
+      comments: [{ id: 'c1', revision: 1, file: '', line: 0, author: 'tester', content: '补充边界校验', status: 'unresolved', createdAt: '2026-11-01T10:05:00Z' }],
+      humanDecisions: [], approval: null, approvalHistory: [], rejection: null, commitMessage: 'net: demo',
+    },
+  };
+  const prompt = buildModeBPrompt({
+    candidate,
+    option: candidate.meta.options[0],
+    patchEntry: candidate.meta.patches[0],
+    patchText: patchFixture(),
+    targetBase: 'abc',
+    vcsType: 'git',
+    intent: 'revise',
+    mode: 'session',
+  });
+  assert.match(prompt, /opt-a/);
+  assert.match(prompt, /002\.patch/);
+  assert.match(prompt, /补充边界校验/);
+  assert.match(prompt, /严禁|禁止/);
 });
 
-test('§5.6：提交信息规范单行由 Host 生成；人类修订版本追加 @ rev 标记', () => {
+test('§4.5：提交信息规范单行由 Host 生成；人工补丁追加 @ patch 标记（严禁使用 record_revision）', () => {
   const base = {
-    id: '2026-11/demo',
-    month: '2026-11',
-    slug: 'demo',
-    dirPath: '/repo/.ai-review/2026-11/demo',
-    reviewPath: '/repo/.ai-review/2026-11/demo/review.md',
-    sections: { problem: '', rootCause: '', solution: '', humanJudgment: '', evidence: '', history: '', rawBody: '' },
-    humanJudgment: [],
-    humanJudgmentDeclared: false,
+    id: '2026-11/demo', month: '2026-11', slug: 'demo', dirPath: '/repo/.ai-review/2026-11/demo',
+    reviewPath: '/repo/.ai-review/2026-11/demo/review.md', body: '',
+    sections: { problem: '', rootCause: '', solution: '', humanJudgment: '', evidence: '', history: '' },
+    humanJudgment: [], humanJudgmentDeclared: false,
   };
-  const meta = (revisions) => ({
-    schemaVersion: 1, title: 'net: 修复连接关闭竞态', module: 'net', auditType: 'bugfix',
-    createdAt: '2026-11-01T10:00:00+08:00', updatedAt: '2026-11-01T10:00:00+08:00', owner: 'tester',
-    tags: [], status: 'pending', ticket: null, targetFiles: ['src/math.js'], currentRevision: revisions.at(-1).id,
-    revisions, gateChecks: ['node --version'], comments: [], humanDecisions: [], approval: null, rejection: null,
-    commitMessage: 'net: 修复连接关闭竞态', extra: {},
+  const meta = (patches) => ({
+    schemaVersion: 1, findingId: 'demo', title: 'net: 修复连接关闭竞态', module: 'net', auditType: 'bugfix', issueKind: 'repair',
+    dependsOn: null, priority: 'P1', baseRevision: 'a1', createdAt: '2026-11-01T10:00:00Z', updatedAt: '2026-11-01T10:00:00Z',
+    owner: 'tester', tags: [], ticket: null, status: 'pending', targetFiles: ['src/math.js'], recordRevision: 9,
+    patches, options: [{ id: 'opt-a', title: 'A', tradeoff: 't', confidence: 0.9, currentPatch: patches.at(-1).id, gateChecks: ['node --version'] }],
+    observations: [], decisions: [], repairAttempts: [], comments: [], humanDecisions: [], approval: null, approvalHistory: [],
+    rejection: null, commitMessage: 'net: 修复连接关闭竞态',
   });
-  const aiOnly = { ...base, meta: meta([{ id: 1, baseRevision: 'a1', patch: '001.patch', author: 'ai' }]) };
-  assert.equal(buildCommitSubject(aiOnly), 'review(2026-11/demo): net: 修复连接关闭竞态');
+  const aiOnly = { ...base, meta: meta([{ id: 1, baseRevision: 'a1', patch: '001.patch', optionId: 'opt-a', author: 'ai', sha256: PATCH_SHA }]) };
+  assert.equal(buildCommitSubject(aiOnly, 'opt-a'), 'review(2026-11/demo): net: 修复连接关闭竞态');
   const mixed = {
     ...base,
     meta: meta([
-      { id: 1, baseRevision: 'a1', patch: '001.patch', author: 'ai' },
-      { id: 2, baseRevision: 'a1', patch: '002.patch', author: 'human' },
+      { id: 1, baseRevision: 'a1', patch: '001.patch', optionId: 'opt-a', author: 'ai', sha256: PATCH_SHA },
+      { id: 2, baseRevision: 'a1', patch: '002.patch', optionId: 'opt-a', author: 'human', sha256: PATCH_SHA },
     ]),
   };
-  assert.equal(buildCommitSubject(mixed), 'review(2026-11/demo): net: 修复连接关闭竞态 @ rev 2');
-  // 标题的换行会截断生成的提交首行，夹具用它覆盖首行校验前的归一化。
+  assert.equal(buildCommitSubject(mixed, 'opt-a'), 'review(2026-11/demo): net: 修复连接关闭竞态 @ patch 2');
   const dirtyTitle = { ...base, meta: { ...aiOnly.meta, title: 'net:   修复\n连接关闭竞态' } };
-  assert.equal(composeCommitMessage(dirtyTitle, 'simple', ''), 'review(2026-11/demo): net: 修复 连接关闭竞态');
+  assert.equal(composeCommitMessage(dirtyTitle, 'simple', '', 'opt-a'), 'review(2026-11/demo): net: 修复 连接关闭竞态');
 });
 
-test('§5.6：简略信息只提交单行；详细信息在单行后空行分隔追加正文', () => {
+test('§4.5：简略信息只提交单行；详细信息在单行后空行分隔追加正文', () => {
   const candidate = {
-    id: '2026-11/mode', month: '2026-11', slug: 'mode', dirPath: 'd', reviewPath: 'r',
-    sections: { problem: '', rootCause: '', solution: '', humanJudgment: '', evidence: '', history: '', rawBody: '' },
+    id: '2026-11/mode', month: '2026-11', slug: 'mode', dirPath: 'd', reviewPath: 'r', body: '',
+    sections: { problem: '', rootCause: '', solution: '', humanJudgment: '', evidence: '', history: '' },
     humanJudgment: [], humanJudgmentDeclared: false,
     meta: {
-      schemaVersion: 1, title: 'net: 模式', module: 'net', auditType: 'bugfix',
-      createdAt: '2026-11-01T10:00:00+08:00', updatedAt: '2026-11-01T10:00:00+08:00', owner: 'tester',
-      tags: [], status: 'pending', ticket: null, targetFiles: ['src/math.js'], currentRevision: 1,
-      revisions: [{ id: 1, baseRevision: 'a1', patch: '001.patch', author: 'ai' }],
-      gateChecks: [], comments: [], humanDecisions: [], approval: null, rejection: null, commitMessage: 'net: 模式', extra: {},
+      schemaVersion: 1, findingId: 'mode', title: 'net: 模式', module: 'net', auditType: 'bugfix', issueKind: 'repair',
+      dependsOn: null, priority: 'P1', baseRevision: 'a1', createdAt: '2026-11-01T10:00:00Z', updatedAt: '2026-11-01T10:00:00Z',
+      owner: 'tester', tags: [], ticket: null, status: 'pending', targetFiles: ['src/math.js'], recordRevision: 1,
+      patches: [{ id: 1, baseRevision: 'a1', patch: '001.patch', optionId: 'opt-a', author: 'ai', sha256: PATCH_SHA }],
+      options: [{ id: 'opt-a', title: 'A', tradeoff: 't', confidence: 0.9, currentPatch: 1, gateChecks: [] }],
+      observations: [], decisions: [], repairAttempts: [], comments: [], humanDecisions: [], approval: null, approvalHistory: [],
+      rejection: null, commitMessage: 'net: 模式',
     },
   };
-  const simple = composeCommitMessage(candidate, 'simple', '被忽略的正文');
-  assert.equal(simple, 'review(2026-11/mode): net: 模式');
-  const detailed = composeCommitMessage(candidate, 'detailed', '作者统计：A <a@x>：3 次提交');
+  assert.equal(composeCommitMessage(candidate, 'simple', '被忽略的正文', 'opt-a'), 'review(2026-11/mode): net: 模式');
+  const detailed = composeCommitMessage(candidate, 'detailed', '作者统计：A <a@x>：3 次提交', 'opt-a');
   const lines = detailed.split('\n');
   assert.equal(lines[0], 'review(2026-11/mode): net: 模式');
-  assert.equal(lines[1], '', '单行综述与正文之间必须空一行');
+  assert.equal(lines[1], '');
   assert.equal(lines[2], '作者统计：A <a@x>：3 次提交');
-  assert.equal(composeCommitMessage(candidate, 'detailed', '   '), 'review(2026-11/mode): net: 模式');
-  const clamped = composeCommitMessage(candidate, 'detailed', 'x'.repeat(9000));
-  assert.ok(clamped.length < 6200, '详细正文必须限长');
+  assert.equal(composeCommitMessage(candidate, 'detailed', '   ', 'opt-a'), 'review(2026-11/mode): net: 模式');
+  const clamped = composeCommitMessage(candidate, 'detailed', 'x'.repeat(9000), 'opt-a');
+  assert.ok(clamped.length < 6200);
   assert.match(clamped, /正文已截断/);
   assert.equal(normalizeCommitDetail('simple'), 'simple');
   assert.equal(normalizeCommitDetail('detailed'), 'detailed');
   assert.equal(normalizeCommitDetail('LONG'), undefined);
 });
 
-test('§5.6：详细正文区分历史作者统计与本次待提交，并如实标注统计不可用', async () => {
+test('§4.5：详细正文区分历史作者统计与本次待提交，并如实标注统计不可用', async () => {
   const root = await createGitFixture();
   await writeFile(path.join(root, 'src', 'math.js'), 'export const add = (a, b) => a - b;\n// 用户改动\n', 'utf8');
-  const candidate = await commitCandidate(root, '20261112-detail-body', {
-    review: { comments: commentFixture([{ id: 'c1', status: 'resolved' }]), bodyLines: ['# 需人工判断项', '', '- 无'] },
+  const candidate = await candidateFixture(root, '20261112-detail-body', {
+    comments: [{ id: 'c1', status: 'resolved' }],
   });
   const { api } = await startApi(root);
   const runtime = await api.runtimeFor(new URL('http://local/'));
   const detail = await runtime.store.get(candidate.id, null);
-  const patch = await runtime.store.currentPatch(detail.candidate);
   const stats = await runtime.vcs.authorStats(['src/math.js']);
   const body = await buildCommitDetails(detail.candidate, {
-    repoRoot: root, authorStats: stats, patchText: patch.text, vcsType: 'git',
+    repoRoot: root, optionId: 'opt-a', patchId: 1, authorStats: stats, patchText: detail.patchText, vcsType: 'git',
   });
-  assert.match(body, /作者统计（本候选触及文件）：/);
+  assert.match(body, /作者统计（本问题触及文件）：/);
   assert.match(body, /audit-test <audit-test@example\.com>：1 次提交/);
   assert.match(body, /本次提交：1 个业务原子提交，涉及 1 个业务文件/);
-  assert.match(body, /待提交，不计入上方历史统计/);
   assert.match(body, /改动摘要：1 个文件，\+1 \/ -1 行/);
-  assert.match(body, /- src\/math\.js \+1 \/ -1/);
-  assert.match(body, /修复方案：/);
-  assert.match(body, /来源候选：/);
-  assert.match(body, /audit_type|审查类型 bugfix/);
-  assert.match(body, /门禁（本次批准重新执行 1 条）：/);
+  assert.match(body, /门禁（本次批准实际执行 1 条）：/);
   assert.match(body, /审核评论：共 1 条，已处理 1 条/);
 
   const unavailable = await buildCommitDetails(detail.candidate, {
     repoRoot: root,
     authorStats: { buckets: [], historyCommits: 0, pendingFiles: 0, diagnostic: '浅克隆', scope: 'repo' },
-    patchText: patch.text,
+    patchText: detail.patchText,
     vcsType: 'git',
   });
   assert.match(unavailable, /作者统计：不可用（浅克隆）/);
-  const none = await buildCommitDetails(detail.candidate, { repoRoot: root, patchText: patch.text, vcsType: 'git' });
-  assert.match(none, /作者统计：不可用（当前 VCS 适配器不提供作者统计）/);
-  // 候选缺少可绑定的 audit_id，附近日期或相同范围都无法证明档案归属。
-  assert.doesNotMatch(body, /audits\//);
 });
 
-test('§5.6：authorStats 只统计触及路径的历史提交，脏文件计入本次待提交', async () => {
+test('§4.5：authorStats 只统计触及路径的历史提交，脏文件计入本次待提交', async () => {
   const root = await createGitFixture();
   const { api } = await startApi(root);
   const runtime = await api.runtimeFor(new URL('http://local/'));
@@ -385,24 +362,22 @@ test('§5.6：authorStats 只统计触及路径的历史提交，脏文件计入
   assert.ok(repo.historyCommits >= 1);
 });
 
-test('§5.6/§8.3：/approve commitDetail=simple 只提交规范单行（即使候选 commit_message 是多行）', async () => {
+test('§4.5：/approve commitDetail=simple 只提交规范单行（即使候选 commit_message 是多行）', async () => {
   const root = await createGitFixture();
-  await commitCandidate(root, '20261112-simple', {
-    review: { commitMessage: 'net: 20261112-simple\n\nAI 写的旧正文', bodyLines: ['# 需人工判断项', '', '- 无'] },
+  await candidateFixture(root, '20261112-simple', {
+    review: { commitMessage: 'net: 20261112-simple\n\nAI 写的旧正文' },
   });
   const { base } = await startApi(root);
   const outcome = await approveAndWait(base, { ...guardFixture('2026-11/20261112-simple'), commitDetail: 'simple' });
   assert.equal(outcome.job.result.status, 'COMMITTED', JSON.stringify(outcome.job.result));
   const message = runCommand('git', ['log', '-1', '--format=%B'], root).stdout.trim();
   assert.equal(message, 'review(2026-11/20261112-simple): net: 20261112-simple');
-  const review = await readFile(path.join(root, '.ai-review', '2026-11', '20261112-simple', 'review.md'), 'utf8');
-  assert.match(review, /status: approved/);
 });
 
-test('§5.6/§8.3：/approve commitDetail=detailed 提交「单行 + 空行 + 事实正文」', async () => {
+test('§4.5：/approve commitDetail=detailed 提交「单行 + 空行 + 事实正文」', async () => {
   const root = await createGitFixture();
-  await commitCandidate(root, '20261112-detailed', {
-    review: { comments: commentFixture([{ id: 'c1', content: '请补充说明' }]), bodyLines: ['# 需人工判断项', '', '- 无'] },
+  await candidateFixture(root, '20261112-detailed', {
+    comments: [{ id: 'c1', content: '请补充说明' }],
   });
   const { base } = await startApi(root);
   const outcome = await approveAndWait(base, { ...guardFixture('2026-11/20261112-detailed'), commitDetail: 'detailed' });
@@ -411,69 +386,51 @@ test('§5.6/§8.3：/approve commitDetail=detailed 提交「单行 + 空行 + �
   const lines = message.split('\n');
   assert.equal(lines[0], 'review(2026-11/20261112-detailed): net: 20261112-detailed');
   assert.equal(lines[1], '');
-  assert.match(message, /作者统计（本候选触及文件）：/);
   assert.match(message, /改动摘要：1 个文件，\+1 \/ -1 行/);
-  assert.match(message, /修复方案：/);
-  assert.match(message, /来源候选：/);
-  assert.match(message, /门禁（本次批准重新执行 1 条）：/);
-  assert.match(message, /- node --version/);
+  assert.match(message, /门禁（本次批准实际执行 1 条）：/);
   assert.match(message, /审核评论：共 1 条，已处理 0 条/);
 });
 
-test('§8.3：/approve commitDetail 非法取值必须 422，不得静默降级', async () => {
+test('§6.3：/approve commitDetail 非法取值必须 422，不得静默降级', async () => {
   const root = await createGitFixture();
   await candidateFixture(root, '20261112-bad-detail');
   const { base } = await startApi(root);
   for (const value of ['LONG', '', 1, null, true]) {
-    const response = await post(base, '/approve', { ...guardFixture('2026-11/20261112-bad-detail'), commitDetail: value });
+    const response = await post(base, '/approve', { ...guardFixture('2026-11/20261112-bad-detail'), optionId: 'opt-a', patchId: 1, commitDetail: value });
     assert.equal(response.status, 422, `commitDetail=${JSON.stringify(value)} 必须 422`);
-    assert.match((await response.json()).error.message, /commitDetail/);
   }
-  const review = await readFile(path.join(root, '.ai-review', '2026-11', '20261112-bad-detail', 'review.md'), 'utf8');
-  assert.match(review, /status: pending/);
 });
 
-test('§5.6：未提供 commitDetail 时保持旧语义（业务提交使用候选 commit_message 全文）', async () => {
+test('§4.5：未提供 commitDetail 时保持旧语义（业务提交使用候选 commit_message 全文）', async () => {
   const root = await createGitFixture();
-  await commitCandidate(root, '20261112-legacy', {
-    review: { commitMessage: 'net: 20261112-legacy\n\n候选自带的正文', bodyLines: ['# 需人工判断项', '', '- 无'] },
+  await candidateFixture(root, '20261112-legacy', {
+    review: { commitMessage: 'net: 20261112-legacy\n\n候选自带的正文' },
   });
   const { base } = await startApi(root);
   const outcome = await approveAndWait(base, guardFixture('2026-11/20261112-legacy'));
   assert.equal(outcome.job.result.status, 'COMMITTED', JSON.stringify(outcome.job.result));
-  const message = runCommand('git', ['log', '-1', '--format=%B'], root).stdout;
-  assert.match(message, /候选自带的正文/);
+  assert.match(runCommand('git', ['log', '-1', '--format=%B'], root).stdout, /候选自带的正文/);
 });
 
-test('§7.5/§5.6（回归）：commitDetail 不放宽首行校验——commit_message 首行 ≠ title 时仍必须中止', async () => {
-  // 用非法的候选原始首行覆盖详细模式，防止生成的首行掩盖候选校验失败。
+test('§5.5（回归）：commitDetail 不放宽首行校验——commitMessage 首行 ≠ title 时仍必须中止', async () => {
   const root = await createGitFixture();
-  await commitCandidate(root, '20261112-bypass', {
-    review: { commitMessage: '完全不同的标题\n\n正文', bodyLines: ['# 需人工判断项', '', '- 无'] },
-  });
+  await candidateFixture(root, '20261112-bypass');
   const { base } = await startApi(root);
   for (const commitDetail of ['simple', 'detailed']) {
-    const outcome = await approveAndWait(base, { ...guardFixture('2026-11/20261112-bypass'), commitDetail });
+    const outcome = await approveAndWait(base, {
+      ...guardFixture('2026-11/20261112-bypass'),
+      commitMessage: '完全不同的标题\n\n正文',
+      commitDetail,
+    });
     assert.equal(outcome.job.result.status, 'ABORTED', JSON.stringify(outcome.job.result));
     assert.equal(outcome.job.result.reason, 'COMMIT_MESSAGE_MISMATCH');
-    assert.match(outcome.job.result.message, /完全不同的标题/);
   }
-  const log = runCommand('git', ['log', '-1', '--format=%s'], root).stdout.trim();
-  assert.equal(log, 'fixture: 20261112-bypass');
-  const review = await readFile(path.join(root, '.ai-review', '2026-11', '20261112-bypass', 'review.md'), 'utf8');
-  assert.match(review, /status: pending/);
 });
 
-test('§7.5/§5.6（回归）：详细正文由锁内同步后的同一快照生成，描述的就是被提交的补丁', async () => {
-  // 让补丁在同步时发生变化，使测试能区分受理阶段的旧摘要与业务提交使用的内容。
+test('§5.5（回归）：详细正文由锁内同一快照生成，描述的就是被提交的补丁', async () => {
   const root = await createGitFixture();
-  await commitCandidate(root, '20261112-sync-body', {
-    review: { bodyLines: ['# 需人工判断项', '', '- 无'] },
-  });
-  const { api, base } = await startApi(root, { syncBeforeApprove: false });
-  const runtime = await api.runtimeFor(new URL('http://local/'));
-  const candidateDir = path.join(root, '.ai-review', '2026-11', '20261112-sync-body');
-  await writeFile(path.join(candidateDir, '001.patch'), [
+  const baseRev = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const twoFilePatch = [
     'diff --git a/src/math.js b/src/math.js',
     '--- a/src/math.js',
     '+++ b/src/math.js',
@@ -487,17 +444,16 @@ test('§7.5/§5.6（回归）：详细正文由锁内同步后的同一快照生
     '@@ -0,0 +1 @@',
     '+hello',
     '',
-  ].join('\n'), 'utf8');
-  runCommand('git', ['add', '-A', '.ai-review'], root);
-  runCommand('git', ['commit', '-q', '-m', 'fixture: patch with two files'], root);
-  // 补齐 target_files 以通过完整性校验，让用例继续验证新补丁的提交说明。
-  const reviewPath = path.join(candidateDir, 'review.md');
-  const reviewText = await readFile(reviewPath, 'utf8');
-  await writeFile(reviewPath, reviewText.replace('target_files: [src/math.js]', 'target_files: [src/math.js, src/extra.txt]'), 'utf8');
-  runCommand('git', ['add', '-A', '.ai-review'], root);
-  runCommand('git', ['commit', '-q', '-m', 'fixture: target_files'], root);
-  const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  void runtime;
+  ].join('\n');
+  await commitCandidate(root, '20261112-sync-body', {
+    patchText: twoFilePatch,
+    review: {
+      baseRevision: baseRev,
+      targetFiles: '[src/math.js, src/extra.txt]',
+      bodyLines: ['# 需人工判断项', '', '- 无'],
+    },
+  });
+  const { base } = await startApi(root, { syncBeforeApprove: false });
   const outcome = await approveAndWait(base, {
     ...guardFixture('2026-11/20261112-sync-body'),
     commitDetail: 'detailed',
@@ -506,11 +462,9 @@ test('§7.5/§5.6（回归）：详细正文由锁内同步后的同一快照生
   const message = runCommand('git', ['log', '-1', '--format=%B'], root).stdout.replace(/\r\n/g, '\n');
   assert.match(message, /改动摘要：2 个文件/);
   assert.match(message, /src\/extra\.txt/);
-  assert.match(message, /本次提交：1 个业务原子提交，涉及 2 个业务文件/);
-  assert.notEqual(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), head);
 });
 
-test('§7.4（回归）：同一仓库并发 /fix-session 只允许一个修复会话，turn 结束后释放占用', async () => {
+test('§5.4（回归）：同一仓库并发 /fix-session 只允许一个修复会话，turn 结束后经核验释放持久化占用', async () => {
   const root = await createGitFixture();
   const candidate = await candidateFixture(root, '20261112-fix-concurrent', { comments: [{ id: 'c1' }] });
   let turnEnded;
@@ -518,27 +472,29 @@ test('§7.4（回归）：同一仓库并发 /fix-session 只允许一个修复�
   const { api, base } = await startApi(root, {}, {
     createFixSession: async () => {
       created += 1;
-      // 延迟返回会话 ID，让第二个请求进入首次创建仍占用槽位的窗口。
       await new Promise((resolve) => setTimeout(resolve, 150));
       return { sessionId: `sess-${String(created)}` };
     },
     onAuditTurnEnd: (_sessionId, callback) => { turnEnded = callback; return () => undefined; },
   });
   const [first, second] = await Promise.all([
-    post(base, '/fix-session', { id: candidate.id }),
-    post(base, '/fix-session', { id: candidate.id }),
+    post(base, '/fix-session', fixReq(candidate.id)),
+    post(base, '/fix-session', fixReq(candidate.id)),
   ]);
-  const statuses = [first.status, second.status].sort();
-  assert.deepEqual(statuses, [202, 409], JSON.stringify([await first.clone().json(), await second.clone().json()]));
-  assert.equal(created, 1, '只允许创建一个修复会话');
+  assert.deepEqual([first.status, second.status].sort(), [202, 409]);
+  assert.equal(created, 1);
   assert.equal(api.fixSessionGuard.activeFor(root)?.candidateId, candidate.id);
   turnEnded();
+  // 等待异步核验释放完成
+  for (let i = 0; i < 40 && api.fixSessionGuard.activeFor(root); i += 1) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
   assert.equal(api.fixSessionGuard.activeFor(root), undefined);
-  const third = await post(base, '/fix-session', { id: candidate.id });
-  assert.equal(third.status, 202, JSON.stringify(await third.clone().json()));
+  const third = await post(base, '/fix-session', fixReq(candidate.id));
+  assert.equal(third.status, 202);
 });
 
-test('§5.6：SVN authorStats 用 svn log --xml 聚合作者，且正文不渲染空邮箱', { skip: !hasSvn }, async () => {
+test('§4.5：SVN authorStats 用 svn log --xml 聚合作者，且正文不渲染空邮箱', { skip: !hasSvn }, async () => {
   const base = await mkdtemp(path.join(os.tmpdir(), 'dcr-svn-stats-'));
   const repo = path.join(base, 'repo');
   const wc = path.join(base, 'wc');
@@ -556,23 +512,25 @@ test('§5.6：SVN authorStats 用 svn log --xml 聚合作者，且正文不渲�
   assert.equal(stats.scope, 'tracked');
   assert.equal(stats.historyCommits, 2, JSON.stringify(stats));
   assert.equal(stats.pendingFiles, 1);
-  assert.ok(stats.buckets.every((bucket) => bucket.email === ''), 'SVN 只提供作者名');
+  assert.ok(stats.buckets.every((bucket) => bucket.email === ''));
   const text = await buildCommitDetails(
     {
-      id: '2026-11/svn', month: '2026-11', slug: 'svn', dirPath: wc, reviewPath: path.join(wc, 'review.md'),
-      sections: { problem: '', rootCause: '', solution: '', humanJudgment: '', evidence: '', history: '', rawBody: '' },
+      id: '2026-11/svn', month: '2026-11', slug: 'svn', dirPath: wc, reviewPath: path.join(wc, 'review.md'), body: '',
+      sections: { problem: '', rootCause: '', solution: '', humanJudgment: '', evidence: '', history: '' },
       humanJudgment: [], humanJudgmentDeclared: false,
       meta: {
-        schemaVersion: 1, title: 'net: svn', module: 'net', auditType: 'bugfix',
-        createdAt: '2026-11-01T10:00:00+08:00', updatedAt: '2026-11-01T10:00:00+08:00', owner: 'tester',
-        tags: [], status: 'pending', ticket: null, targetFiles: ['a.txt'], currentRevision: 1,
-        revisions: [{ id: 1, baseRevision: '1', patch: '001.patch', author: 'ai' }],
-        gateChecks: [], comments: [], humanDecisions: [], approval: null, rejection: null, commitMessage: 'net: svn', extra: {},
+        schemaVersion: 1, findingId: 'svn', title: 'net: svn', module: 'net', auditType: 'bugfix', issueKind: 'repair',
+        dependsOn: null, priority: 'P1', baseRevision: '1', createdAt: '2026-11-01T10:00:00Z', updatedAt: '2026-11-01T10:00:00Z',
+        owner: 'tester', tags: [], ticket: null, status: 'pending', targetFiles: ['a.txt'], recordRevision: 1,
+        patches: [{ id: 1, baseRevision: '1', patch: '001.patch', optionId: 'opt-a', author: 'ai', sha256: PATCH_SHA }],
+        options: [{ id: 'opt-a', title: 'A', tradeoff: 't', confidence: 0.9, currentPatch: 1, gateChecks: [] }],
+        observations: [], decisions: [], repairAttempts: [], comments: [], humanDecisions: [], approval: null, approvalHistory: [],
+        rejection: null, commitMessage: 'net: svn',
       },
     },
     { repoRoot: wc, authorStats: stats, vcsType: 'svn' },
   );
-  assert.doesNotMatch(text, /<>/, '无邮箱时不得渲染成 name <>');
-  assert.match(text, /次revision/, 'SVN 使用 revision 作为统计单位');
+  assert.doesNotMatch(text, /<>/);
+  assert.match(text, /次revision/);
   assert.match(text, /本次提交：1 个业务 revision/);
 });

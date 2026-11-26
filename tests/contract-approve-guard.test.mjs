@@ -1,11 +1,12 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
+import { writeCandidate as writeSchemaCandidate } from './fixtures/contract.mjs';
 
 const servers = [];
 after(async () => {
@@ -27,27 +28,21 @@ async function startApi(root) {
 }
 
 async function writeCandidate(root, slug, extra = {}) {
-  const dir = path.join(root, '.ai-review', '2026-11', slug);
-  await mkdir(dir, { recursive: true });
-  const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  await writeFile(path.join(dir, 'review.md'), [
-    '---', 'schema_version: 1', `title: "net: ${slug}"`, 'module: net', 'audit_type: bugfix',
-    'created_at: "2026-11-08T10:00:00+08:00"', 'updated_at: "2026-11-08T10:00:00+08:00"', 'owner: tester',
-    'tags: []', `status: ${extra.status ?? 'pending'}`, 'ticket: null', 'target_files: [src/math.js]', 'current_revision: 1',
-    'revisions:', '  - id: 1', `    base_revision: "${base}"`, '    patch: 001.patch', '    author: ai',
-    ...(extra.gateChecks ? ['gate_checks:', ...extra.gateChecks.map((c) => `  - "${c.replaceAll('"', '\\"')}"`)] : ['gate_checks: ["node --version"]']),
-    'comments: []', 'human_decisions: []', 'approval: null', 'rejection: null',
-    `commit_message: "net: ${slug}"`, '---', '', '# 问题与影响', '', '# 需人工判断项', '- 无', '',
-  ].join('\n'), 'utf8');
-  await writeFile(path.join(dir, '001.patch'), [
-    'diff --git a/src/math.js b/src/math.js',
-    '--- a/src/math.js',
-    '+++ b/src/math.js',
-    '@@ -1 +1 @@',
-    '-export const add = (a, b) => a - b;',
-    '+export const add = (a, b) => a + b;',
-    '',
-  ].join('\n'), 'utf8');
+  const baseRev = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const gates = extra.gateChecks
+    ? `[${extra.gateChecks.map((c) => JSON.stringify(c)).join(', ')}]`
+    : '["node --version"]';
+  await writeSchemaCandidate(root, slug, {
+    review: {
+      title: `net: ${slug}`,
+      commitMessage: `net: ${slug}`,
+      baseRevision: baseRev,
+      createdAt: '2026-11-08T10:00:00+08:00',
+      updatedAt: '2026-11-08T10:00:00+08:00',
+      status: extra.status ?? 'pending',
+      gateChecks: gates,
+    },
+  });
 }
 
 function commitFixture(root) {
@@ -57,7 +52,8 @@ function commitFixture(root) {
 
 async function approveAndWait(base, payload) {
   const response = await fetch(`${base}/approve`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ optionId: 'opt-a', patchId: 1, ...payload }),
   });
   if (response.status !== 202) return { httpStatus: response.status, body: await response.json() };
   const { jobId } = await response.json();
@@ -86,20 +82,20 @@ test('切换本地评审仓库后，旧页面无法写入含同一候选的工�
   runCommand('git', ['fetch', first, 'HEAD'], second);
   runCommand('git', ['reset', '--hard', 'FETCH_HEAD'], second);
   const head = runCommand('git', ['rev-parse', 'HEAD'], first).stdout.trim();
-  const api = new ReviewApi({ settings: { ...DEFAULT_SETTINGS, repoRoot: first, owner: 'tester' }, saveSettings: async next => next });
+  const api = new ReviewApi({ settings: { ...DEFAULT_SETTINGS, repoRoot: first, owner: 'tester' }, saveSettings: async (next) => next });
   await api.init();
   const opened = await api.invoke({ method: 'GET', path: '/candidate', query: { id: guardOf(slug).id, expectedRepoRoot: first } });
   assert.equal(opened.status, 200);
   assert.equal((await api.invoke({ method: 'PUT', path: '/settings', body: { repoRoot: second } })).status, 200);
   const staleQueue = await api.invoke({ method: 'GET', path: '/queue', query: { expectedRepoRoot: first } });
   assert.equal(staleQueue.status, 409);
-  const body = { ...guardOf(slug), reason: '回归测试' };
-  const staleWrite = await api.invoke({ method: 'POST', path: '/reject', query: { expectedRepoRoot: first }, body });
+  const body = { ...guardOf(slug), action: 'accept_as_is', reason: '回归测试' };
+  const staleWrite = await api.invoke({ method: 'POST', path: '/finding/decision', query: { expectedRepoRoot: first }, body });
   assert.equal(staleWrite.status, 409);
   assert.equal(staleWrite.body.error.code, 'conflict');
   assert.equal(runCommand('git', ['rev-parse', 'HEAD'], first).stdout.trim(), head);
   assert.equal(runCommand('git', ['rev-parse', 'HEAD'], second).stdout.trim(), head);
-  assert.equal((await api.invoke({ method: 'POST', path: '/reject', query: { expectedRepoRoot: second }, body })).status, 200);
+  assert.equal((await api.invoke({ method: 'POST', path: '/finding/decision', query: { expectedRepoRoot: second }, body })).status, 200);
   assert.notEqual(runCommand('git', ['rev-parse', 'HEAD'], second).stdout.trim(), head);
   assert.equal(runCommand('git', ['rev-parse', 'HEAD'], first).stdout.trim(), head);
 });
@@ -117,7 +113,6 @@ test('G19：changes_requested 不能批准——受理前 409 conflict', async (
 test('G26：门禁期间修改目标业务文件 → BUSINESS_CONTENT_CHANGED 并回滚', async () => {
   const root = await createGitFixture();
   await writeCandidate(root, '20261108-mutate', {
-    // 附加内容避开换行转义，防止不同 shell 改变传给 Node 的脚本。
     gateChecks: ["node -e \"require('fs').appendFileSync('src/math.js','-- injected')\""],
   });
   commitFixture(root);
@@ -126,7 +121,8 @@ test('G26：门禁期间修改目标业务文件 → BUSINESS_CONTENT_CHANGED �
   assert.equal(outcome.job.result.status, 'ABORTED');
   assert.equal(outcome.job.result.reason, 'BUSINESS_CONTENT_CHANGED');
   const text = await readFile(path.join(root, 'src', 'math.js'), 'utf8');
-  assert.ok(!text.includes('injected'), text);  const status = runCommand('git', ['status', '--porcelain', 'src'], root).stdout.trim();
+  assert.ok(!text.includes('injected'), text);
+  const status = runCommand('git', ['status', '--porcelain', 'src'], root).stdout.trim();
   assert.equal(status, '');
   const detail = await (await fetch(`${base}/candidate?id=${encodeURIComponent('2026-11/20261108-mutate')}`)).json();
   assert.equal(detail.candidate.meta.status, 'pending');
@@ -156,7 +152,7 @@ test('G19/G26 回归：干净门禁仍可正常批准（COMMITTED）', async () 
   assert.ok(outcome.job.result.commitRevision);
 });
 
-test('§7.5/§8.3：/approve 提供 commitMessage 时替换并写入 review.md 与业务提交说明', async () => {
+test('§5.5：/approve 提供 commitMessage 时替换并写入 review.md 与业务提交说明', async () => {
   const root = await createGitFixture();
   await writeCandidate(root, '20261108-msg');
   commitFixture(root);
@@ -173,7 +169,7 @@ test('§7.5/§8.3：/approve 提供 commitMessage 时替换并写入 review.md �
   assert.match(subject, /详细说明：替换后的提交信息/);
 });
 
-test('§7.5：请求体 commitMessage 首行与 title 不一致 → ABORTED / COMMIT_MESSAGE_MISMATCH，不写入', async () => {
+test('§5.5：请求体 commitMessage 首行与 title 不一致 → ABORTED / COMMIT_MESSAGE_MISMATCH，不写入', async () => {
   const root = await createGitFixture();
   await writeCandidate(root, '20261108-badmsg');
   commitFixture(root);

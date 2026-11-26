@@ -34,7 +34,7 @@ test('托管内部入口保留审核 guard 与 owner 校验，身份不会串扰
     assert.equal(mine.body.canAct, true);
     assert.equal(theirs.body.canAct, false);
     const meta = mine.body.candidate.meta;
-    const payload = { id: query.id, expectedRevision: meta.currentRevision, expectedOwner: meta.owner,
+    const payload = { id: query.id, expectedRevision: meta.recordRevision, expectedOwner: meta.owner,
         expectedUpdatedAt: meta.updatedAt, content: '请补充验证', revision: 1 };
     const forbidden = await api.invoke({ method: 'POST', path: '/comments', body: payload, actor: other });
     assert.equal(forbidden.status, 403);

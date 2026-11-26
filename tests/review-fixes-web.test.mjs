@@ -34,13 +34,27 @@ function candidateFixture(extra = {}) {
     let index = 0, tree;
     const hooks = [], effects = [], commands = [], saved = new Map();
     const meta = {
-        currentRevision: 2, updatedAt: 'now', owner: '张三', status: 'pending',
-        comments: [{ id: 'old-comment', status: 'unresolved' }], revisions: [{ id: 1 }, { id: 2 }],
-        gateChecks: ['npm run verify'],
+        recordRevision: 2, updatedAt: 'now', owner: '张三', status: 'pending',
+        issueKind: 'repair', priority: 'P2', title: '测试问题',
+        comments: [{ id: 'old-comment', status: 'unresolved' }],
+        options: [{
+            id: 'opt-a', currentPatch: 2, summary: '修复方案', reason: '原因', tradeoff: '权衡', confidence: 0.9,
+            gateChecks: ['npm run verify'],
+        }],
+        patches: [
+            { id: 1, optionId: 'opt-a', patch: '001.patch', baseRevision: 'b1', sha256: 'a'.repeat(64), author: 'ai', createdAt: 'now' },
+            { id: 2, optionId: 'opt-a', patch: '002.patch', baseRevision: 'b1', sha256: 'b'.repeat(64), author: 'ai', createdAt: 'now' },
+        ],
+        repairAttempts: [], humanDecisions: [], approvalHistory: [],
         ...extra.meta,
     };
     const value = {
+        selection: { optionId: 'opt-a', patchId: 2 },
+        selectedOption: meta.options[0],
+        selectedPatch: meta.patches[1],
+        selectedPatchBanned: false,
         candidate: { meta, sections: {}, humanJudgment: [], humanJudgmentDeclared: true },
+        finding: null,
         comments: [], validation: [], patchText: patch, ...extra.value,
     };
     const useState = initial => {
@@ -130,30 +144,30 @@ test('AC-UI-01 SVN Index 路径的 a 与 b 目录保留为真实文件名的一�
 test('AC-UI-01 候选页有未提交意见时禁用直接 AI 修复并保留草稿', () => {
     const view = candidateFixture();
     view.writeComment('请检查中文文件');
-    assert.equal(view.button('让 AI 处理未解决意见').props.disabled, true);
+    assert.equal(view.button('让 AI 按意见修订提案').props.disabled, true);
     assert.match(view.text(), /先提交.*草稿/);
     assert.equal(view.comment(), '请检查中文文件');
     assert.equal(view.commands.length, 0);
     view.writeComment('');
-    assert.equal(view.button('让 AI 处理未解决意见').props.disabled, false);
-    view.button('让 AI 处理未解决意见').props.onClick();
-    assert.deepEqual(JSON.parse(JSON.stringify(view.commands)), [['p', 'ai-fix', { id: 'candidate-a' }, { expectedRevision: 2, expectedOwner: '张三', expectedUpdatedAt: 'now' }]]);
+    assert.equal(view.button('让 AI 按意见修订提案').props.disabled, false);
+    view.button('让 AI 按意见修订提案').props.onClick();
+    assert.deepEqual(JSON.parse(JSON.stringify(view.commands)), [['p', 'ai-fix', { id: 'candidate-a', optionId: 'opt-a', patchId: 2 }, { expectedRevision: 2, expectedOwner: '张三', expectedUpdatedAt: 'now' }]]);
 });
 
 test('中央候选详情提供按意见修复入口，移除人工补丁表单', () => {
     const view = candidateFixture();
-    assert.ok(view.button('让 AI 处理未解决意见'));
+    assert.ok(view.button('让 AI 按意见修订提案'));
     assert.doesNotMatch(view.text(), /人工提交新补丁|校验并保存人工版本|Unified Diff/);
 });
 
 test('AC-UI-01 候选页只有未提交行定位时也不能忽略草稿直接 AI 修复', () => {
     const view = candidateFixture();
     view.selectAnchor();
-    assert.equal(view.button('让 AI 处理未解决意见').props.disabled, true);
+    assert.equal(view.button('让 AI 按意见修订提案').props.disabled, true);
     assert.match(view.text(), /先提交.*草稿/);
     assert.match(view.text(), /src\/中文.ts:1 · RIGHT/);
     view.removeAnchor();
-    assert.equal(view.button('让 AI 处理未解决意见').props.disabled, false);
+    assert.equal(view.button('让 AI 按意见修订提案').props.disabled, false);
 });
 
 test('AC-UI-01 已批准候选展示派生业务提交及三态诊断并保留历史门禁', () => {
@@ -163,16 +177,16 @@ test('AC-UI-01 已批准候选展示派生业务提交及三态诊断并保留�
         ['unknown', undefined, /未.*确认|无法.*确认/],
     ]) {
         const view = candidateFixture({
-            meta: { status: 'approved', approval: { approvedBy: '李四', approvedAt: 'approved-at', gateResults: [{ command: 'npm run verify', exitCode: 0 }] } },
+            meta: { status: 'approved', approval: { optionId: 'opt-a', patchId: 2, approvedBy: '李四', approvedAt: 'approved-at', gateResults: [{ command: 'npm run verify', exitCode: 0 }] } },
             value: { approvalCommitLookup: lookup, approvalCommitRevision: revision },
         });
         assert.match(view.text(), /业务提交/);
         assert.match(view.text(), diagnostic);
         if (revision) assert.ok(view.text().includes(revision));
         assert.equal(view.errors().length, 0);
-        view.tab('版本与门禁');
+        view.tab('补丁账本与门禁');
         assert.match(view.text(), /npm run verify/);
-        assert.match(view.text(), /批准记录.*李四/);
+        assert.match(view.text(), /当前批准记录.*李四/);
         assert.match(view.text(), /exitCode/);
     }
 });

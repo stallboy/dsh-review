@@ -7,7 +7,6 @@ import test from 'node:test';
 import { runCommand } from './helpers.mjs';
 import { gitBlobHash, SvnAdapter } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { SvnBaseCandidateSource } from '../packages/dsh-plugin/dist/host/shared-facts.js';
-import { Writers } from '../packages/dsh-plugin/dist/host/api-writers.js';
 
 async function fixture(t, reviewData = true) {
     const temporaryRoot = path.resolve(os.tmpdir());
@@ -161,7 +160,7 @@ test('AC-APPROVE-01：SVN 原子提交同时保存核对内容和删除，接受
     assert.doesNotMatch(runCommand('svn', ['list', '-r', result.commitRevision, '.ai-review'], root).stdout, /reviewers\.yml/);
 });
 
-test('AC-APPROVE-01：SVN 继承自动属性导致追加失败后真实 Writers 恢复为干净状态', async t => {
+test('AC-APPROVE-01：SVN 继承自动属性导致追加失败后原子提交拒绝并撤销新增调度', async t => {
     const { root, vcs } = await fixture(t);
     const candidate = '.ai-review/2026-11/fix';
     const dirPath = path.join(root, candidate);
@@ -174,16 +173,21 @@ test('AC-APPROVE-01：SVN 继承自动属性导致追加失败后真实 Writers 
     runCommand('svn', ['propset', 'svn:auto-props', '*.patch = review:marker=on', '.ai-review'], root);
     runCommand('svn', ['commit', '-qm', 'candidate', '.ai-review'], root);
     runCommand('svn', ['update', '-q'], root);
-    const entriesBefore = new Set(await readdir(dirPath));
     const probeBefore = await vcs.getCommitProbe([`${candidate}/review.md`]);
     await writeFile(reviewPath, 'updated revision 2\n');
     await writeFile(path.join(dirPath, '002.patch'), 'new patch\n');
-    const writers = new Writers({}, {});
-    const result = await writers.commitAndClassify({ runtime: { store: { repoRoot: root }, vcs }, message: 'append', paths: [candidate], probePaths: [`${candidate}/review.md`], expectedFiles: [{ relPath: `${candidate}/review.md`, text: 'updated revision 2\n' }, { relPath: `${candidate}/002.patch`, text: 'new patch\n' }] });
-    assert.equal(result.landed, false, JSON.stringify(result));
-    assert.equal(result.outcome, 'ABORTED');
-    assert.match(result.detail, /review:marker/);
-    await writers.restoreAppendedRevision({ reviewPath, dirPath }, previous, entriesBefore);
+    const result = await vcs.atomicCommit({
+        message: 'append',
+        paths: [candidate],
+        verifyEntries: [
+            expected(`${candidate}/review.md`, 'updated revision 2\n'),
+            expected(`${candidate}/002.patch`, 'new patch\n'),
+        ],
+    });
+    assert.equal(result.success, false, JSON.stringify(result));
+    assert.match(result.errorOutput, /review:marker/);
+    await writeFile(reviewPath, previous);
+    await rm(path.join(dirPath, '002.patch'), { force: true });
     assert.equal(await readFile(reviewPath, 'utf8'), previous);
     assert.deepEqual((await readdir(dirPath)).sort(), ['001.patch', 'review.md']);
     assert.equal(await vcs.getCommitProbe([`${candidate}/review.md`]), probeBefore);

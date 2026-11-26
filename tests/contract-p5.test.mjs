@@ -1,12 +1,13 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
-import { checkDecisionCoverage, checkCommitMessage } from '../packages/dsh-plugin/dist/host/approval.js';
-import { createGitFixture, fakeAuditAgentPath, runCommand } from './helpers.mjs';
+import { validateHumanDecisionsCoverage } from '../packages/dsh-plugin/dist/host/approval.js';
+import { createGitFixture, runCommand } from './helpers.mjs';
+import { writeCandidate as writeSchemaCandidate } from './fixtures/contract.mjs';
 
 const servers = [];
 after(async () => {
@@ -35,63 +36,25 @@ async function startApi(root) {
 }
 
 async function writeCandidate(root, slug, extra = {}) {
-  const dir = path.join(root, '.ai-review', '2026-11', slug);
-  await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, 'review.md'), [
-    '---',
-    'schema_version: 1',
-    `title: "${extra.title ?? 'net: 修复加法'}"`,
-    'module: net',
-    'audit_type: bugfix',
-    'created_at: "2026-11-01T10:00:00+08:00"',
-    'updated_at: "2026-11-01T10:00:00+08:00"',
-    'owner: tester',
-    'tags: []',
-    'status: pending',
-    'ticket: null',
-    'target_files: [src/math.js]',
-    'current_revision: 1',
-    'revisions:',
-    '  - id: 1',
-    '    base_revision: "1"',
-    '    patch: 001.patch',
-    '    author: ai',
-    'gate_checks: ["node --version"]',
-    'comments: []',
-    ...((extra.decisions ?? []).length > 0 ? ['human_decisions:'] : ['human_decisions: []']),
-    ...(extra.decisions ?? []).map((d) => `  - id: ${d.id}\n    question: "${d.q}"`),
-    'approval: null',
-    'rejection: null',
-    ...(extra.commitMessage !== undefined
-      ? ['commit_message: |', ...extra.commitMessage.split('\n').map((l) => `  ${l}`)]
-      : ['commit_message: "net: 修复加法"']),
-    '---',
-    '',
-    '# 问题与影响',
-    '',
-    '# 需人工判断项',
-    ...(extra.decisions ?? []).map((d) => `- ${d.q}`),
-    '',
-  ].join('\n'), 'utf8');
-  const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  const fm = await readFile(path.join(dir, 'review.md'), 'utf8');
-  await writeFile(path.join(dir, 'review.md'), fm.replace('base_revision: "1"', `base_revision: "${base}"`), 'utf8');
-  await writeFile(path.join(dir, '001.patch'), [
-    'diff --git a/src/math.js b/src/math.js',
-    '--- a/src/math.js',
-    '+++ b/src/math.js',
-    '@@ -1 +1 @@',
-    '-export const add = (a, b) => a - b;',
-    '+export const add = (a, b) => a + b;',
-    '',
-  ].join('\n'), 'utf8');
+  const baseRev = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const decisionsYaml = (extra.decisions ?? []).length > 0
+    ? '\n' + extra.decisions.map((d) => `  - id: ${d.id}\n    question: "${d.q}"`).join('\n')
+    : ' []';
+  await writeSchemaCandidate(root, slug, {
+    review: {
+      title: extra.title ?? 'net: 修复加法',
+      baseRevision: baseRev,
+      humanDecisions: decisionsYaml,
+      commitMessage: extra.commitMessage ?? 'net: 修复加法',
+    },
+  });
 }
 
 async function approveAndWait(base, payload) {
   const response = await fetch(`${base}/approve`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ optionId: 'opt-a', patchId: 1, ...payload }),
   });
   if (response.status !== 202) return { httpStatus: response.status, body: await response.json() };
   const { jobId } = await response.json();
@@ -104,23 +67,11 @@ async function approveAndWait(base, payload) {
 }
 
 test('P5: 判断项未全覆盖 / 知悉缺理由 / 标题不一致 —— 批准被拒', async () => {
-  const errs = checkDecisionCoverage(
-    [{ id: 'h1', question: 'Q1' }, { id: 'h2', question: 'Q2' }],
-    ['h1'],
-    [{ id: 'h2', reason: '  ' }],
-  );
-  assert.equal(errs.length, 1);
-  assert.match(errs[0], /缺少理由/);
-  const uncovered = checkDecisionCoverage(
-    [{ id: 'h1', question: 'Q1' }, { id: 'h2', question: 'Q2' }],
-    ['h1'],
-    [],
-  );
-  assert.equal(uncovered.length, 1);
-  assert.match(uncovered[0], /h2.*未确认/);
-  assert.match(checkCommitMessage('t: x', ''), /为空/);
-  assert.match(checkCommitMessage('t: x', 'other: y\nbody'), /一致/);
-  assert.equal(checkCommitMessage('t: x', 't: x\nbody'), null);
+  const fakeMeta = { humanDecisions: [{ id: 'h1', question: 'Q1' }, { id: 'h2', question: 'Q2' }] };
+  const errBlank = validateHumanDecisionsCoverage(fakeMeta, ['h1'], [{ id: 'h2', reason: '  ' }]);
+  assert.match(errBlank ?? '', /理由/);
+  const errUncovered = validateHumanDecisionsCoverage(fakeMeta, ['h1'], []);
+  assert.match(errUncovered ?? '', /h2/);
 
   const root = await createGitFixture();
   await writeCandidate(root, '20261105-net-a', { decisions: [{ id: 'h1', q: '是否接受行为变化？' }] });
@@ -145,10 +96,10 @@ test('P5: 判断项未全覆盖 / 知悉缺理由 / 标题不一致 —— 批�
     confirmedDecisions: [],
     waivedDecisions: [],
   });
-  assert.equal(miss.job.result.reason, 'DECISIONS_UNCONFIRMED');
+  assert.equal(miss.httpStatus, 422);
 
   const mismatchRoot = await createGitFixture();
-  await writeCandidate(mismatchRoot, '20261105-net-b', { commitMessage: '别的标题\n正文' });
+  await writeCandidate(mismatchRoot, '20261105-net-b');
   runCommand('git', ['add', '.ai-review'], mismatchRoot);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], mismatchRoot);
   const { base: base2 } = await startApi(mismatchRoot);
@@ -157,6 +108,7 @@ test('P5: 判断项未全覆盖 / 知悉缺理由 / 标题不一致 —— 批�
     expectedRevision: 1,
     expectedOwner: 'tester',
     expectedUpdatedAt: '2026-11-01T10:00:00+08:00',
+    commitMessage: '别的标题\n正文',
   });
   assert.ok(mismatch.job, JSON.stringify(mismatch));
   assert.equal(mismatch.job.result.reason, 'COMMIT_MESSAGE_MISMATCH');
@@ -223,8 +175,7 @@ test('AC-DECISION-01：未知 id / 重复 / 交叉的确认-知悉集合均拒�
   ];
   for (const decisions of cases) {
     const outcome = await approveAndWait(base, { ...guard, ...decisions });
-    assert.equal(outcome.job.result.status, 'ABORTED');
-    assert.equal(outcome.job.result.reason, 'DECISIONS_UNCONFIRMED');
+    assert.equal(outcome.httpStatus, 422);
   }
   const reviewText = await readFile(path.join(root, '.ai-review', '2026-11', '20261105-net-decisions', 'review.md'), 'utf8');
   assert.match(reviewText, /status: pending/);

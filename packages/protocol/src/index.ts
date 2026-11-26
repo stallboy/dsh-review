@@ -1,333 +1,410 @@
 export * from './review.js';
 
 export const PROTOCOL_VERSION = 1;
-export const SCHEDULED_AUDIT_ACTOR = 'system-scheduled-audit';
 export const SCHEDULED_AUDIT_WAIT_MS = 30 * 60_000;
-export const RETIRED_MANUAL_REVISION = 'manual-revision';
+export const SCHEDULED_AUDIT_ACTOR = 'system-scheduled-audit';
 
 export const OPERATIONS = [
-    'approve', 'comments', 'comments-batch', 'comment-status', 'takeover', 'reject', 'resume', 'rebase',
-    'ai-fix', 'reopen', 'archive-stale', 'audit', 'audit-finalize',
-    'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'finding-decision', 'sync', 'test',
+  'comments',
+  'comments-batch',
+  'comment-status',
+  'takeover',
+  'resume',
+  'approve',
+  'ai-fix',
+  'rebase',
+  'finding-decision',
+  'reviewers-init',
+  'audit',
+  'audit-finalize',
+  'audit-release',
+  'candidate-finalize',
+  'audit-self-test',
+  'sync',
 ] as const;
 
-export type ManagedOperation = typeof OPERATIONS[number];
-export type JsonRecord = Record<string, unknown>;
-export type CommandState = 'queued' | 'dispatched' | 'accepted' | 'executing' | 'completed' | 'recovery_required';
-export type DeliveryState = 'not_required' | 'pending' | 'delivered' | 'conflict' | 'unknown';
+export type Operation = (typeof OPERATIONS)[number];
+export type ManagedOperation = Operation;
 
-export interface Actor {
-    userId: string;
-    reviewIdentity: string;
+export const QUERY_KINDS = ['candidate', 'diff', 'patch', 'audit', 'reviewers', 'findings'] as const;
+export type QueryKind = (typeof QUERY_KINDS)[number];
+
+export class ProtocolError extends Error {
+  constructor(readonly code: string, message = code, readonly status = 422) {
+    super(message);
+  }
 }
 
-export interface Guard {
-    expectedRevision: number;
-    expectedOwner: string;
-    expectedUpdatedAt: string;
+export interface Actor {
+  userId: string;
+  reviewIdentity: string;
 }
 
 export type AuditRecurrence =
-    | { kind: 'daily' }
-    | { kind: 'weekly'; weekdays: number[] }
-    | { kind: 'interval'; days: number; startDate: string };
+  | { kind: 'daily' }
+  | { kind: 'weekly'; weekdays: number[] }
+  | { kind: 'interval'; days: number; startDate: string };
 
 export interface AuditPlanSettings {
-    name: string;
-    enabled: boolean;
-    startTime: string;
-    timeZone: string;
-    recurrence: AuditRecurrence;
-    note: string;
+  name: string;
+  enabled: boolean;
+  startTime: string;
+  timeZone: string;
+  recurrence: AuditRecurrence;
+  note: string;
 }
 
 export interface ScheduledAudit {
-    scheduledAt: string;
-    expiresAt: string;
+  scheduledAt: string;
+  expiresAt: string;
+}
+
+export interface CommandGuard {
+  expectedRevision: number;
+  expectedOwner: string;
+  expectedUpdatedAt: string;
 }
 
 export interface ManagedCommand {
-    commandId: string;
-    requestHash: string;
-    projectId: string;
-    nodeId: string;
-    bindingGeneration: number;
-    projectConfigRevision: number;
-    operation: ManagedOperation | typeof RETIRED_MANUAL_REVISION;
-    actor: Actor;
-    payload: JsonRecord;
-    guard?: Guard;
-    scheduledAudit?: ScheduledAudit;
-    createdAt: string;
+  commandId: string;
+  requestHash: string;
+  projectId: string;
+  nodeId: string;
+  bindingGeneration: number;
+  projectConfigRevision: number;
+  actor: Actor;
+  operation: Operation;
+  payload: JsonRecord;
+  guard?: CommandGuard;
+  scheduledAudit?: ScheduledAudit;
+  createdAt: string;
 }
-
-export interface DeliveryResult {
-    state: DeliveryState;
-    commitRevision?: string;
-    reason?: string;
-}
-
-export interface ManagedResult {
-    outcome: JsonRecord & { status: string };
-    delivery: DeliveryResult;
-}
-
-export function retiredManualRevisionResult(): ManagedResult {
-    return { outcome: { status: 'ABORTED', reason: 'CANCELLED', message: '人工补丁提交已撤除' }, delivery: { state: 'not_required' } };
-}
-
-export interface PendingCommandSummary {
-    commandId: string;
-    projectId: string;
-    operation: string;
-    state: CommandState;
-    detail?: string;
-}
-
-export interface CommandRecord extends ManagedCommand {
-    state: CommandState;
-    cancelRequested: boolean;
-    updatedAt: string;
-    result?: ManagedResult;
-}
-
-export interface WorkspaceRegistration {
-    workspaceId: string;
-    label: string;
-    vcsType: 'git' | 'svn';
-    target: string;
-    executionConfigHash?: string;
-    supportsScheduledAudit?: true;
-    auditSelfTest?: true;
-    findingWorkflow?: true;
-    issueWorkflow?: true;
-}
-
-export interface NodeRegistration {
-    protocolVersion: number;
-    instanceId: string;
-    pluginVersion: string;
-    dshVersion: string;
-    platform: string;
-    workspaces: WorkspaceRegistration[];
-}
-
-export interface NodeRecord extends NodeRegistration {
-    nodeId: string;
-    name: string;
-    lastSeenAt: string | null;
-    enabled: boolean;
-    online: boolean;
-    compatible: boolean;
-}
-
-export interface ProjectRecord {
-    projectId: string;
-    name: string;
-    nodeId: string;
-    workspaceId: string;
-    bindingGeneration: number;
-    projectConfigRevision: number;
-    vcsType: 'git' | 'svn';
-    target: string;
-    enabled: boolean;
-    executionConfigHash?: string;
-}
-
-export interface ArtifactManifest {
-    hash: string;
-    size: number;
-}
-
-export interface ProjectSnapshot {
-    findingWorkflow?: boolean;
-    issueWorkflow?: boolean;
-    projectId: string;
-    bindingGeneration: number;
-    projectConfigRevision: number;
-    snapshotSequence: number;
-    vcsSnapshot: string;
-    collectedAt: string;
-    queue: JsonRecord[];
-    findings: JsonRecord[];
-    audits: JsonRecord[];
-    errors: unknown[];
-    artifacts?: ArtifactManifest[];
-}
-
-export type QueryKind = 'candidate' | 'patch' | 'diff' | 'audit' | 'reviewers';
 
 export interface ManagedQuery {
-    queryId: string;
-    projectId: string;
-    bindingGeneration: number;
-    vcsSnapshot: string;
-    kind: QueryKind;
-    params: JsonRecord;
+  queryId: string;
+  projectId: string;
+  bindingGeneration: number;
+  vcsSnapshot: string;
+  kind: QueryKind;
+  params: JsonRecord;
 }
 
 export interface ManagedQueryResult {
-    queryId: string;
-    vcsSnapshot: string;
-    status: 'ready' | 'snapshot_moved' | 'error';
-    data?: unknown;
-    error?: string;
+  queryId: string;
+  vcsSnapshot: string;
+  status: 'ready' | 'snapshot_moved' | 'error';
+  data?: unknown;
+  error?: string;
+}
+
+export interface WorkspaceRegistration {
+  workspaceId: string;
+  label: string;
+  vcsType: 'git' | 'svn';
+  target: string;
+  executionConfigHash?: string;
+  auditSelfTest?: boolean;
+  supportsScheduledAudit?: boolean;
+  scheduledAuditNotes?: boolean;
+  stageExecutors?: string[];
+}
+
+export interface NodeRegistration {
+  protocolVersion: number;
+  instanceId: string;
+  pluginVersion: string;
+  dshVersion: string;
+  platform: string;
+  workspaces: WorkspaceRegistration[];
+}
+
+export interface NodeRecord extends NodeRegistration {
+  nodeId: string;
+  name: string;
+  enabled: boolean;
+  lastSeenAt: string | null;
+  online: boolean;
+  compatible: boolean;
+}
+
+export interface ProjectRecord {
+  projectId: string;
+  name: string;
+  nodeId: string;
+  workspaceId: string;
+  bindingGeneration: number;
+  projectConfigRevision: number;
+  vcsType: 'git' | 'svn';
+  target: string;
+  executionConfigHash?: string;
+  enabled: boolean;
+}
+
+export interface AuditSummary {
+  auditId: string;
+  createdAt: string;
+  baseRevision: string;
+  scope: string;
+  trigger: 'manual' | 'scheduled';
+  issueCount: number;
+  issues: string[];
+}
+
+export interface ProjectSnapshot {
+  projectId: string;
+  bindingGeneration: number;
+  projectConfigRevision: number;
+  vcsSnapshot: string;
+  snapshotSequence: number;
+  collectedAt: string;
+  currentBase: string | null;
+  counts: Record<string, number>;
+  queue: JsonRecord[];
+  audits: AuditSummary[];
+  findings: JsonRecord[];
+  errors: string[];
+  artifacts?: { hash: string; size: number }[];
+}
+
+export interface PendingCommandSummary {
+  commandId: string;
+  projectId: string;
+  operation: string;
+  state: 'queued' | 'dispatched' | 'accepted' | 'executing' | 'recovery_required';
+  detail?: string;
+}
+
+export interface CommandRecord extends ManagedCommand {
+  state: 'queued' | 'dispatched' | 'accepted' | 'executing' | 'completed' | 'recovery_required';
+  cancelRequested: boolean;
+  updatedAt: string;
+  result?: ManagedResult;
+}
+
+export interface ManagedResult {
+  outcome: JsonRecord & { status: string };
+  delivery: {
+    state: 'not_required' | 'pending' | 'delivered' | 'conflict' | 'unknown';
+    commitRevision?: string;
+    reason?: string;
+  };
 }
 
 export interface NodeEvent {
-    commandId: string;
-    sequence: number;
-    type: 'accepted' | 'progress' | 'result' | 'recovery_required';
-    logs?: string[];
-    auditTimeoutStopping?: true;
-    result?: ManagedResult;
+  commandId: string;
+  sequence: number;
+  type: 'accepted' | 'progress' | 'result' | 'recovery_required';
+  at?: string;
+  logs?: string[];
+  result?: ManagedResult;
+  auditTimeoutStopping?: true;
+  event?: JsonRecord;
 }
 
-export class ProtocolError extends Error {
-    constructor(field: string) {
-        super(`无效协议字段：${field}`);
-        this.name = 'ProtocolError';
-    }
-}
+export type JsonRecord = Record<string, unknown>;
 
 export function record(value: unknown, field: string): JsonRecord {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ProtocolError(field);
-    return value as JsonRecord;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new ProtocolError('bad_request', `无效协议字段：${field}`);
+  }
+  return value as JsonRecord;
 }
 
-export function textValue(value: unknown, field: string, max = 256): string {
-    if (typeof value !== 'string' || !value.trim() || value.length > max) throw new ProtocolError(field);
-    return value;
+export function textValue(value: unknown, field: string, max = 400): string {
+  if (typeof value !== 'string' || !value.trim() || value.length > max) {
+    throw new ProtocolError('bad_request', `无效协议字段：${field}`);
+  }
+  return value.trim();
 }
 
 export function entityId(value: unknown, field: string): string {
-    const id = textValue(value, field, 128);
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(id)) throw new ProtocolError(field);
-    return id;
+  const id = textValue(value, field, 128);
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(id)) {
+    throw new ProtocolError('bad_request', `无效协议字段：${field}`);
+  }
+  return id;
 }
 
 export function positiveInteger(value: unknown, field: string): number {
-    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) throw new ProtocolError(field);
-    return value;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    throw new ProtocolError('bad_request', `无效协议字段：${field}`);
+  }
+  return value;
 }
 
-export function timestamp(value: unknown, field: string): string {
-    const result = textValue(value, field, 40);
-    if (!/^\d{4}-\d\d-\d\dT/.test(result) || !Number.isFinite(Date.parse(result))) throw new ProtocolError(field);
-    return result;
-}
-
-export function validateCommand(value: unknown, allowRetiredManualRevision = false): ManagedCommand {
-    const input = record(value, 'command');
-    entityId(input.commandId, 'commandId');
-    if (typeof input.requestHash !== 'string' || !/^[a-f0-9]{64}$/.test(input.requestHash)) throw new ProtocolError('requestHash');
-    entityId(input.projectId, 'projectId');
-    entityId(input.nodeId, 'nodeId');
-    positiveInteger(input.bindingGeneration, 'bindingGeneration');
-    positiveInteger(input.projectConfigRevision, 'projectConfigRevision');
-    const operation = input.operation as ManagedCommand['operation'];
-    if (operation === RETIRED_MANUAL_REVISION ? !allowRetiredManualRevision : !OPERATIONS.includes(operation)) throw new ProtocolError('operation');
-    const actor = record(input.actor, 'actor');
-    entityId(actor.userId, 'actor.userId');
-    textValue(actor.reviewIdentity, 'actor.reviewIdentity', 160);
-    const payload = record(input.payload, 'payload');
-    if (operation !== RETIRED_MANUAL_REVISION) validatePayload(operation, payload);
-    if (input.scheduledAudit !== undefined) {
-        const schedule = record(input.scheduledAudit, 'scheduledAudit');
-        const start = timestamp(schedule.scheduledAt, 'scheduledAudit.scheduledAt');
-        const expiry = timestamp(schedule.expiresAt, 'scheduledAudit.expiresAt');
-        if (input.operation !== 'audit' || actor.userId !== SCHEDULED_AUDIT_ACTOR || (input.payload as JsonRecord).targetPath !== '.'
-            || Date.parse(expiry) - Date.parse(start) !== SCHEDULED_AUDIT_WAIT_MS) throw new ProtocolError('scheduledAudit');
-    } else if (actor.userId === SCHEDULED_AUDIT_ACTOR) {
-        throw new ProtocolError('scheduledAudit');
-    }
-    timestamp(input.createdAt, 'createdAt');
-    const needsGuard = !['audit', 'audit-finalize', 'audit-release', 'candidate-finalize', 'convert', 'dismiss-finding', 'finding-decision', 'sync', 'test'].includes(String(input.operation));
-    if (needsGuard || input.guard !== undefined) {
-        const guard = record(input.guard, 'guard');
-        positiveInteger(guard.expectedRevision, 'guard.expectedRevision');
-        textValue(guard.expectedOwner, 'guard.expectedOwner', 160);
-        timestamp(guard.expectedUpdatedAt, 'guard.expectedUpdatedAt');
-    }
-    return structuredClone(input) as unknown as ManagedCommand;
-}
-
-function validatePayload(operation: ManagedOperation, payload: JsonRecord): void {
-    const fields: Record<ManagedOperation, string[]> = {
-        approve: ['id', 'confirmedDecisions', 'waivedDecisions', 'commitMessage', 'commitDetail', 'expectedFindingVersion', 'optionId', 'patchId'], comments: ['id', 'content', 'revision', 'file', 'line', 'side', 'anchor', 'optionId', 'patchId'],
-        'comments-batch': ['id', 'comments', 'optionId', 'patchId'], 'comment-status': ['id', 'commentId', 'status'], takeover: ['id'], reject: ['id', 'reason', 'category'], resume: ['id'],
-        rebase: ['id', 'optionId', 'patchId'], 'ai-fix': ['id', 'optionId', 'patchId'], reopen: ['id', 'from', 'reason'], 'archive-stale': ['id'],
-        audit: ['targetPath', 'note', 'findingWorkflow', 'issueWorkflow'], 'audit-finalize': ['auditId'], 'audit-release': ['auditId', 'confirmStopped'], 'candidate-finalize': ['id', 'optionId', 'patchId'],
-        convert: ['auditId', 'findingId', 'candidateId'], 'dismiss-finding': ['auditId', 'findingId', 'reason'], sync: [], test: [],
-        'finding-decision': ['findingId', 'expectedFindingVersion', 'action', 'reason', 'reviewAfter', 'reviewWhen', 'hint'],
-    };
-    for (const key of Object.keys(payload)) if (!fields[operation].includes(key)) throw new ProtocolError(`payload.${key}`);
-    for (const key of ['id', 'from', 'candidateId']) if (payload[key] !== undefined && (typeof payload[key] !== 'string' || !/^\d{4}-\d{2}\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(payload[key]))) throw new ProtocolError(`payload.${key}`);
-    if (payload.auditId !== undefined && (typeof payload.auditId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(payload.auditId))) throw new ProtocolError('payload.auditId');
-    for (const key of ['content', 'file', 'side', 'commentId', 'status', 'reason', 'category', 'targetPath', 'note', 'findingId', 'commitMessage', 'commitDetail',
-        'expectedFindingVersion', 'action', 'reviewAfter', 'reviewWhen', 'hint']) {
-        if (payload[key] !== undefined && typeof payload[key] !== 'string') throw new ProtocolError(`payload.${key}`);
-    }
-    if (payload.revision !== undefined) positiveInteger(payload.revision, 'payload.revision');
-    if (payload.patchId !== undefined) positiveInteger(payload.patchId, 'payload.patchId');
-    if (payload.optionId !== undefined && (typeof payload.optionId !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(payload.optionId))) throw new ProtocolError('payload.optionId');
-    if (payload.line !== undefined && (typeof payload.line !== 'number' || !Number.isSafeInteger(payload.line) || payload.line < 0 || (payload.file && payload.line === 0))) throw new ProtocolError('payload.line');
-    for (const key of ['comments', 'confirmedDecisions', 'waivedDecisions']) if (payload[key] !== undefined && !Array.isArray(payload[key])) throw new ProtocolError(`payload.${key}`);
-    if (payload.confirmStopped !== undefined && typeof payload.confirmStopped !== 'boolean') throw new ProtocolError('payload.confirmStopped');
-    if (payload.issueWorkflow !== undefined && payload.issueWorkflow !== true) throw new ProtocolError('payload.issueWorkflow');
-    if (payload.findingWorkflow !== undefined && payload.findingWorkflow !== true) throw new ProtocolError('payload.findingWorkflow');
-}
-
-export function validateSnapshot(value: unknown): ProjectSnapshot {
-    const input = record(value, 'snapshot');
-    if (input.issueWorkflow !== undefined && typeof input.issueWorkflow !== 'boolean') throw new ProtocolError('issueWorkflow');
-    if (input.findingWorkflow !== undefined && typeof input.findingWorkflow !== 'boolean') throw new ProtocolError('findingWorkflow');
-    entityId(input.projectId, 'projectId');
-    positiveInteger(input.bindingGeneration, 'bindingGeneration');
-    positiveInteger(input.projectConfigRevision, 'projectConfigRevision');
-    positiveInteger(input.snapshotSequence, 'snapshotSequence');
-    textValue(input.vcsSnapshot, 'vcsSnapshot');
-    timestamp(input.collectedAt, 'collectedAt');
-    for (const key of ['queue', 'findings', 'audits', 'errors']) {
-        if (!Array.isArray(input[key])) throw new ProtocolError(key);
-    }
-    for (const key of ['queue', 'findings', 'audits']) {
-        for (const item of input[key] as unknown[]) record(item, key);
-    }
-    if ((input.queue as JsonRecord[]).some(item => Number(item.schemaVersion) >= 3) && input.issueWorkflow !== true) throw new ProtocolError('issueWorkflow');
-    if (input.artifacts !== undefined) {
-        if (!Array.isArray(input.artifacts)) throw new ProtocolError('artifacts');
-        for (const item of input.artifacts) {
-            const artifact = record(item, 'artifact');
-            if (typeof artifact.hash !== 'string' || !/^[a-f0-9]{64}$/.test(artifact.hash)) throw new ProtocolError('artifact.hash');
-            if (typeof artifact.size !== 'number' || !Number.isSafeInteger(artifact.size) || artifact.size < 0) throw new ProtocolError('artifact.size');
-        }
-    }
-    return structuredClone(input) as unknown as ProjectSnapshot;
+export function nonNegativeInteger(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new ProtocolError('bad_request', `无效协议字段：${field}`);
+  }
+  return value;
 }
 
 export function validateRegistration(value: unknown): NodeRegistration {
-    const input = record(value, 'registration');
-    if (Object.keys(input).some(key => !['protocolVersion', 'instanceId', 'pluginVersion', 'dshVersion', 'platform', 'workspaces'].includes(key))) throw new ProtocolError('registration');
-    positiveInteger(input.protocolVersion, 'protocolVersion');
-    entityId(input.instanceId, 'instanceId');
-    for (const key of ['pluginVersion', 'dshVersion', 'platform']) textValue(input[key], key);
-    if (!Array.isArray(input.workspaces)) throw new ProtocolError('workspaces');
-    const ids = new Set<string>();
-    for (const item of input.workspaces) {
-        const workspace = record(item, 'workspace');
-        if (Object.keys(workspace).some(key => !['workspaceId', 'label', 'vcsType', 'target', 'executionConfigHash', 'supportsScheduledAudit', 'findingWorkflow', 'issueWorkflow', 'auditSelfTest'].includes(key))) throw new ProtocolError('workspace');
-        const id = entityId(workspace.workspaceId, 'workspaceId');
-        if (ids.has(id)) throw new ProtocolError('重复 workspaceId');
-        ids.add(id);
-        textValue(workspace.label, 'workspace.label');
-        if (workspace.vcsType !== 'git' && workspace.vcsType !== 'svn') throw new ProtocolError('workspace.vcsType');
-        textValue(workspace.target, 'workspace.target');
-        if (workspace.executionConfigHash !== undefined && (typeof workspace.executionConfigHash !== 'string' || !/^[a-f0-9]{64}$/.test(workspace.executionConfigHash))) throw new ProtocolError('workspace.executionConfigHash');
-        if (workspace.auditSelfTest !== undefined && workspace.auditSelfTest !== true) throw new ProtocolError('workspace.auditSelfTest');
-        if (workspace.supportsScheduledAudit !== undefined && workspace.supportsScheduledAudit !== true) throw new ProtocolError('workspace.supportsScheduledAudit');
-        if (workspace.issueWorkflow !== undefined && workspace.issueWorkflow !== true) throw new ProtocolError('workspace.issueWorkflow');
-        if (workspace.findingWorkflow !== undefined && workspace.findingWorkflow !== true) throw new ProtocolError('workspace.findingWorkflow');
+  const input = record(value, 'registration');
+  const protocolVersion = positiveInteger(input.protocolVersion, 'protocolVersion');
+  const instanceId = entityId(input.instanceId, 'instanceId');
+  const pluginVersion = textValue(input.pluginVersion, 'pluginVersion', 64);
+  const dshVersion = textValue(input.dshVersion, 'dshVersion', 64);
+  const platform = textValue(input.platform, 'platform', 64);
+  if (!Array.isArray(input.workspaces)) throw new ProtocolError('bad_request', '无效协议字段：workspaces');
+  const seen = new Set<string>();
+  const workspaces = input.workspaces.map((item, index) => {
+    const entry = record(item, 'workspace');
+    const workspaceId = entityId(entry.workspaceId, 'workspaceId');
+    if (seen.has(workspaceId)) throw new ProtocolError('bad_request', '无效协议字段：重复 workspaceId');
+    seen.add(workspaceId);
+    const rawVcsType = entry.vcsType;
+    if (rawVcsType !== 'git' && rawVcsType !== 'svn') throw new ProtocolError('bad_request', '无效协议字段：workspace.vcsType');
+    const vcsType: 'git' | 'svn' = rawVcsType;
+    if (entry.executionConfigHash !== undefined && (typeof entry.executionConfigHash !== 'string' || !/^[a-f0-9]{64}$/.test(entry.executionConfigHash))) {
+      throw new ProtocolError('bad_request', '无效协议字段：workspace.executionConfigHash');
     }
-    return structuredClone(input) as unknown as NodeRegistration;
+    if (entry.auditSelfTest !== undefined && typeof entry.auditSelfTest !== 'boolean') {
+      throw new ProtocolError('bad_request', '无效协议字段：workspace.auditSelfTest');
+    }
+    if (entry.supportsScheduledAudit !== undefined && typeof entry.supportsScheduledAudit !== 'boolean') {
+      throw new ProtocolError('bad_request', '无效协议字段：workspace.supportsScheduledAudit');
+    }
+    if (entry.scheduledAuditNotes !== undefined && typeof entry.scheduledAuditNotes !== 'boolean') {
+      throw new ProtocolError('bad_request', '无效协议字段：workspace.scheduledAuditNotes');
+    }
+    if (entry.stageExecutors !== undefined && (!Array.isArray(entry.stageExecutors) || entry.stageExecutors.some((e) => typeof e !== 'string'))) {
+      throw new ProtocolError('bad_request', '无效协议字段：workspace.stageExecutors');
+    }
+    return {
+      workspaceId,
+      label: textValue(entry.label, 'workspace.label', 160),
+      vcsType,
+      target: textValue(entry.target, 'workspace.target', 200),
+      ...(entry.executionConfigHash ? { executionConfigHash: entry.executionConfigHash } : {}),
+      ...(entry.auditSelfTest ? { auditSelfTest: true } : {}),
+      ...(entry.supportsScheduledAudit ? { supportsScheduledAudit: true } : {}),
+      ...(entry.scheduledAuditNotes ? { scheduledAuditNotes: true } : {}),
+      ...(Array.isArray(entry.stageExecutors) ? { stageExecutors: entry.stageExecutors as string[] } : {}),
+    };
+  });
+  return { protocolVersion, instanceId, pluginVersion, dshVersion, platform, workspaces };
+}
+
+export function validateSnapshot(value: unknown): ProjectSnapshot {
+  const input = record(value, 'snapshot');
+  const collectedAt = textValue(input.collectedAt, 'collectedAt', 64);
+  if (Number.isNaN(Date.parse(collectedAt))) throw new ProtocolError('bad_request', 'collectedAt 格式无效');
+  if (!Array.isArray(input.queue)) throw new ProtocolError('bad_request', 'snapshot.queue 必须是数组');
+  if (!Array.isArray(input.audits)) throw new ProtocolError('bad_request', 'snapshot.audits 必须是数组');
+  if (!Array.isArray(input.errors)) throw new ProtocolError('bad_request', 'snapshot.errors 必须是数组');
+  const findings = Array.isArray(input.findings) ? input.findings : [];
+  const counts = input.counts === undefined ? {} : record(input.counts, 'counts');
+  const normalizedCounts: Record<string, number> = {};
+  for (const [key, count] of Object.entries(counts)) {
+    normalizedCounts[key] = nonNegativeInteger(count, `counts.${key}`);
+  }
+  const artifacts = input.artifacts === undefined ? undefined
+    : !Array.isArray(input.artifacts) ? (() => { throw new ProtocolError('bad_request', 'artifacts 必须是数组'); })()
+      : input.artifacts.map((item, index) => {
+        const entry = record(item, `artifacts[${index}]`);
+        const hash = textValue(entry.hash, 'artifact.hash', 64);
+        if (!/^[a-f0-9]{64}$/.test(hash)) throw new ProtocolError('bad_request', 'artifact.hash 必须是 SHA-256 摘要');
+        return { hash, size: nonNegativeInteger(entry.size, 'artifact.size') };
+      });
+  return {
+    projectId: entityId(input.projectId, 'projectId'),
+    bindingGeneration: positiveInteger(input.bindingGeneration, 'bindingGeneration'),
+    projectConfigRevision: positiveInteger(input.projectConfigRevision, 'projectConfigRevision'),
+    vcsSnapshot: textValue(input.vcsSnapshot, 'vcsSnapshot', 512),
+    snapshotSequence: positiveInteger(input.snapshotSequence, 'snapshotSequence'),
+    collectedAt,
+    currentBase: input.currentBase === undefined || input.currentBase === null ? null : textValue(input.currentBase, 'currentBase', 200),
+    counts: normalizedCounts,
+    queue: input.queue.map((item, index) => record(item, `queue[${index}]`)),
+    audits: input.audits.map((item, index) => {
+      const entry = record(item, `audits[${index}]`);
+      const issues = Array.isArray(entry.issues) ? entry.issues.map((v, i) => textValue(v, `audits[${index}].issues[${i}]`, 200)) : [];
+      return {
+        auditId: textValue(entry.auditId, 'auditId', 120),
+        createdAt: textValue(entry.createdAt, 'createdAt', 64),
+        baseRevision: textValue(entry.baseRevision, 'baseRevision', 200),
+        scope: textValue(entry.scope, 'scope', 200),
+        trigger: entry.trigger === 'scheduled' ? 'scheduled' : 'manual',
+        issueCount: entry.issueCount === undefined ? issues.length : nonNegativeInteger(entry.issueCount, 'issueCount'),
+        issues,
+      };
+    }),
+    findings: findings.map((item, index) => record(item, `findings[${index}]`)),
+    errors: input.errors.map((item, index) => textValue(item, `errors[${index}]`, 2000)),
+    ...(artifacts ? { artifacts } : {}),
+  };
+}
+
+const GUARDED_OPERATIONS = new Set<Operation>([
+  'comments',
+  'comments-batch',
+  'comment-status',
+  'takeover',
+  'resume',
+  'approve',
+  'ai-fix',
+  'rebase',
+  'finding-decision',
+  'candidate-finalize',
+]);
+
+export function validateCommand(value: unknown): ManagedCommand {
+  const input = record(value, 'command');
+  const operation = input.operation as Operation;
+  if (!OPERATIONS.includes(operation)) throw new ProtocolError('bad_request', `不支持的操作类型：operation=${String(input.operation)}`);
+  const actorInput = record(input.actor, 'actor');
+  const guardInput = input.guard === undefined ? undefined : record(input.guard, 'guard');
+  if (GUARDED_OPERATIONS.has(operation) && !guardInput) {
+    throw new ProtocolError('bad_request', `${operation} 缺少必需的 guard`);
+  }
+  const guard = guardInput ? {
+    expectedRevision: positiveInteger(guardInput.expectedRevision, 'guard.expectedRevision'),
+    expectedOwner: textValue(guardInput.expectedOwner, 'guard.expectedOwner', 160),
+    expectedUpdatedAt: textValue(guardInput.expectedUpdatedAt, 'guard.expectedUpdatedAt', 64),
+  } : undefined;
+  const payload = record(input.payload, 'payload');
+  if ('owner' in payload && operation !== 'takeover') {
+    throw new ProtocolError('bad_request', '禁止在 payload.owner 伪造负责人');
+  }
+  if ('patchText' in payload) {
+    throw new ProtocolError('bad_request', '不支持 payload.patchText');
+  }
+  if (operation === 'comments') {
+    const file = typeof payload.file === 'string' ? payload.file : '';
+    const line = payload.line === undefined ? 0 : Number(payload.line);
+    if (file !== '' && (!Number.isSafeInteger(line) || line <= 0)) {
+      throw new ProtocolError('bad_request', '行内评论的 payload.line 必须是正整数');
+    }
+    if (file === '' && line !== 0) {
+      throw new ProtocolError('bad_request', '总体评论的 payload.line 必须为 0');
+    }
+  }
+  const scheduledInput = input.scheduledAudit === undefined ? undefined : record(input.scheduledAudit, 'scheduledAudit');
+  const scheduledAudit = scheduledInput ? {
+    scheduledAt: textValue(scheduledInput.scheduledAt, 'scheduledAudit.scheduledAt', 64),
+    expiresAt: textValue(scheduledInput.expiresAt, 'scheduledAudit.expiresAt', 64),
+  } : undefined;
+  if (scheduledAudit) {
+    if (operation !== 'audit') throw new ProtocolError('bad_request', '定时审查参数只适用于 audit 操作');
+    const scheduled = Date.parse(scheduledAudit.scheduledAt);
+    const expires = Date.parse(scheduledAudit.expiresAt);
+    if (!Number.isFinite(scheduled) || !Number.isFinite(expires) || expires - scheduled !== SCHEDULED_AUDIT_WAIT_MS) {
+      throw new ProtocolError('bad_request', 'scheduledAudit 窗口无效');
+    }
+  }
+  return {
+    commandId: entityId(input.commandId, 'commandId'),
+    requestHash: textValue(input.requestHash, 'requestHash', 128),
+    projectId: entityId(input.projectId, 'projectId'),
+    nodeId: entityId(input.nodeId, 'nodeId'),
+    bindingGeneration: positiveInteger(input.bindingGeneration, 'bindingGeneration'),
+    projectConfigRevision: positiveInteger(input.projectConfigRevision, 'projectConfigRevision'),
+    actor: { userId: textValue(actorInput.userId, 'actor.userId', 128), reviewIdentity: textValue(actorInput.reviewIdentity, 'actor.reviewIdentity', 160) },
+    operation,
+    payload,
+    ...(guard ? { guard } : {}),
+    ...(scheduledAudit ? { scheduledAudit } : {}),
+    createdAt: textValue(input.createdAt, 'createdAt', 64),
+  };
 }

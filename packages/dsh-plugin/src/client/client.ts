@@ -39,6 +39,7 @@
     repoRoot: string; owner: string; vcsType: 'auto' | 'git' | 'svn'; baseBranch: string;
     runner: 'dsh' | 'manual' | 'external'; dshCommand: string; externalCommand: string;
     autoFixOnFailure: boolean; gateTimeoutMs: number; syncBeforeApprove: boolean;
+    stageExecutors: string[];
   }
     interface ConnectionDraft {
         mode: 'local' | 'external';
@@ -126,22 +127,36 @@
   interface Comment {
     id: string; revision: number; file: string; line: number; author: string;
     content: string; status: 'unresolved' | 'partial' | 'resolved'; createdAt?: string;
-    /** 总体意见省略侧别；缺失侧别的旧行内评论按补丁侧匹配。 */
     side?: 'LEFT' | 'RIGHT';
-    /** 版本变化后可用原文锚点找回行号失配的评论。 */
     anchor?: { snippet: string; before?: string; after?: string };
+    optionId?: string;
+    patchId?: number;
     extra?: Record<string, unknown>;
   }
+  interface OptionPatchCheck {
+    state: 'clean' | 'conflicted' | 'unknown';
+    checkedBase: string;
+    checkedAt: string;
+  }
+  interface OptionSummary {
+    optionId: string;
+    patchId: number;
+    baseRevision: string;
+    tradeoff: string;
+    confidence: number;
+    banned: boolean;
+    patchCheck: OptionPatchCheck;
+  }
   interface QueueItem {
-    findingId?: string;
-    id: string; title: string; owner: string; status: string; tags: string[]; ticket: string | null;
-    currentRevision: number; createdAt: string; patchStats: Stats; unresolvedComments: number;
+    id: string; findingId: string; issueKind: 'repair' | 'confirm' | 'deferred'; dependsOn: string | null;
+    title: string; owner: string; module: string; priority: string; status: string; deferred: boolean;
+    tags: string[]; ticket: string | null; recordRevision: number; createdAt: string; updatedAt: string;
+    targetFiles: string[]; optionCount: number; options: OptionSummary[];
+    patchStats: Stats; unresolvedComments: number;
     humanJudgmentCount: number; humanJudgmentDeclared: boolean; isBaseBehind: boolean; baseRevision: string; lastFeedback: string; parseError?: string;
-    /** 本地视图不计入共享统计。 */
     local?: boolean;
-    /** 尚未进入共享快照的候选没有可打开的详情。 */
     localOnly?: boolean;
-    isStale?: boolean; duplicateOf?: string;
+    duplicateOf?: string;
   }
   /** releasable 租约仍阻塞共享写入，直到显式释放或收尾。 */
   interface AuditLeaseInfo {
@@ -153,18 +168,38 @@
     counts: Record<string, number>; owner: string; me: string; repoRoot?: string;
     auditLease?: AuditLeaseInfo;
   }
+  interface PatchEntry {
+    id: number; optionId: string; patch: string; baseRevision: string;
+    author: 'ai' | 'human'; sha256: string;
+  }
+  interface RepairOption {
+    id: string; title: string; tradeoff: string; confidence: number;
+    currentPatch: number; gateChecks: string[];
+  }
+  interface RepairAttempt {
+    id: number; optionId: string; patchId: number; at: string;
+    baseRevision: string; actor: string; applyMode: string; result: string;
+    restored: boolean; evidence: string;
+  }
   interface CandidateMeta {
-    findingId?: string;
-    schemaVersion: number; title: string; createdAt: string; updatedAt: string; owner: string; tags: string[]; status: string;
-    ticket: string | null; currentRevision: number;
-    /** AC-UI-01：用 Frontmatter 的判断项 ID 收集确认与知悉，避免正文改写影响批准校验。 */
-    humanDecisions?: { id: string; question: string; note?: string }[];
-    revisions: { id: number; baseRevision: string; patch: string; author?: 'ai' | 'human'; extra?: Record<string, unknown> }[];
-    gateChecks: string[]; comments: Comment[];
-    approval: { approvedBy: string; approvedAt: string } | null;
+    schemaVersion: 1; findingId: string; issueKind: 'repair' | 'confirm' | 'deferred'; dependsOn: string | null;
+    title: string; createdAt: string; updatedAt: string; owner: string; module: string; priority: string;
+    tags: string[]; status: string; ticket: string | null; recordRevision: number;
+    targetFiles: string[];
+    humanDecisions: { id: string; question: string; note?: string }[];
+    patches: PatchEntry[];
+    options: RepairOption[];
+    repairAttempts: RepairAttempt[];
+    comments: Comment[];
+    approval: { approvedBy: string; approvedAt: string; optionId: string; patchId: number; recordRevision: number; gateChecks: string[]; gateResults: any[] } | null;
+    approvalHistory: any[];
+    commitMessage: string | null;
   }
   interface Detail {
     selection?: { optionId: string; patchId: number };
+    selectedOption?: RepairOption;
+    selectedPatch?: PatchEntry;
+    selectedPatchBanned?: boolean;
     finding?: FindingView;
     candidate: {
       id: string; month: string; slug: string; dirPath: string; reviewPath: string; meta: CandidateMeta;
@@ -179,16 +214,17 @@
     /** 业务提交从历史中定位；定位不明时已批准状态仍然有效。 */
     approvalCommitLookup?: 'found' | 'ambiguous' | 'unknown';
     /** G40：预检只用于提示冲突，批准时仍须重新验证补丁。 */
-    patchCheck?: { state: 'clean' | 'conflicted' | 'unknown'; checkedBase: string; checkedAt: string };
+    patchCheck?: OptionPatchCheck;
     canAct: boolean; me: string;
   }
   interface FindingView {
-    findingId: string; findingVersion: string; title: string; summary: string; disposition: string;
+    id: string; findingId: string; recordRevision: number; owner: string; updatedAt: string;
+    issueKind: 'repair' | 'confirm' | 'deferred'; dependsOn: string | null;
+    title: string; summary: string; priority: string; issueStatus: string; disposition: string; deferred: boolean;
     baseRevision?: string; repairPlan?: string; targetFiles: string[];
-    options: { candidateId: string; optionId?: string; patchId?: number; tradeoff: string; status: string }[];
-    reviewId?: string; issueStatus?: string;
+    options: Array<{ optionId: string; title: string; tradeoff: string; confidence: number; patchId: number; banned: boolean; gateChecks: string[] }>;
     decision?: { reason?: string; reviewAfter?: string; reviewWhen?: string };
-    repairHints?: string[]; repairRevisions?: string[];
+    repairHints: string[]; repairAttempts: RepairAttempt[];
   }
   interface DiffResult {
     mode: 'full' | 'incremental'; unifiedDiff: string; fromRevision: number | null; toRevision: number;
@@ -284,7 +320,17 @@
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
   }
   function statusText(status: string): string {
-    return status === 'pending' ? '待审核' : status === 'changes_requested' ? '待修改' : status === 'approved' ? '已批准' : status === 'rejected' ? '已放弃' : status;
+    const map: Record<string, string> = {
+      pending: '待审核',
+      changes_requested: '待修订',
+      repair_failed: '修复失败',
+      human_takeover: '人工接手',
+      awaiting_verification: '待复查验证',
+      approved: '已批准',
+      rejected: '已接受现状',
+      resolved: '已解决',
+    };
+    return map[status] ?? status;
   }
   function statsText(stats: Stats | null | undefined): string {
     if (!stats) return '—';
@@ -297,10 +343,10 @@
   /** AC-LOCK-01：评论可在版本和负责人不变时推进 updatedAt，旧页面也须判为过期。 */
   function isGuardStale(
     snapshot: { revision: number; owner: string; updatedAt: string } | null,
-    meta: { currentRevision: number; owner: string; updatedAt: string },
+    meta: { recordRevision: number; owner: string; updatedAt: string },
   ): boolean {
     if (!snapshot) return false;
-    return snapshot.revision !== meta.currentRevision
+    return snapshot.revision !== meta.recordRevision
       || snapshot.owner !== meta.owner
       || snapshot.updatedAt !== meta.updatedAt;
   }
@@ -331,7 +377,7 @@
         return EMPTY_DETAIL_STATE;
       case 'loaded': {
         const meta = action.detail.candidate.meta;
-        const nextGuard = { revision: meta.currentRevision, owner: meta.owner, updatedAt: meta.updatedAt };
+        const nextGuard = { revision: meta.recordRevision, owner: meta.owner, updatedAt: meta.updatedAt };
         if (!state.guard) return { ...state, detail: action.detail, guard: nextGuard };
         const stale = isGuardStale(state.guard, meta) || state.stale;
         return { ...state, detail: action.detail, stale };
@@ -713,34 +759,63 @@
       const [reviewAfter, setReviewAfter] = useState('');
       const [reviewWhen, setReviewWhen] = useState('');
       const [copy, setCopy] = useState('');
-      const closed = finding.disposition === 'applied' || finding.disposition === 'resolved';
-      const dispositionText: Record<string, string> = {
-        undecided: '待审核', accept_as_is: '接受现状', defer: '延期', human_takeover: '人工接手', applied: '已应用', resolved: '已解决',
-      };
+      const closed = finding.issueStatus === 'approved' || finding.issueStatus === 'resolved';
+      const canResumeFromRepairFailed = finding.options.some(option => !option.banned);
+      const canAcceptAsIs = !closed && ['pending', 'changes_requested', 'repair_failed', 'human_takeover'].includes(finding.issueStatus);
+      const canDefer = !closed && ['pending', 'changes_requested', 'repair_failed'].includes(finding.issueStatus) && !finding.deferred;
+      const canHumanTakeover = !closed && ['pending', 'changes_requested', 'repair_failed', 'awaiting_verification'].includes(finding.issueStatus);
+      const canResumeReview = !closed && (
+        finding.deferred
+        || finding.issueStatus === 'rejected'
+        || finding.issueStatus === 'human_takeover'
+        || finding.issueStatus === 'awaiting_verification'
+        || (finding.issueStatus === 'repair_failed' && canResumeFromRepairFailed)
+      );
+      const reasonRequired = ['accept_as_is', 'defer', 'resume_review', 'add_repair_hint'].includes(form)
+        || (form === 'human_takeover' && finding.issueStatus === 'awaiting_verification');
       const submit = (action: string, fields: Record<string, unknown> = {}): void => {
-        save({ findingId: finding.findingId, expectedFindingVersion: finding.findingVersion, action, ...fields });
+        save({
+          id: finding.id,
+          expectedRevision: finding.recordRevision,
+          expectedOwner: finding.owner,
+          expectedUpdatedAt: finding.updatedAt,
+          action,
+          ...fields,
+        });
         setForm('');
+        setReason('');
       };
       return h('section', { className: 'dcr-card', 'aria-label': finding.title },
-        h('h2', null, finding.title),
-        h('p', null, finding.summary),
-        h('span', { className: 'dcr-chip' }, ({ repair_failed: '修复失败，等待人工', awaiting_verification: '外部完成，等待复核', human_takeover: '人工接手', resolved: '已解决' } as Record<string, string>)[finding.issueStatus ?? ''] ?? dispositionText[finding.disposition]),
-        finding.reviewId ? h('button', { className: 'dcr-btn', onClick: () => choose(finding.reviewId!) }, '查看问题、证据与历史') : null,
-        finding.decision?.reason ? h('p', null, finding.decision.reason) : null,
-        finding.decision?.reviewAfter || finding.decision?.reviewWhen
-          ? h('p', null, [finding.decision.reviewAfter, finding.decision.reviewWhen].filter(Boolean).join(' · ')) : null,
-        finding.repairRevisions?.length ? h('p', null, `修复提交 ${finding.repairRevisions.join('、')}`) : null,
-        finding.repairPlan ? h('details', null, h('summary', null, '修复方案与验收'), h(RichText, { text: finding.repairPlan })) : null,
-        finding.options.length ? h('div', { className: 'dcr-row' }, ...finding.options.map((option, index) =>
-          h('button', { key: option.candidateId + (option.optionId ?? ''), className: 'dcr-btn', disabled: option.candidateId === currentId && option.optionId === props.currentOption,
-            onClick: () => choose(option.candidateId, option.optionId && option.patchId ? { optionId: option.optionId, patchId: option.patchId } : undefined) },
-          `${finding.options.length === 1 ? '查看补丁' : `方案 ${String(index + 1)}`} · ${option.tradeoff}`))) : null,
         h('div', { className: 'dcr-row' },
-          !closed && finding.disposition === 'undecided' ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('accept_as_is') }, '本次不修改') : null,
-          !closed && finding.disposition !== 'human_takeover' ? h('button', { className: 'dcr-btn', disabled: busy,
-            onClick: () => submit('human_takeover') }, '人工接手') : null,
-          !closed && finding.disposition !== 'undecided' ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('resume_review') }, '重新审核') : null,
-          finding.disposition === 'human_takeover' ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('add_repair_hint') }, '提交修复线索') : null,
+          h('h2', { className: 'dcr-grow', style: { margin: 0, fontSize: 15 } }, `${finding.priority} · ${finding.title}`),
+          h('span', { className: `dcr-chip ${finding.issueStatus}` }, statusText(finding.issueStatus)),
+          finding.deferred ? h('span', { className: 'dcr-chip warn' }, '已延期') : null,
+          h('span', { className: 'dcr-chip' }, finding.issueKind === 'repair' ? '补丁修复' : finding.issueKind === 'confirm' ? '文字方案' : '前置依赖延期'),
+        ),
+        h('p', null, finding.summary),
+        finding.dependsOn ? h('p', { className: 'dcr-small dcr-muted' }, `依赖前置问题：${finding.dependsOn}`) : null,
+        finding.id !== currentId ? h('button', { className: 'dcr-btn', onClick: () => choose(finding.id) }, '查看问题详情、证据与历史') : null,
+        finding.decision?.reason ? h('p', null, `处置说明：${finding.decision.reason}`) : null,
+        finding.decision?.reviewAfter || finding.decision?.reviewWhen
+          ? h('p', { className: 'dcr-small dcr-muted' }, `复查条件：${[finding.decision.reviewAfter, finding.decision.reviewWhen].filter(Boolean).join(' · ')}`) : null,
+        finding.repairPlan ? h('details', null, h('summary', null, '修复方案与验收'), h(RichText, { text: finding.repairPlan })) : null,
+        finding.options.length ? h('div', { className: 'dcr-row', style: { marginTop: 8 } }, ...finding.options.map((option, index) =>
+          h('button', {
+            key: option.optionId,
+            className: `dcr-btn ${option.banned ? 'd' : ''}`,
+            disabled: finding.id === currentId && option.optionId === props.currentOption,
+            onClick: () => choose(finding.id, { optionId: option.optionId, patchId: option.patchId }),
+          },
+          `${finding.options.length === 1 ? '查看补丁' : `方案 ${String(index + 1)} (${option.optionId})`} · ${option.tradeoff}${option.banned ? ' [已封禁]' : ''}`))) : null,
+        h('div', { className: 'dcr-row', style: { marginTop: 8 } },
+          canAcceptAsIs ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('accept_as_is') }, '接受现状') : null,
+          canDefer ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('defer') }, '延期') : null,
+          canHumanTakeover ? h('button', {
+            className: 'dcr-btn', disabled: busy,
+            onClick: () => finding.issueStatus === 'awaiting_verification' ? setForm('human_takeover') : submit('human_takeover'),
+          }, finding.issueStatus === 'awaiting_verification' ? '撤回至人工接手' : '人工接手') : null,
+          canResumeReview ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('resume_review') }, finding.deferred ? '解除延期' : '恢复审核') : null,
+          finding.issueStatus === 'human_takeover' ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('add_repair_hint') }, '提交修复线索') : null,
           finding.issueStatus === 'human_takeover' ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('external_completed') }, '反馈外部完成') : null,
           h('button', { className: 'dcr-btn', onClick: () => {
             const text = [finding.title, finding.findingId, `基线 ${finding.baseRevision ?? ''}`, finding.targetFiles.join('\n'),
@@ -749,20 +824,31 @@
           } }, '复制交接内容'),
           h('span', { role: 'status' }, copy),
         ),
-        finding.repairHints?.length ? h('ul', null, ...finding.repairHints.map((hint, index) => h('li', { key: index }, hint))) : null,
-        form ? h('div', null,
-          form === 'accept_as_is' || form === 'defer' ? h('select', { 'aria-label': '处置', className: 'dcr-select', value: form,
-            onChange: (event: any) => setForm(event.target.value) },
-          h('option', { value: 'accept_as_is' }, '接受现状'), h('option', { value: 'defer' }, '延期')) : null,
-          h('textarea', { className: 'dcr-textarea', 'aria-label': form === 'add_repair_hint' ? '修复线索' : '处置理由',
-            value: reason, onChange: (event: any) => setReason(event.target.value) }),
-          form === 'defer' ? h('div', { className: 'dcr-row' },
-            h('input', { type: 'date', 'aria-label': '复查日期', value: reviewAfter, onChange: (event: any) => setReviewAfter(event.target.value) }),
-            h('input', { 'aria-label': '复查条件', value: reviewWhen, onChange: (event: any) => setReviewWhen(event.target.value) })) : null,
-          h('button', { className: 'dcr-btn p', disabled: busy || !reason.trim(), onClick: () => submit(form, form === 'add_repair_hint'
-            ? { hint: reason.trim() } : { reason: reason.trim(), ...(form === 'defer' && reviewAfter ? { reviewAfter } : {}),
-              ...(form === 'defer' && reviewWhen.trim() ? { reviewWhen: reviewWhen.trim() } : {}) }) }, '保存'),
-          h('button', { className: 'dcr-btn', onClick: () => setForm('') }, '取消'),
+        finding.repairHints.length ? h('ul', null, ...finding.repairHints.map((hint, index) => h('li', { key: index }, hint))) : null,
+        form ? h('div', { style: { marginTop: 8 } },
+          h('textarea', {
+            className: 'dcr-textarea',
+            'aria-label': form === 'add_repair_hint' ? '修复线索' : form === 'external_completed' ? '外部完成说明（可选）' : '处置理由',
+            placeholder: form === 'add_repair_hint' ? '填写修复线索或提交编号…' : form === 'external_completed' ? '可选说明…' : '请填写处置理由…',
+            value: reason, onChange: (event: any) => setReason(event.target.value),
+          }),
+          form === 'defer' ? h('div', { className: 'dcr-row', style: { marginTop: 6 } },
+            h('input', { className: 'dcr-input', type: 'date', 'aria-label': '复查日期', value: reviewAfter, onChange: (event: any) => setReviewAfter(event.target.value) }),
+            h('input', { className: 'dcr-input', 'aria-label': '复查条件', placeholder: '触发复查条件', value: reviewWhen, onChange: (event: any) => setReviewWhen(event.target.value) })) : null,
+          h('div', { className: 'dcr-row', style: { marginTop: 6 } },
+            h('button', {
+              className: 'dcr-btn p',
+              disabled: busy || (reasonRequired && !reason.trim()),
+              onClick: () => submit(form, form === 'add_repair_hint'
+                ? { hint: reason.trim() }
+                : {
+                    ...(reason.trim() ? { reason: reason.trim() } : {}),
+                    ...(form === 'defer' && reviewAfter ? { reviewAfter } : {}),
+                    ...(form === 'defer' && reviewWhen.trim() ? { reviewWhen: reviewWhen.trim() } : {}),
+                  }),
+            }, '保存'),
+            h('button', { className: 'dcr-btn', onClick: () => { setForm(''); setReason(''); } }, '取消'),
+          ),
         ) : null);
     }
 
@@ -1347,12 +1433,10 @@
       const [detailState, dispatchDetail] = useReducer(detailReducer, EMPTY_DETAIL_STATE);
       const { detail, stale } = detailState;
       const selectedId = detailState.id;
-      const [allowedGates, setAllowedGates] = useState<string[] | null>(null);
       const [job, setJob] = useState<Job | null>(null);
-      const [panel, setPanel] = useState<'' | 'approve' | 'reject'>('');
+      const [panel, setPanel] = useState<'' | 'approve'>('');
       const [selectedIssue, setSelectedIssue] = useState<{ id: string; optionId: string; patchId: number } | null>(null);
       const detailFetch = useRef(0);
-      const [approvalFindingVersion, setApprovalFindingVersion] = useState<string | undefined>(undefined);
       const [ack, setAck] = useState<Record<string, boolean>>({});
       const [waiveReason, setWaiveReason] = useState<Record<string, string>>({});
       const jobLogOffsetRef = useRef<number | null>(null);
@@ -1369,7 +1453,6 @@
       const rowSideOf = (l: { kind: string }): 'LEFT' | 'RIGHT' => (l.kind === 'del' ? 'LEFT' : 'RIGHT');
       const rowNoOf = (l: { kind: string; oldNo: number | null; newNo: number | null }): number | null =>
         l.kind === 'del' ? l.oldNo : l.newNo;
-      const [rejectReason, setRejectReason] = useState('');
       const [draft, setDraft] = useState<{ file: string; line: number; text: string; side: 'LEFT' | 'RIGHT' } | null>(null);
       const [auditOpen, setAuditOpen] = useState(false);
       const [auditTarget, setAuditTarget] = useState('');
@@ -1435,7 +1518,7 @@
           setQueue(value);
           if (value.configured) {
             const { findings: latest, errors } = await api.get<{ findings: FindingView[]; errors: string[] }>('/findings');
-            setFindings(latest.filter(item => item.findingVersion));
+            setFindings(latest);
             setFindingErrors(errors);
           } else { setFindings([]); setFindingErrors([]); }
           setError('');
@@ -1447,12 +1530,9 @@
         setLoading(true);
         try {
           const requestId = ++detailFetch.current;
-          const selected = selectedIssue?.id === id ? `&optionId=${encodeURIComponent(selectedIssue.optionId)}` : '';
+          const selected = selectedIssue?.id === id ? `&optionId=${encodeURIComponent(selectedIssue.optionId)}&patchId=${String(selectedIssue.patchId)}` : '';
           const value = await api.get<Detail>(`/candidate?id=${encodeURIComponent(id)}${selected}`);
           if (requestId !== detailFetch.current) return;
-          void api.get<{ config?: { allowedGateCommands?: string[] } }>('/reviewers')
-            .then((reviewers) => setAllowedGates(reviewers.config?.allowedGateCommands ?? []))
-            .catch(() => setAllowedGates([]));
           dispatchDetail({ type: 'loaded', detail: value });
           setError('');
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
@@ -1526,7 +1606,7 @@
         setFixSession(null);
         setFixPrompt(null);
         setFixCopied(false);
-      }, [detail?.candidate.id, detail?.candidate.meta.currentRevision]);
+      }, [detail?.candidate.id, detail?.candidate.meta.recordRevision]);
 
       useEffect(() => {
         if (!panel) return;
@@ -1581,9 +1661,9 @@
       };
 
       const guard = (): { expectedRevision: number; expectedOwner: string; expectedUpdatedAt: string } => {
-        if (!detail) throw new Error('候选未加载');
+        if (!detail) throw new Error('问题未加载');
         return {
-          expectedRevision: detail.candidate.meta.currentRevision,
+          expectedRevision: detail.candidate.meta.recordRevision,
           expectedOwner: detail.candidate.meta.owner,
           expectedUpdatedAt: detail.candidate.meta.updatedAt,
         };
@@ -1694,31 +1774,8 @@
         finally { setBusy(false); }
       };
 
-      const reject = async (): Promise<void> => {
-        if (!detail || !rejectReason.trim()) return;
-        setBusy(true);
-        try {
-          await api.post('/reject', { id: detail.candidate.id, ...guard(), reason: rejectReason });
-          setPanel(''); setRejectReason('');
-          setScreen('queue'); dispatchDetail({ type: 'leave' });
-          await loadQueue();
-        } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-        finally { setBusy(false); }
-      };
-
-      /** G4：白名单仅影响确认交互；白名单不可用时仍须确认所有门禁命令。 */
       const approve = (): void => {
-        if (!detail) return;
-        if (detail.candidate.meta.findingId && (!approvalFindingVersion || approvalFindingVersion !== detail.finding?.findingVersion)) {
-          setError('发现已更新，请重新确认所选补丁');
-          return;
-        }
-        const gates = detail.candidate.meta.gateChecks.map((command) => command.trim()).filter(Boolean);
-        const nonWhitelisted = allowedGates === null ? gates : gates.filter((command) => !allowedGates.includes(command));
-        if (nonWhitelisted.length > 0
-          && !window.confirm(`以下门禁命令不在 reviewers.yml 白名单中，将以当前用户权限执行（可能联网、修改或删除文件）：\n${nonWhitelisted.join('\n')}\n\n确认执行？`)) {
-          return;
-        }
+        if (!detail || !detail.selection) return;
         setPanel('');
         const decisions = detail.candidate.meta.humanDecisions ?? [];
         const confirmedDecisions = decisions.filter((item) => ack[item.id]).map((item) => item.id);
@@ -1726,11 +1783,23 @@
           .filter((item) => !ack[item.id] && (waiveReason[item.id] ?? '').trim().length > 0)
           .map((item) => ({ id: item.id, reason: (waiveReason[item.id] ?? '').trim() }));
         void startJob('/approve', {
-          id: detail.candidate.id, ...guard(), confirmedDecisions, waivedDecisions,
-          ...(approvalFindingVersion ? { expectedFindingVersion: approvalFindingVersion } : {}),
-          ...(detail.selection ?? {}),
+          id: detail.candidate.id,
+          ...guard(),
+          ...detail.selection,
+          confirmedDecisions,
+          waivedDecisions,
           commitDetail,
         });
+      };
+
+      const initReviewers = async (): Promise<void> => {
+        setBusy(true); setError('');
+        try {
+          await api.post('/reviewers/init', { defaultOwner: settings?.owner || health?.owner || undefined });
+          await refreshHealth();
+          await loadQueue();
+        } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+        finally { setBusy(false); }
       };
 
       /** 先保存并刷新意见，让修复会话或导出的提示词包含刚提交的反馈。 */
@@ -1758,11 +1827,11 @@
       };
 
       const launchFixSession = async (): Promise<void> => {
-        if (!detail) return;
+        if (!detail || !detail.selection) return;
         setFixLaunching(true); setError('');
         try {
           const value = await api.post<{ sessionId: string; title: string; revision: number }>('/fix-session', {
-            id: detail.candidate.id, ...(detail.selection ?? {}),
+            id: detail.candidate.id, ...guard(), ...detail.selection,
           });
           setFixSession({ sessionId: value.sessionId, title: value.title, revision: value.revision });
           setFixPrompt(null);
@@ -1780,7 +1849,7 @@
           const query = new URLSearchParams({ id: detail.candidate.id, mode: 'session' });
           if (detail.selection) { query.set('optionId', detail.selection.optionId); query.set('patchId', String(detail.selection.patchId)); }
           const value = await api.get<{ prompt: string }>(`/fix-prompt?${query.toString()}`);
-          setFixPrompt({ text: value.prompt, revision: detail.candidate.meta.currentRevision });
+          setFixPrompt({ text: value.prompt, revision: detail.candidate.meta.recordRevision });
         } catch (e) {
           setError(e instanceof Error ? e.message : String(e));
         } finally {
@@ -1932,23 +2001,11 @@
         setError('');
         try {
           await api.post(path, body);
+          dispatchDetail({ type: 'rebind' });
           await loadQueue();
           if (selectedId) await loadDetail(selectedId);
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
         finally { setBusy(false); }
-      };
-
-      const convertFinding = async (): Promise<void> => {
-        const auditId = window.prompt('最新有效观察的 auditId');
-        const findingId = auditId ? window.prompt('findingId') : null;
-        const candidateId = findingId ? window.prompt('要绑定的已存在候选 id') : null;
-        if (auditId && findingId && candidateId) await runWrite('/convert', { auditId, findingId, candidateId });
-      };
-      const dismissFinding = async (): Promise<void> => {
-        const auditId = window.prompt('最新有效观察的 auditId');
-        const findingId = auditId ? window.prompt('findingId') : null;
-        const reason = findingId ? window.prompt('忽略理由（必填）') : null;
-        if (auditId && findingId && reason?.trim()) await runWrite('/dismiss-finding', { auditId, findingId, reason });
       };
 
       const openCandidate = (id: string, selection?: { optionId: string; patchId: number }): void => {
@@ -2011,7 +2068,7 @@
       };
 
       /** 复用 /queue 的筛选结果，避免面板重复维护共享与本地候选的筛选规则。 */
-      const filteredItems = useMemo(() => (queue?.items ?? []).filter(item => !item.findingId || item.localOnly), [queue]);
+      const filteredItems = useMemo(() => queue?.items ?? [], [queue]);
 
       const renderSettings = (): any => {
         if (!settings) return h('div', { className: 'dcr-empty' }, '加载设置…');
@@ -2051,13 +2108,25 @@
                   h('label', null, '外部修复命令（prompt 从 stdin 传入）'),
                   h('input', { className: 'dcr-input', value: settings.externalCommand, placeholder: 'codex exec -', onChange: (e: any) => update({ externalCommand: e.target.value }) }),
                 ),
+                h('div', { className: 'dcr-field', style: { gridColumn: '1 / -1' } },
+                  h('label', null, '审查子阶段优先外部执行器（逗号分隔，例如 codex, claude；不可用或留空时自动降级为本 Harness 独立子代理）'),
+                  h('input', {
+                    className: 'dcr-input',
+                    value: (settings.stageExecutors ?? []).join(', '),
+                    placeholder: 'codex, claude',
+                    onChange: (e: any) => update({
+                      stageExecutors: String(e.target.value).split(',').map((s: string) => s.trim()).filter(Boolean),
+                    }),
+                  }),
+                ),
               ),
               h('div', { className: 'dcr-checks' },
-                h('label', { className: 'dcr-check' }, h('input', { type: 'checkbox', checked: settings.autoFixOnFailure, onChange: (e: any) => update({ autoFixOnFailure: Boolean(e.target.checked) }) }), h('span', null, '批准失败时自动尝试 AI 修复')),
+                h('label', { className: 'dcr-check' }, h('input', { type: 'checkbox', checked: settings.autoFixOnFailure, onChange: (e: any) => update({ autoFixOnFailure: Boolean(e.target.checked) }) }), h('span', null, '允许记录失败诊断（门禁失败绝不自动重试修复）')),
                 h('label', { className: 'dcr-check' }, h('input', { type: 'checkbox', checked: settings.syncBeforeApprove, onChange: (e: any) => update({ syncBeforeApprove: Boolean(e.target.checked) }) }), h('span', null, '批准前同步最新基线')),
               ),
               h('div', { className: 'dcr-row', style: { marginTop: 12 } },
                 h('button', { className: 'dcr-btn p', disabled: busy, onClick: () => { void saveSettings(); } }, busy ? '保存中…' : '保存'),
+                h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void initReviewers(); } }, '初始化 reviewers.yml'),
                 screen === 'settings' && health?.configured ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setScreen('queue') }, '返回评审') : null,
               ),
               settingsResponse && !settingsResponse.validation.ok ? h('div', { className: 'dcr-banner err', style: { marginTop: 10 } }, settingsResponse.validation.errors.join('；') || '配置不完整') : null,
@@ -2068,20 +2137,38 @@
       };
 
       const renderQueue = (): any => {
-        const visibleFindings = findings.filter(finding => (!filter.dir || finding.targetFiles.some(file => file.includes(filter.dir)))
-          && (!filter.text || `${finding.title} ${finding.findingId}`.toLowerCase().includes(filter.text.toLowerCase())));
+        const visibleFindings = findings.filter(finding =>
+          (!filter.owner || finding.owner === filter.owner)
+          && (!filter.statuses || filter.statuses.split(',').includes(finding.issueStatus))
+          && (!filter.dir || finding.targetFiles.some(file => file.includes(filter.dir)))
+          && (!filter.text || `${finding.title} ${finding.findingId} ${finding.id}`.toLowerCase().includes(filter.text.toLowerCase())));
         const localTotal = queue?.items.filter((item) => item.local).length ?? 0;
         const hasActiveFilter = Boolean(filter.owner || filter.statuses || filter.text || filter.tag || filter.dir || filter.createdAfter || filter.createdBefore);
+        const missingReviewers = (health?.diagnostics ?? []).some(d => d.includes('reviewers.yml'));
         return h('div', { className: 'dcr-body' },
         h('div', { className: 'dcr-wrap' },
           renderJob(),
           renderLeaseBanner(),
+          missingReviewers ? h('div', { className: 'dcr-banner warn' },
+            h('div', { className: 'dcr-row' },
+              h('span', { className: 'dcr-grow' }, '尚未初始化 .ai-review/reviewers.yml（发起仓库审查前必须完成配置）。'),
+              h('button', { className: 'dcr-btn p', disabled: busy, onClick: () => { void initReviewers(); } }, '一键初始化 reviewers.yml'),
+            ),
+          ) : null,
           h('div', { className: 'dcr-card' },
             h('div', { className: 'dcr-row' },
               h('input', { className: 'dcr-input', style: { width: 140 }, placeholder: '负责人', value: filter.owner, onChange: (e: any) => setFilter({ ...filter, owner: e.target.value }) }),
               h('select', { className: 'dcr-select', value: filter.statuses, onChange: (e: any) => setFilter({ ...filter, statuses: e.target.value }) },
-                h('option', { value: '' }, '全部状态'), h('option', { value: 'pending' }, '待审核'), h('option', { value: 'changes_requested' }, '待修改'),
-                h('option', { value: 'pending,changes_requested' }, '待处理'), h('option', { value: 'approved' }, '已批准'), h('option', { value: 'rejected' }, '已放弃')),
+                h('option', { value: '' }, '全部状态'),
+                h('option', { value: 'pending' }, '待审核'),
+                h('option', { value: 'changes_requested' }, '待修订'),
+                h('option', { value: 'repair_failed' }, '修复失败'),
+                h('option', { value: 'human_takeover' }, '人工接手'),
+                h('option', { value: 'awaiting_verification' }, '待复查验证'),
+                h('option', { value: 'pending,changes_requested,repair_failed' }, '全部待处理'),
+                h('option', { value: 'approved' }, '已批准'),
+                h('option', { value: 'rejected' }, '已接受现状'),
+                h('option', { value: 'resolved' }, '已解决')),
               h('input', { className: 'dcr-input', style: { flex: 1, minWidth: 170 }, placeholder: '搜索标题 / ticket / 目录', value: filter.text, onChange: (e: any) => setFilter({ ...filter, text: e.target.value }) }),
               h('input', { className: 'dcr-input', style: { width: 110 }, placeholder: 'tag', value: filter.tag, onChange: (e: any) => setFilter({ ...filter, tag: e.target.value }) }),
               h('button', { className: 'dcr-btn', disabled: loading, onClick: () => { void loadQueue(); } }, loading ? '加载中…' : '刷新'),
@@ -2119,8 +2206,6 @@
               h('button', { className: 'dcr-btn', disabled: auditLaunching || !auditReady, onClick: () => { void startManualAudit(); } }, '创建外部执行租约'),
               auditLeaseId ? h('button', { className: 'dcr-btn', disabled: auditLaunching, onClick: () => { void startJob('/audit/finalize', { auditId: auditLeaseId }); } }, '收尾并提交') : null,
               auditLeaseId ? h('button', { className: 'dcr-btn g', disabled: busy, onClick: () => { void releaseAuditLease(); } }, releaseArmed ? '再次点击确认释放' : '确认停止并释放') : null,
-              h('button', { className: 'dcr-btn', onClick: () => { void convertFinding(); } }, '转换 finding'),
-              h('button', { className: 'dcr-btn', onClick: () => { void dismissFinding(); } }, '忽略 finding'),
               h('button', { className: 'dcr-btn g', onClick: () => setAuditOpen(false) }, '取消'),
               h('span', { className: 'dcr-grow' }),
               h('span', { className: 'dcr-small dcr-muted' }, `基线 ${short(queue?.currentBase ?? health?.currentBase)} · 使用新建 DSH 会话`),
@@ -2137,14 +2222,14 @@
           ) : null,
           error ? h('div', { className: 'dcr-banner err' }, error) : null,
           ...findingErrors.map((message, index) => h('div', { key: index, className: 'dcr-banner err' }, message)),
-          ...visibleFindings.map(finding => h(FindingCard, { key: finding.findingVersion, finding, busy, choose: openCandidate,
+          ...visibleFindings.map(finding => h(FindingCard, { key: `${finding.id}/${String(finding.recordRevision)}`, finding, busy, choose: openCandidate,
             save: (body: Record<string, unknown>) => { void runWrite('/finding/decision', body); } })),
           filteredItems.length === 0 && visibleFindings.length === 0 ? h('div', { className: 'dcr-empty' },
             h('div', null, hasActiveFilter
-              ? '当前筛选条件下没有候选；本地未提交候选同样受筛选影响，可调整或清空上方筛选。'
-              : '队列为空：仓库 .ai-review 中还没有候选修复。'),
+              ? '当前筛选条件下没有问题；本地未提交问题同样受筛选影响，可调整或清空上方筛选。'
+              : '队列为空：仓库 .ai-review 中还没有问题记录。'),
             !hasActiveFilter ? h('div', { style: { marginTop: 12 } },
-              h('button', { className: 'dcr-btn p', disabled: busy, onClick: openAudit }, '审查当前仓库并生成候选'),
+              h('button', { className: 'dcr-btn p', disabled: busy, onClick: openAudit }, '审查当前仓库并生成问题'),
             ) : null,
           ) :
             h('div', { className: 'dcr-list' }, ...filteredItems.map((item) => h('div',
@@ -2155,15 +2240,15 @@
               },
               h('div', { className: 'dcr-row', style: { alignItems: 'flex-start' } },
                 h('div', { className: 'dcr-grow' },
-                  h('h2', null, item.title),
+                  h('h2', null, `${item.priority} · ${item.title}`),
                   h('div', { className: 'dcr-meta' },
                     h('span', { className: `dcr-chip ${item.status}` }, statusText(item.status)),
+                    item.deferred ? h('span', { className: 'dcr-chip warn' }, '已延期') : null,
                     item.localOnly
                       ? h('span', { className: 'dcr-chip rejected' }, '本地草稿（未提交）')
                       : item.local ? h('span', { className: 'dcr-chip rejected' }, '本地视图（未提交）') : null,
-                    item.isStale ? h('span', { className: 'dcr-chip warn' }, '已过期') : null,
-                    item.duplicateOf ? h('span', { className: 'dcr-chip rejected' }, `重复候选（${item.duplicateOf}）`) : null,
-                    h('span', null, `rev ${String(item.currentRevision)}`),
+                    item.duplicateOf ? h('span', { className: 'dcr-chip rejected' }, `重复问题（${item.duplicateOf}）`) : null,
+                    h('span', null, `记录 ${String(item.recordRevision)}`),
                     h('span', null, item.ticket ? `#${item.ticket}` : '无 ticket'),
                     h('span', null, `owner ${item.owner}`),
                     h('span', null, statsText(item.patchStats)),
@@ -2188,54 +2273,64 @@
       };
 
       const renderDetail = (): any => {
-        if (!detail) return h('div', { className: 'dcr-body' }, error ? h('div', { className: 'dcr-banner err' }, error) : h('div', { className: 'dcr-empty' }, '加载候选…'));
+        if (!detail) return h('div', { className: 'dcr-body' }, error ? h('div', { className: 'dcr-banner err' }, error) : h('div', { className: 'dcr-empty' }, '加载问题…'));
         const candidate = detail.candidate;
-        const canAct = detail.canAct && !stale && candidate.meta.status !== 'approved' && candidate.meta.status !== 'rejected';
-        const canApproveFinding = !candidate.meta.findingId || (detail.finding?.disposition === 'undecided'
-          && detail.finding.options.some(option => option.candidateId === candidate.id && option.status === 'pending'));
+        const selectedOption = detail.selectedOption ?? (detail.selection ? candidate.meta.options.find(opt => opt.id === detail.selection?.optionId) : candidate.meta.options[0]);
+        const gateChecks = selectedOption?.gateChecks ?? [];
+        const canAct = detail.canAct && !stale && ['pending', 'changes_requested', 'repair_failed'].includes(candidate.meta.status);
+        const canApproveOption = Boolean(
+          canAct
+          && candidate.meta.status === 'pending'
+          && !detail.finding?.deferred
+          && selectedOption
+          && detail.selection
+          && !detail.selectedPatchBanned
+          && gateChecks.length > 0,
+        );
         const items = (candidate.meta.humanDecisions ?? []).map((decision) => ({ id: decision.id, label: decision.question }));
         const ackCount = items.filter((item) => ack[item.id]).length;
         const waivedCount = items.filter((item) => !ack[item.id] && (waiveReason[item.id] ?? '').trim().length > 0).length;
         const allAck = items.length === 0 || ackCount + waivedCount === items.length;
         const files = diffFiles;
-        const currentPatchId = detail.selection?.patchId ?? candidate.meta.currentRevision;
-        const currentPatch = candidate.meta.revisions.find(revision => revision.id === currentPatchId);
-        const previousPatches = candidate.meta.revisions.filter(revision => revision.id < currentPatchId && (!detail.selection || revision.extra?.['option_id'] === detail.selection.optionId));
+        const currentPatchId = detail.selection?.patchId ?? selectedOption?.currentPatch ?? 0;
+        const currentPatch = detail.selectedPatch ?? candidate.meta.patches.find(patch => patch.id === currentPatchId);
+        const previousPatches = candidate.meta.patches.filter(patch => patch.id < currentPatchId && (!selectedOption || patch.optionId === selectedOption.id));
         const baseRevision = currentPatch?.baseRevision ?? '';
+        const failedAttempts = (candidate.meta.repairAttempts ?? []).filter(attempt => attempt.result !== 'applied');
         const steps = [
           { title: '同步基线', desc: settings?.syncBeforeApprove ? '先 pull --ff-only / svn update；失败即中止。' : '按当前基线验证，不自动同步远端。' },
-          { title: '应用补丁', desc: `应用方案 ${detail.selection?.optionId ?? ''} 的 ${currentPatch?.patch ?? '补丁'}。` },
-          { title: '执行门禁', desc: `${String(candidate.meta.gateChecks.length)} 条命令逐条执行，任一失败即回滚。` },
-          { title: '原子提交', desc: candidate.meta.schemaVersion === 3 ? '业务代码与问题记录进入同一个提交，保留历史补丁。' : '业务代码、review.md 状态与补丁清理进入同一个提交。' },
+          { title: '应用补丁', desc: `应用方案 ${detail.selection?.optionId ?? ''} 的 ${currentPatch?.patch ?? '补丁'}（严格 → 三方合并 → Mode C 辅助）。` },
+          { title: '执行门禁', desc: `${String(gateChecks.length)} 条明文命令逐条执行，任一失败即还原并永久封禁该补丁。` },
+          { title: '原子提交', desc: '业务代码与问题记录进入同一个原子提交，保留不可变补丁账本。' },
         ];
         /** 预览首行须与 Host 的 buildCommitSubject 同步；实际提交信息由 Host 生成。 */
         const commitPreview = (): string => {
-          const revHuman = candidate.meta.revisions.filter((revision) => revision.author === 'human');
-          const latestHuman = revHuman.reduce((max, revision) => Math.max(max, revision.id), 0);
+          const revHuman = candidate.meta.patches.filter((patch) => patch.author === 'human');
+          const latestHuman = revHuman.reduce((max, patch) => Math.max(max, patch.id), 0);
           const title = candidate.meta.title.replace(/\s+/g, ' ').trim();
-          const subject = `review(${candidate.id}): ${title}${latestHuman > 0 ? ` @ rev ${String(latestHuman)}` : ''}`;
+          const subject = `review(${candidate.id}): ${title}${latestHuman > 0 ? ` @ patch ${String(latestHuman)}` : ''}`;
           if (commitDetail === 'simple') return subject;
           return [
             subject,
             '',
-            '作者统计（候选触及文件）：…',
+            '作者统计（补丁触及文件）：…',
             '',
             '改动摘要：N 个文件，+X / -Y 行',
             '',
             '修复方案：',
             '…',
             '',
-            '来源候选：',
-            `- .ai-review/${candidate.id}（rev ${String(candidate.meta.currentRevision)}）`,
+            '来源问题：',
+            `- .ai-review/${candidate.id}（记录 ${String(candidate.meta.recordRevision)} · ${detail.selection?.optionId ?? ''} / patch ${String(currentPatchId)}）`,
             '',
-            `门禁（本次批准重新执行 ${String(candidate.meta.gateChecks.length)} 条）：`,
-            ...(candidate.meta.gateChecks.length > 0 ? candidate.meta.gateChecks.map((command) => `- ${command}`) : ['- （无）']),
+            `门禁（本次批准重新执行 ${String(gateChecks.length)} 条）：`,
+            ...(gateChecks.length > 0 ? gateChecks.map((command) => `- ${command}`) : ['- （无）']),
           ].join('\n');
         };
         const commitMessagePanel = (): any => h('div', { className: 'dcr-commit' },
           h('div', { className: 'dcr-row' },
             h('strong', { className: 'dcr-grow' }, '提交信息'),
-            h('span', { className: 'dcr-small dcr-muted' }, '首行自动取候选 title（§5.6 要求首行与 title 一致）'),
+            h('span', { className: 'dcr-small dcr-muted' }, '首行自动取问题 title（需与标题一致）'),
           ),
           h('div', { className: 'dcr-seg', role: 'group', 'aria-label': '提交信息详略' },
             h('button', {
@@ -2249,13 +2344,14 @@
           ),
           h('div', { className: 'dcr-small dcr-muted', style: { margin: '6px 0' } },
             commitDetail === 'detailed'
-              ? '详细信息：一句简单描述单行综述 → 空行 → 作者统计、改动摘要、修复方案、来源候选、门禁与人工判断项（正文由 Host 在批准提交时按实际应用的补丁生成，下面的预览中以 … 表示）。'
-              : '简略信息：只提交一行 `review(<候选>): <标题>`，正文留空。'),
+              ? '详细信息：单行综述 → 空行 → 作者统计、改动摘要、修复方案、来源问题、门禁与人工判断项。'
+              : '简略信息：只提交一行 `review(<问题>): <标题>`，正文留空。'),
           h('div', { className: 'dcr-small dcr-muted' }, '预览'),
           h('pre', { className: 'dcr-commit-preview' }, commitPreview()),
         );
-        const approvalPanel = (): any => h('div', { className: 'dcr-card dcr-approve' },          h('div', { className: 'dcr-row' },
-            h('h3', { className: 'dcr-grow', style: { margin: 0 } }, '确认批准并提交'),
+        const approvalPanel = (): any => h('div', { className: 'dcr-card dcr-approve' },
+          h('div', { className: 'dcr-row' },
+            h('h3', { className: 'dcr-grow', style: { margin: 0 } }, `确认批准并提交（${detail.selection?.optionId ?? ''} / patch ${String(currentPatchId)}）`),
             h('button', { className: 'dcr-btn g', onClick: () => setPanel('') }, '取消'),
           ),
           h('div', { className: 'dcr-approve-steps' },
@@ -2271,8 +2367,8 @@
             items.length === 0
               ? (candidate.humanJudgmentDeclared ? 'AI 已确认无需额外人工判断，可直接批准。' : 'AI 未填写需人工判断项，批准前请先补全。')
               : allAck
-                ? `已确认全部 ${String(items.length)} 项需人工判断点。`
-                : `还有 ${String(items.length - ackCount)} 项需人工判断项未确认；请先在上方逐项勾选。`,
+                ? `已覆盖全部 ${String(items.length)} 项需人工判断点。`
+                : `还有 ${String(items.length - ackCount - waivedCount)} 项需人工判断项未覆盖；请逐项确认或填写放弃理由。`,
           ),
           items.length > 0 ? h('div', { className: 'dcr-approve-acks' },
             h('div', { className: 'dcr-small dcr-muted' }, '逐项确认或填写理由放弃（精确覆盖后才解锁批准）：'),
@@ -2288,32 +2384,20 @@
               }),
             )),
           ) : null,
-          h('details', { className: 'dcr-details', open: true, style: { marginTop: 10 } },
-            h('summary', null, `合并门禁（${String(candidate.meta.gateChecks.length)} 条）`),
-            candidate.meta.gateChecks.length === 0
+          h('div', { style: { marginTop: 10 } },
+            h('div', { className: 'dcr-small', style: { fontWeight: 600, marginBottom: 4 } }, `将执行的完整合并门禁命令（${String(gateChecks.length)} 条，明文展示，以当前用户权限执行）：`),
+            gateChecks.length === 0
               ? h('div', { className: 'dcr-banner warn' }, '门禁为空，无法批准；请在总体意见中要求 AI 补全 gate_checks 后再提交。')
-              : h('div', null, ...candidate.meta.gateChecks.map((command, index) => h('div', { key: index, className: 'dcr-gate-item dcr-mono dcr-small' }, command))),
+              : h('div', null, ...gateChecks.map((command, index) => h('div', { key: index, className: 'dcr-gate-item dcr-mono dcr-small' }, command))),
           ),
           commitMessagePanel(),
           h('div', { className: 'dcr-row', style: { marginTop: 12 } },
-            h('button', { className: 'dcr-btn p', disabled: busy || !canApproveFinding || !allAck || candidate.meta.gateChecks.length === 0, onClick: approve }, busy ? '执行中…' : '确认批准并提交'),
+            h('button', { className: 'dcr-btn p', disabled: busy || !canApproveOption || !allAck || gateChecks.length === 0, onClick: approve }, busy ? '执行中…' : '确认批准并提交'),
             h('button', { className: 'dcr-btn', onClick: () => setPanel('') }, '再想想'),
             h('span', { className: 'dcr-grow' }),
             h('span', { className: 'dcr-small dcr-muted' }, settings?.syncBeforeApprove ? '批准前自动同步基线' : '不自动同步基线'),
           ),
           h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 8 } }, '批准过程在页内显示实时日志，不弹窗、不锁定其他页面。'),
-        );
-        const rejectPanel = (): any => h('div', { className: 'dcr-card' },
-          h('div', { className: 'dcr-row' },
-            h('h3', { className: 'dcr-grow', style: { margin: 0 } }, '放弃候选'),
-            h('button', { className: 'dcr-btn g', onClick: () => setPanel('') }, '取消'),
-          ),
-          h('div', { className: 'dcr-banner warn', style: { marginTop: 8 } }, '放弃会删除所有过程补丁并提交 .ai-review 变更，仅保留 review.md 归档。'),
-          h('textarea', { className: 'dcr-textarea', autoFocus: true, placeholder: '放弃原因（必填）', value: rejectReason, onChange: (e: any) => setRejectReason(e.target.value) }),
-          h('div', { className: 'dcr-row', style: { marginTop: 8 } },
-            h('button', { className: 'dcr-btn d', disabled: busy || !rejectReason.trim(), onClick: () => { void reject(); } }, busy ? '执行中…' : '确认放弃'),
-            h('button', { className: 'dcr-btn', onClick: () => setPanel('') }, '取消'),
-          ),
         );
         // 跨基线兜底只有 Hunk 级近似，逐行渲染会误导行号和评论定位。
         const crossBaseFallback = diff?.resolutionMode === 'cross_base_hunk_fallback' || /^# 跨基线 Hunk 对比/m.test(diff?.unifiedDiff ?? '');
@@ -2323,7 +2407,7 @@
         const threadNode = (comment: Comment): any => h('div', { key: comment.id, className: `dcr-thread${splitView ? ' split' : ''}` },
           h('div', { className: 'dcr-thread-head' },
             h('span', null, comment.author),
-            h('span', null, `记录 ${String(comment.revision)}${comment.extra?.['option_id'] ? ` / ${String(comment.extra['option_id'])} / patch ${String(comment.extra['patch_id'])}` : ''}`),
+            h('span', null, `记录 ${String(comment.revision)}${comment.optionId ? ` / ${comment.optionId} / patch ${String(comment.patchId ?? '')}` : ''}`),
             h('span', { className: comment.status === 'resolved' ? 'dcr-st-resolved' : comment.status === 'partial' ? 'dcr-st-partial' : 'dcr-st-unresolved' }, commentText(comment.status)),
             h('span', { className: 'dcr-grow' }),
             canAct ? h('select', { className: 'dcr-select', style: { padding: '0 3px', fontSize: 11 }, value: comment.status, onChange: (e: any) => { void setCommentStatus(comment.id, e.target.value); } },
@@ -2338,7 +2422,7 @@
           side: 'LEFT' | 'RIGHT',
           rowNo: number | null,
         ): Comment[] => rowNo === null ? [] : detail.comments.filter((comment) => {
-          if (comment.file !== file.path || (detail.selection && comment.extra?.['option_id'] !== detail.selection.optionId)) return false;
+          if (comment.file !== file.path || (detail.selection && comment.optionId !== detail.selection.optionId)) return false;
           const exact = comment.line === rowNo && (comment.side ?? 'RIGHT') === side;
           const re = relocated.get(comment.id);
           const relocatedHere = re !== undefined && re.line === rowNo && re.side === side;
@@ -2393,11 +2477,14 @@
           h('div', { className: 'dcr-wrap' },
             renderJob(),
             stale ? h('div', { className: 'dcr-banner err' },
-              h('div', null, '该候选已在其他窗口更新（版本或 owner 变化），当前页面已锁定。'),
+              h('div', null, '该问题已在其他窗口更新（版本或 owner 变化），当前页面已锁定。'),
               h('button', { className: 'dcr-btn', style: { marginTop: 6 }, onClick: reloadCurrent }, '加载最新并解除锁定'),
             ) : null,
-            detail.isBaseBehind ? h('div', { className: 'dcr-banner warn' }, `仓库基线 ${short(detail.currentBase)} 已不同于候选基线 ${short(baseRevision)}；批准时会先同步再严格应用补丁。`) : null,
-            detail.patchCheck ? h('div', { className: `dcr-banner ${detail.patchCheck.state === 'conflicted' ? 'warn' : 'info'}`, style: { marginTop: 6 } },
+            detail.selectedPatchBanned ? h('div', { className: 'dcr-banner err' },
+              `当前方案补丁（${detail.selection?.optionId ?? ''} / patch ${String(currentPatchId)}）曾因门禁验证失败被永久封禁，禁止再次批准。请提交意见修订补丁、切换到另一未失败方案或转人工处理。`,
+            ) : null,
+            detail.isBaseBehind && selectedOption ? h('div', { className: 'dcr-banner warn' }, `仓库基线 ${short(detail.currentBase)} 已不同于补丁基线 ${short(baseRevision)}；批准时会先同步再严格应用补丁。`) : null,
+            detail.patchCheck && selectedOption ? h('div', { className: `dcr-banner ${detail.patchCheck.state === 'conflicted' ? 'warn' : 'info'}`, style: { marginTop: 6 } },
               h('span', { className: 'dcr-grow' },
                 detail.patchCheck.state === 'conflicted'
                   ? `补丁预检：在基线 ${short(detail.patchCheck.checkedBase)} 无法直接应用；可先 Rebase。批准时在当前目标重新校验，符合条件时会尝试三方合并。`
@@ -2408,13 +2495,25 @@
                 ? h('button', { className: 'dcr-btn', disabled: busy || !canAct, onClick: () => { void rebaseCandidate(); } }, 'Rebase')
                 : null,
             ) : null,
+            candidate.meta.status === 'repair_failed' && failedAttempts.length > 0 ? h('div', { className: 'dcr-card' },
+              h('h3', null, '最近修复失败诊断（门禁失败绝不自动重试）'),
+              ...failedAttempts.map((attempt) => h('div', { key: attempt.id, className: 'dcr-hist' },
+                h('div', { className: 'dcr-row' },
+                  h('strong', null, `尝试 #${String(attempt.id)} · ${attempt.optionId} / patch ${String(attempt.patchId)}`),
+                  h('span', { className: 'dcr-chip rejected' }, `${attempt.result} (${attempt.applyMode})`),
+                  h('span', { className: 'dcr-small dcr-muted' }, attempt.restored ? '业务工作区已彻底还原' : '还原异常，请核验现场'),
+                ),
+                h('div', { className: 'dcr-small', style: { marginTop: 4 } }, attempt.evidence),
+              )),
+            ) : null,
             h('div', { className: 'dcr-card dcr-candidate-head' },
               h('div', { className: 'dcr-row', style: { alignItems: 'flex-start' } },
                 h('div', { className: 'dcr-grow' },
-                  h('h2', { style: { margin: '0 0 7px', fontSize: 18 } }, candidate.meta.title),
+                  h('h2', { style: { margin: '0 0 7px', fontSize: 18 } }, `${candidate.meta.priority} · ${candidate.meta.title}`),
                   h('div', { className: 'dcr-meta' },
                     h('span', { className: `dcr-chip ${candidate.meta.status}` }, statusText(candidate.meta.status)),
-                    h('span', null, `rev ${String(candidate.meta.currentRevision)}`),
+                    detail.finding?.deferred ? h('span', { className: 'dcr-chip warn' }, '已延期') : null,
+                    h('span', null, `记录 ${String(candidate.meta.recordRevision)}`),
                     h('span', null, candidate.meta.ticket ? `#${candidate.meta.ticket}` : '无 ticket'),
                     h('span', null, `owner ${candidate.meta.owner}`),
                     h('span', null, `创建 ${dateText(candidate.meta.createdAt)}`),
@@ -2429,22 +2528,18 @@
                   ) : null,
                 ),
                 h('div', { className: 'dcr-row' },
-                  !detail.canAct ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void takeover(); } }, '接管审核') : null,
+                  !detail.canAct && !['approved', 'resolved'].includes(candidate.meta.status) ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void takeover(); } }, '接管审核') : null,
                   canAct && candidate.meta.status === 'changes_requested'
                     ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => { void resumeCandidate(); } }, '转回待审核') : null,
-                  canAct && !candidate.meta.findingId ? h('button', { className: 'dcr-btn d', disabled: busy, onClick: () => setPanel(panel === 'reject' ? '' : 'reject') }, panel === 'reject' ? '收起放弃' : '放弃') : null,
-                  canAct && canApproveFinding ? h('button', {
+                  canApproveOption ? h('button', {
                     className: 'dcr-btn p',
                     disabled: busy || detail.validation.length > 0,
-                    title: detail.validation.length > 0 ? detail.validation.join('；') : !allAck ? '打开审批面板，逐项确认人工判断项' : '确认批准并提交',
-                    onClick: () => {
-                      setApprovalFindingVersion(detail.finding?.findingVersion);
-                      setPanel(panel === 'approve' ? '' : 'approve');
-                    },
-                  }, panel === 'approve' ? '收起审批' : candidate.meta.findingId ? '接受并应用' : '批准并提交') : null,
+                    title: detail.validation.length > 0 ? detail.validation.join('；') : !allAck ? '打开审批面板，逐项覆盖人工判断项' : '确认批准并提交',
+                    onClick: () => { setPanel(panel === 'approve' ? '' : 'approve'); },
+                  }, panel === 'approve' ? '收起审批' : `批准并应用 (${selectedOption?.id ?? ''})`) : null,
                 ),
               ),
-              detail.finding ? h(FindingCard, { key: detail.finding.findingVersion, finding: detail.finding, currentId: candidate.id, currentOption: detail.selection?.optionId,
+              detail.finding ? h(FindingCard, { key: `${detail.finding.id}/${String(detail.finding.recordRevision)}`, finding: detail.finding, currentId: candidate.id, currentOption: detail.selection?.optionId,
                 busy, choose: openCandidate, save: (body: Record<string, unknown>) => { void runWrite('/finding/decision', body); } }) : null,
               h('div', { className: 'dcr-kpis' },
                 h('div', { className: 'dcr-kpi' },
@@ -2454,11 +2549,11 @@
                 h('div', { className: 'dcr-kpi' },
                   h('div', { className: 'dcr-kpi-label' }, '人工确认'),
                   h('div', { className: `dcr-kpi-value ${items.length > 0 && !allAck ? 'warn' : !candidate.humanJudgmentDeclared ? 'warn' : 'ok'}` },
-                    items.length > 0 ? `${String(ackCount)}/${String(items.length)}` : candidate.humanJudgmentDeclared ? '无需' : '未填写'),
+                    items.length > 0 ? `${String(ackCount + waivedCount)}/${String(items.length)}` : candidate.humanJudgmentDeclared ? '无需' : '未填写'),
                 ),
                 h('div', { className: 'dcr-kpi' },
                   h('div', { className: 'dcr-kpi-label' }, '门禁'),
-                  h('div', { className: `dcr-kpi-value ${candidate.meta.gateChecks.length > 0 ? 'ok' : 'warn'}` }, `${String(candidate.meta.gateChecks.length)} 条`),
+                  h('div', { className: `dcr-kpi-value ${gateChecks.length > 0 ? 'ok' : 'warn'}` }, `${String(gateChecks.length)} 条`),
                 ),
                 h('div', { className: 'dcr-kpi' },
                   h('div', { className: 'dcr-kpi-label' }, '补丁'),
@@ -2469,7 +2564,6 @@
               detail.validation.length > 0 ? h('div', { className: 'dcr-banner err', style: { marginTop: 10 } }, `评审数据不完整：${detail.validation.join('；')}`) : null,
             ),
             panel === 'approve' ? approvalPanel() : null,
-            panel === 'reject' ? rejectPanel() : null,
             items.length === 0
               ? (candidate.humanJudgmentDeclared
                   ? null
@@ -2489,10 +2583,10 @@
             h('div', { className: 'dcr-card' }, h('h3', null, '当前修复方案'), h(RichText, { text: candidate.sections.solution })),
             h('div', { className: 'dcr-card' },
               h('h3', null, '合并门禁与验证证据'),
-              candidate.meta.gateChecks.length === 0
-                ? h('div', { className: 'dcr-banner warn' }, '尚未定义 gate_checks。')
-                : h('div', null, ...candidate.meta.gateChecks.map((command, index) => h('div', { key: index, className: 'dcr-gate-item dcr-mono dcr-small' }, command))),
-              h('div', { className: 'dcr-small dcr-muted' }, '点击批准即代表确认并在本机执行以上命令；任一失败会阻止合并。'),
+              gateChecks.length === 0
+                ? h('div', { className: 'dcr-banner warn' }, '当前方案未定义 gate_checks。')
+                : h('div', null, ...gateChecks.map((command, index) => h('div', { key: index, className: 'dcr-gate-item dcr-mono dcr-small' }, command))),
+              h('div', { className: 'dcr-small dcr-muted' }, '点击批准即代表确认并在本机以当前用户权限明文执行以上命令；任一失败会阻止合并并永久封禁该补丁。'),
               candidate.sections.evidence
                 ? h('details', { className: 'dcr-details', style: { marginTop: 8 } },
                     h('summary', null, '验证证据'),
@@ -2503,11 +2597,11 @@
             h('div', { className: 'dcr-card' },
               h('h3', null, '总体意见'),
               h('div', { className: 'dcr-small dcr-muted', style: { marginBottom: 6 } },
-                '提交后按下方「修复执行方式」保存意见并启动下一版：新建 DSH 会话可直接观察/追问，导出提示词可交给 codex 等外部 Agent；只想记录意见时点「仅提交意见」。'),
+                '提交后按下方「提案修订方式」保存意见并启动下一版：新建 DSH 会话可直接观察/追问，导出提示词可交给外部 Agent；只想记录意见时点「仅提交意见」。'),
               h('textarea', { className: 'dcr-textarea', value: general, disabled: !canAct, placeholder: canAct ? '写给 AI/作者的整体意见（可加入草稿批量提交）…' : '仅 owner 可提交意见', onChange: (e: any) => setGeneral(e.target.value) }),
               h('div', { className: 'dcr-row', style: { marginTop: 8, alignItems: 'center' } },
-                h('span', { className: 'dcr-small dcr-muted' }, '修复执行方式'),
-                h('div', { className: 'dcr-seg', role: 'group', 'aria-label': '修复执行方式' },
+                h('span', { className: 'dcr-small dcr-muted' }, '提案修订方式'),
+                h('div', { className: 'dcr-seg', role: 'group', 'aria-label': '提案修订方式' },
                   h('button', {
                     className: `dcr-btn ${fixTarget === 'session' ? 'p' : ''}`, type: 'button', disabled: !canAct,
                     'aria-pressed': fixTarget === 'session', onClick: () => setFixTarget('session'),
@@ -2519,10 +2613,10 @@
                 ),
                 h('span', { className: 'dcr-small dcr-muted' },
                   fixTarget === 'session'
-                    ? '新建一个可见的 DSH 会话并投递修复提示词；会话只产出候选新版本，`.ai-review/` 仍由你在面板上收尾提交。'
-                    : '生成新会话口径的修复提示词，复制后粘贴到外部 Agent（如 codex exec）；完成后回到这里收尾。'),
+                    ? '新建可见 DSH 会话并投递 Mode B 修订提示词；完成后在面板收尾校验提交。'
+                    : '生成 Mode B 修订提示词，复制后粘贴到外部 Agent；完成后回到这里收尾。'),
               ),
-              candidate.meta.schemaVersion === 3 ? h('button', { className: 'dcr-btn', disabled: !canAct || busy, onClick: () => { void startJob('/candidate/finalize', { id: candidate.id, ...guard(), ...(detail.selection ?? {}) }); } }, '校验并提交修订提案') : null,
+              selectedOption ? h('button', { className: 'dcr-btn', style: { marginTop: 8 }, disabled: !canAct || busy, onClick: () => { void startJob('/candidate/finalize', { id: candidate.id, ...guard(), ...(detail.selection ?? {}) }); } }, '校验并提交修订提案') : null,
               batchDrafts.length > 0 ? h('div', { className: 'dcr-banner info', style: { marginTop: 6 } },
                 h('div', { className: 'dcr-small' }, `草稿 ${String(batchDrafts.length)} 条：`),
                 ...batchDrafts.map((draft, index) => h('div', { key: index, className: 'dcr-row', style: { alignItems: 'center', marginTop: 2 } },
@@ -2531,7 +2625,7 @@
                 )),
               ) : null,
               h('div', { className: 'dcr-row', style: { marginTop: 8 } },
-                h('button', {
+                selectedOption ? h('button', {
                   className: 'dcr-btn p',
                   disabled: !canAct || busy || fixLaunching || fixPromptLoading || (batchDrafts.length === 0 && !general.trim()),
                   onClick: () => {
@@ -2539,7 +2633,7 @@
                     setBatchDrafts([]); setGeneral('');
                     void submitFeedbackAndFix(drafts);
                   },
-                }, fixLaunching ? '正在创建会话…' : fixPromptLoading ? '生成提示词…' : fixTarget === 'session' ? '提交意见并新建修复会话' : '提交意见并导出修复提示词'),
+                }, fixLaunching ? '正在创建会话…' : fixPromptLoading ? '生成提示词…' : fixTarget === 'session' ? '提交意见并新建修订会话' : '提交意见并导出修订提示词') : null,
                 h('button', {
                   className: 'dcr-btn',
                   disabled: !canAct || busy || (batchDrafts.length === 0 && !general.trim()),
@@ -2560,37 +2654,36 @@
                   disabled: !canAct || busy,
                   onClick: () => { const drafts = batchDrafts; setBatchDrafts([]); void submitBatch(drafts); },
                 }, `批量提交 ${String(batchDrafts.length)} 条`) : null,
-                batchDrafts.length > 0 ? h('button', {
+                selectedOption && batchDrafts.length > 0 ? h('button', {
                   className: 'dcr-btn',
                   disabled: !canAct || busy || fixLaunching || fixPromptLoading,
                   onClick: () => {
-                    // 批量修复也要带上尚未加入草稿的输入，避免静默丢掉反馈。
                     const drafts = [...batchDrafts, ...(general.trim() ? [general.trim()] : [])];
                     setBatchDrafts([]); setGeneral('');
                     void submitFeedbackAndFix(drafts);
                   },
-                }, fixTarget === 'session' ? '批量提交并新建修复会话' : '批量提交并导出提示词') : null,
+                }, fixTarget === 'session' ? '批量提交并新建修订会话' : '批量提交并导出提示词') : null,
                 h('span', { className: 'dcr-grow' }),
-                h('span', { className: 'dcr-small dcr-muted' }, '提交后状态变为“待修改”，并写入仓库 review.md。'),
+                h('span', { className: 'dcr-small dcr-muted' }, '提交后写入仓库 review.md（repair_failed 状态保持不变）。'),
               ),
               fixSession ? h('div', { className: 'dcr-banner info', style: { marginTop: 8 } },
-                `已创建修复会话（rev ${String(fixSession.revision)}）：${fixSession.title}。请在侧边栏打开该会话查看过程；它产出新版本后回到这里刷新队列并收尾提交。`,
+                `已创建修订会话（记录 ${String(fixSession.revision)}）：${fixSession.title}。请在侧边栏打开该会话查看过程；产出新补丁后回到这里收尾提交。`,
               ) : null,
-              fixPrompt && fixPrompt.revision === candidate.meta.currentRevision ? h('div', { className: 'dcr-field', style: { marginTop: 10 } },
+              fixPrompt && fixPrompt.revision === candidate.meta.recordRevision ? h('div', { className: 'dcr-field', style: { marginTop: 10 } },
                 h('div', { className: 'dcr-row' },
-                  h('label', { className: 'dcr-grow' }, '修复提示词（新会话口径，可整段粘贴到外部 Agent）'),
+                  h('label', { className: 'dcr-grow' }, '修订提示词（新会话口径，可整段粘贴到外部 Agent）'),
                   h('button', { className: 'dcr-btn', onClick: () => { void copyFixPrompt(); } }, fixCopied ? '已复制' : '复制'),
                 ),
                 h('textarea', { className: 'dcr-textarea', style: { minHeight: 220 }, readOnly: true, value: fixPrompt.text }),
               ) : null,
             ),
-            h('div', { className: 'dcr-diff', ref: diffCardRef },
+            selectedOption ? h('div', { className: 'dcr-diff', ref: diffCardRef },
               h('div', { className: 'dcr-diff-bar' },
-                h('strong', null, '代码差异'),
+                h('strong', null, `代码差异 · ${selectedOption.id} / patch ${String(currentPatchId)}`),
                 h('button', { className: `dcr-btn ${diffMode === 'full' ? 'p' : ''}`, onClick: () => setDiffMode('full') }, '完整差异'),
                 previousPatches.length > 0 ? h('button', { className: `dcr-btn ${diffMode === 'incremental' ? 'p' : ''}`, onClick: () => { setDiffFrom(previousPatches.at(-1)!.id); setDiffMode('incremental'); } }, '版本增量') : null,
                 diffMode === 'incremental' ? h('select', { className: 'dcr-select', value: String(diffFrom), onChange: (e: any) => setDiffFrom(Number(e.target.value)) },
-                  ...previousPatches.map((r) => h('option', { key: r.id, value: String(r.id) }, `rev ${String(r.id)}`)),
+                  ...previousPatches.map((p) => h('option', { key: p.id, value: String(p.id) }, `patch ${String(p.id)}`)),
                 ) : null,
                 diffMode === 'incremental' ? h('span', { className: 'dcr-small dcr-muted' }, `→ patch ${String(currentPatchId)}`) : null,
                 h('span', { className: 'dcr-grow' }),
@@ -2612,11 +2705,10 @@
                   h('pre', { className: 'dcr-raw' }, diff?.unifiedDiff || '（无差异）'),
                 ) :
                 h('div', { className: 'dcr-diff-body' }, ...files.map((file) => {
-                  // G39：重定位只影响当前差异的显示坐标，原评论仍保留创建时的位置。
                   const lineKeys = new Set(file.lines.map((l) => `${rowSideOf(l)}:${String(rowNoOf(l))}`));
                   const relocated = new Map<string, { side: 'LEFT' | 'RIGHT'; line: number }>();
                   for (const comment of detail.comments) {
-                    if (comment.file !== file.path || !comment.anchor || (detail.selection && comment.extra?.['option_id'] !== detail.selection.optionId)) continue;
+                    if (comment.file !== file.path || !comment.anchor || (detail.selection && comment.optionId !== detail.selection.optionId)) continue;
                     const key = `${comment.side ?? 'RIGHT'}:${String(comment.line)}`;
                     if (lineKeys.has(key)) continue;
                     const target = file.lines.find((l) => l.text === comment.anchor?.snippet);
@@ -2675,9 +2767,9 @@
                   ),
                 ),
               ) : null,
-            ),
+            ) : h('div', { className: 'dcr-card dcr-small dcr-muted' }, '当前为纯文字方案，无关联代码差异。'),
             h('div', { className: 'dcr-card' },
-              h('h3', null, '评论与历史'),
+              h('h3', null, '评论与补丁账本'),
               detail.comments.length === 0 ? h('div', { className: 'dcr-muted dcr-small' }, '暂无评论') :
                 h('div', null, ...detail.comments.map((comment) => h('div', { key: comment.id, style: { borderTop: '1px solid var(--dsw-alias-border-l1)', paddingTop: 7, marginTop: 7 } },
                   h('div', { className: 'dcr-row dcr-small' },
@@ -2691,15 +2783,16 @@
                   h(RichText, { text: comment.content, className: 'dcr-small' }),
                 ))),
               h('div', { className: 'dcr-sep' }),
-              ...candidate.meta.revisions.map((revision) => h('div', { key: revision.id, className: 'dcr-hist' },
+              ...candidate.meta.patches.map((patch) => h('div', { key: patch.id, className: 'dcr-hist' },
                 h('div', { className: 'dcr-row' },
-                  h('strong', null, `rev ${String(revision.id)}`),
-                  h('span', { className: 'dcr-small dcr-muted' }, `base ${short(revision.baseRevision)}`),
-                  h('span', { className: 'dcr-small' }, statsText(detail.revisionStats[String(revision.id)]?.stats ?? EMPTY_STATS)),
+                  h('strong', null, `patch #${String(patch.id)} (${patch.optionId})`),
+                  h('span', { className: 'dcr-small dcr-muted' }, `base ${short(patch.baseRevision)}`),
+                  h('span', { className: 'dcr-small' }, statsText(detail.revisionStats[String(patch.id)]?.stats ?? EMPTY_STATS)),
                   h('span', { className: 'dcr-grow' }),
-                  h('button', { className: 'dcr-btn g', onClick: () => { setDiffMode('incremental'); setDiffFrom(revision.id); } }, '查看增量'),
+                  selectedOption && patch.optionId === selectedOption.id && patch.id < currentPatchId
+                    ? h('button', { className: 'dcr-btn g', onClick: () => { setDiffMode('incremental'); setDiffFrom(patch.id); } }, '查看增量') : null,
                 ),
-                h('div', { className: 'dcr-small dcr-mono dcr-muted' }, revision.patch),
+                h('div', { className: 'dcr-small dcr-mono dcr-muted' }, `${patch.patch} · sha256 ${patch.sha256.slice(0, 12)}`),
               )),
               candidate.sections.history
                 ? h('details', { className: 'dcr-details', style: { marginTop: 8 } },
@@ -2788,7 +2881,7 @@
           h('div', { className: 'dcr-grow' },
             h('div', { className: 'dcr-row' },
               h('h1', null, '评审'),
-              h('span', { className: 'dcr-chip' }, `${String((health?.counts.pending ?? 0) + (health?.counts.changes_requested ?? 0))} 个候选待处理`),
+              h('span', { className: 'dcr-chip' }, `${String((health?.counts.pending ?? 0) + (health?.counts.changes_requested ?? 0) + (health?.counts.repair_failed ?? 0) + (health?.counts.human_takeover ?? 0) + (health?.counts.awaiting_verification ?? 0))} 个问题待处理`),
               health?.vcsType ? h('span', { className: 'dcr-chip' }, health.vcsType.toUpperCase()) : null,
               health?.currentBase ? h('span', { className: 'dcr-chip dcr-mono' }, short(health.currentBase)) : null,
             ),

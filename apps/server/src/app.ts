@@ -71,7 +71,7 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
         if (pathname.startsWith('/node-api/')) {
             const token = /^Bearer ([a-zA-Z0-9_-]+)$/.exec(String(req.headers.authorization ?? ''))?.[1] ?? '';
             req.nodeId = database.nodeIdentity(token);
-        } else if ((pathname.startsWith('/api/v1/') || pathname === '/test') && !['/api/v1/auth/login', '/api/v1/info'].includes(pathname)) {
+        } else if (pathname.startsWith('/api/v1/') && !['/api/v1/auth/login', '/api/v1/info'].includes(pathname)) {
             const session = localSession ?? database.session(sessionToken(req));
             req.actor = session.user;
             req.csrfToken = session.csrfToken;
@@ -93,7 +93,7 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
 
     app.get('/health', async () => ({ status: 'ok', service: 'dsh-review-central', protocolVersion: 1 }));
     app.get('/api/v1/info', async () => ({ centralId: database.centralId, protocolVersion: PROTOCOL_VERSION,
-        registrationCapabilities: { executionConfigHash: true, workspaceIssues: true, findingWorkflow: true, issueWorkflow: true, auditSelfTest: true } }));
+        registrationCapabilities: { executionConfigHash: true, workspaceIssues: true, auditSelfTest: true } }));
     app.post('/api/v1/auth/login', async (req, reply) => {
         const input = body(req);
         const username = textValue(input.username, 'username', 80);
@@ -164,7 +164,13 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
     });
     app.get('/api/v1/projects/:projectId/queue', async req => {
         const projectId = params(req).projectId!, snapshot = snapshots.get(projectId);
-        return { ...snapshots.view(projectId), items: snapshot?.queue ?? [], errors: snapshot?.errors ?? [] };
+        return {
+            ...snapshots.view(projectId),
+            items: snapshot?.queue ?? [],
+            counts: snapshot?.counts ?? null,
+            currentBase: snapshot?.currentBase ?? null,
+            errors: snapshot?.errors ?? [],
+        };
     });
     for (const kind of ['findings', 'audits'] as const) {
         app.get(`/api/v1/projects/:projectId/${kind}`, async req => {
@@ -177,11 +183,11 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
     app.get('/api/v1/commands/:commandId', async req => ({ command: commands.get(params(req).commandId!) }));
     app.get('/api/v1/tasks/:commandId/logs', async req => commands.logs(params(req).commandId!, Number((req.query as Record<string, string>).since ?? 0)));
     app.post('/api/v1/projects/:projectId/commands', async (req, reply) => reply.status(202).send({ command: commands.create(params(req).projectId!, body(req), (req as RequestContext).actor!) }));
-    app.post('/test', async (req, reply) => {
+    app.post('/api/v1/test', async (req, reply) => {
         const input = body(req);
         if (Object.keys(input).some(key => !['projectId', 'idempotencyKey'].includes(key))) throw new ProtocolError('test');
         const command = commands.create(textValue(input.projectId, 'projectId'), {
-            operation: 'test', idempotencyKey: input.idempotencyKey, payload: {},
+            operation: 'audit-self-test', idempotencyKey: input.idempotencyKey, payload: {},
         }, (req as RequestContext).actor!, true);
         return reply.status(202).send({ command });
     });

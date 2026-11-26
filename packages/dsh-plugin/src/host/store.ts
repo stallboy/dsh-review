@@ -1,1153 +1,1067 @@
-import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { lstat, readFile, readdir, realpath, rename, writeFile } from 'node:fs/promises';
+/**
+ * 评审存储层（唯一契约 schema_version: 1）：
+ * 管理 .ai-review/ 下的问题记录读写、快照一致性、不变量校验、评论/接管/处置/批准落盘与 8 状态统计。
+ */
+
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { currentReviewPatch, issueInvariantErrors, selectIssuePatch } from './issue-review.js';
-import type { IssueSelection } from './types.js';
-import process from 'node:process';
+import { parseReviewMarkdown, serializeReviewMarkdown } from './frontmatter.js';
+import { fullReviewInvariants, MONTH_PATTERN, quickReviewInvariants, SLUG_PATTERN } from './invariants.js';
 import {
-  appendVersionSection,
-  extractHumanJudgment,
-  findLastFeedback,
-  parseReviewMarkdown,
-  parseSections,
-  ReviewFormatError,
-  serializeReviewMarkdown,
-} from './frontmatter.js';
-import { parsePatch, isAiReviewPath, anchorFromPatch } from './patch.js';
-import { quickReviewInvariants, fullReviewInvariants, isRepoRelativePath } from './invariants.js';
-import { entryFromCandidate, fingerprintOf, withinWindow } from './memory.js';
-import type {
-  CandidateSummary,
-  ConcurrencyGuard,
-  PatchStats,
-  ReviewCandidate,
-  ReviewComment,
-  ReviewFilter,
-  ReviewFrontmatter,
-  ReviewStatus,
-  ValidationReport,
+  applyIssueDecision,
+  bannedOptionPatches,
+  COMMENTABLE_STATUSES,
+  formatPatchFilename,
+  isDeferred,
+  nextUpdatedAt,
+  resolveOptionSelection,
+  type IssueDecisionRequest,
+} from './issue-review.js';
+import { entryFromCandidate, findDuplicateRejection, type NegativeMemoryEntry } from './memory.js';
+import { extractPatchSymbols, parsePatch } from './patch.js';
+import { loadReviewers } from './reviewers.js';
+import {
+  ApiError,
+  REVIEW_STATUSES,
+  type ApprovalInfo,
+  type CandidateSummary,
+  type CommentAnchor,
+  type CommentSide,
+  type CommentStatus,
+  type ConcurrencyGuard,
+  type IssueSelection,
+  type OptionSummary,
+  type PatchEntry,
+  type PatchStats,
+  type RepairAttempt,
+  type RepairOption,
+  type ReviewCandidate,
+  type ReviewComment,
+  type ReviewFilter,
+  type ReviewFrontmatter,
+  type ReviewStatus,
 } from './types.js';
-import { ApiError } from './types.js';
 
-const MONTH_PATTERN = /^\d{4}-\d{2}$/;
-const SLUG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-const EMPTY_STATS: PatchStats = { files: 0, additions: 0, deletions: 0, entries: [] };
+export const EMPTY_STATS: PatchStats = { files: 0, additions: 0, deletions: 0, entries: [] };
 
-export interface CandidateDetail {
-  candidate: ReviewCandidate;
-  currentBase: string | null;
-  isBaseBehind: boolean;
-  patchText: string;
-  patchStats: PatchStats;
-}
-
-function candidateId(month: string, slug: string): string {
-  return `${month}/${slug}`;
-}
-
-interface ScannedCandidate {
-  candidate: ReviewCandidate | null;
-  stats: PatchStats;
-  invariantErrors: string[] | null;
-  error: string | null;
-}
-
-/** 限制并发 VCS 子进程数量，减少大量候选扫描时的资源占用。 */
-const SCAN_CONCURRENCY = 6;
-
-async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let cursor = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (cursor < items.length) {
-      const index = cursor;
-      cursor += 1;
-      results[index] = await fn(items[index] as T);
-    }
-  });
-  await Promise.all(workers);
-  return results;
-}
-
-/** 写路径可读工作区。共享读必须由同一 VCS 快照提供评审数据和补丁。 */
 export interface CandidateSource {
-  /** 目录必须包含 review.md，返回值使用 YYYY-MM/slug。 */
   listCandidateDirs(): Promise<string[]>;
   listDirEntries(month: string, slug: string): Promise<string[] | null>;
   readReviewText(month: string, slug: string): Promise<string | null>;
   readPatchText(month: string, slug: string, patchName: string): Promise<string | null>;
-  /** 评审文件或补丁相对读取快照有本地改动时返回 true。 */
-  hasLocalChanges(month: string, slug: string): Promise<boolean>;
-  /** 一次读取可代替逐候选查询。返回 null 时须逐项回退，本地视图也不能随共享快照缓存。 */
+  readPatchBytes?(month: string, slug: string, patchName: string): Promise<Buffer | null>;
+  hasLocalChanges?(month: string, slug: string): Promise<boolean>;
   localChangedCandidateIds?(): Promise<Set<string> | null>;
-  /** VCS status 可能折叠未跟踪目录或应用忽略规则，须通过文件系统发现本地候选。 */
-  listLocalOnlyDirs(): Promise<string[]>;
+  listLocalOnlyDirs?(): Promise<string[]>;
+  listTopLevelReviewEntries?(): Promise<string[]>;
 }
 
 export class FilesystemCandidateSource implements CandidateSource {
   constructor(private readonly repoRoot: string) {}
 
   async listCandidateDirs(): Promise<string[]> {
-    const root = path.join(this.repoRoot, '.ai-review');
-    const ids: string[] = [];
-    let months: string[] = [];
+    const aiRoot = path.join(this.repoRoot, '.ai-review');
+    let months: string[];
     try {
-      months = (await readdir(root, { withFileTypes: true }))
-        .filter((entry) => entry.isDirectory() && MONTH_PATTERN.test(entry.name))
-        .map((entry) => entry.name);
-    } catch {
-      return ids;
+      const entries = await readdir(aiRoot, { withFileTypes: true });
+      months = entries.filter((e) => e.isDirectory() && MONTH_PATTERN.test(e.name)).map((e) => e.name);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
     }
-    for (const month of months) {
-      let slugs: string[] = [];
-      try {
-        slugs = (await readdir(path.join(root, month), { withFileTypes: true }))
-          .filter((entry) => entry.isDirectory() && SLUG_PATTERN.test(entry.name))
-          .map((entry) => entry.name);
-      } catch {
-        continue;
-      }
-      for (const slug of slugs) {
-        if (existsSync(path.join(root, month, slug, 'review.md'))) ids.push(candidateId(month, slug));
+    const ids: string[] = [];
+    for (const month of months.sort()) {
+      const monthPath = path.join(aiRoot, month);
+      const entries = await readdir(monthPath, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        ids.push(`${month}/${entry.name}`);
       }
     }
     return ids;
   }
 
+  async listTopLevelReviewEntries(): Promise<string[]> {
+    try {
+      return (await readdir(path.join(this.repoRoot, '.ai-review'))).sort();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+      throw error;
+    }
+  }
+
   async listDirEntries(month: string, slug: string): Promise<string[] | null> {
     try {
       return await readdir(path.join(this.repoRoot, '.ai-review', month, slug));
-    } catch {
-      return null;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
     }
   }
 
   async readReviewText(month: string, slug: string): Promise<string | null> {
     try {
       return await readFile(path.join(this.repoRoot, '.ai-review', month, slug, 'review.md'), 'utf8');
-    } catch {
-      return null;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
+  async readPatchBytes(month: string, slug: string, patchName: string): Promise<Buffer | null> {
+    try {
+      return await readFile(path.join(this.repoRoot, '.ai-review', month, slug, patchName));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
     }
   }
 
   async readPatchText(month: string, slug: string, patchName: string): Promise<string | null> {
-    try {
-      return await readFile(path.join(this.repoRoot, '.ai-review', month, slug, patchName), 'utf8');
-    } catch {
-      return null;
-    }
-  }
-
-  async hasLocalChanges(): Promise<boolean> {
-    return false;
-  }
-
-  async listLocalOnlyDirs(): Promise<string[]> {
-    return [];
+    const bytes = await this.readPatchBytes(month, slug, patchName);
+    return bytes === null ? null : bytes.toString('utf8');
   }
 }
 
-function ensureInside(parent: string, child: string): void {
-  const relative = path.relative(parent, child);
-  if (relative.startsWith('..') || path.isAbsolute(relative)) {
-    throw new ApiError(400, 'bad_request', '候选目录路径越界');
-  }
+export interface CandidateDetail {
+  candidate: ReviewCandidate;
+  selection?: IssueSelection;
+  option?: RepairOption;
+  patchEntry?: PatchEntry;
+  currentBase: string | null;
+  isBaseBehind: boolean;
+  patchText: string;
+  patchStats: PatchStats;
+  patchPaths: string[];
+  comments: ReviewComment[];
+  validation: string[];
+  revisionStats: Record<string, { patch: string; baseRevision: string; optionId: string; author: 'ai' | 'human'; stats: PatchStats | null }>;
 }
 
-/** 列表和计数共用过滤条件，保证两者使用同一份扫描结果时口径一致。 */
-export function matchesReviewFilter(summary: CandidateSummary, filter: ReviewFilter): boolean {
-  if (filter.owner && summary.owner !== filter.owner) return false;
-  if (filter.statuses && filter.statuses.length > 0 && !filter.statuses.includes(summary.status)) return false;
-  if (filter.tag && !summary.tags.some((tag) => tag.toLowerCase() === filter.tag?.toLowerCase())) return false;
-  if (filter.dir) {
-    const needle = filter.dir.replaceAll('\\', '/').toLowerCase();
-    if (!summary.id.toLowerCase().includes(needle) && !summary.patchStats.entries.some((entry) => entry.path.toLowerCase().includes(needle))) {
-      return false;
-    }
-  }
-  if (filter.text) {
-    const needle = filter.text.toLowerCase();
-    const haystack = `${summary.title} ${summary.id} ${summary.ticket ?? ''} ${summary.tags.join(' ')}`.toLowerCase();
-    if (!haystack.includes(needle)) return false;
-  }
-  if (filter.createdAfter && timePoint(summary.createdAt) < timePoint(filter.createdAfter)) return false;
-  if (filter.createdBefore && timePoint(summary.createdAt) > timePoint(filter.createdBefore)) return false;
-  return true;
+export interface ListResult {
+  items: CandidateSummary[];
+  errors: string[];
 }
 
-function timePoint(value: string): number {
-  const parsed = new Date(value).getTime();
-  return Number.isNaN(parsed) ? Number.POSITIVE_INFINITY : parsed;
+export interface AddCommentInput {
+  author: string;
+  content: string;
+  revision?: number;
+  optionId?: string;
+  patchId?: number;
+  file?: string;
+  line?: number;
+  side?: CommentSide;
+  anchor?: CommentAnchor;
 }
 
-/** 冻结时钟和回拨也必须推进值，否则并发守卫无法检出未推进补丁版本的写入。 */
-export function nextUpdatedAt(previous: string): string {
-  const now = Date.now();
-  const prevMs = previous ? new Date(previous).getTime() : Number.NaN;
-  const nextMs = Number.isNaN(prevMs) || now > prevMs ? now : prevMs + 1;
-  return new Date(nextMs).toISOString();
+export interface BusinessBaseCheck {
+  (fromBase: string, currentBase: string): Promise<boolean>;
+}
+
+export function emptyStatusCounts(): Record<ReviewStatus, number> {
+  return {
+    pending: 0,
+    changes_requested: 0,
+    approved: 0,
+    rejected: 0,
+    repair_failed: 0,
+    human_takeover: 0,
+    awaiting_verification: 0,
+    resolved: 0,
+  };
+}
+
+function emptyFrontmatter(): ReviewFrontmatter {
+  return {
+    schemaVersion: 1,
+    findingId: '',
+    title: '',
+    module: '',
+    auditType: '',
+    issueKind: 'confirm',
+    dependsOn: null,
+    priority: 'P2',
+    baseRevision: '',
+    createdAt: '',
+    updatedAt: '',
+    owner: '',
+    tags: [],
+    ticket: null,
+    status: 'pending',
+    targetFiles: [],
+    recordRevision: 1,
+    patches: [],
+    options: [],
+    observations: [],
+    decisions: [],
+    repairAttempts: [],
+    comments: [],
+    humanDecisions: [],
+    approval: null,
+    approvalHistory: [],
+    rejection: null,
+    commitMessage: null,
+  };
+}
+
+function nextCommentId(comments: readonly ReviewComment[]): string {
+  const used = new Set(comments.map((c) => c.id));
+  let max = 0;
+  for (const comment of comments) {
+    const match = /^c(\d+)$/.exec(comment.id);
+    if (match) max = Math.max(max, Number(match[1]));
+  }
+  let candidate = max + 1;
+  while (used.has(`c${String(candidate)}`)) candidate += 1;
+  return `c${String(candidate)}`;
+}
+
+function splitAndValidateId(id: string): [string, string] {
+  const normalized = id.replaceAll('\\', '/').trim();
+  const parts = normalized.split('/');
+  if (parts.length !== 2) throw new ApiError(400, 'bad_request', `问题 id 格式非法（须为 YYYY-MM/slug）：${id}`);
+  const [month, slug] = [parts[0] ?? '', parts[1] ?? ''];
+  if (!MONTH_PATTERN.test(month) || !SLUG_PATTERN.test(slug)) {
+    throw new ApiError(400, 'bad_request', `问题 id 格式非法（slug 必须小写 ASCII）：${id}`);
+  }
+  return [month, slug];
 }
 
 export class ReviewStore {
-  private readonly fsSource: FilesystemCandidateSource;
-  /** 只缓存可证明的共享快照及其解析结果。本地视图实时计算，带扫描错误的条目在后续请求重新读取。 */
-  private readonly scanCache = new Map<string, Map<string, ScannedCandidate | null>>();
-  private static readonly SCAN_CACHE_MAX = 8;
+  readonly reviewRoot: string;
 
   constructor(readonly repoRoot: string) {
-    this.fsSource = new FilesystemCandidateSource(repoRoot);
+    this.reviewRoot = path.join(repoRoot, '.ai-review');
   }
 
-  private get aiReviewRoot(): string {
-    return path.join(this.repoRoot, '.ai-review');
+  private fsSource(): FilesystemCandidateSource {
+    return new FilesystemCandidateSource(this.repoRoot);
   }
 
-  resolveCandidateDir(id: string): { month: string; slug: string; dir: string } {
-    const normalized = id.replaceAll('\\', '/').replace(/^\/+|\/+$/g, '');
-    const parts = normalized.split('/');
-    if (parts.length !== 2) throw new ApiError(400, 'bad_request', '候选 id 必须是 YYYY-MM/slug');
-    const [month = '', slug = ''] = parts;
-    if (!MONTH_PATTERN.test(month) || !SLUG_PATTERN.test(slug)) {
-      throw new ApiError(400, 'bad_request', '候选 id 格式非法');
-    }
-    const dir = path.join(this.aiReviewRoot, month, slug);
-    ensureInside(this.aiReviewRoot, dir);
-    return { month, slug, dir };
+  dirOf(month: string, slug: string): string {
+    return path.join(this.reviewRoot, month, slug);
   }
 
-  private parseCandidateText(month: string, slug: string, text: string): ReviewCandidate {
-    const dir = path.join(this.aiReviewRoot, month, slug);
-    const reviewPath = path.join(dir, 'review.md');
-    try {
-      const parsed = parseReviewMarkdown(text);
-      const sections = parseSections(parsed.body);
-      const candidate: ReviewCandidate = {
-        id: candidateId(month, slug),
-        month,
-        slug,
-        dirPath: dir,
-        reviewPath,
-        meta: parsed.meta,
-        sections,
-        humanJudgment: extractHumanJudgment(sections.humanJudgment),
-        humanJudgmentDeclared: sections.humanJudgment.trim().length > 0,
-      };
-      const invariantErrors = quickReviewInvariants(candidate);
-      if (invariantErrors.length > 0) {
-        return this.brokenCandidate(month, slug, dir, reviewPath, invariantErrors.join('；'), candidate.meta.reopenedFrom);
-      }
-      return candidate;
-    } catch (error) {
-      if (!(error instanceof ReviewFormatError)) throw error;
-      const reopenedFrom = /^reopened_from:\s*["']?([^\s"']+)["']?\s*$/m.exec(text)?.[1] ?? null;
-      return this.brokenCandidate(month, slug, dir, reviewPath, error.message, reopenedFrom);
-    }
+  reviewFileOf(month: string, slug: string): string {
+    return path.join(this.dirOf(month, slug), 'review.md');
   }
 
-  private async readCandidate(month: string, slug: string): Promise<ReviewCandidate> {
-    return this.parseCandidateText(
-      month,
-      slug,
-      await readFile(path.join(this.aiReviewRoot, month, slug, 'review.md'), 'utf8'),
-    );
+  async listCandidateIds(source?: CandidateSource): Promise<string[]> {
+    const activeSource = source ?? this.fsSource();
+    return (await activeSource.listCandidateDirs()).sort();
   }
 
-  private brokenCandidate(
-    month: string,
-    slug: string,
-    dir: string,
-    reviewPath: string,
-    message: string,
-    reopenedFrom?: string | null,
-  ): ReviewCandidate {
-    const meta: ReviewFrontmatter = {
-      schemaVersion: 1,
-      title: slug,
-      module: '',
-      auditType: '',
-      createdAt: '',
-      updatedAt: '',
-      owner: '',
-      tags: [],
-      status: 'pending',
-      ticket: null,
-      targetFiles: [],
-      currentRevision: 0,
-      revisions: [],
-      gateChecks: [],
-      comments: [],
-      humanDecisions: [],
-      approval: null,
-      rejection: null,
-      commitMessage: '',
-      ...(reopenedFrom !== undefined ? { reopenedFrom } : {}),
-      extra: {},
-    };
-    return {
-      id: candidateId(month, slug),
-      month,
-      slug,
-      dirPath: dir,
-      reviewPath,
-      meta,
-      sections: {
-        problem: '',
-        rootCause: '',
-        solution: '',
-        humanJudgment: '',
-        evidence: '',
-        history: '',
-        rawBody: '',
-      },
-      humanJudgment: [],
-      humanJudgmentDeclared: false,
-      parseError: message,
-    };
+  async readPatchBytes(month: string, slug: string, patchName: string, source?: CandidateSource): Promise<Buffer | null> {
+    const activeSource = source ?? this.fsSource();
+    if (activeSource.readPatchBytes) {
+      return activeSource.readPatchBytes(month, slug, patchName);
+    }
+    const text = await activeSource.readPatchText(month, slug, patchName);
+    return text === null ? null : Buffer.from(text, 'utf8');
   }
 
-  private async scanCandidate(readSource: CandidateSource, month: string, slug: string): Promise<ScannedCandidate | null> {
-    try {
-      const text = await readSource.readReviewText(month, slug);
-      if (text === null) return null;
-      const candidate = this.parseCandidateText(month, slug, text);
-      const entries = await readSource.listDirEntries(month, slug).catch(() => null);
-      const entriesHas = (name: string): boolean => entries?.includes(name) ?? false;
-      const currentPatchName = currentReviewPatch(candidate.meta)?.patch ?? '';
-      let stats = EMPTY_STATS;
-      const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
-      if (candidate.parseError === undefined && currentPatchName) {
-        if (!entriesHas(currentPatchName) && !archived) {
-          throw new Error(`当前版本补丁不存在：${currentPatchName}`);
-        }
-        const patchText = entriesHas(currentPatchName) ? await readSource.readPatchText(month, slug, currentPatchName) : null;
-        // 补丁全文只用于本次解析，避免共享快照缓存随补丁体积增长。
-        if (patchText !== null) stats = parsePatch(patchText).stats;
-      }
-      let invariantErrors: string[] | null = null;
-      if (candidate.parseError === undefined) {
-        const violations = fullReviewInvariants({
-          candidate,
-          patchExists: (revision) => candidate.meta.issue ? entriesHas(revision.patch) : archived || entriesHas(revision.patch),
-          currentPatchPaths: stats === EMPTY_STATS ? null : stats.entries.map((entry) => entry.path),
-        });
-        if (violations.length > 0) invariantErrors = violations;
-      }
-      return { candidate, stats, invariantErrors, error: null };
-    } catch (error) {
-      const message = `${month}/${slug}: ${error instanceof Error ? error.message : String(error)}`;
-      return { candidate: null, stats: EMPTY_STATS, invariantErrors: null, error: message };
+  async readPatch(id: string, name: string, source?: CandidateSource): Promise<string> {
+    const [month, slug] = splitAndValidateId(id);
+    if (!/^\d{3,}\.patch$/.test(name)) {
+      throw new ApiError(400, 'bad_request', `非法补丁文件名：${name}`);
     }
-  }
-
-  private async scanCandidates(src: CandidateSource, ids: string[]): Promise<Map<string, ScannedCandidate | null>> {
-    const entries = await mapLimit(ids, SCAN_CONCURRENCY, async (id) => {
-      const [month = '', slug = ''] = id.split('/');
-      return [id, await this.scanCandidate(src, month, slug)] as const;
-    });
-    return new Map(entries);
-  }
-
-  async list(
-    filter: ReviewFilter,
-    currentBase: string | null,
-    staleDays?: number | null,
-    rejectionMemoryWindow?: number | null,
-    source?: CandidateSource,
-  ): Promise<{ items: CandidateSummary[]; errors: string[] }> {
-    const src: CandidateSource = source ?? this.fsSource;
-    const items: CandidateSummary[] = [];
-    const errors: string[] = [];
-    const memoryEntries: import('./memory.js').RejectionMemoryEntry[] = [];
-    const chainInfo = new Map<string, { reopenedFrom: string | null; status: ReviewStatus }>();
-    let sharedDirs: string[] = [];
-    try {
-      sharedDirs = await src.listCandidateDirs();
-    } catch (error) {
-      return { items, errors: [error instanceof Error ? error.message : String(error)] };
+    const candidate = await this.loadCandidate(month, slug, source);
+    if (!candidate) throw new ApiError(404, 'not_found', `问题不存在：${id}`);
+    if (candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${candidate.parseError}`);
+    if (!candidate.meta.patches.some((entry) => entry.patch === name)) {
+      throw new ApiError(404, 'not_found', `补丁 ${name} 不在问题 ${id} 的 patches 账本中`);
     }
-    const shared = new Set(sharedDirs);
-    const localOnly = new Set((await src.listLocalOnlyDirs().catch(() => [] as string[])).filter((id) => !shared.has(id)));
-    const allDirs = [...new Set([...sharedDirs, ...localOnly])].sort((left, right) => right.localeCompare(left));
-
-    const snapshotReader = (src as { snapshotId?: () => Promise<string | null> }).snapshotId;
-    const snapshot = typeof snapshotReader === 'function' ? await snapshotReader.call(src).catch(() => null) : null;
-    const cachedScan = snapshot !== null ? this.scanCache.get(snapshot) ?? null : null;
-    let scannedShared: Map<string, ScannedCandidate | null>;
-    if (cachedScan) {
-      const missing = sharedDirs.filter((id) => !cachedScan.has(id));
-      scannedShared = missing.length > 0
-        ? new Map([...cachedScan, ...await this.scanCandidates(src, missing)])
-        : cachedScan;
-    } else {
-      scannedShared = await this.scanCandidates(src, sharedDirs);
-      if (snapshot !== null) {
-        const cacheable = new Map<string, ScannedCandidate | null>();
-        for (const [id, entry] of scannedShared) {
-          if (entry?.error) continue;
-          cacheable.set(id, entry);
-        }
-        this.scanCache.set(snapshot, cacheable);
-        if (this.scanCache.size > ReviewStore.SCAN_CACHE_MAX) {
-          const first = this.scanCache.keys().next().value;
-          if (first !== undefined) this.scanCache.delete(first);
-        }
-      }
-    }
-    const scannedLocal = await this.scanCandidates(this.fsSource, [...localOnly]);
-
-    const changedIds = typeof src.localChangedCandidateIds === 'function'
-      ? await src.localChangedCandidateIds().catch(() => null)
-      : null;
-    const localOf = async (month: string, slug: string): Promise<boolean> => {
-      if (changedIds) return changedIds.has(candidateId(month, slug));
-      return src.hasLocalChanges(month, slug).catch(() => true);
-    };
-
-    for (const id of allDirs) {
-      const [month = '', slug = ''] = id.split('/');
-      const isLocalOnly = localOnly.has(id);
-      const scanned = (isLocalOnly ? scannedLocal : scannedShared).get(id);
-      if (!scanned) continue;
-      if (scanned.error !== null) {
-        errors.push(scanned.error);
-        const summary: CandidateSummary = {
-          id: candidateId(month, slug),
-          title: slug,
-          owner: '',
-          status: 'pending',
-          tags: [],
-          ticket: null,
-          currentRevision: 0,
-          createdAt: '',
-          dirPath: path.join(this.aiReviewRoot, month, slug),
-          patchStats: EMPTY_STATS,
-          unresolvedComments: 0,
-          humanJudgmentCount: 0,
-          humanJudgmentDeclared: false,
-          isBaseBehind: false,
-          baseRevision: '',
-          lastFeedback: '',
-          parseError: scanned.error,
-        };
-        // 解析失败的本地草稿也须标为本地，否则会被误作共享事实。
-        summary.local = isLocalOnly || (await localOf(month, slug)) || undefined;
-        summary.localOnly = isLocalOnly || undefined;
-        if (matchesReviewFilter(summary, filter)) items.push(summary);
-        continue;
-      }
-      const candidate = scanned.candidate;
-      if (!candidate) continue;
-      if (scanned.invariantErrors) {
-        const summary = this.toSummary(
-          this.brokenCandidate(month, slug, path.join(this.aiReviewRoot, month, slug), path.join(this.aiReviewRoot, month, slug, 'review.md'), scanned.invariantErrors.join('；')),
-          scanned.stats, currentBase, staleDays,
-        );
-        summary.reopenedFrom = candidate.meta.reopenedFrom ?? null;
-        summary.local = isLocalOnly || (await localOf(month, slug)) || undefined;
-        summary.localOnly = isLocalOnly || undefined;
-        if (matchesReviewFilter(summary, filter)) items.push(summary);
-        continue;
-      }
-      const summary = this.toSummary(candidate, scanned.stats, currentBase, staleDays);
-      summary.local = isLocalOnly || (await localOf(month, slug)) || undefined;
-      summary.localOnly = isLocalOnly || undefined;
-      if (!summary.local) {
-        chainInfo.set(candidate.id, { reopenedFrom: candidate.meta.reopenedFrom ?? null, status: candidate.meta.status });
-        if (candidate.meta.status === 'rejected') {
-          const entry = entryFromCandidate({ candidateId: candidate.id, meta: candidate.meta });
-          if (entry) memoryEntries.push(entry);
-        }
-      }
-      if (!matchesReviewFilter(summary, filter)) continue;
-      items.push(summary);
-    }
-    // I16 将指向同一被拒候选的多个直接替代者视为重开链异常。
-    const replacementCount = new Map<string, number>();
-    for (const info of chainInfo.values()) {
-      if (info.reopenedFrom) replacementCount.set(info.reopenedFrom, (replacementCount.get(info.reopenedFrom) ?? 0) + 1);
-    }
-    for (const [rejectedId, count] of replacementCount) {
-      if (count > 1) errors.push(`I16: rejected 候选 ${rejectedId} 有 ${String(count)} 个直接替代候选（应最多 1 个），相关 finding 不参与正常投影`);
-    }
-    items.sort((left, right) => {
-      const byDate = timePoint(right.createdAt) - timePoint(left.createdAt);
-      return byDate !== 0 ? byDate : right.id.localeCompare(left.id);
-    });
-    if (rejectionMemoryWindow !== undefined && rejectionMemoryWindow !== null && rejectionMemoryWindow > 0) {
-      // 只豁免该候选在自身重开链上继承的拒绝记录，链外同指纹的拒绝仍生效。
-      const chainExempted = new Map<string, Set<string>>();
-      for (const [startId, info] of chainInfo) {
-        if (!info.reopenedFrom) continue;
-        const exempt = new Set<string>();
-        const visited = new Set<string>([startId]);
-        let current: string | null = info.reopenedFrom;
-        while (current !== null && !visited.has(current)) {
-          visited.add(current);
-          const ancestor = chainInfo.get(current);
-          if (!ancestor || ancestor.status !== 'rejected') break;
-          exempt.add(current);
-          current = ancestor.reopenedFrom;
-        }
-        if (exempt.size > 0) chainExempted.set(startId, exempt);
-      }
-      const memory = memoryEntries
-        .filter((entry) => withinWindow(entry, rejectionMemoryWindow))
-        .sort((left, right) => right.rejectedAtMs - left.rejectedAtMs);
-      for (const item of items) {
-        if (item.local || item.parseError || item.status === 'rejected' || item.status === 'approved') continue;
-        const exempt = chainExempted.get(item.id);
-        const match = memory.find((entry) => entry.fingerprint === item.fingerprint && !(exempt?.has(entry.candidateId) ?? false));
-        if (match) item.duplicateOf = match.candidateId;
-      }
-    }
-    return { items, errors };
-  }
-
-  private toSummary(candidate: ReviewCandidate, stats: PatchStats, currentBase: string | null, staleDays?: number | null): CandidateSummary {
-    const current = currentReviewPatch(candidate.meta);
-    const baseRevision = current?.baseRevision ?? '';
-    const unresolved = candidate.meta.comments.filter((comment) => comment.status !== 'resolved').length;
-    const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
-    const anchor = new Date(candidate.meta.updatedAt || candidate.meta.createdAt).getTime();
-    const isStale = staleDays !== undefined && staleDays !== null && staleDays > 0 && !archived
-      && !Number.isNaN(anchor) && (Date.now() - anchor) / 86_400_000 >= staleDays;
-    return {
-      id: candidate.id,
-      schemaVersion: candidate.meta.schemaVersion,
-      ...(candidate.meta.issue ? { issue: structuredClone(candidate.meta.issue) } : {}),
-      title: candidate.meta.title,
-      owner: candidate.meta.owner,
-      status: candidate.meta.status,
-      // 返回值可能被调用方修改，防止修改传播到跨请求共享的扫描缓存。
-      tags: [...candidate.meta.tags],
-      ticket: candidate.meta.ticket,
-      currentRevision: candidate.meta.currentRevision,
-      createdAt: candidate.meta.createdAt,
-      dirPath: candidate.dirPath,
-      patchStats: { files: stats.files, additions: stats.additions, deletions: stats.deletions, entries: stats.entries.map((entry) => ({ ...entry })) },
-      unresolvedComments: unresolved,
-      humanJudgmentCount: candidate.humanJudgment.length,
-      humanJudgmentDeclared: candidate.humanJudgmentDeclared,
-      isBaseBehind: !archived && currentBase !== null && baseRevision !== '' && baseRevision !== currentBase,
-      baseRevision,
-      lastFeedback: findLastFeedback(candidate.meta),
-      reopenedFrom: candidate.meta.reopenedFrom ?? null,
-      ...(candidate.meta.findingId !== undefined ? { findingId: candidate.meta.findingId } : {}),
-      fingerprint: fingerprintOf(candidate.meta),
-      ...(isStale ? { isStale: true } : {}),
-      ...(candidate.parseError ? { parseError: candidate.parseError } : {}),
-    };
-  }
-
-  private patchPathFor(candidate: ReviewCandidate, patchName: string): string {
-    const name = path.basename(patchName);
-    if (name !== patchName || name.includes('..')) {
-      throw new ApiError(400, 'bad_request', 'patch 文件名非法');
-    }
-    return path.join(candidate.dirPath, name);
-  }
-
-  async get(id: string, currentBase: string | null, source?: CandidateSource, selection?: IssueSelection): Promise<CandidateDetail> {
-    const src = source ?? this.fsSource;
-    const { month, slug } = this.resolveCandidateDir(id);
-    const text = await src.readReviewText(month, slug);
-    if (text === null) {
-      throw new ApiError(404, 'not_found', `候选不存在：${id}`);
-    }
-    const candidate = this.parseCandidateText(month, slug, text);
-    // 保留损坏候选的诊断入口，使用户能看到错误并处理该候选。
-    if (candidate.parseError) {
-      return {
-        candidate,
-        currentBase,
-        isBaseBehind: false,
-        patchText: '',
-        patchStats: EMPTY_STATS,
-      };
-    }
-    const current = currentReviewPatch(candidate.meta, selection);
-    if (!current && candidate.meta.issue) return { candidate, currentBase, isBaseBehind: false, patchText: '', patchStats: EMPTY_STATS };
-    if (!current) throw new ApiError(500, 'internal', '当前版本元数据缺失');
-    const entries = await src.listDirEntries(month, slug).catch(() => null);
-    const hasPatch = entries?.includes(current.patch) ?? false;
-    const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
-    if (!hasPatch && !archived) {
-      throw new ApiError(422, 'bad_request', `当前版本补丁不存在：${current.patch}`);
-    }
-    const patchText = hasPatch ? (await src.readPatchText(month, slug, current.patch)) ?? '' : '';
-    return {
-      candidate,
-      currentBase,
-      isBaseBehind: currentBase !== null && current.baseRevision !== currentBase,
-      patchText,
-      patchStats: patchText ? parsePatch(patchText).stats : EMPTY_STATS,
-    };
-  }
-
-  async readPatch(id: string, patchName: string, source?: CandidateSource): Promise<string> {
-    const src = source ?? this.fsSource;
-    const { month, slug } = this.resolveCandidateDir(id);
-    const name = path.basename(patchName);
-    if (name !== patchName || name.includes('..')) {
-      throw new ApiError(400, 'bad_request', 'patch 文件名非法');
-    }
-    const text = await src.readPatchText(month, slug, patchName);
-    if (text === null) throw new ApiError(404, 'not_found', `补丁不存在：${patchName}`);
+    const text = await (source ?? this.fsSource()).readPatchText(month, slug, name);
+    if (text === null) throw new ApiError(404, 'not_found', `补丁文件缺失：${name}`);
     return text;
   }
 
-  /** 评审目录必须解析到实际仓库内，且目标文件不能是符号链接。 */
-  private async ensureSafeWriteTarget(filePath: string): Promise<void> {
-    const dir = path.dirname(filePath);
-    const realDir = await realpath(dir).catch(() => null);
-    const realRepo = await realpath(this.repoRoot).catch(() => path.resolve(this.repoRoot));
-    const realRoot = await realpath(this.aiReviewRoot).catch(() => path.resolve(this.aiReviewRoot));
-    if (!realDir) throw new ApiError(422, 'bad_request', `写入目录不存在：${dir}`);
-    ensureInside(realRepo, realRoot);
-    ensureInside(realRoot, realDir);
-    const existing = await lstat(filePath).catch(() => null);
-    if (existing?.isSymbolicLink()) {
-      throw new ApiError(422, 'bad_request', `拒绝写入符号链接目标：${filePath}`);
-    }
-  }
-
-  async write(candidate: ReviewCandidate, options?: { touchUpdatedAt?: boolean }): Promise<void> {
-    await this.ensureSafeWriteTarget(candidate.reviewPath);
-    if (options?.touchUpdatedAt !== false) {
-      candidate.meta.updatedAt = nextUpdatedAt(candidate.meta.updatedAt);
-      if (candidate.meta.issue) candidate.meta.currentRevision += 1;
-    }
-    const text = serializeReviewMarkdown(candidate.meta, candidate.sections.rawBody);
-    const temp = `${candidate.reviewPath}.tmp-${String(process.pid)}`;
-    await writeFile(temp, text, 'utf8');
-    await rename(temp, candidate.reviewPath);
-    // 检测首次校验之后父目录被换成符号链接的情况。
-    const realAfter = await realpath(path.dirname(candidate.reviewPath)).catch(() => null);
-    const realRoot = await realpath(this.aiReviewRoot).catch(() => path.resolve(this.aiReviewRoot));
-    if (realAfter) ensureInside(realRoot, realAfter);
-    candidate.sections = parseSections(candidate.sections.rawBody);
-    candidate.humanJudgment = extractHumanJudgment(candidate.sections.humanJudgment);
-    candidate.humanJudgmentDeclared = candidate.sections.humanJudgment.trim().length > 0;
-  }
-
-  async ensureWriteAllowed(candidate: ReviewCandidate, guard: ConcurrencyGuard): Promise<void> {
-    const staleDetails = () => ({
-      currentRevision: candidate.meta.currentRevision,
-      currentOwner: candidate.meta.owner,
-      currentUpdatedAt: candidate.meta.updatedAt,
-    });
-    if (guard.expectedRevision !== candidate.meta.currentRevision || guard.expectedOwner !== candidate.meta.owner) {
-      throw new ApiError(409, 'stale', '候选已被其他人更新，请重新加载', staleDetails());
-    }
-    const expectedAt = new Date(guard.expectedUpdatedAt).getTime();
-    const currentAt = new Date(candidate.meta.updatedAt).getTime();
-    if (Number.isNaN(expectedAt) || expectedAt !== currentAt) {
-      throw new ApiError(409, 'stale', '候选已被其他人更新，请重新加载', staleDetails());
-    }
-    if (candidate.meta.status === 'approved' || candidate.meta.status === 'rejected' || candidate.meta.status === 'resolved') {
-      throw new ApiError(409, 'conflict', '该候选已归档，不能再修改');
-    }
-  }
-
-  private async normalizeCommentInput(
-    candidate: ReviewCandidate,
-    input: { selection?: IssueSelection; content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> } },
-  ): Promise<{ extra?: Record<string, unknown>; content: string; revision: number; file: string; line: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> } }> {
-    const content = input.content.trim();
-    if (!content) throw new ApiError(422, 'bad_request', '意见内容不能为空');
-    const revision = input.revision ?? candidate.meta.currentRevision;
-    if (!Number.isInteger(revision) || (candidate.meta.schemaVersion === 3 ? revision < 1 || revision > candidate.meta.currentRevision : !candidate.meta.revisions.some((item) => item.id === revision))) {
-      throw new ApiError(422, 'bad_request', `评论 revision 必须指向已有版本：${String(revision)}`);
-    }
-    const selection = candidate.meta.schemaVersion === 3 ? input.selection : undefined;
-    if (selection) selectIssuePatch(candidate.meta, selection);
-    const binding = selection ? { extra: { option_id: selection.optionId, patch_id: selection.patchId } } : {};
-    const file = (input.file ?? '').replaceAll('\\', '/');
-    const line = input.line ?? 0;
-    if (file === '') {
-      if (line !== 0) throw new ApiError(422, 'bad_request', '总体评论必须 line=0');
-      if (input.side !== undefined) throw new ApiError(422, 'bad_request', '总体评论不能携带 side');
-      if (input.anchor !== undefined) throw new ApiError(422, 'bad_request', '总体评论不能携带 anchor');
-      return { ...binding, content, revision, file: '', line: 0 };
-    }
-    if (candidate.meta.schemaVersion === 3 && !selection) throw new ApiError(422, 'bad_request', '行内意见必须绑定明确的方案和补丁');
-    if (!isRepoRelativePath(file)) throw new ApiError(422, 'bad_request', `行内评论文件不是合法仓库相对路径：${file}`);
-    if (!Number.isInteger(line) || line <= 0) throw new ApiError(422, 'bad_request', '行内评论 line 必须为正整数');
-    if (input.side !== 'LEFT' && input.side !== 'RIGHT') {
-      throw new ApiError(422, 'bad_request', '行内评论必须指明 LEFT 或 RIGHT');
-    }
-    let anchor = input.anchor;
-    if (anchor !== undefined) {
-      if (!anchor.snippet.trim()) throw new ApiError(422, 'bad_request', 'anchor.snippet 不能为空');
-      anchor = {
-        snippet: anchor.snippet,
-        ...(typeof anchor.before === 'string' && anchor.before ? { before: anchor.before } : {}),
-        ...(typeof anchor.after === 'string' && anchor.after ? { after: anchor.after } : {}),
-        ...(anchor.extra ? { extra: anchor.extra } : {}),
-      };
-    } else {
-      anchor = await this.extractHostAnchor(candidate, selection?.patchId ?? revision, file, line, input.side);
-    }
-    return { ...binding, content, revision, file, line, side: input.side, ...(anchor ? { anchor } : {}) };
-  }
-
-  private async extractHostAnchor(
-    candidate: ReviewCandidate,
-    revision: number,
-    file: string,
-    line: number,
-    side: 'LEFT' | 'RIGHT',
-  ): Promise<{ snippet: string; before?: string; after?: string } | undefined> {
-    const entry = candidate.meta.revisions.find((item) => item.id === revision);
-    if (!entry) return undefined;
+  async loadCandidate(month: string, slug: string, source?: CandidateSource): Promise<ReviewCandidate | null> {
+    const activeSource = source ?? this.fsSource();
+    const id = `${month}/${slug}`;
+    const dirPath = this.dirOf(month, slug);
+    const reviewPath = this.reviewFileOf(month, slug);
+    const text = await activeSource.readReviewText(month, slug);
+    if (text === null) return null;
     try {
-      const patchText = await readFile(path.join(candidate.dirPath, entry.patch), 'utf8');
-      return anchorFromPatch(patchText, file, line, side);
-    } catch {
-      return undefined;
+      const parsed = parseReviewMarkdown(text);
+      const quickErrors = quickReviewInvariants({ id, month, slug, meta: parsed.meta });
+      return {
+        id,
+        month,
+        slug,
+        dirPath,
+        reviewPath,
+        meta: parsed.meta,
+        body: parsed.body,
+        sections: parsed.sections,
+        humanJudgment: parsed.humanJudgment,
+        humanJudgmentDeclared: parsed.humanJudgmentDeclared,
+        ...(quickErrors.length > 0 ? { parseError: quickErrors.join('；') } : {}),
+      };
+    } catch (error) {
+      return {
+        id,
+        month,
+        slug,
+        dirPath,
+        reviewPath,
+        meta: emptyFrontmatter(),
+        body: '',
+        sections: { problem: '', rootCause: '', solution: '', humanJudgment: '', evidence: '', history: '' },
+        humanJudgment: [],
+        humanJudgmentDeclared: false,
+        parseError: error instanceof Error ? error.message : String(error),
+      };
     }
   }
 
-  async addComment(
-    id: string,
-    author: string,
-    input: { selection?: IssueSelection; content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string } },
-    guard: ConcurrencyGuard,
-  ): Promise<ReviewCandidate> {
-    const { month, slug } = this.resolveCandidateDir(id);
-    const candidate = await this.readCandidate(month, slug);
-    if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
-    await this.ensureWriteAllowed(candidate, guard);
-    const normalized = await this.normalizeCommentInput(candidate, input);
-    const comment: ReviewComment = {
-      id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
-      ...normalized,
-      author,
-      status: 'unresolved',
-      createdAt: new Date().toISOString(),
-    };
-    candidate.meta.comments.push(comment);
-    if (candidate.meta.status === 'pending') candidate.meta.status = 'changes_requested';
-    await this.write(candidate);
-    return candidate;
-  }
-
-  /** 恢复审核只改变候选状态，不要求作者重新生产补丁。 */
-  async resume(id: string, guard: ConcurrencyGuard): Promise<ReviewCandidate> {
-    const { month, slug } = this.resolveCandidateDir(id);
-    const candidate = await this.readCandidate(month, slug);
-    if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
-    await this.ensureWriteAllowed(candidate, guard);
-    if (candidate.meta.status !== 'changes_requested') {
-      throw new ApiError(409, 'conflict', `只有 changes_requested 可转回 pending（当前 ${candidate.meta.status}）`);
-    }
-    candidate.meta.status = 'pending';
-    await this.write(candidate);
-    return candidate;
-  }
-
-  /** 任一评论无效时整批不落盘，避免修正输入后重试时重复写入先前的评论。 */
-  async addComments(
-    id: string,
-    author: string,
-    inputs: Array<{ selection?: IssueSelection; content: string; file?: string; line?: number; revision?: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string } }>,
-    guard: ConcurrencyGuard,
-  ): Promise<ReviewCandidate> {
-    if (inputs.length === 0) throw new ApiError(422, 'bad_request', '批量评论不能为空');
-    const { month, slug } = this.resolveCandidateDir(id);
-    const candidate = await this.readCandidate(month, slug);
-    if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
-    await this.ensureWriteAllowed(candidate, guard);
-    const normalized: Array<{ content: string; revision: number; file: string; line: number; side?: 'LEFT' | 'RIGHT'; anchor?: { snippet: string; before?: string; after?: string } }> = [];
-    for (const input of inputs) {
-      normalized.push(await this.normalizeCommentInput(candidate, input));
-    }
-    const comments: ReviewComment[] = normalized.map((item) => ({
-      id: `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
-      ...item,
-      author,
-      status: 'unresolved' as const,
-      createdAt: new Date().toISOString(),
-    }));
-    candidate.meta.comments.push(...comments);
-    if (candidate.meta.status === 'pending') candidate.meta.status = 'changes_requested';
-    await this.write(candidate);
-    return candidate;
-  }
-
-  async setCommentStatus(
-    id: string,
-    commentId: string,
-    status: ReviewComment['status'],
-    guard: ConcurrencyGuard,
-  ): Promise<ReviewCandidate> {
-    const { month, slug } = this.resolveCandidateDir(id);
-    const candidate = await this.readCandidate(month, slug);
-    if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
-    await this.ensureWriteAllowed(candidate, guard);
-    const comment = candidate.meta.comments.find((item) => item.id === commentId);
-    if (!comment) throw new ApiError(404, 'not_found', '意见不存在');
-    comment.status = status;
-    await this.write(candidate);
-    return candidate;
-  }
-
-  async transferOwner(id: string, owner: string, guard: ConcurrencyGuard): Promise<ReviewCandidate> {
-    const { month, slug } = this.resolveCandidateDir(id);
-    const candidate = await this.readCandidate(month, slug);
-    if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
-    await this.ensureWriteAllowed(candidate, guard);
-    const next = owner.trim();
-    if (!next) throw new ApiError(400, 'bad_request', '新负责人不能为空');
-    candidate.meta.owner = next;
-    await this.write(candidate);
-    return candidate;
-  }
-
-  async reject(
-    id: string,
-    reason: string,
-    guard: ConcurrencyGuard,
-    options?: { rejectedBy?: string; requireStaleDays?: number; category?: string; relatedSymbols?: string[] },
-  ): Promise<ReviewCandidate> {
-    const { month, slug } = this.resolveCandidateDir(id);
-    const candidate = await this.readCandidate(month, slug);
-    if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
-    await this.ensureWriteAllowed(candidate, guard);
-    const trimmed = reason.trim();
-    if (!trimmed) throw new ApiError(422, 'bad_request', '放弃原因不能为空');
-    if (options?.category !== undefined && !options.category.trim()) {
-      throw new ApiError(422, 'bad_request', '拒绝分类必须是非空字符串');
-    }
-    if (options?.requireStaleDays !== undefined) {
-      const anchor = new Date(candidate.meta.updatedAt || candidate.meta.createdAt).getTime();
-      const ageDays = (Date.now() - anchor) / 86_400_000;
-      if (Number.isNaN(anchor)) throw new ApiError(422, 'bad_request', 'updated_at 无法解析，不能判定超时');
-      if (ageDays < options.requireStaleDays) {
-        throw new ApiError(409, 'conflict', `未超过 stale_days（${String(options.requireStaleDays)} 天，当前 ${ageDays.toFixed(1)} 天），不能按超时归档`);
-      }
-    }
-    candidate.meta.status = 'rejected';
-    candidate.meta.approval = null;
-    // 补丁会在拒绝后删除，须先保存可供后续复查的关联符号。
-    candidate.meta.rejection = {
-      rejectedBy: options?.rejectedBy ?? guard.expectedOwner,
-      rejectedAt: new Date().toISOString(),
-      reason: trimmed,
-      ...((options?.category !== undefined || (options?.relatedSymbols?.length ?? 0) > 0)
-        ? {
-            extra: {
-              ...(options?.category !== undefined ? { category: options.category } : {}),
-              ...(options?.relatedSymbols && options.relatedSymbols.length > 0 ? { related_symbols: options.relatedSymbols } : {}),
-            },
-          }
-        : {}),
-    };
-    candidate.sections.rawBody = appendVersionSection(
-      candidate.sections.rawBody,
-      candidate.meta.currentRevision,
-      candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision)?.baseRevision ?? '',
-      `### 放弃\n${trimmed}`,
-    );
-    await this.write(candidate);
-    return candidate;
-  }
-
-  /** 调用方负责核验 Owner 的人工操作，防止自动流程自行豁免拒绝记忆。 */
-  async reopen(
-    id: string,
-    fromId: string,
-    reason: string,
-    guard: ConcurrencyGuard,
-    source?: CandidateSource,
-  ): Promise<ReviewCandidate> {
-    const readShared = async (candidateKey: string): Promise<ReviewCandidate> => {
-      const resolved = this.resolveCandidateDir(candidateKey);
-      if (!source) return this.readCandidate(resolved.month, resolved.slug);
-      const text = await source.readReviewText(resolved.month, resolved.slug);
-      if (text === null) throw new ApiError(404, 'not_found', `共享候选不存在：${candidateKey}`);
-      return this.parseCandidateText(resolved.month, resolved.slug, text);
-    };
-    const candidate = await readShared(id);
-    if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
-    await this.ensureWriteAllowed(candidate, guard);
-    const trimmedReason = reason.trim();
-    if (!trimmedReason) throw new ApiError(422, 'bad_request', '重开理由不能为空');
-    const fromCandidate = await readShared(fromId);
-    if (fromCandidate.parseError) throw new ApiError(422, 'bad_request', `被拒候选无法解析：${fromCandidate.parseError}`);
-    if (fromCandidate.meta.status !== 'rejected' || !fromCandidate.meta.rejection) {
-      throw new ApiError(409, 'conflict', `reopened_from 必须指向 rejected 候选：${fromId}`);
-    }
-    if (await this.hasDirectReplacement(fromId, candidate.id, source)) {
-      throw new ApiError(409, 'conflict', `被拒候选 ${fromId} 已有直接替代候选，不能再重开（I16）`);
-    }
-    candidate.meta.reopenedFrom = fromId;
-    candidate.meta.reopenedReason = trimmedReason;
-    await this.write(candidate);
-    return candidate;
-  }
-
-  private async hasDirectReplacement(fromId: string, excludeId: string, source?: CandidateSource): Promise<boolean> {
-    if (source) {
-      for (const id of await source.listCandidateDirs()) {
-        if (id === excludeId) continue;
-        const { month, slug } = this.resolveCandidateDir(id);
-        const text = await source.readReviewText(month, slug);
-        if (text === null) throw new Error(`无法读取共享候选 ${id}，不能证明重开唯一性`);
-        const candidate = this.parseCandidateText(month, slug, text);
-        if (candidate.meta.reopenedFrom === fromId) return true;
-      }
-      return false;
-    }
-    const months = await readdir(this.aiReviewRoot, { withFileTypes: true }).catch(() => []);
-    for (const monthEntry of months) {
-      if (!monthEntry.isDirectory() || !MONTH_PATTERN.test(monthEntry.name)) continue;
-      const month = monthEntry.name;
-      const slugs = await readdir(path.join(this.aiReviewRoot, month), { withFileTypes: true }).catch(() => []);
-      for (const slugEntry of slugs) {
-        if (!slugEntry.isDirectory()) continue;
-        const slug = slugEntry.name;
-        if (candidateId(month, slug) === excludeId) continue;
-        const candidate = await this.readCandidate(month, slug);
-        if (candidate.meta.reopenedFrom === fromId) return true;
-      }
-    }
-    return false;
-  }
-
-  /** 调用方负责隔离工作区并运行门禁。此处写入评审数据和补丁。 */
-  async appendRevision(
-    id: string,
-    input: { baseRevision: string; patchText: string; optionId?: string },
-    guard: ConcurrencyGuard,
-  ): Promise<ReviewCandidate> {
-    const { month, slug } = this.resolveCandidateDir(id);
-    const candidate = await this.readCandidate(month, slug);
-    if (candidate.parseError) throw new ApiError(422, 'bad_request', candidate.parseError);
-    await this.ensureWriteAllowed(candidate, guard);
-    const selected = candidate.meta.issue
-      ? candidate.meta.issue.options.find(option => option.id === input.optionId)
-      : undefined;
-    if (candidate.meta.issue && !selected) throw new ApiError(422, 'bad_request', '修订问题补丁须明确方案编号');
-    const nextId = candidate.meta.issue ? candidate.meta.revisions.length + 1 : candidate.meta.currentRevision + 1;
-    const patchName = `${String(nextId).padStart(3, '0')}.patch`;
-    const { writeFile: writePatchFile } = await import('node:fs/promises');
-    const patchPath = path.join(candidate.dirPath, patchName);
-    await this.ensureSafeWriteTarget(patchPath);
-    await writePatchFile(patchPath, input.patchText, 'utf8');
-    candidate.meta.revisions.push({ id: nextId, baseRevision: input.baseRevision, patch: patchName, author: 'ai',
-      ...(selected ? { extra: { option_id: selected.id } } : {}) });
-    if (selected) selected.currentPatch = nextId;
-    else candidate.meta.currentRevision = nextId;
-    candidate.meta.status = 'pending';
-    candidate.meta.approval = null;
-    await this.write(candidate);
-    return candidate;
-  }
-
-  async applyApproval(
-    candidate: ReviewCandidate,
-    approvedBy: string,
-    report: ValidationReport,
-    decisions?: { confirmed: string[]; waived: { id: string; reason: string }[] },
-    selection?: IssueSelection,
-    binding?: { baseRevision: string; patchSha256: string },
-  ): Promise<void> {
-    candidate.meta.status = 'approved';
-    candidate.meta.approval = {
-      approvedBy,
-      approvedAt: new Date().toISOString(),
-      // 业务提交版本从 VCS 历史派生，避免为回填哈希额外产生一次提交。
-      gateChecks: report.results.map(result => result.command),
-      gateResults: report.results.map((result) => ({
-        command: result.command,
-        exit_code: result.exitCode ?? -1,
-        duration_ms: result.durationMs,
-      })),
-      confirmedDecisions: decisions ? [...decisions.confirmed] : [],
-      waivedDecisions: decisions ? decisions.waived.map((item) => ({ ...item })) : [],
-      ...(selection ? { extra: { option_id: selection.optionId, patch_id: selection.patchId,
-        record_revision: candidate.meta.currentRevision, base_revision: binding?.baseRevision, patch_sha256: binding?.patchSha256 } } : {}),
-    };
-    const current = currentReviewPatch(candidate.meta, selection);
-    if (candidate.meta.issue && selection) candidate.meta.issue.repairAttempts.push({ ...selection,
-      baseRevision: binding?.baseRevision ?? current?.baseRevision ?? candidate.meta.issue.baseRevision, at: candidate.meta.approval.approvedAt,
-      actor: approvedBy, result: 'applied', restored: false, evidence: report.formattedEvidenceMarkdown });
-    candidate.sections.rawBody = appendVersionSection(
-      candidate.sections.rawBody,
-      candidate.meta.currentRevision,
-      current?.baseRevision ?? '',
-      ['### 验证结果', report.formattedEvidenceMarkdown, '### 人类总体意见', `批准（${approvedBy}）`].join('\n\n'),
-    );
-    await this.write(candidate);
-  }
-
-  async validateCandidate(candidate: ReviewCandidate): Promise<string[]> {
-    if (candidate.meta.issue) {
-      const errors = issueInvariantErrors(candidate.meta);
-      if (!candidate.meta.owner) errors.push('owner 为空');
-      if (candidate.meta.issue.options.length && !candidate.humanJudgmentDeclared) errors.push('需人工判断项未填写');
-      return errors;
-    }
-    const errors: string[] = [];
-    const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
-    const ids = new Set<number>();
-    for (const revision of candidate.meta.revisions) {
-      if (ids.has(revision.id)) errors.push(`重复的版本号：${String(revision.id)}`);
-      ids.add(revision.id);
-      if (!Number.isInteger(revision.id) || revision.id <= 0) errors.push(`版本号必须是正整数：${String(revision.id)}`);
-      if (!archived) {
-        const patchPath = this.patchPathFor(candidate, revision.patch);
-        if (!existsSync(patchPath)) errors.push(`版本 ${String(revision.id)} 的补丁不存在：${revision.patch}`);
-      }
-    }
-    const current = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision);
-    if (!current) errors.push('current_revision 不在 revisions 中');
-    if (!archived && candidate.meta.gateChecks.length === 0) errors.push('gate_checks 为空：批准前必须定义合并门禁命令');
-    if (!candidate.meta.owner) errors.push('owner 为空');
-    if (!archived && !candidate.humanJudgmentDeclared) {
+  async validateFullCandidate(candidate: ReviewCandidate, source?: CandidateSource): Promise<string[]> {
+    if (candidate.parseError) return [candidate.parseError];
+    const activeSource = source ?? this.fsSource();
+    const entries = await activeSource.listDirEntries(candidate.month, candidate.slug);
+    if (entries === null) return [`问题目录不存在：${candidate.id}`];
+    const errors = await fullReviewInvariants({
+      id: candidate.id,
+      month: candidate.month,
+      slug: candidate.slug,
+      meta: candidate.meta,
+      patchFilesOnDisk: entries,
+      readPatchBytes: (patchName) => this.readPatchBytes(candidate.month, candidate.slug, patchName, activeSource),
+    });
+    if (!candidate.humanJudgmentDeclared) {
       errors.push('需人工判断项未填写');
     }
     return errors;
   }
 
-  async currentPatch(candidate: ReviewCandidate, source?: CandidateSource, selection?: IssueSelection): Promise<{ path: string; text: string; baseRevision: string }> {
-    const current = currentReviewPatch(candidate.meta, selection);
-    if (!current) throw new ApiError(500, 'internal', '当前版本缺失');
-    const patchPath = this.patchPathFor(candidate, current.patch);
-    const text = source
-      ? await source.readPatchText(candidate.month, candidate.slug, current.patch)
-      : await readFile(patchPath, 'utf8');
-    if (text === null) throw new ApiError(404, 'not_found', `共享快照中不存在补丁：${current.patch}`);
-    return {
-      path: patchPath,
-      text,
-      baseRevision: current.baseRevision,
-    };
-  }
+  /** 读取共享快照中的全部合法问题记录（用于跨问题校验、负向记忆与 /findings 投影；排除有本地未提交改动的候选，遵循 SPEC §7.1）。 */
+  async listSharedCandidates(source?: CandidateSource): Promise<{ candidates: ReviewCandidate[]; errors: string[] }> {
+    const activeSource: CandidateSource = source ?? this.fsSource();
+    const ids = await this.listCandidateIds(activeSource);
+    const localChanged = activeSource.localChangedCandidateIds ? await activeSource.localChangedCandidateIds() : null;
+    const candidates: ReviewCandidate[] = [];
+    const errors: string[] = [];
+    const findingIdMap = new Map<string, string[]>();
 
-  /** 只交付共享补丁内容，避免共享流程通过返回的路径读到工作区草稿。 */
-  async readSharedPatch(
-    candidate: ReviewCandidate,
-    source: CandidateSource,
-    revisionId?: number,
-  ): Promise<{ revision: number; patchName: string; text: string; baseRevision: string }> {
-    const revision = revisionId === undefined
-      ? currentReviewPatch(candidate.meta)
-      : candidate.meta.revisions.find((item) => item.id === revisionId);
-    if (!revision) throw new ApiError(500, 'internal', '版本缺失');
-    const text = await source.readPatchText(candidate.month, candidate.slug, revision.patch);
-    if (text === null) {
-      throw new ApiError(404, 'not_found', `共享快照中不存在补丁：${revision.patch}（候选 ${candidate.id}）`);
+    for (const id of ids) {
+      const [month, slug] = id.split('/');
+      if (!month || !slug) continue;
+      if (localChanged?.has(id)) continue;
+      if (!localChanged && activeSource.hasLocalChanges && await activeSource.hasLocalChanges(month, slug)) continue;
+      const candidate = await this.loadCandidate(month, slug, activeSource);
+      if (!candidate) continue;
+      if (!candidate.parseError && candidate.meta.findingId) {
+        const list = findingIdMap.get(candidate.meta.findingId) ?? [];
+        list.push(id);
+        findingIdMap.set(candidate.meta.findingId, list);
+      }
+      candidates.push(candidate);
     }
-    return { revision: revision.id, patchName: revision.patch, text, baseRevision: revision.baseRevision };
-  }
 
-  async validateFullCandidate(
-    candidate: ReviewCandidate,
-    source?: CandidateSource,
-    associationSource?: CandidateSource,
-  ): Promise<string[]> {
-    const errors = await this.validateCandidate(candidate);
-    const current = currentReviewPatch(candidate.meta);
-    if (!current && !candidate.meta.issue) return errors;
-    const entries = source
-      ? await source.listDirEntries(candidate.month, candidate.slug).catch(() => null)
-      : await readdir(candidate.dirPath).catch(() => null);
-    const archived = candidate.meta.status === 'approved' || candidate.meta.status === 'rejected';
-    if (candidate.meta.schemaVersion === 3) {
-      for (const revision of candidate.meta.revisions) {
-        const text = source ? await source.readPatchText(candidate.month, candidate.slug, revision.patch)
-          : await readFile(this.patchPathFor(candidate, revision.patch), 'utf8').catch(() => null);
-        if (text === null) { errors.push('历史补丁不可读：' + revision.patch); continue; }
-        if (revision.extra?.['sha256'] && createHash('sha256').update(text).digest('hex') !== revision.extra['sha256']) errors.push('补丁内容与问题版本绑定的摘要不匹配：' + revision.patch);
-        const paths = parsePatch(text).paths;
-        if (paths.some(file => isAiReviewPath(file))) errors.push('补丁包含禁止路径：' + revision.patch);
-        if (candidate.meta.issue?.options.some(option => option.currentPatch === revision.id)
-          && paths.some(file => !candidate.meta.targetFiles.includes(file))) errors.push('方案补丁越出问题声明的文件范围：' + revision.patch);
-      }
-    }
-    let currentPatchPaths: string[] | null = null;
-    if (!archived && current) {
-      try {
-        const text = source
-          ? await source.readPatchText(candidate.month, candidate.slug, current.patch)
-          : await readFile(this.patchPathFor(candidate, current.patch), 'utf8');
-        if (text === null) errors.push(`I5: 无法读取当前补丁 ${current.patch}，不能证明 target_files 一致`);
-        else currentPatchPaths = parsePatch(text).paths.filter((file) => !isAiReviewPath(file));
-      } catch {
-        errors.push(`I5: 无法读取当前补丁 ${current.patch}，不能证明 target_files 一致`);
-      }
-    }
-    const linkedSource = associationSource ?? source;
-    const reopenedTargetRejected = candidate.meta.reopenedFrom
-      ? await (async (): Promise<((target: string) => boolean | null) | undefined> => {
-          try {
-            const { month, slug } = this.resolveCandidateDir(candidate.meta.reopenedFrom ?? '');
-            const targetCandidate = linkedSource
-              ? await (async () => {
-                  const text = await linkedSource.readReviewText(month, slug);
-                  return text === null ? null : this.parseCandidateText(month, slug, text);
-                })()
-              : await this.readCandidate(month, slug);
-            const rejected = targetCandidate !== null && targetCandidate.parseError === undefined
-              && targetCandidate.meta.status === 'rejected' && targetCandidate.meta.rejection !== null;
-            return () => rejected;
-          } catch {
-            return () => false;
+    for (const [findingId, dupIds] of findingIdMap) {
+      if (dupIds.length > 1) {
+        const message = `重复的 finding_id（${findingId}）出现在多个问题目录：${dupIds.join(', ')}`;
+        errors.push(message);
+        for (const candidate of candidates) {
+          if (dupIds.includes(candidate.id)) {
+            candidate.parseError = candidate.parseError ? `${candidate.parseError}；${message}` : message;
           }
-        })()
-      : undefined;
-    errors.push(...fullReviewInvariants({
-      candidate,
-      patchExists: (revision) => entries?.includes(revision.patch) ?? false,
-      currentPatchPaths,
-      ...(reopenedTargetRejected ? { reopenedTargetRejected } : {}),
-    }));
-    return [...new Set(errors)];
+        }
+      }
+    }
+
+    return { candidates, errors };
   }
 
-  async listStatusCounts(owner: string, source?: CandidateSource): Promise<Record<ReviewStatus, number>> {
-    const counts = {
-      pending: 0,
-      changes_requested: 0,
-      approved: 0,
-      rejected: 0,
-    } as Record<ReviewStatus, number>;
-    const { items } = await this.list({ owner }, null, undefined, undefined, source);
-    for (const item of items) if (!item.local) counts[item.status] = (counts[item.status] ?? 0) + 1;
+  /** AC-READ-01 / §3.1：检测 .ai-review/ 下非规范目录或开发期遗留文件（如 findings/），仅诊断不阻断合法问题。 */
+  async nonCanonicalReviewEntries(source?: CandidateSource): Promise<string[]> {
+    const activeSource = source ?? this.fsSource();
+    const entries = activeSource.listTopLevelReviewEntries
+      ? await activeSource.listTopLevelReviewEntries()
+      : await this.fsSource().listTopLevelReviewEntries();
+    const diagnostics: string[] = [];
+    for (const name of entries) {
+      if (name === 'reviewers.yml' || name === 'audits' || MONTH_PATTERN.test(name)) continue;
+      diagnostics.push(`检测到非规范或遗留评审目录/文件 .ai-review/${name}，不参与当前共享流程，请手动清理。`);
+    }
+    return diagnostics;
+  }
+
+  async list(
+    filter: ReviewFilter,
+    currentBase: string | null,
+    isBehind?: BusinessBaseCheck,
+    nowMs: number = Date.now(),
+    source?: CandidateSource,
+    reviewersSource?: { readReviewersText(): Promise<string | null> },
+  ): Promise<ListResult> {
+    const activeSource: CandidateSource = source ?? this.fsSource();
+    const errors: string[] = await this.nonCanonicalReviewEntries(activeSource);
+    const sharedIds = await this.listCandidateIds(activeSource);
+    const sharedSet = new Set(sharedIds);
+    const localChanged = activeSource.localChangedCandidateIds ? await activeSource.localChangedCandidateIds() : null;
+    const localOnlyDirs = activeSource.listLocalOnlyDirs
+      ? (await activeSource.listLocalOnlyDirs()).filter((id: string) => !sharedSet.has(id))
+      : [];
+
+    const reviewers = await loadReviewers(this.repoRoot, reviewersSource).catch(() => null);
+    const staleDays = reviewers?.staleDays ?? 14;
+    const rejectionWindowDays = reviewers?.rejectionMemoryDays ?? 30;
+    const staleThresholdMs = staleDays * 24 * 60 * 60 * 1000;
+
+    // 加载全部共享候选，用于 I1 finding_id 唯一性校验与负向记忆重复计算
+    const loadedShared: Array<{ candidate: ReviewCandidate; local: boolean }> = [];
+    const findingIdMap = new Map<string, string[]>();
+
+    for (const id of sharedIds) {
+      const [month, slug] = id.split('/');
+      if (!month || !slug) continue;
+      let isLocal = false;
+      if (localChanged !== null) {
+        isLocal = localChanged.has(id);
+      } else if (activeSource.hasLocalChanges) {
+        isLocal = await activeSource.hasLocalChanges(month, slug).catch(() => true);
+      }
+      const candidate = await this.loadCandidate(month, slug, activeSource);
+      if (!candidate) continue;
+      if (!candidate.parseError) {
+        const fullErrors = await this.validateFullCandidate(candidate, activeSource);
+        if (fullErrors.length > 0) {
+          candidate.parseError = fullErrors.join('；');
+        }
+      }
+      if (candidate.parseError) {
+        errors.push(`${candidate.id}: ${candidate.parseError}`);
+      } else if (!isLocal && candidate.meta.findingId) {
+        const list = findingIdMap.get(candidate.meta.findingId) ?? [];
+        list.push(id);
+        findingIdMap.set(candidate.meta.findingId, list);
+      }
+      loadedShared.push({ candidate, local: isLocal });
+    }
+
+    for (const [findingId, dupIds] of findingIdMap) {
+      if (dupIds.length > 1) {
+        const message = `重复的 finding_id（${findingId}）出现在多个问题目录：${dupIds.join(', ')}`;
+        errors.push(message);
+        for (const item of loadedShared) {
+          if (dupIds.includes(item.candidate.id)) {
+            item.candidate.parseError = item.candidate.parseError ? `${item.candidate.parseError}；${message}` : message;
+          }
+        }
+      }
+    }
+
+    const cleanSharedCandidates = loadedShared
+      .filter((entry) => !entry.local && !entry.candidate.parseError)
+      .map((entry) => entry.candidate);
+
+    const summaries: CandidateSummary[] = [];
+
+    const toSummary = async (
+      candidate: ReviewCandidate,
+      summarySource: CandidateSource,
+      flags: { local?: boolean; localOnly?: boolean },
+    ): Promise<CandidateSummary> => {
+      const meta = candidate.meta;
+      if (candidate.parseError) {
+        return {
+          id: candidate.id,
+          findingId: meta.findingId,
+          title: meta.title || candidate.id,
+          module: meta.module,
+          auditType: meta.auditType,
+          issueKind: meta.issueKind,
+          dependsOn: meta.dependsOn,
+          priority: meta.priority,
+          owner: meta.owner,
+          status: 'broken',
+          tags: meta.tags,
+          ticket: meta.ticket,
+          currentRevision: meta.recordRevision,
+          recordRevision: meta.recordRevision,
+          createdAt: meta.createdAt,
+          updatedAt: meta.updatedAt,
+          baseRevision: meta.baseRevision,
+          patchStats: EMPTY_STATS,
+          unresolvedComments: 0,
+          humanJudgmentCount: 0,
+          humanJudgmentDeclared: candidate.humanJudgmentDeclared,
+          isBaseBehind: false,
+          lastFeedback: '',
+          deferred: false,
+          options: [],
+          parseError: candidate.parseError,
+          ...flags,
+        };
+      }
+
+      const banned = bannedOptionPatches(meta);
+      const optionSummaries: OptionSummary[] = [];
+      let primaryStats: PatchStats = EMPTY_STATS;
+      let primaryBase = meta.baseRevision;
+
+      for (let i = 0; i < meta.options.length; i += 1) {
+        const option = meta.options[i]!;
+        const patchEntry = meta.patches.find((p) => p.id === option.currentPatch);
+        const patchText = patchEntry
+          ? await summarySource.readPatchText(candidate.month, candidate.slug, patchEntry.patch)
+          : null;
+        const stats = patchText !== null ? parsePatch(patchText).stats : EMPTY_STATS;
+        if (i === 0) {
+          primaryStats = stats;
+          if (patchEntry?.baseRevision) primaryBase = patchEntry.baseRevision;
+        }
+        optionSummaries.push({
+          id: option.id,
+          title: option.title,
+          tradeoff: option.tradeoff,
+          confidence: option.confidence,
+          currentPatch: option.currentPatch,
+          banned: banned.has(`${option.id}#${String(option.currentPatch)}`),
+          patchStats: stats,
+        });
+      }
+
+      let behind = false;
+      if (currentBase && primaryBase && primaryBase !== currentBase) {
+        behind = isBehind ? await isBehind(primaryBase, currentBase) : true;
+      }
+
+      const unresolvedComments = meta.comments.filter((c) => c.status !== 'resolved').length;
+      const lastComment = meta.comments[meta.comments.length - 1];
+      const lastFeedback = lastComment ? `${lastComment.author}: ${lastComment.content.slice(0, 80)}` : '';
+      const updatedMs = Date.parse(meta.updatedAt);
+      const isActiveOpen = ['pending', 'changes_requested', 'repair_failed'].includes(meta.status);
+      const isStale = !flags.local && isActiveOpen && Number.isFinite(updatedMs) && (nowMs - updatedMs) > staleThresholdMs;
+
+      let duplicateOf: string | undefined;
+      if (!flags.local && isActiveOpen) {
+        const dup = findDuplicateRejection(candidate, cleanSharedCandidates, rejectionWindowDays, nowMs);
+        if (dup) duplicateOf = dup.candidateId;
+      }
+
+      return {
+        id: candidate.id,
+        findingId: meta.findingId,
+        title: meta.title,
+        module: meta.module,
+        auditType: meta.auditType,
+        issueKind: meta.issueKind,
+        dependsOn: meta.dependsOn,
+        priority: meta.priority,
+        owner: meta.owner,
+        status: meta.status,
+        tags: [...meta.tags],
+        ticket: meta.ticket,
+        currentRevision: meta.recordRevision,
+        recordRevision: meta.recordRevision,
+        createdAt: meta.createdAt,
+        updatedAt: meta.updatedAt,
+        baseRevision: primaryBase,
+        patchStats: primaryStats,
+        unresolvedComments,
+        humanJudgmentCount: meta.humanDecisions.length,
+        humanJudgmentDeclared: candidate.humanJudgmentDeclared,
+        isBaseBehind: behind,
+        lastFeedback,
+        deferred: isDeferred(meta),
+        options: optionSummaries,
+        ...(isStale ? { isStale: true } : {}),
+        ...(duplicateOf ? { duplicateOf } : {}),
+        ...flags,
+      };
+    };
+
+    for (const { candidate, local } of loadedShared) {
+      summaries.push(await toSummary(candidate, activeSource, local ? { local: true } : {}));
+    }
+
+    const fsSrc = this.fsSource();
+    for (const id of localOnlyDirs) {
+      const [month, slug] = id.split('/');
+      if (!month || !slug) continue;
+      const candidate = await this.loadCandidate(month, slug, fsSrc);
+      if (!candidate) continue;
+      summaries.push(await toSummary(candidate, fsSrc, { local: true, localOnly: true }));
+    }
+
+    const filtered = summaries.filter((item) => matchesFilter(item, filter));
+    filtered.sort((left, right) => {
+      const lMs = Date.parse(left.updatedAt) || 0;
+      const rMs = Date.parse(right.updatedAt) || 0;
+      return rMs - lMs || left.id.localeCompare(right.id);
+    });
+
+    return { items: filtered, errors };
+  }
+
+  /** SPEC §6.2：counts 必须包含全部 8 个规范状态键，仅统计非 local 共享问题。 */
+  async listStatusCounts(
+    owner: string | undefined,
+    source?: CandidateSource,
+  ): Promise<Record<ReviewStatus, number>> {
+    const counts = emptyStatusCounts();
+    const activeSource = source ?? this.fsSource();
+    const { candidates } = await this.listSharedCandidates(activeSource);
+    for (const candidate of candidates) {
+      if (candidate.parseError) continue;
+      if (owner && candidate.meta.owner !== owner) continue;
+      if (REVIEW_STATUSES.includes(candidate.meta.status)) {
+        counts[candidate.meta.status] += 1;
+      }
+    }
     return counts;
   }
 
-  /** 包含损坏或未写完的候选目录，便于审查收尾核对 Agent 的实际产物。 */
-  async listCandidateIds(): Promise<string[]> {
-    const ids: string[] = [];
-    let months: string[] = [];
-    try {
-      months = (await readdir(this.aiReviewRoot, { withFileTypes: true }))
-        .filter((entry) => entry.isDirectory() && MONTH_PATTERN.test(entry.name))
-        .map((entry) => entry.name);
-    } catch {
-      return ids;
-    }
-    months.sort((left, right) => left.localeCompare(right));
-    for (const month of months) {
-      let slugs: string[] = [];
-      try {
-        slugs = (await readdir(path.join(this.aiReviewRoot, month), { withFileTypes: true }))
-          .filter((entry) => entry.isDirectory() && SLUG_PATTERN.test(entry.name))
-          .map((entry) => entry.name);
-      } catch {
-        continue;
+  async get(
+    id: string,
+    currentBase: string | null,
+    source?: CandidateSource,
+    isBehind?: BusinessBaseCheck,
+    requestedSelection?: { optionId?: string; patchId?: number },
+  ): Promise<CandidateDetail> {
+    const [month, slug] = splitAndValidateId(id);
+    const activeSource = source ?? this.fsSource();
+    const candidate = await this.loadCandidate(month, slug, activeSource);
+    if (!candidate) throw new ApiError(404, 'not_found', `问题不存在：${id}`);
+
+    const validation = await this.validateFullCandidate(candidate, activeSource);
+    const meta = candidate.meta;
+
+    let selection: IssueSelection | undefined;
+    let option: RepairOption | undefined;
+    let patchEntry: PatchEntry | undefined;
+    let patchText = '';
+    let patchStats: PatchStats = EMPTY_STATS;
+    let patchPaths: string[] = [];
+
+    if (!candidate.parseError) {
+      const resolved = resolveOptionSelection(meta, requestedSelection);
+      if (resolved) {
+        selection = resolved.selection;
+        option = resolved.option;
+        patchEntry = resolved.patch;
+        const text = await activeSource.readPatchText(month, slug, patchEntry.patch);
+        if (text !== null) {
+          patchText = text;
+          const parsed = parsePatch(text);
+          patchStats = parsed.stats;
+          patchPaths = parsed.paths;
+        }
       }
-      for (const slug of slugs) {
-        const dir = path.join(this.aiReviewRoot, month, slug);
-        const entries = await readdir(dir).catch(() => [] as string[]);
-        if (!entries.some((name) => name === 'review.md' || /\.patch$/i.test(name))) continue;
-        ids.push(candidateId(month, slug));
-      }
     }
-    return ids;
+
+    const revisionStats: CandidateDetail['revisionStats'] = {};
+    for (const entry of meta.patches) {
+      const text = await activeSource.readPatchText(month, slug, entry.patch);
+      revisionStats[String(entry.id)] = {
+        patch: entry.patch,
+        baseRevision: entry.baseRevision,
+        optionId: entry.optionId,
+        author: entry.author,
+        stats: text !== null ? parsePatch(text).stats : null,
+      };
+    }
+
+    const activeBase = patchEntry?.baseRevision || meta.baseRevision;
+    let isBaseBehind = false;
+    if (currentBase && activeBase && activeBase !== currentBase) {
+      isBaseBehind = isBehind ? await isBehind(activeBase, currentBase) : true;
+    }
+
+    return {
+      candidate,
+      ...(selection ? { selection } : {}),
+      ...(option ? { option } : {}),
+      ...(patchEntry ? { patchEntry } : {}),
+      currentBase,
+      isBaseBehind,
+      patchText,
+      patchStats,
+      patchPaths,
+      comments: [...meta.comments],
+      validation,
+      revisionStats,
+    };
   }
+
+  checkGuard(meta: ReviewFrontmatter, guard: ConcurrencyGuard): void {
+    const expectedMs = Date.parse(guard.expectedUpdatedAt);
+    const actualMs = Date.parse(meta.updatedAt);
+    const timestampMatch = Number.isFinite(expectedMs) && Number.isFinite(actualMs)
+      ? expectedMs === actualMs
+      : guard.expectedUpdatedAt === meta.updatedAt;
+    if (
+      meta.recordRevision !== guard.expectedRevision
+      || meta.owner !== guard.expectedOwner
+      || !timestampMatch
+    ) {
+      throw new ApiError(409, 'stale', '问题已被并发修改，请刷新后重试', {
+        currentRevision: meta.recordRevision,
+        currentOwner: meta.owner,
+        currentUpdatedAt: meta.updatedAt,
+      });
+    }
+  }
+
+  async write(candidate: ReviewCandidate, options: { touchUpdatedAt?: boolean; now?: Date } = {}): Promise<ReviewCandidate> {
+    const touch = options.touchUpdatedAt ?? true;
+    const now = options.now ?? new Date();
+    const updatedMeta: ReviewFrontmatter = touch
+      ? { ...candidate.meta, updatedAt: nextUpdatedAt(candidate.meta.updatedAt, now) }
+      : candidate.meta;
+    await mkdir(candidate.dirPath, { recursive: true });
+    const serialized = serializeReviewMarkdown(updatedMeta, candidate.body);
+    await writeFile(candidate.reviewPath, serialized, 'utf8');
+    const parsed = parseReviewMarkdown(serialized);
+    return {
+      ...candidate,
+      meta: parsed.meta,
+      body: parsed.body,
+      sections: parsed.sections,
+      humanJudgment: parsed.humanJudgment,
+      humanJudgmentDeclared: parsed.humanJudgmentDeclared,
+    };
+  }
+
+  private buildCommentEntry(
+    meta: ReviewFrontmatter,
+    input: AddCommentInput,
+    existingComments: readonly ReviewComment[],
+    at: string,
+  ): ReviewComment {
+    const content = input.content.trim();
+    if (!content) throw new ApiError(422, 'bad_request', '评论内容不能为空');
+    const author = input.author.trim();
+    if (!author) throw new ApiError(422, 'bad_request', '评论作者不能为空');
+
+    // SPEC §3.3 / §6.3：revision 缺省取提交前当前共享 record_revision；显式传入须在 1..record_revision 内。
+    const revision = input.revision === undefined ? meta.recordRevision : input.revision;
+    if (!Number.isInteger(revision) || revision < 1 || revision > meta.recordRevision) {
+      throw new ApiError(422, 'bad_request', `评论 revision 越界（须在 1..${String(meta.recordRevision)} 之间）`);
+    }
+
+    const file = (input.file ?? '').trim();
+    const line = input.line ?? 0;
+    const isGeneral = file === '' && line === 0;
+    const id = nextCommentId(existingComments);
+
+    if (isGeneral) {
+      if (input.side !== undefined || input.anchor !== undefined || input.optionId !== undefined || input.patchId !== undefined) {
+        throw new ApiError(422, 'bad_request', '总体评论不得携带 side / anchor / optionId / patchId');
+      }
+      return {
+        id,
+        revision,
+        file: '',
+        line: 0,
+        author,
+        content,
+        status: 'unresolved',
+        createdAt: at,
+      };
+    }
+
+    if (!file || !Number.isInteger(line) || line < 1) {
+      throw new ApiError(422, 'bad_request', '行内评论必须提供非空 file 与正整数 line');
+    }
+    if (input.side !== 'LEFT' && input.side !== 'RIGHT') {
+      throw new ApiError(422, 'bad_request', '行内评论必须提供合法 side（LEFT 或 RIGHT）');
+    }
+    if (!input.optionId || typeof input.patchId !== 'number' || !Number.isInteger(input.patchId) || input.patchId < 1) {
+      throw new ApiError(422, 'bad_request', '行内评论必须显式指定 optionId 与 patchId');
+    }
+    const patch = meta.patches.find((p) => p.id === input.patchId && p.optionId === input.optionId);
+    if (!patch) {
+      throw new ApiError(422, 'bad_request', `行内评论指向的方案/补丁不存在或归属不匹配（${input.optionId} / #${String(input.patchId)}）`);
+    }
+    if (input.anchor && !input.anchor.snippet.trim()) {
+      throw new ApiError(422, 'bad_request', 'anchor.snippet 不能为空');
+    }
+    return {
+      id,
+      revision,
+      optionId: input.optionId,
+      patchId: input.patchId,
+      file,
+      line,
+      side: input.side,
+      author,
+      content,
+      status: 'unresolved',
+      createdAt: at,
+      ...(input.anchor ? { anchor: input.anchor } : {}),
+    };
+  }
+
+  async addCommentsBatch(
+    id: string,
+    guard: ConcurrencyGuard,
+    inputs: readonly AddCommentInput[],
+    source?: CandidateSource,
+    now: Date = new Date(),
+  ): Promise<{ candidate: ReviewCandidate; added: ReviewComment[] }> {
+    if (inputs.length === 0) throw new ApiError(400, 'bad_request', '评论列表不能为空');
+    const detail = await this.get(id, null, source);
+    if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
+    const meta = detail.candidate.meta;
+    this.checkGuard(meta, guard);
+
+    if (!COMMENTABLE_STATUSES.has(meta.status)) {
+      throw new ApiError(409, 'conflict', `当前状态 ${meta.status} 不允许提交评论`);
+    }
+
+    const at = nextUpdatedAt(meta.updatedAt, now);
+    const allComments = [...meta.comments];
+    const added: ReviewComment[] = [];
+    for (const input of inputs) {
+      const comment = this.buildCommentEntry(meta, input, allComments, at);
+      allComments.push(comment);
+      added.push(comment);
+    }
+
+    // SPEC §4.1：pending 新增未解决评论变 changes_requested；repair_failed 保持 repair_failed！
+    const nextStatus: ReviewStatus = meta.status === 'pending' ? 'changes_requested' : meta.status;
+    const nextMeta: ReviewFrontmatter = {
+      ...meta,
+      status: nextStatus,
+      recordRevision: meta.recordRevision + 1,
+      updatedAt: at,
+      comments: allComments,
+    };
+
+    const updated = await this.write({ ...detail.candidate, meta: nextMeta }, { touchUpdatedAt: false });
+    return { candidate: updated, added };
+  }
+
+  async addComment(
+    id: string,
+    guard: ConcurrencyGuard,
+    input: AddCommentInput,
+    source?: CandidateSource,
+    now: Date = new Date(),
+  ): Promise<{ candidate: ReviewCandidate; comment: ReviewComment }> {
+    const { candidate, added } = await this.addCommentsBatch(id, guard, [input], source, now);
+    return { candidate, comment: added[0]! };
+  }
+
+  async setCommentStatus(
+    id: string,
+    guard: ConcurrencyGuard,
+    commentId: string,
+    status: CommentStatus,
+    source?: CandidateSource,
+    now: Date = new Date(),
+  ): Promise<ReviewCandidate> {
+    const detail = await this.get(id, null, source);
+    if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
+    const meta = detail.candidate.meta;
+    this.checkGuard(meta, guard);
+    if (!COMMENTABLE_STATUSES.has(meta.status)) {
+      throw new ApiError(409, 'conflict', `当前状态 ${meta.status} 不允许修改评论状态`);
+    }
+    const index = meta.comments.findIndex((c) => c.id === commentId);
+    if (index < 0) throw new ApiError(404, 'not_found', `评论不存在：${commentId}`);
+    const nextComments = meta.comments.map((c, idx) => (idx === index ? { ...c, status } : c));
+    const at = nextUpdatedAt(meta.updatedAt, now);
+    const nextMeta: ReviewFrontmatter = {
+      ...meta,
+      recordRevision: meta.recordRevision + 1,
+      updatedAt: at,
+      comments: nextComments,
+    };
+    return this.write({ ...detail.candidate, meta: nextMeta }, { touchUpdatedAt: false });
+  }
+
+  async takeover(
+    id: string,
+    guard: ConcurrencyGuard,
+    newOwner: string,
+    source?: CandidateSource,
+    now: Date = new Date(),
+  ): Promise<ReviewCandidate> {
+    const owner = newOwner.trim();
+    if (!owner) throw new ApiError(422, 'bad_request', '目标负责人不能为空');
+    const detail = await this.get(id, null, source);
+    if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
+    const meta = detail.candidate.meta;
+    this.checkGuard(meta, guard);
+    if (meta.status === 'approved' || meta.status === 'resolved') {
+      throw new ApiError(409, 'conflict', `已关闭状态（${meta.status}）不允许接管`);
+    }
+    const at = nextUpdatedAt(meta.updatedAt, now);
+    const nextMeta: ReviewFrontmatter = {
+      ...meta,
+      owner,
+      recordRevision: meta.recordRevision + 1,
+      updatedAt: at,
+    };
+    return this.write({ ...detail.candidate, meta: nextMeta }, { touchUpdatedAt: false });
+  }
+
+  /** SPEC §4.1：/resume 仅用于 Owner 将 changes_requested 转回 pending，不得用于 repair_failed。 */
+  async resume(
+    id: string,
+    guard: ConcurrencyGuard,
+    source?: CandidateSource,
+    now: Date = new Date(),
+  ): Promise<ReviewCandidate> {
+    const detail = await this.get(id, null, source);
+    if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
+    const meta = detail.candidate.meta;
+    this.checkGuard(meta, guard);
+    if (meta.status !== 'changes_requested') {
+      throw new ApiError(409, 'conflict', `/resume 仅适用于 changes_requested 状态（当前为 ${meta.status}）`);
+    }
+    const at = nextUpdatedAt(meta.updatedAt, now);
+    const nextMeta: ReviewFrontmatter = {
+      ...meta,
+      status: 'pending',
+      recordRevision: meta.recordRevision + 1,
+      updatedAt: at,
+    };
+    return this.write({ ...detail.candidate, meta: nextMeta }, { touchUpdatedAt: false });
+  }
+
+  async applyDecision(
+    id: string,
+    guard: ConcurrencyGuard,
+    request: IssueDecisionRequest,
+    actor: string,
+    source?: CandidateSource,
+    now: Date = new Date(),
+  ): Promise<ReviewCandidate> {
+    const detail = await this.get(id, null, source);
+    if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
+    const meta = detail.candidate.meta;
+    this.checkGuard(meta, guard);
+
+    let relatedSymbols: string[] | undefined;
+    if (request.action === 'accept_as_is' && meta.options.length > 0) {
+      const activeSource = source ?? this.fsSource();
+      const patchTexts: string[] = [];
+      for (const option of meta.options) {
+        const patchEntry = meta.patches.find((p) => p.id === option.currentPatch);
+        if (!patchEntry) continue;
+        const text = await activeSource.readPatchText(detail.candidate.month, detail.candidate.slug, patchEntry.patch);
+        if (text) patchTexts.push(text);
+      }
+      relatedSymbols = extractPatchSymbols(patchTexts);
+    }
+
+    const nextMeta = applyIssueDecision(meta, request, actor, now, relatedSymbols);
+    return this.write({ ...detail.candidate, meta: nextMeta }, { touchUpdatedAt: false });
+  }
+
+  async applyApproval(
+    candidate: ReviewCandidate,
+    input: {
+      approval: ApprovalInfo;
+      attempt: RepairAttempt;
+      commitMessage: string;
+      now?: Date;
+    },
+  ): Promise<ReviewCandidate> {
+    const at = nextUpdatedAt(candidate.meta.updatedAt, input.now ?? new Date());
+    const nextMeta: ReviewFrontmatter = {
+      ...candidate.meta,
+      status: 'approved',
+      recordRevision: candidate.meta.recordRevision + 1,
+      updatedAt: at,
+      repairAttempts: [...candidate.meta.repairAttempts, input.attempt],
+      approval: input.approval,
+      rejection: null,
+      commitMessage: input.commitMessage,
+    };
+    return this.write({ ...candidate, meta: nextMeta }, { touchUpdatedAt: false });
+  }
+
+  async recordRepairFailure(
+    candidate: ReviewCandidate,
+    attempt: RepairAttempt,
+    now: Date = new Date(),
+  ): Promise<ReviewCandidate> {
+    const at = nextUpdatedAt(candidate.meta.updatedAt, now);
+    const nextMeta: ReviewFrontmatter = {
+      ...candidate.meta,
+      status: 'repair_failed',
+      recordRevision: candidate.meta.recordRevision + 1,
+      updatedAt: at,
+      repairAttempts: [...candidate.meta.repairAttempts, attempt],
+    };
+    return this.write({ ...candidate, meta: nextMeta }, { touchUpdatedAt: false });
+  }
+
+  async findDuplicateForCandidate(
+    candidate: ReviewCandidate,
+    source?: CandidateSource,
+    reviewersSource?: { readReviewersText(): Promise<string | null> },
+    nowMs: number = Date.now(),
+  ): Promise<NegativeMemoryEntry | null> {
+    const reviewers = await loadReviewers(this.repoRoot, reviewersSource).catch(() => null);
+    const windowDays = reviewers?.rejectionMemoryDays ?? 30;
+    const { candidates } = await this.listSharedCandidates(source);
+    return findDuplicateRejection(candidate, candidates, windowDays, nowMs);
+  }
+
+  async negativeMemoryEntries(
+    source?: CandidateSource,
+    reviewersSource?: { readReviewersText(): Promise<string | null> },
+    nowMs: number = Date.now(),
+  ): Promise<{ entries: NegativeMemoryEntry[]; windowDays: number; maxAntiPatterns: number }> {
+    const reviewers = await loadReviewers(this.repoRoot, reviewersSource).catch(() => null);
+    const windowDays = reviewers?.rejectionMemoryDays ?? 30;
+    const maxAntiPatterns = reviewers?.maxAntiPatterns ?? 20;
+    const { candidates } = await this.listSharedCandidates(source);
+    const entries: NegativeMemoryEntry[] = [];
+    for (const candidate of candidates) {
+      if (candidate.parseError) continue;
+      const entry = entryFromCandidate({ candidateId: candidate.id, meta: candidate.meta });
+      if (entry && (nowMs - entry.rejectedAtMs) <= windowDays * 24 * 60 * 60 * 1000) {
+        entries.push(entry);
+      }
+    }
+    return { entries, windowDays, maxAntiPatterns };
+  }
+
+  /** 为新补丁分配递增编号与文件名。 */
+  nextPatchNumber(meta: ReviewFrontmatter): { id: number; patch: string } {
+    const id = meta.patches.length + 1;
+    return { id, patch: formatPatchFilename(id) };
+  }
+}
+
+function matchesFilter(item: CandidateSummary, filter: ReviewFilter): boolean {
+  if (filter.owner !== undefined && filter.owner !== '' && item.owner !== filter.owner) return false;
+  if (filter.statuses && filter.statuses.length > 0 && item.status !== 'broken' && !filter.statuses.includes(item.status)) {
+    return false;
+  }
+  if (filter.tag) {
+    const wanted = filter.tag.trim().toLowerCase();
+    if (!item.tags.includes(wanted)) return false;
+  }
+  if (filter.dir) {
+    const prefix = filter.dir.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
+    const touched = item.patchStats.entries.some((e) => e.path === prefix || e.path.startsWith(`${prefix}/`));
+    if (!touched && item.module !== prefix) return false;
+  }
+  if (filter.text) {
+    const needle = filter.text.trim().toLowerCase();
+    const haystack = `${item.id} ${item.findingId} ${item.title} ${item.module} ${item.owner} ${item.tags.join(' ')}`.toLowerCase();
+    if (!haystack.includes(needle)) return false;
+  }
+  if (filter.createdAfter) {
+    const afterMs = Date.parse(filter.createdAfter);
+    const createdMs = Date.parse(item.createdAt);
+    if (Number.isFinite(afterMs) && Number.isFinite(createdMs) && createdMs < afterMs) return false;
+  }
+  if (filter.createdBefore) {
+    const beforeMs = Date.parse(filter.createdBefore);
+    const createdMs = Date.parse(item.createdAt);
+    if (Number.isFinite(beforeMs) && Number.isFinite(createdMs) && createdMs > beforeMs) return false;
+  }
+  return true;
 }

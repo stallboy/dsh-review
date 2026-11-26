@@ -1,10 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, writeFile } from 'node:fs/promises';
-import path from 'node:path';
 import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
-import { extractHumanJudgment, isEmptyHumanJudgmentText } from '../packages/dsh-plugin/dist/host/frontmatter.js';
+import { parseHumanJudgmentItems, isEmptyHumanJudgmentText } from '../packages/dsh-plugin/dist/host/frontmatter.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
+import { writeCandidate as writeSchemaCandidate } from './fixtures/contract.mjs';
 
 test('placeholder human-judgment text is treated as empty', () => {
   for (const value of ['', '  ', '无', '无。', '无：响应字段不变', '暂无', '不适用', 'None', 'n/a', '**无**。']) {
@@ -15,8 +14,8 @@ test('placeholder human-judgment text is treated as empty', () => {
   }
 });
 
-test('extractHumanJudgment drops "无" categories and keeps real decisions', () => {
-  const items = extractHumanJudgment([
+test('parseHumanJudgmentItems drops "无" categories and keeps real decisions', () => {
+  const items = parseHumanJudgmentItems([
     '- **业务逻辑与产品取舍**：无。响应字段、过滤语义均不变。',
     '- **架构、兼容性与性能影响**：`matchesReviewFilter` 成为导出函数，需要确认命名。',
     '- 无',
@@ -29,66 +28,36 @@ test('extractHumanJudgment drops "无" categories and keeps real decisions', () 
 });
 
 async function writeCandidate(root, baseRevision, humanSection) {
-  const dir = path.join(root, '.ai-review', '2026-10', 'readable');
-  await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, '001.patch'), [
-    'diff --git a/src/math.js b/src/math.js',
-    '--- a/src/math.js',
-    '+++ b/src/math.js',
-    '@@ -1 +1 @@',
-    '-export const add = (a, b) => a - b;',
-    '+export const add = (a, b) => a + b;',
-    '',
-  ].join('\n'), 'utf8');
-  await writeFile(path.join(dir, 'review.md'), [
-    '---',
-    'schema_version: 1',
-    'title: "test: 可读的审查文案"',
-    'module: test',
-    'audit_type: bugfix',
-    'created_at: "2026-10-31T20:00:00+08:00"',
-    'updated_at: "2026-10-31T20:00:00+08:00"',
-    'owner: tester',
-    'tags: [test]',
-    'status: pending',
-    'ticket: null',
-    'target_files: [src/math.js]',
-    'current_revision: 1',
-    'revisions:',
-    '  - id: 1',
-    `    base_revision: "${baseRevision}"`,
-    '    patch: "001.patch"',
-    '    author: ai',
-    'gate_checks:',
-    '  - "node --version"',
-    'comments: []',
-    'human_decisions: []',
-    'approval: null',
-    'rejection: null',
-    'commit_message: "test: 可读的审查文案"',
-    '---',
-    '',
-    '# 问题与影响',
-    '- **触发**：调用加法时结果错误。',
-    '',
-    '# 根因',
-    '- 运算符写反。',
-    '',
-    '# 当前修复方案',
-    '- 改回加号并补测试。',
-    '',
-    '# 需人工判断项',
-    humanSection,
-    '',
-    '# 验证证据',
-    '- `npm test` 通过。',
-    '',
-    '# 审核记录',
-    '',
-    '## 版本 1 (base: ' + baseRevision + ')',
-    '### 方案说明',
-    '- 初始版本。',
-  ].join('\n'), 'utf8');
+  await writeSchemaCandidate(root, 'readable', {
+    month: '2026-10',
+    review: {
+      baseRevision: JSON.stringify(baseRevision),
+      title: 'test: 可读的审查文案',
+      module: 'test',
+      tags: '[test]',
+      commitMessage: 'test: 可读的审查文案',
+      bodyLines: [
+        '# 问题与影响',
+        '- **触发**：调用加法时结果错误。',
+        '',
+        '# 根因',
+        '- 运算符写反。',
+        '',
+        '# 当前修复方案',
+        '- 改回加号并补测试。',
+        '',
+        '# 需人工判断项',
+        humanSection,
+        '',
+        '# 验证证据',
+        '- `npm test` 通过。',
+        '',
+        '# 审核记录',
+        `## 版本 1 (base: ${baseRevision})`,
+        '- 初始版本。',
+      ],
+    },
+  });
 }
 
 test('a candidate that only says "无" is declared and valid, without fake review items', async () => {
@@ -100,7 +69,7 @@ test('a candidate that only says "无" is declared and valid, without fake revie
   const detail = await store.get('2026-10/readable', baseRevision);
   assert.equal(detail.candidate.humanJudgmentDeclared, true);
   assert.deepEqual(detail.candidate.humanJudgment, []);
-  assert.deepEqual(await store.validateCandidate(detail.candidate), []);
+  assert.deepEqual(await store.validateFullCandidate(detail.candidate), []);
 
   const listed = await store.list({ owner: 'tester' }, baseRevision);
   assert.equal(listed.items[0].humanJudgmentCount, 0);
@@ -115,6 +84,6 @@ test('a candidate without the human-judgment section is invalid', async () => {
 
   const detail = await store.get('2026-10/readable', baseRevision);
   assert.equal(detail.candidate.humanJudgmentDeclared, false);
-  const errors = await store.validateCandidate(detail.candidate);
-  assert.ok(errors.includes('需人工判断项未填写'), errors.join('；'));
+  const errors = await store.validateFullCandidate(detail.candidate);
+  assert.ok(errors.some((e) => /需人工判断项/.test(e)), errors.join('；'));
 });

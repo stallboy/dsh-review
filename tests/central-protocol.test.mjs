@@ -14,7 +14,7 @@ function command() {
         commandId: 'cmd-1', requestHash: 'a'.repeat(64), projectId: 'project-a', nodeId: 'node-a',
         bindingGeneration: 1, projectConfigRevision: 1, operation: 'approve',
         actor: { userId: 'user-a', reviewIdentity: '审核者甲' },
-        payload: { id: '2026-11/fix-retry', confirmedDecisions: ['cancel'], waivedDecisions: [] },
+        payload: { id: '2026-11/fix-retry', optionId: 'opt-a', patchId: 1, confirmedDecisions: ['cancel'], waivedDecisions: [] },
         guard: { expectedRevision: 2, expectedOwner: '审核者甲', expectedUpdatedAt: '2026-11-16T06:00:00.000Z' },
         createdAt: '2026-11-16T06:10:00.000Z',
     };
@@ -26,25 +26,27 @@ test('中央协议保留受信身份、绑定、配置和批准 guard', async ()
     assert.deepEqual(validateCommand(command()), command());
 });
 
-test('批准缺少 guard 或非正版本号时拒绝', async () => {
+test('批准和问题写操作缺少 guard 或非正版本号时拒绝', async () => {
     const { validateCommand } = await protocol();
     const missing = command();
     delete missing.guard;
     assert.throws(() => validateCommand(missing), /guard/);
+    assert.throws(() => validateCommand({ ...missing, operation: 'finding-decision', payload: { id: '2026-11/fix-retry', action: 'human_takeover' } }), /guard/);
     assert.throws(() => validateCommand({ ...command(), guard: { ...command().guard, expectedRevision: 0 } }), /expectedRevision/);
 });
 
-test('中央协议拒绝未知操作和路径注入式实体编号', async () => {
+test('中央协议拒绝未知或已废止操作与非法载荷字段', async () => {
     const { validateCommand } = await protocol();
     assert.throws(() => validateCommand({ ...command(), operation: 'shell' }), /operation/);
     assert.throws(() => validateCommand({ ...command(), operation: 'manual-revision', payload: { id: command().payload.id, patchText: 'diff' } }), /operation/);
-    assert.throws(() => validateCommand({ ...command(), operation: 'ai-fix', payload: { id: command().payload.id, patchText: 'diff' } }), /payload.patchText/);
+    assert.throws(() => validateCommand({ ...command(), operation: 'dismiss-finding', payload: { auditId: '../secret', findingId: 'f1', reason: 'test' } }), /operation/);
+    assert.throws(() => validateCommand({ ...command(), operation: 'reject', payload: { id: command().payload.id, reason: 'test' } }), /operation/);
+    assert.throws(() => validateCommand({ ...command(), operation: 'ai-fix', payload: { id: command().payload.id, patchText: 'diff' } }), /payload\.patchText/);
     assert.throws(() => validateCommand({ ...command(), projectId: '../other' }), /projectId/);
     assert.throws(() => validateCommand({ ...command(), bindingGeneration: Number.NaN }), /bindingGeneration/);
-    assert.throws(() => validateCommand({ ...command(), payload: { id: '2026-11/fix-retry', owner: 'forged' } }), /payload.owner/);
-    assert.throws(() => validateCommand({ ...command(), operation: 'dismiss-finding', payload: { auditId: '../secret', findingId: 'f1', reason: 'test' } }), /auditId/);
+    assert.throws(() => validateCommand({ ...command(), payload: { id: '2026-11/fix-retry', owner: 'forged' } }), /payload\.owner/);
     assert.doesNotThrow(() => validateCommand({ ...command(), operation: 'comments', payload: { id: '2026-11/fix-retry', file: '', line: 0, revision: 1, content: '总体意见' } }));
-    assert.throws(() => validateCommand({ ...command(), operation: 'comments', payload: { id: '2026-11/fix-retry', file: 'src/main.ts', line: 0, revision: 1, content: '行内意见' } }), /payload.line/);
+    assert.throws(() => validateCommand({ ...command(), operation: 'comments', payload: { id: '2026-11/fix-retry', file: 'src/main.ts', line: 0, revision: 1, content: '行内意见' } }), /payload\.line/);
 });
 
 test('快照要求正序号与完整独立的项目版本', async () => {
@@ -52,6 +54,7 @@ test('快照要求正序号与完整独立的项目版本', async () => {
     const snapshot = {
         projectId: 'project-a', bindingGeneration: 1, projectConfigRevision: 1, snapshotSequence: 3,
         vcsSnapshot: 'commit-a', collectedAt: '2026-11-16T06:00:00.000Z',
+        currentBase: null, counts: {},
         queue: [], findings: [], audits: [], errors: [],
     };
     assert.deepEqual(validateSnapshot(snapshot), snapshot);

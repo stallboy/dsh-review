@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rename, rm, symlink } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { bindProject, setupCentral } from './central-helpers.mjs';
 import { createGitFixture, reportOnlyAgentPath, runCommand } from './helpers.mjs';
 import { ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
+import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { startManagedNode } from '../packages/dsh-plugin/dist/managed/managed-config.js';
 import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
 import { ManagedNode } from '../packages/dsh-plugin/dist/managed/managed-node.js';
@@ -59,9 +61,20 @@ test('停用目录缺失仍声明历史工作副本，旧配置项目继续立�
     const operations = state.operations([inactive, active]);
     await operations.init();
     assert.equal(initialized, 1);
+    const expectedHash = createHash('sha256').update(JSON.stringify({
+        runner: 'manual',
+        dshCommand: DEFAULT_SETTINGS.dshCommand,
+        externalCommand: DEFAULT_SETTINGS.externalCommand,
+        gateTimeoutMs: DEFAULT_SETTINGS.gateTimeoutMs,
+        syncBeforeApprove: false,
+        autoFixOnFailure: DEFAULT_SETTINGS.autoFixOnFailure,
+        stageExecutors: DEFAULT_SETTINGS.stageExecutors,
+    })).digest('hex');
     assert.deepEqual(operations.registrations(), [inactive, active].map(({ workspaceId, label, vcsType, target }) => ({
         workspaceId, label, vcsType, target,
-        executionConfigHash: 'e83155e251ecaf2b9c7eb8b7202a3df891091cdb32d38be46e4c266ff8e0383d',
+        executionConfigHash: expectedHash,
+        auditSelfTest: true,
+        stageExecutors: DEFAULT_SETTINGS.stageExecutors,
     })));
     assert.deepEqual((await operations.snapshot(project(active))).queue, []);
     await assert.rejects(operations.snapshot({ ...project(active), workspaceId: 'unconfigured', root: active.root }), /项目与节点工作副本不匹配/);
@@ -87,6 +100,10 @@ test('中央重新启用项目后，同一节点经真实轮询恢复定时审�
     const state = await fixture(t);
     const workspace = await state.workspace('workspace-a', false);
     workspace.settings = { runner: 'external', externalCommand: `"${process.execPath}" "${reportOnlyAgentPath()}"` };
+    await mkdir(path.join(workspace.root, '.ai-review'), { recursive: true });
+    await writeFile(path.join(workspace.root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nrules: []\n', 'utf8');
+    runCommand('git', ['add', '.ai-review/reviewers.yml'], workspace.root);
+    runCommand('git', ['commit', '-qm', 'init reviewers'], workspace.root);
     const remote = path.join(state.directory, 'remote.git');
     runCommand('git', ['init', '--bare', '-q', remote], workspace.root);
     runCommand('git', ['remote', 'add', 'origin', remote], workspace.root);

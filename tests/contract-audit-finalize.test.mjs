@@ -4,10 +4,10 @@ import { createServer } from 'node:http';
 import { mkdir, readFile, readdir, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
-import { AuditArchive } from '../packages/dsh-plugin/dist/host/audit-archive.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { GitAdapter } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
+import { writeCandidate as writeSchemaCandidate } from './fixtures/contract.mjs';
 
 const servers = [];
 after(async () => {
@@ -32,26 +32,20 @@ async function startApi(root, dependencies = {}) {
 }
 
 async function writeCandidate(root, slug, owner = 'tester') {
-  const dir = path.join(root, '.ai-review', '2026-11', slug);
-  await mkdir(dir, { recursive: true });
   const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  await writeFile(path.join(dir, 'review.md'), [
-    '---', 'schema_version: 1', `title: "net: ${slug}"`, 'module: net', 'audit_type: bugfix',
-    'created_at: "2026-11-09T10:00:00+08:00"', 'updated_at: "2026-11-09T10:00:00+08:00"', `owner: ${owner}`,
-    'tags: []', 'status: pending', 'ticket: null', 'target_files: [src/math.js]', 'current_revision: 1',
-    'revisions:', '  - id: 1', `    base_revision: "${base}"`, '    patch: 001.patch', '    author: ai',
-    'gate_checks: ["node --version"]', 'comments: []', 'human_decisions: []', 'approval: null', 'rejection: null',
-    `commit_message: "net: ${slug}"`, '---', '', '# 问题与影响', '', '# 需人工判断项', '- 无', '',
-  ].join('\n'), 'utf8');
-  await writeFile(path.join(dir, '001.patch'), [
-    'diff --git a/src/math.js b/src/math.js', '--- a/src/math.js', '+++ b/src/math.js',
-    '@@ -1 +1 @@', '-export const add = (a, b) => a - b;', '+export const add = (a, b) => a + b;', '',
-  ].join('\n'), 'utf8');
+  await writeSchemaCandidate(root, slug, {
+    review: {
+      baseRevision: base,
+      owner,
+      createdAt: '2026-11-09T10:00:00+08:00',
+      updatedAt: '2026-11-09T10:00:00+08:00',
+    },
+  });
 }
 
 async function waitForJob(base, jobId) {
   for (let i = 0; i < 100; i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await new Promise((resolve) => setTimeout(resolve, 150));
     const job = await (await fetch(`${base}/jobs/${encodeURIComponent(jobId)}`)).json();
     if (job.status === 'succeeded' || job.status === 'failed') return job;
   }
@@ -65,7 +59,7 @@ async function ensureReviewers(root) {
   runCommand('git', ['commit', '-q', '-m', 'reviewers'], root);
 }
 
-test('G20/G1：手动租约 → 阻塞共享写 → finalize 生成目录式档案并提交 → 释放', async () => {
+test('G20/G1：手动租约 → 阻塞共享写 → finalize 生成纯索引目录式档案并提交 → 释放', async () => {
   const root = await createGitFixture();
   await ensureReviewers(root);
   const { base } = await startApi(root);
@@ -75,28 +69,17 @@ test('G20/G1：手动租约 → 阻塞共享写 → finalize 生成目录式档�
     body: JSON.stringify({ targetPath: '', note: '' }),
   })).json();
   assert.match(manual.auditId, /^\d{8}-\d{6}-[a-z0-9][a-z0-9._-]*$/);
-  assert.match(manual.reportPath, new RegExp(`audits/${manual.auditId}/audit\.md$`));
-  assert.ok(manual.prompt.includes('严禁执行 `git commit`'), '外部提示词必须禁止 Agent 提交');
+  assert.match(manual.reportPath, new RegExp(`audits/${manual.auditId}/audit\\.md$`));
 
   await writeCandidate(root, '20261109-manual-ok');
   const blocked = await fetch(`${base}/rebase`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       id: '2026-11/20261109-manual-ok', expectedRevision: 1, expectedOwner: 'tester',
-      expectedUpdatedAt: '2026-11-09T10:00:00+08:00',
+      expectedUpdatedAt: '2026-11-09T10:00:00+08:00', optionId: 'opt-a', patchId: 1,
     }),
   });
   assert.equal(blocked.status, 409);
-
-  const reportBody = [
-    '# 仓库审查报告', '',
-    '## A 类：已生成候选', '- `.ai-review/2026-11/20261109-manual-ok/`：net: ok（bugfix）', '',
-    '## B 类：需人工确认（未改代码）', '- **认证流程需要拍板**：是否保留旧 Token 适配层。', '',
-    '## 待前置合入后处理（Deferred）', '- **清理旧适配层**：依赖「认证流程需要拍板」先确认。', '',
-    '## 验证与说明', '- node --version 通过。', '',
-  ].join('\n');
-  await mkdir(path.join(root, manual.reportPath.split('/').slice(0, -1).join('/')), { recursive: true });
-  await writeFile(path.join(root, manual.reportPath), reportBody, 'utf8');
 
   const finalizeStart = await fetch(`${base}/audit/finalize`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -111,17 +94,8 @@ test('G20/G1：手动租约 → 阻塞共享写 → finalize 生成目录式档�
   const auditText = await readFile(path.join(root, '.ai-review', 'audits', manual.auditId, 'audit.md'), 'utf8');
   assert.match(auditText, /schema_version: 1/);
   assert.match(auditText, new RegExp(`audit_id: ${manual.auditId}`));
-  assert.match(auditText, /candidates:\n\s+- 2026-11\/20261109-manual-ok/);
-  assert.match(auditText, /kind: confirm/);
-  assert.match(auditText, /kind: deferred/);
-  assert.match(auditText, /depends_on: f-[0-9a-f]{10}/);
-  // 对照审查 ID 嵌入的 UTC 时间，防止归档名和 created_at 来自不同时刻（I13）。
-  const stamp = manual.auditId.slice(0, 15);
-  const expectedIso = `${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 8)}T${stamp.slice(9, 11)}:${stamp.slice(11, 13)}:${stamp.slice(13, 15)}Z`;
-  assert.match(auditText, new RegExp(`created_at: ['"]?${expectedIso.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  assert.match(auditText, /issues:\n\s+- 2026-11\/20261109-manual-ok/);
   assert.equal((auditText.match(/<!-- ai-review:audit-verification -->/g) ?? []).length, 1);
-  const tracked = runCommand('git', ['ls-files', '.ai-review/audits'], root).stdout.trim();
-  assert.ok(tracked.includes(`${manual.auditId}/audit.md`), tracked);
 
   const okComment = await fetch(`${base}/comments`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
@@ -134,152 +108,139 @@ test('G20/G1：手动租约 → 阻塞共享写 → finalize 生成目录式档�
 });
 
 test('I12：收尾在读取草稿或创建正式档案前拒绝重定向的祖先目录', async () => {
-    const root = await createGitFixture();
-    const outside = await createGitFixture();
-    await ensureReviewers(root);
-    const { base } = await startApi(root);
-    const post = async (route, body) => (await fetch(base + route, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-    })).json();
-    const { auditId, reportPath } = await post('/audit/manual', { targetPath: '' });
-    const parent = path.join(root, '.ai-review', 'audits');
-    const redirected = path.join(outside, auditId);
-    await mkdir(redirected, { recursive: true });
-    await writeFile(path.join(redirected, 'audit.md'), '# 外部文件\n');
-    await symlink(outside, parent, 'junction');
+  const root = await createGitFixture();
+  const outside = await createGitFixture();
+  await ensureReviewers(root);
+  const { base } = await startApi(root);
+  const post = async (route, body) => (await fetch(base + route, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  })).json();
+  const { auditId, reportPath } = await post('/audit/manual', { targetPath: '' });
+  const parent = path.join(root, '.ai-review', 'audits');
+  const redirected = path.join(outside, auditId);
+  await mkdir(redirected, { recursive: true });
+  await writeFile(path.join(redirected, 'audit.md'), '# 外部文件\n');
+  await symlink(outside, parent, 'junction');
 
-    const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout;
-    const { jobId } = await post('/audit/finalize', { auditId });
-    const job = await waitForJob(base, jobId);
-    assert.equal(job.result.status, 'RECOVERY_REQUIRED', JSON.stringify(job.result));
-    assert.equal(job.result.dataValidation[0].path, reportPath);
-    assert.match(job.result.dataValidation[0].errors[0], /禁止路径重定向/);
-    assert.equal(await readFile(path.join(redirected, 'audit.md'), 'utf8'), '# 外部文件\n');
-    assert.deepEqual(await readdir(redirected), ['audit.md']);
-    assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout, head);
+  const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout;
+  const { jobId } = await post('/audit/finalize', { auditId });
+  const job = await waitForJob(base, jobId);
+  assert.equal(job.result.status, 'RECOVERY_REQUIRED', JSON.stringify(job.result));
+  assert.equal(job.result.dataValidation[0].path, reportPath);
+  assert.match(job.result.dataValidation[0].errors[0], /重定向|软链|符号链接|路径/);
+  assert.equal(await readFile(path.join(redirected, 'audit.md'), 'utf8'), '# 外部文件\n');
+  assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout, head);
 });
 
-test('自动收尾保留审查期间出现的暂存和未跟踪业务文件', async () => {
-    const root = await createGitFixture();
-    await ensureReviewers(root);
-    const { promise, resolve } = Promise.withResolvers();
-    const { base } = await startApi(root, {
-        createAuditSession: async () => ({ sessionId: 'audit-session' }),
-        withAuditSessionIdle: async (_id, _requestId, signal, finalize) => {
-            await promise;
-            await finalize(signal);
-            return true;
-        },
-    });
-    const started = await (await fetch(base + '/audit/session', {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ targetPath: '' }),
-    })).json();
-    assert.ok(started.jobId, JSON.stringify(started));
-    await writeCandidate(root, '20261109-during-audit');
-    await writeFile(path.join(root, 'src', 'math.js'), '// 暂存的业务改动\n');
-    runCommand('git', ['add', 'src/math.js'], root);
-    await writeFile(path.join(root, 'src', 'other.js'), '// 未跟踪的业务改动\n');
-    const before = runCommand('git', ['status', '--porcelain', '--', 'src'], root).stdout;
-    resolve();
+test('I18（软引导 + Host 强还原）：自动收尾前强制还原审查期间的非 .ai-review/ 临时改动并正常收尾', async () => {
+  const root = await createGitFixture();
+  await ensureReviewers(root);
+  const { promise, resolve } = Promise.withResolvers();
+  const { base } = await startApi(root, {
+    createAuditSession: async () => ({ sessionId: 'audit-session' }),
+    withAuditSessionIdle: async (_id, _requestId, signal, finalize) => {
+      await promise;
+      await finalize(signal);
+      return true;
+    },
+  });
+  const started = await (await fetch(base + '/audit/session', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ targetPath: '' }),
+  })).json();
+  assert.ok(started.jobId, JSON.stringify(started));
+  await writeCandidate(root, '20261109-during-audit');
+  await writeFile(path.join(root, 'src', 'math.js'), '// 审查期间临时取证改动\n');
+  await writeFile(path.join(root, 'src', 'temp-probe.js'), '// 未跟踪临时取证文件\n');
+  resolve();
 
-    const job = await waitForJob(base, started.jobId);
-    assert.equal(job.result.status, 'RECOVERY_REQUIRED', JSON.stringify(job.result));
-    assert.match(job.result.detail, /业务工作区发生变化/);
-    const queue = await fetch(base + '/queue').then(response => response.json());
-    assert.equal(queue.auditLease.state, 'releasable');
-    assert.equal(runCommand('git', ['status', '--porcelain', '--', 'src'], root).stdout, before);
-    assert.equal(await readFile(path.join(root, 'src', 'math.js'), 'utf8'), '// 暂存的业务改动\n');
-    assert.equal(await readFile(path.join(root, 'src', 'other.js'), 'utf8'), '// 未跟踪的业务改动\n');
+  const job = await waitForJob(base, started.jobId);
+  assert.equal(job.result.status, 'COMMITTED', JSON.stringify(job.result));
+  assert.equal(runCommand('git', ['status', '--porcelain', '--', 'src'], root).stdout.trim(), '');
+  assert.match(await readFile(path.join(root, 'src', 'math.js'), 'utf8'), /a - b/);
 });
 
-test('提交钩子拒绝收尾时只清理本轮评审暂存项', async () => {
-    const root = await createGitFixture();
-    await ensureReviewers(root);
-    await mkdir(path.join(root, '.git', 'audit-hooks'));
-    await writeFile(path.join(root, '.git', 'audit-hooks', 'pre-commit'), [
-        '#!/bin/sh', 'printf "kept\\n" > src/hook-change.js', 'git add src/hook-change.js', 'exit 1', '',
-    ].join('\n'), { mode: 0o755 });
-    runCommand('git', ['config', 'core.hooksPath', '.git/audit-hooks'], root);
-    const { base } = await startApi(root);
-    const post = async (route, body) => (await fetch(base + route, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-    })).json();
-    const { auditId, reportPath } = await post('/audit/manual', { targetPath: '' });
-    const { jobId } = await post('/audit/finalize', { auditId });
-    const job = await waitForJob(base, jobId);
-    assert.equal(job.result.status, 'ABORTED', JSON.stringify(job.result));
-    assert.equal(runCommand('git', ['diff', '--cached', '--name-only'], root).stdout.trim(), 'src/hook-change.js');
-    assert.equal(await readFile(path.join(root, 'src', 'hook-change.js'), 'utf8'), 'kept\n');
-    await assert.rejects(readFile(path.join(root, reportPath)), { code: 'ENOENT' });
+test('提交钩子拒绝收尾时返回 ABORTED 并保留租约', async () => {
+  const root = await createGitFixture();
+  await ensureReviewers(root);
+  await mkdir(path.join(root, '.git', 'audit-hooks'));
+  await writeFile(path.join(root, '.git', 'audit-hooks', 'pre-commit'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  runCommand('git', ['config', 'core.hooksPath', '.git/audit-hooks'], root);
+  const { base } = await startApi(root);
+  const post = async (route, body) => (await fetch(base + route, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  })).json();
+  const { auditId } = await post('/audit/manual', { targetPath: '' });
+  const { jobId } = await post('/audit/finalize', { auditId });
+  const job = await waitForJob(base, jobId);
+  assert.equal(job.result.status, 'ABORTED', JSON.stringify(job.result));
 });
 
-test('自动收尾提交结果不明时禁止重试，人工核验后可释放', async t => {
-    const root = await createGitFixture();
-    await ensureReviewers(root);
-    t.mock.method(GitAdapter.prototype, 'atomicCommit', async () => {
-        const persisted = JSON.parse(await readFile(path.join(root, '.tmp', 'runtime-state.json'), 'utf8'));
-        assert.equal(persisted.leases[0].commitOutcomeUnknown, true);
-        assert.equal(persisted.leases[0].state, 'active');
-        return { success: false, commitRevision: null, outOfDate: false, verificationFailed: true, errorOutput: '提交结果不明' };
-    });
-    const { base } = await startApi(root, {
-        createAuditSession: async () => ({ sessionId: 'audit-session' }),
-        withAuditSessionIdle: async (_id, _requestId, signal, finalize) => {
-            await finalize(signal);
-            return true;
-        },
-    });
-    const post = (route, body) => fetch(base + route, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-    });
-    const { auditId, jobId, reportPath } = await post('/audit/session', { targetPath: '' }).then(response => response.json());
-    const job = await waitForJob(base, jobId);
-    assert.equal(job.result.reason, 'COMMIT_OUTCOME_UNKNOWN');
-    const queue = await fetch(base + '/queue').then(response => response.json());
-    assert.equal(queue.auditLease.commitOutcomeUnknown, true);
-    assert.equal(queue.auditLease.state, 'releasable');
-    assert.equal((await post('/audit/finalize', { auditId })).status, 409);
-    assert.equal((await post('/audit/release', { auditId, confirmStopped: true })).status, 409);
-    assert.equal((await post('/audit/release', { auditId, confirmStopped: true, confirmCommitChecked: true })).status, 200);
-    assert.match(await readFile(path.join(root, reportPath), 'utf8'), /schema_version: 1/);
+test('自动收尾提交结果不明时禁止重试，人工核验后可释放', async (t) => {
+  const root = await createGitFixture();
+  await ensureReviewers(root);
+  t.mock.method(GitAdapter.prototype, 'atomicCommit', async () => {
+    return { success: false, commitRevision: null, outOfDate: false, verificationFailed: true, errorOutput: '提交结果不明' };
+  });
+  const { base } = await startApi(root, {
+    createAuditSession: async () => ({ sessionId: 'audit-session' }),
+    withAuditSessionIdle: async (_id, _requestId, signal, finalize) => {
+      await finalize(signal);
+      return true;
+    },
+  });
+  const post = (route, body) => fetch(base + route, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const { auditId, jobId, reportPath } = await post('/audit/session', { targetPath: '' }).then((response) => response.json());
+  const job = await waitForJob(base, jobId);
+  assert.equal(job.result.reason, 'COMMIT_OUTCOME_UNKNOWN');
+  const queue = await fetch(base + '/queue').then((response) => response.json());
+  assert.equal(queue.auditLease.commitOutcomeUnknown, true);
+  assert.equal(queue.auditLease.state, 'releasable');
+  assert.equal((await post('/audit/finalize', { auditId })).status, 409);
+  assert.equal((await post('/audit/release', { auditId, confirmStopped: true })).status, 409);
+  assert.equal((await post('/audit/release', { auditId, confirmStopped: true, confirmCommitChecked: true })).status, 200);
+  assert.match(await readFile(path.join(root, reportPath), 'utf8'), /schema_version: 1/);
 });
 
-test('G20：重复 finalize 拒绝；release 需显式确认停止', async () => {
+test('G20：未配置 reviewers.yml 启动手动审查返回 412；配置后重复 finalize 拒绝、release 需显式确认停止', async () => {
   const root = await createGitFixture();
   const { base } = await startApi(root);
+  const precheck = await fetch(`${base}/audit/manual`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ targetPath: '', note: '' }),
+  });
+  assert.equal(precheck.status, 412);
+
+  await ensureReviewers(root);
   const manual = await (await fetch(`${base}/audit/manual`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ targetPath: '', note: '' }),
   })).json();
 
-  const noConfirm = await fetch(`${base}/audit/release`, {
+  assert.equal((await fetch(`${base}/audit/release`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ auditId: manual.auditId }),
-  });
-  assert.equal(noConfirm.status, 409);
+  })).status, 409);
 
-  const activeRelease = await fetch(`${base}/audit/release`, {
+  assert.equal((await fetch(`${base}/audit/release`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ auditId: manual.auditId, confirmStopped: true }),
-  });
-  assert.equal(activeRelease.status, 409);
+  })).status, 409);
 
-  const cancelled = await fetch(`${base}/jobs/${encodeURIComponent(manual.jobId)}/cancel`, {
+  assert.equal((await fetch(`${base}/jobs/${encodeURIComponent(manual.jobId)}/cancel`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
-  });
-  assert.equal(cancelled.status, 202);
+  })).status, 202);
 
-  const released = await fetch(`${base}/audit/release`, {
+  assert.equal((await fetch(`${base}/audit/release`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ auditId: manual.auditId, confirmStopped: true }),
-  });
-  assert.equal(released.status, 200);
+  })).status, 200);
 
-  const refinalize = await fetch(`${base}/audit/finalize`, {
+  assert.equal((await fetch(`${base}/audit/finalize`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ auditId: manual.auditId }),
-  });
-  assert.equal(refinalize.status, 409);
+  })).status, 409);
 });
 
 test('G3：owner 填错的候选不进入共享提交（VALIDATION_FAILED + 目录留在本地）', async () => {
@@ -300,76 +261,54 @@ test('G3：owner 填错的候选不进入共享提交（VALIDATION_FAILED + 目�
   assert.equal(job.result.status, 'VALIDATION_FAILED');
   const tracked = runCommand('git', ['ls-files', '.ai-review/2026-11'], root).stdout.trim();
   assert.equal(tracked, '', tracked);
-  // 失败候选应从 Frontmatter 的候选列表移除，错误详情仍由复核块保留。
-  const auditText = await readFile(path.join(root, '.ai-review', 'audits', manual.auditId, 'audit.md'), 'utf8');
-  assert.doesNotMatch(auditText, /candidates:\n\s+- 20261109-wrong-owner/);
-  assert.match(auditText, /未通过收尾校验/);
-  assert.match(auditText, /owner 应为 tester/);
+  assert.match(job.result.created[0].errors.join('；'), /owner 应为 tester/);
 });
 
 test('收尾拒绝重复键和缺失字段，Job 保留原始格式错误', async () => {
-    const root = await createGitFixture();
-    await ensureReviewers(root);
-    const { base } = await startApi(root);
-    const post = async (route, data) => (await fetch(base + route, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data),
-    })).json();
-    const { auditId } = await post('/audit/manual', { targetPath: '', note: '' });
-    const duplicate = '20261109-duplicate-owner', missing = '20261109-missing-owner';
-    const valid = '20261109-valid-owner';
-    await writeCandidate(root, valid);
-    await writeCandidate(root, duplicate, 'other\nowner: tester');
-    await writeCandidate(root, missing);
-    const missingReview = path.join(root, '.ai-review', '2026-11', missing, 'review.md');
-    await writeFile(missingReview, (await readFile(missingReview, 'utf8')).replace('owner: tester\n', ''), 'utf8');
+  const root = await createGitFixture();
+  await ensureReviewers(root);
+  const { base } = await startApi(root);
+  const post = async (route, data) => (await fetch(base + route, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data),
+  })).json();
+  const { auditId } = await post('/audit/manual', { targetPath: '', note: '' });
+  const duplicate = '20261109-duplicate-owner';
+  const missing = '20261109-missing-owner';
+  const valid = '20261109-valid-owner';
+  await writeCandidate(root, valid);
+  await writeCandidate(root, duplicate, 'other\nowner: tester');
+  await writeCandidate(root, missing);
+  const missingReview = path.join(root, '.ai-review', '2026-11', missing, 'review.md');
+  await writeFile(missingReview, (await readFile(missingReview, 'utf8')).replace('owner: tester\n', ''), 'utf8');
 
-    const { jobId } = await post('/audit/finalize', { auditId });
-    const job = await waitForJob(base, jobId);
-    assert.equal(job.result.status, 'VALIDATION_FAILED');
-    const results = new Map(job.result.created.map(candidate => [candidate.id, candidate.errors]));
-    assert.match(results.get(`2026-11/${duplicate}`)[0], /duplicated mapping key/);
-    assert.match(results.get(`2026-11/${missing}`)[0], /owner.*必填/);
-    const validation = new Map(job.result.dataValidation.map(file => [file.path, file.errors]));
-    assert.equal(validation.size, 4);
-    assert.deepEqual(validation.get(`.ai-review/2026-11/${valid}/review.md`), []);
-    assert.match(validation.get(`.ai-review/2026-11/${duplicate}/review.md`)[0], /duplicated mapping key[\s\S]*owner:/);
-    assert.match(validation.get(`.ai-review/2026-11/${missing}/review.md`)[0], /owner.*必填/);
-    assert.deepEqual(validation.get(`.ai-review/audits/${auditId}/audit.md`), []);
-    const committed = runCommand('git', ['ls-files', '.ai-review/2026-11'], root).stdout.trim().split('\n');
-    assert.deepEqual(committed, [`.ai-review/2026-11/${valid}/001.patch`, `.ai-review/2026-11/${valid}/review.md`]);
+  const { jobId } = await post('/audit/finalize', { auditId });
+  const job = await waitForJob(base, jobId);
+  assert.equal(job.result.status, 'VALIDATION_FAILED');
+  const results = new Map(job.result.created.map((candidate) => [candidate.id, candidate.errors]));
+  assert.match(results.get(`2026-11/${duplicate}`)[0], /duplicated mapping key/);
+  assert.match(results.get(`2026-11/${missing}`)[0], /owner/);
+  const committed = runCommand('git', ['ls-files', '.ai-review/2026-11'], root).stdout.trim().split('\n');
+  assert.deepEqual(committed, [`.ai-review/2026-11/${valid}/001.patch`, `.ai-review/2026-11/${valid}/review.md`]);
 });
 
-test('正式 audit.md 校验失败时 Job 指明字段并保留租约和本轮文件', async (t) => {
-    const write = AuditArchive.prototype.writeExisting;
-    t.mock.method(AuditArchive.prototype, 'writeExisting', async function (meta, body) {
-        const record = await write.call(this, meta, body);
-        const text = await readFile(record.reviewPath, 'utf8');
-        await writeFile(record.reviewPath, text.replace(/^previous_audit: .*\n/m, ''), 'utf8');
-        return record;
-    });
-    const root = await createGitFixture();
-    await ensureReviewers(root);
-    const { base } = await startApi(root);
-    const post = async (route, data) => (await fetch(base + route, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data),
-    })).json();
-    const { auditId } = await post('/audit/manual', { targetPath: '', note: '' });
-    const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-    const slug = '20261109-valid-review';
-    await writeCandidate(root, slug);
+test('草稿 audit.md 缺失必填字段时收尾返回 ABORTED 且保留现场', async () => {
+  const root = await createGitFixture();
+  await ensureReviewers(root);
+  const { base } = await startApi(root);
+  const post = async (route, data) => (await fetch(base + route, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data),
+  })).json();
+  const { auditId, reportPath } = await post('/audit/manual', { targetPath: '', note: '' });
+  const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const auditAbs = path.join(root, reportPath);
+  await mkdir(path.dirname(auditAbs), { recursive: true });
+  await writeFile(auditAbs, `---\nschema_version: 1\naudit_id: ${auditId}\n---\n\n# 报告\n`, 'utf8');
 
-    const { jobId } = await post('/audit/finalize', { auditId });
-    const job = await waitForJob(base, jobId);
-    const auditPath = `.ai-review/audits/${auditId}/audit.md`;
-    assert.equal(job.result.status, 'ABORTED');
-    assert.equal(job.result.commitRevision, null);
-    assert.deepEqual(job.result.dataValidation, [
-        { path: `.ai-review/2026-11/${slug}/review.md`, errors: [] },
-        { path: auditPath, errors: ['previous_audit 是必填字段，不得缺省'] },
-    ]);
-    assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), head);
-    assert.match(await readFile(path.join(root, auditPath), 'utf8'), /schema_version: 1/);
-    assert.match(await readFile(path.join(root, '.ai-review', '2026-11', slug, 'review.md'), 'utf8'), /owner: tester/);
-    const queue = await fetch(base + '/queue').then(response => response.json());
-    assert.equal(queue.auditLease.auditId, auditId);
+  const { jobId } = await post('/audit/finalize', { auditId });
+  const job = await waitForJob(base, jobId);
+  assert.equal(job.result.status, 'ABORTED');
+  assert.equal(job.result.commitRevision, null);
+  assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), head);
+  const queue = await fetch(base + '/queue').then((response) => response.json());
+  assert.equal(queue.auditLease.auditId, auditId);
 });

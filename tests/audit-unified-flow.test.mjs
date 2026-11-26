@@ -8,7 +8,6 @@ import { compatibleAuditBase, readSvnAuditUrl } from '../packages/dsh-plugin/dis
 import { SvnAdapter } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
-import { runGateChecks } from '../packages/dsh-plugin/dist/host/validator.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
 import { fullPatch, taskData } from './fixtures/proposal-patch.mjs';
 import { runAuditChannel } from './fixtures/phased-audit-agent.mjs';
@@ -29,8 +28,7 @@ async function workspace(t, vcsType) {
         runCommand('svn', ['add', 'src'], root);
     }
     await mkdir(path.join(root, '.ai-review'));
-    await writeFile(path.join(root, '.ai-review/reviewers.yml'),
-        'default_owner: tester\nrules: []\nallowed_gate_commands: ["node --version"]\nverify_gate_on_audit_finalize: declared\n');
+    await writeFile(path.join(root, '.ai-review/reviewers.yml'), 'default_owner: tester\nrules: []\n');
     runCommand(vcsType, vcsType === 'git' ? ['add', '-A'] : ['add', '.ai-review'], root);
     runCommand(vcsType, ['commit', '-m', 'audit baseline'], root);
     if (vcsType === 'svn') runCommand('svn', ['update'], root);
@@ -70,7 +68,8 @@ test('外部通道随 Host 关闭撤销，重启后的未封存租约仍可核�
     await assert.rejects(fetch(address, { method: 'POST' }));
     const restarted = new ReviewApi(deps);
     await restarted.init();
-    assert.equal((await request(restarted, '/audit/finalize', { auditId })).status, 409);
+    assert.equal((await request(restarted, '/audit/release', { auditId, confirmStopped: true })).status, 409);
+    await restarted.leaseTransition(auditId, 'releasable');
     assert.equal((await request(restarted, '/audit/release', { auditId, confirmStopped: true })).status, 200);
     const next = await request(restarted, '/audit/manual', { targetPath: 'src' });
     assert.equal(next.status, 202);
@@ -91,74 +90,91 @@ async function waitForJob(api, id) {
 
 for (const vcsType of ['git', 'svn']) {
     for (const mode of ['external', 'headless']) {
-        test(vcsType + ' ' + mode + ' 共用原目录阶段、问题索引和提案预检', { timeout: 35_000 }, async t => {
+        test(vcsType + ' ' + mode + ' 共用原目录阶段、纯索引档案和提案预检', { timeout: 35_000 }, async t => {
             const { root, temp } = await workspace(t, vcsType);
             const sourceFile = vcsType === 'svn' ? 'src/math@case.js' : 'src/math.js';
-            const navigation = [{ path: sourceFile, line: 1 }];
             const external = fileURLToPath(new URL('./fixtures/phased-audit-agent.mjs', import.meta.url));
             const api = new ReviewApi({
-                settings: { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType,
-                    runner: 'external', externalCommand: '"' + process.execPath + '" "' + external + '" hold' },
+                settings: {
+                    ...DEFAULT_SETTINGS,
+                    repoRoot: root,
+                    owner: 'tester',
+                    vcsType,
+                    runner: 'external',
+                    externalCommand: '"' + process.execPath + '" "' + external + '" hold',
+                },
                 statePath: path.join(temp, 'runtime.json'),
                 saveSettings: async settings => settings,
-                auditStageGates: runGateChecks,
-                auditStageExecutor: async ({ prompt, repoRoot, onProcessTreeStopped }) => {
-                    onProcessTreeStopped?.(true);
-                    if (prompt.startsWith('# 初审')) return {
-                        leads: ['local-fix', 'policy-fix', 'future-fix'].map(leadId => ({
-                            leadId, entry: leadId, navigation, preconditions: ['运行加法'], expectedBehavior: '正确计算', suspectedImpact: '计算错误',
-                        })), coverage: [], limits: [],
+                auditStageExecutor: async ({ stage, runner, artifactDir, prompt }) => {
+                    if (stage === 'scan') return {
+                        ok: true,
+                        executorUsed: runner,
+                        output: {
+                            leads: ['local-fix', 'policy-fix', 'future-fix'].map(leadId => ({
+                                leadId,
+                                entry: leadId,
+                                path: sourceFile,
+                                line: 1,
+                                precondition: '运行加法',
+                                expected: '正确计算',
+                                impact: '计算错误',
+                            })),
+                            coverage: [],
+                            limits: [],
+                        },
                     };
-                    if (prompt.startsWith('# 独立复核')) return {
-                        verdict: 'confirmed', reason: '基线中实际执行减法', preconditions: ['输入两个非零数'],
-                        observedBehavior: '返回差值', impact: '加法结果不正确', evidence: [{ ...navigation[0], excerpt: source, reason: '计算表达式' }], limits: [],
+                    if (stage === 'verify') return {
+                        ok: true,
+                        executorUsed: runner,
+                        output: {
+                            verdict: 'confirmed',
+                            reason: '基线中实际执行减法',
+                            evidence: [{ path: sourceFile, line: 1, excerpt: source, reason: '计算表达式' }],
+                        },
                     };
                     const data = taskData(prompt);
-                    const patchPath = data.candidate.artifactDir + '/proposal.patch';
-                    await writeFile(path.join(repoRoot, patchPath), fullPatch(sourceFile, source + '\n', source.replace('a - b', 'a + b') + '\n'));
-                    return { status: 'ready', patchPath, confidence: 95, tradeoff: '直接修正表达式', humanDecisions: [], summary: '修正加法', reason: '' };
+                    const patchRel = path.posix.join(data.candidate.artifactRelDir, 'proposal.patch');
+                    await writeFile(path.join(artifactDir, 'proposal.patch'), fullPatch(sourceFile, source + '\n', source.replace('a - b', 'a + b') + '\n'));
+                    return {
+                        ok: true,
+                        executorUsed: runner,
+                        output: {
+                            status: 'ready',
+                            optionId: 'opt-fix',
+                            title: '直接修正表达式',
+                            patchPath: patchRel,
+                            confidence: 95,
+                            tradeoff: '直接修正表达式',
+                            humanDecisions: [],
+                            summary: '修正加法',
+                            reason: '',
+                        },
+                    };
                 },
             });
             await api.init();
+            t.after(() => api.closeAudit());
             const post = (endpoint, body = {}) => api.invoke({ method: 'POST', path: endpoint, body });
             const start = await post(mode === 'external' ? '/audit/manual' : '/audit');
             assert.equal(start.status, 202, JSON.stringify(start.body));
             let job = start.body.jobId;
             if (mode === 'external') {
                 const { auditId, prompt } = start.body;
-                assert.equal((await post('/audit/finalize', { auditId })).status, 409);
                 const result = await runAuditChannel(prompt);
                 assert.equal(result.reportPath, start.body.reportPath);
                 const final = await post('/audit/finalize', { auditId });
                 assert.equal(final.status, 202, JSON.stringify(final.body));
                 job = final.body.jobId;
             }
-            if (mode === 'headless') {
-                for (let attempt = 0; attempt < 500; attempt++) {
-                    const { body: progress } = await api.invoke({ method: 'GET', path: '/jobs/' + job });
-                    const line = progress.log.find(item => item.startsWith('{"reportPath"'));
-                    if (line) {
-                        const reportPath = JSON.parse(line).reportPath;
-                        const auditId = path.basename(path.dirname(reportPath));
-                        const premature = await post('/audit/finalize', { auditId });
-                        assert.equal(premature.status, 409);
-                        assert.match(premature.body.error.message, /Runner 已退出/);
-                        break;
-                    }
-                    assert.equal(progress.status, 'running', JSON.stringify(progress));
-                    await new Promise(resolve => setTimeout(resolve, 40));
-                }
-            }
             const completed = await waitForJob(api, job);
             assert.equal(completed.result?.status, 'COMMITTED', JSON.stringify(completed));
-            const report = await readFile(path.join(root, completed.result.reportPath), 'utf8');
+            const report = await readFile(path.join(root, completed.result.report.path), 'utf8');
             assert.ok(report.indexOf('政策仍需确认') < report.indexOf('等待政策落地'));
             assert.ok(report.indexOf('等待政策落地') < report.indexOf('加法结果错误'));
-            assert.match(report, /schema_version: 3/);
-            assert.doesNotMatch(report, /门禁.*通过/);
+            assert.match(report, /schema_version: 1/);
             const { body: findings } = await api.invoke({ method: 'GET', path: '/findings' });
             assert.equal(findings.findings.length, 3);
-            assert.ok(findings.findings.every(item => item.reviewId));
+            assert.ok(findings.findings.every(item => item.id));
         });
     }
 }

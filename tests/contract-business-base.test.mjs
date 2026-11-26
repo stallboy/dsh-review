@@ -44,13 +44,12 @@ async function waitJob(base, jobId, attempts = 120) {
   return job;
 }
 
-/** 评论、状态更新和收尾都会提交评审元数据。用只改 `.ai-review/` 的提交复现 HEAD 前进但业务基线相同的场景。 */
 function commitReviewMetaOnly(root, message) {
   runCommand('git', ['add', '-A', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '--allow-empty', '-m', message], root);
 }
 
-test('§7.7：VcsAdapter.businessChangesBetween 排除 .ai-review/，只报告业务路径（Git）', async () => {
+test('§5.7：VcsAdapter.businessChangesBetween 排除 .ai-review/，只报告业务路径（Git）', async () => {
   const root = await createGitFixture();
   const from = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   await commitCandidate(root, '20261111-meta-only');
@@ -64,15 +63,14 @@ test('§7.7：VcsAdapter.businessChangesBetween 排除 .ai-review/，只报告�
   assert.deepEqual(await vcs.businessChangesBetween(from, metaOnlyHead), [], '只有 .ai-review 变更时必须返回空');
   assert.deepEqual(await vcs.businessChangesBetween(from, businessHead), ['src/math.js']);
   assert.deepEqual(await vcs.businessChangesBetween(from, from), []);
-  // 未知版本没有可比较的树，调用者必须按无法证明基线是否相同处理。
   assert.equal(await vcs.businessChangesBetween('not-a-rev', businessHead), null);
 });
 
-test('§7.7：评论推进 HEAD 后 /candidate 的 isBaseBehind 仍为 false（业务基线未变）', async () => {
+test('§5.7：评论推进 HEAD 后 /candidate 的 isBaseBehind 仍为 false（业务基线未变）', async () => {
   const root = await createGitFixture();
   const realBase = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   const candidate = await commitCandidate(root, '20261111-comment-head', {
-    review: { baseRevision: JSON.stringify(realBase) },
+    review: { baseRevision: realBase },
   });
   const { base } = await startApi(root);
 
@@ -88,18 +86,18 @@ test('§7.7：评论推进 HEAD 后 /candidate 的 isBaseBehind 仍为 false（�
   assert.equal(after.isBaseBehind, false, '业务代码未变时不得显示基线落后');
 });
 
-test('§7.7：/rebase 在业务基线未变（仅 .ai-review 提交）时返回 ABORTED / BASE_UNCHANGED', async () => {
+test('§5.7：/rebase 在业务基线未变（仅 .ai-review 提交）时返回 ABORTED / BASE_UNCHANGED', async () => {
   const root = await createGitFixture();
   const realBase = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   const candidate = await commitCandidate(root, '20261111-rebase-base-unchanged', {
-    review: { baseRevision: JSON.stringify(realBase) },
+    review: { baseRevision: realBase },
   });
   commitReviewMetaOnly(root, 'review meta only');
   const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   assert.notEqual(head, realBase, '前置条件：HEAD 已前进但业务代码未变');
 
   const { base } = await startApi(root);
-  const res = await post(base, '/rebase', { ...guardFixture(candidate.id) });
+  const res = await post(base, '/rebase', { ...guardFixture(candidate.id), optionId: 'opt-a', patchId: 1 });
   assert.equal(res.status, 202);
   const job = await waitJob(base, (await res.json()).jobId);
   assert.equal(job.result?.status, 'ABORTED', JSON.stringify(job.result));
@@ -108,36 +106,32 @@ test('§7.7：/rebase 在业务基线未变（仅 .ai-review 提交）时返回 
   assert.doesNotMatch(files, /002\.patch/);
 });
 
-test('§7.7：业务代码确有变化时 /rebase 正常产生新版本（不是 BASE_UNCHANGED）', async () => {
+test('§5.7：业务代码确有变化时 /rebase 正常进入 Mode B（不是 BASE_UNCHANGED）', async () => {
   const root = await createGitFixture();
   const realBase = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   const candidate = await commitCandidate(root, '20261111-rebase-business-changed', {
-    review: {
-      baseRevision: JSON.stringify(realBase),
-      bodyLines: ['# 需人工判断项', '', '- 无'],
-    },
+    review: { baseRevision: realBase },
   });
   await writeFile(path.join(root, 'src', 'other.js'), 'export const x = 1;\n', 'utf8');
   runCommand('git', ['add', 'src'], root);
   runCommand('git', ['commit', '-q', '-m', 'business moves'], root);
 
   const { base } = await startApi(root);
-  const res = await post(base, '/rebase', { ...guardFixture(candidate.id) });
+  const res = await post(base, '/rebase', { ...guardFixture(candidate.id), optionId: 'opt-a', patchId: 1 });
   assert.equal(res.status, 202);
   const job = await waitJob(base, (await res.json()).jobId);
-  assert.equal(job.result?.status, 'COMMITTED', JSON.stringify(job.result));
-  assert.equal(job.result.newRevision, 2);
+  assert.equal(job.result?.status, 'MANUAL_REQUIRED', JSON.stringify(job.result));
+  assert.match(String(job.result.prompt), /opt-a/);
 });
 
-test('§7.7/§7.5：ai_fix 的 ABORTED reason 与审批原因表相互独立（类型边界）', async () => {
+test('§5.5/§5.6：ai_fix 的 ABORTED reason 与审批原因表相互独立（类型边界）', async () => {
   const types = await readFile(new URL('../packages/dsh-plugin/src/host/types.ts', import.meta.url), 'utf8');
   const approvalBlock = /export type ApprovalAbortReason =([\s\S]*?);/.exec(types)?.[1] ?? '';
   assert.ok(approvalBlock.length > 0, '必须能定位 ApprovalAbortReason');
-  assert.doesNotMatch(approvalBlock, /REBASE_CONFLICT/, '§7.5 审批原因表不得包含 REBASE_CONFLICT');
-  assert.doesNotMatch(approvalBlock, /BASE_UNCHANGED/, '§7.5 审批原因表不得包含 BASE_UNCHANGED');
+  assert.doesNotMatch(approvalBlock, /REBASE_CONFLICT/, '审批原因表不得包含 REBASE_CONFLICT');
+  assert.doesNotMatch(approvalBlock, /BASE_UNCHANGED/, '审批原因表不得包含 BASE_UNCHANGED');
   const aiFixBlock = /export type AiFixAbortReason =([\s\S]*?);/.exec(types)?.[1] ?? '';
   assert.match(aiFixBlock, /REBASE_CONFLICT/);
   assert.match(aiFixBlock, /BASE_UNCHANGED/);
-  assert.match(aiFixBlock, /GATE_CHECK_FAILED/);
   assert.match(aiFixBlock, /DIRTY_WORKSPACE/);
 });

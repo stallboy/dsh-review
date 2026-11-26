@@ -1,11 +1,12 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
+import { writeCandidate } from './fixtures/contract.mjs';
 
 const servers = [];
 after(async () => {
@@ -22,24 +23,6 @@ async function startApi(root, owner = 'tester') {
   const base = `http://127.0.0.1:${String(address.port)}${API_PREFIX}`;
   servers.push(server);
   return { base };
-}
-
-function candidateFm(slug, updatedAt = '2026-11-01T10:00:00+08:00') {
-  return [
-    '---', 'schema_version: 1', `title: "net: ${slug}"`, 'module: net', 'audit_type: bugfix',
-    'created_at: "2026-11-01T10:00:00+08:00"', `updated_at: "${updatedAt}"`, 'owner: tester',
-    'tags: []', 'status: pending', 'ticket: null', 'target_files: [src/math.js]', 'current_revision: 1',
-    'revisions:', '  - id: 1', '    base_revision: "1"', '    patch: 001.patch', '    author: ai',
-    'gate_checks: ["node --version"]', 'comments: []', 'human_decisions: []', 'approval: null', 'rejection: null',
-    'commit_message: "net: x"', '---', '', '# 问题与影响', '',
-  ].join('\n');
-}
-
-async function writeCandidate(root, slug) {
-  const dir = path.join(root, '.ai-review', '2026-11', slug);
-  await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, 'review.md'), candidateFm(slug), 'utf8');
-  await writeFile(path.join(dir, '001.patch'), 'diff --git a/src/math.js b/src/math.js\n', 'utf8');
 }
 
 function commitAll(root, message) {
@@ -86,7 +69,7 @@ test('G10：详情读取 HEAD 同一快照——工作区手改不进入共享�
   assert.equal(queue2.counts.pending, 1);
 });
 
-test('G8：非 Owner 的候选共享写返回 403；takeover 是唯一例外（AC-SECURITY-01 部分）', async () => {
+test('G8：非 Owner 的问题共享写返回 403；takeover 是唯一例外（AC-SECURITY-01 部分）', async () => {
   const root = await createGitFixture();
   await writeCandidate(root, '20261109-owned');
   commitAll(root, 'fixture');
@@ -104,25 +87,25 @@ test('G8：非 Owner 的候选共享写返回 403；takeover 是唯一例外（A
   const comment = await post('/comments', { ...guard, content: '越权评论' });
   assert.equal(comment.status, 403);
   assert.equal((await comment.json()).error.code, 'forbidden');
-  const reject = await post('/reject', { ...guard, reason: '越权拒绝' });
-  assert.equal(reject.status, 403);
-  const approve = await post('/approve', { ...guard });
+  const decision = await post('/finding/decision', { ...guard, action: 'accept_as_is', reason: '越权接受现状' });
+  assert.equal(decision.status, 403);
+  const approve = await post('/approve', { ...guard, optionId: 'opt-a', patchId: 1 });
   assert.equal(approve.status, 403);
 
   const takeover = await post('/takeover', { ...guard, owner: 'other' });
   assert.equal(takeover.status, 200);
+  const takeoverBody = await takeover.json();
   const commentAfter = await post('/comments', {
     id: '2026-11/20261109-owned',
-    expectedRevision: 1,
+    expectedRevision: takeoverBody.candidate.meta.recordRevision,
     expectedOwner: 'other',
-    expectedUpdatedAt: (await takeover.json()).candidate.meta.updatedAt,
+    expectedUpdatedAt: takeoverBody.candidate.meta.updatedAt,
     content: '接管后的评论',
   });
   assert.equal(commentAfter.status, 200);
 });
 
 test('G10：整个 .ai-review 未跟踪（首次审查）时本地候选仍可见——status 目录折叠不得吞掉 local 诊断', async () => {
-  // 首次审查时 Git 会把整个未跟踪目录折叠成 `?? .ai-review/`，基于候选层级解析会漏掉目录下的草稿。
   const root = await createGitFixture();
   await writeCandidate(root, '20261112-first-audit');
   const { base } = await startApi(root);
@@ -136,13 +119,11 @@ test('G10：整个 .ai-review 未跟踪（首次审查）时本地候选仍可�
   const detail = await fetch(`${base}/candidate?id=${encodeURIComponent('2026-11/20261112-first-audit')}`);
   assert.equal(detail.status, 404, 'local-only 候选不存在于共享快照，详情应 404');
 
-  // 忽略 `.ai-review` 会让 Git 状态没有输出，用于覆盖只能从文件系统找到本地候选的情形。
   await writeFile(path.join(root, '.gitignore'), '.ai-review/\n', 'utf8');
   const ignored = await (await fetch(`${base}/queue`)).json();
   assert.equal(ignored.items.find((entry) => entry.id.endsWith('first-audit'))?.localOnly, true,
     '.ai-review 被 gitignore 时本地候选诊断仍可见');
 
-  // 先取消忽略，否则 git add 无法把候选纳入共享视图。
   await rm(path.join(root, '.gitignore'), { force: true });
   commitAll(root, 'commit candidates');
   const shared = await (await fetch(`${base}/queue`)).json();

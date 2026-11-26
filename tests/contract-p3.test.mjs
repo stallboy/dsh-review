@@ -2,12 +2,13 @@ import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { existsSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
 import { createGitFixture, fakeAuditAgentPath, runCommand } from './helpers.mjs';
+import { writeCandidate } from './fixtures/contract.mjs';
 
 const servers = [];
 after(async () => {
@@ -36,64 +37,13 @@ async function startApi(root) {
   return { base };
 }
 
-async function writeCandidate(root, slug, updatedAt) {
-  const dir = path.join(root, '.ai-review', '2026-11', slug);
-  await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, 'review.md'), [
-    '---',
-    'schema_version: 1',
-    `title: "net: ${slug}"`,
-    'module: net',
-    'audit_type: bugfix',
-    'created_at: "2026-11-01T10:00:00+08:00"',
-    `updated_at: "${updatedAt}"`,
-    'owner: tester',
-    'tags: []',
-    'status: pending',
-    'ticket: null',
-    'target_files: [src/math.js]',
-    'current_revision: 1',
-    'revisions:',
-    '  - id: 1',
-    '    base_revision: "1"',
-    '    patch: 001.patch',
-    '    author: ai',
-    'gate_checks: ["node --version"]',
-    'comments: []',
-    'human_decisions: []',
-    'approval: null',
-    'rejection: null',
-    'commit_message: "net: x"',
-    '---',
-    '',
-    '# 问题与影响',
-    '',
-  ].join('\n'), 'utf8');
-  await writeFile(path.join(dir, '001.patch'), [
-    'diff --git a/src/math.js b/src/math.js',
-    '--- a/src/math.js',
-    '+++ b/src/math.js',
-    '@@ -1 +1 @@',
-    '-export const add = (a, b) => a - b;',
-    '+export const add = (a, b) => a + b;',
-    '',
-  ].join('\n'), 'utf8');
-}
-
-const HEAD_BEFORE = 'HEAD@{0}';
-
-test('P3: 队列只提示过期，不产生共享提交', async () => {
+test('P3: 队列只提示过期（isStale），不产生共享提交', async () => {
   const root = await createGitFixture();
-  const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   const staleIso = new Date(Date.now() - 20 * 86_400_000).toISOString();
   const freshIso = new Date(Date.now() - 86_400_000).toISOString();
-  await writeCandidate(root, '20261104-net-stale', staleIso);
-  await writeCandidate(root, '20261104-net-fresh', freshIso);
-  await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), [
-    'default_owner: tester',
-    'stale_days: 14',
-    '',
-  ].join('\n'), 'utf8');
+  await writeCandidate(root, '20261104-net-stale', { review: { createdAt: staleIso, updatedAt: staleIso } });
+  await writeCandidate(root, '20261104-net-fresh', { review: { createdAt: freshIso, updatedAt: freshIso } });
+  await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nstale_days: 14\n', 'utf8');
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const commitBefore = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
@@ -106,15 +56,12 @@ test('P3: 队列只提示过期，不产生共享提交', async () => {
   assert.equal(freshItem?.isStale, undefined);
   const commitAfter = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   assert.equal(commitAfter, commitBefore);
-  assert.notEqual(base, HEAD_BEFORE);
 });
 
-test('P3: 显式归档写 system:stale + 删补丁 + 只写一次；未过期候选拒绝归档', async () => {
+test('P3: 已废止 /archive-stale 返回 404；使用 /finding/decision defer + accept_as_is 替代且保留不可变补丁', async () => {
   const root = await createGitFixture();
   const staleIso = new Date(Date.now() - 20 * 86_400_000).toISOString();
-  const freshIso = new Date(Date.now() - 86_400_000).toISOString();
-  await writeCandidate(root, '20261104-net-stale', staleIso);
-  await writeCandidate(root, '20261104-net-fresh', freshIso);
+  await writeCandidate(root, '20261104-net-stale', { review: { createdAt: staleIso, updatedAt: staleIso } });
   await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nstale_days: 14\n', 'utf8');
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
@@ -122,50 +69,78 @@ test('P3: 显式归档写 system:stale + 删补丁 + 只写一次；未过期候
   const { base: apiUrl } = await startApi(root);
   const staleDir = path.join(root, '.ai-review', '2026-11', '20261104-net-stale');
 
-  const tooFresh = await fetch(`${apiUrl}/archive-stale`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261104-net-fresh', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: freshIso }),
-  });
-  assert.equal(tooFresh.status, 409);
-  assert.match((await tooFresh.json()).error.message, /未超过 stale_days/);
-
-  const ok = await fetch(`${apiUrl}/archive-stale`, {
+  const gone = await fetch(`${apiUrl}/archive-stale`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ id: '2026-11/20261104-net-stale', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: staleIso }),
   });
-  assert.equal(ok.status, 200);
-  const { candidate } = await ok.json();
+  assert.equal(gone.status, 404);
+
+  const accepted = await fetch(`${apiUrl}/finding/decision`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      id: '2026-11/20261104-net-stale',
+      expectedRevision: 1,
+      expectedOwner: 'tester',
+      expectedUpdatedAt: staleIso,
+      action: 'accept_as_is',
+      reason: '长期过期且已无必要修改',
+      category: 'out_of_scope',
+    }),
+  });
+  assert.equal(accepted.status, 200);
+  const { candidate } = await accepted.json();
   assert.equal(candidate.meta.status, 'rejected');
-  assert.equal(candidate.meta.rejection.rejectedBy, 'system:stale');
-  assert.match(candidate.meta.rejection.reason, /超时/);
-  assert.ok(!existsSync(path.join(staleDir, '001.patch')), '归档后补丁应删除');
-
-  const again = await fetch(`${apiUrl}/archive-stale`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261104-net-stale', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: staleIso }),
-  });
-  assert.equal(again.status, 409);
+  assert.equal(candidate.meta.rejection.rejectedBy, 'tester');
+  assert.equal(candidate.meta.rejection.category, 'out_of_scope');
+  assert.ok(existsSync(path.join(staleDir, '001.patch')), 'SPEC §3.1：历史补丁必须永久保留，不得删除');
 
   const store = new ReviewStore(root);
   const detail = await store.get('2026-11/20261104-net-stale', null);
-  assert.equal(detail.candidate.meta.rejection.rejectedBy, 'system:stale');
+  assert.equal(detail.candidate.meta.rejection.reason, '长期过期且已无必要修改');
 });
 
-test('P3: 未配置 stale_days 时归档被拒绝', async () => {
+test('P3: 未配置 stale_days 时按 SPEC 默认 14 天提示过期，defer 延期暂停后阻断批准', async () => {
   const root = await createGitFixture();
   const staleIso = new Date(Date.now() - 20 * 86_400_000).toISOString();
-  await writeCandidate(root, '20261104-net-stale', staleIso);
+  const freshIso = new Date(Date.now() - 5 * 86_400_000).toISOString();
+  await writeCandidate(root, '20261104-net-stale', { review: { createdAt: staleIso, updatedAt: staleIso } });
+  await writeCandidate(root, '20261104-net-fresh', { review: { createdAt: freshIso, updatedAt: freshIso } });
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const { base: apiUrl } = await startApi(root);
-  const response = await fetch(`${apiUrl}/archive-stale`, {
+
+  const queue = await (await fetch(`${apiUrl}/queue`)).json();
+  assert.equal(queue.items.find((item) => item.id.endsWith('net-stale'))?.isStale, true);
+  assert.equal(queue.items.find((item) => item.id.endsWith('net-fresh'))?.isStale, undefined);
+
+  const deferred = await fetch(`${apiUrl}/finding/decision`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ id: '2026-11/20261104-net-stale', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: staleIso }),
+    body: JSON.stringify({
+      id: '2026-11/20261104-net-stale',
+      expectedRevision: 1,
+      expectedOwner: 'tester',
+      expectedUpdatedAt: staleIso,
+      action: 'defer',
+      reason: '等下个迭代再处理',
+    }),
   });
-  assert.equal(response.status, 409);
-  assert.match((await response.json()).error.message, /stale_days/);
+  assert.equal(deferred.status, 200);
+  const deferredBody = await deferred.json();
+  const blockedApprove = await fetch(`${apiUrl}/approve`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      id: '2026-11/20261104-net-stale',
+      expectedRevision: deferredBody.candidate.meta.recordRevision,
+      expectedOwner: 'tester',
+      expectedUpdatedAt: deferredBody.candidate.meta.updatedAt,
+      optionId: 'opt-a',
+      patchId: 1,
+    }),
+  });
+  assert.equal(blockedApprove.status, 409);
+  assert.match((await blockedApprove.json()).error.message, /延期|defer/);
 });

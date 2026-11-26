@@ -26,32 +26,24 @@ async function nodeRuntime(t, app, registration, execute, extra = {}) {
     return { node, journal, transport };
 }
 
-test('已受理的旧人工补丁任务直接结束，下一条任务仍可执行', async t => {
+test('取消中的任务可干净结束，下一条任务仍可正常执行', async t => {
     const { app, headers } = await setupCentral(t);
     const registration = await registerNode(app);
     const project = await bindProject(app, headers, registration);
     const url = `/api/v1/projects/${project.projectId}/commands`;
-    const created = await app.inject({ method: 'POST', url, headers, payload: approvePayload('legacy-command') });
+    const created = await app.inject({ method: 'POST', url, headers, payload: approvePayload('cancelled-before-run') });
     assert.equal(created.statusCode, 202, created.body);
-    const { state, updatedAt, cancelRequested, ...command } = created.json().command;
-    assert.equal(state, 'queued');
-    const retired = { ...command, operation: 'manual-revision', payload: { ...command.payload, patchText: 'diff --git a/foo b/foo\n' } };
-    app.database.sql.prepare('UPDATE commands SET envelope=? WHERE command_id=?').run(JSON.stringify(retired), retired.commandId);
-    const ack = await app.inject({ method: 'POST', url: `/node-api/v1/commands/${retired.commandId}/ack`, headers: registration.headers,
-        payload: { instanceId: registration.instanceId } });
-    assert.equal(ack.statusCode, 200, ack.body);
-    assert.equal(ack.json().command.cancelRequested, true);
+    const commandId = created.json().command.commandId;
+    await app.inject({ method: 'POST', url: `/api/v1/commands/${commandId}/cancel`, headers, payload: {} });
     const executions = [];
     const runtime = await nodeRuntime(t, app, registration, async value => {
         executions.push(value.operation);
-        return { outcome: { status: 'ABORTED', reason: 'CANCELLED' }, delivery: { state: 'not_required' } };
+        return { outcome: { status: 'COMMITTED', commitRevision: 'c1' }, delivery: { state: 'delivered', commitRevision: 'c1' } };
     });
     for (let index = 0; index < 3; index++) { await runtime.node.tick(); await runtime.node.drain(); }
-    const legacy = (await app.inject({ url: `/api/v1/commands/${retired.commandId}`, headers })).json().command;
-    assert.equal(legacy.state, 'completed');
-    assert.equal(legacy.result.outcome.reason, 'CANCELLED');
-    const events = app.database.sql.prepare("SELECT json_extract(payload,'$.event.type') AS type FROM events WHERE command_id=? ORDER BY sequence").all(retired.commandId);
-    assert.deepEqual(events.map(event => event.type), ['result']);
+    const cancelled = (await app.inject({ url: `/api/v1/commands/${commandId}`, headers })).json().command;
+    assert.equal(cancelled.state, 'completed');
+    assert.equal(cancelled.result.outcome.status, 'ABORTED');
     assert.deepEqual(executions, []);
     const next = await app.inject({ method: 'POST', url, headers, payload: approvePayload('next-command') });
     assert.equal(next.statusCode, 202, next.body);
@@ -59,24 +51,22 @@ test('已受理的旧人工补丁任务直接结束，下一条任务仍可执�
     assert.deepEqual(executions, ['approve']);
 });
 
-test('中央已结束旧人工补丁任务后，节点可重放并结清遗留的本地受理记录', async t => {
-    const { app, headers, dataDir, createCentralApp } = await setupCentral(t);
-    const registration = await registerNode(app);
+test('中央已提前结清自检任务后，节点重放受理记录不会重复启动并清零未决状态', async t => {
+    const { app, headers } = await setupCentral(t);
+    const registration = await registerNode(app, 'node-self', 'workspace-a', { auditSelfTest: true });
     const project = await bindProject(app, headers, registration);
-    const created = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.projectId}/commands`, headers, payload: approvePayload('lost-ack') });
+    const created = await app.inject({ method: 'POST', url: '/api/v1/test', headers, payload: { projectId: project.projectId, idempotencyKey: 'selftest-settle' } });
     assert.equal(created.statusCode, 202, created.body);
     const { state, updatedAt, cancelRequested, ...command } = created.json().command;
-    const retired = { ...command, operation: 'manual-revision', payload: { ...command.payload, patchText: 'diff --git a/foo b/foo\n' } };
-    app.database.sql.prepare("UPDATE commands SET state='dispatched',envelope=? WHERE command_id=?").run(JSON.stringify(retired), retired.commandId);
-    const upgraded = await createCentralApp({ dataDir });
-    upgraded.database.sql.prepare('UPDATE projects SET config_revision=config_revision+1 WHERE project_id=?').run(project.projectId);
+    const doneResult = { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', step: 'workspace', message: '已提前结清' }, delivery: { state: 'not_required' } };
+    app.database.sql.prepare("UPDATE commands SET state='completed',result=? WHERE command_id=?").run(JSON.stringify(doneResult), command.commandId);
     let executions = 0;
-    const runtime = await nodeRuntime(t, upgraded, registration, async () => { executions++; });
-    runtime.journal.accept(retired);
+    const runtime = await nodeRuntime(t, app, registration, async () => { executions++; });
+    runtime.journal.accept(command);
     await runtime.node.tick();
     await runtime.node.drain();
     assert.equal(executions, 0);
-    assert.equal(runtime.journal.get(retired.commandId).phase, 'completed');
+    assert.equal(runtime.journal.get(command.commandId).phase, 'completed');
     assert.equal(runtime.journal.hasUnsettled(), false);
 });
 

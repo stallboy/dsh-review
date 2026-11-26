@@ -97,8 +97,28 @@ function candidateFixture() {
     }).outputText;
     let index = 0, tree, available = true, id = 'candidate-a';
     const hooks = [], effects = [];
-    const meta = { currentRevision: 2, updatedAt: 'now', owner: '张三', status: 'pending', comments: [], revisions: [{ id: 1 }, { id: 2 }], gateChecks: [] };
-    const value = { candidate: { meta, sections: {}, humanJudgment: [], humanJudgmentDeclared: true }, comments: [], validation: [], patchText: patch };
+    const meta = {
+        recordRevision: 2,
+        updatedAt: 'now',
+        owner: '张三',
+        status: 'pending',
+        issueKind: 'repair',
+        priority: 'P2',
+        comments: [],
+        patches: [{ id: 1, optionId: 'opt-a', patch: '001.patch', baseRevision: 'a', author: 'ai', sha256: '0'.repeat(64) }, { id: 2, optionId: 'opt-a', patch: '002.patch', baseRevision: 'a', author: 'ai', sha256: '0'.repeat(64) }],
+        options: [{ id: 'opt-a', title: '方案 A', tradeoff: '最小改动', confidence: 90, currentPatch: 2, gateChecks: ['echo ok'] }],
+        repairAttempts: [],
+        approvalHistory: [],
+    };
+    const value = {
+        selection: { optionId: 'opt-a', patchId: 2 },
+        selectedOption: meta.options[0],
+        selectedPatch: meta.patches[1],
+        candidate: { meta, sections: {}, humanJudgment: [], humanJudgmentDeclared: true },
+        comments: [],
+        validation: [],
+        patchText: patch,
+    };
     const useState = initial => {
         const slot = index++;
         if (!(slot in hooks)) hooks[slot] = typeof initial === 'function' ? initial() : initial;
@@ -117,7 +137,7 @@ function candidateFixture() {
         useQuery: options => options.queryKey[0] === 'project' ? { data: { project: { name: 'test' }, writable: true, vcsSnapshot: 'snapshot', freshness: 'synced' } }
             : options.queryKey[0] === 'candidate' ? { data: available ? value : undefined } : options.queryKey[0] === 'comparison' ? { data: { unifiedDiff: patch } } : {},
         sessionStorage: { getItem: () => null }, Diff, Markdown, Link: () => null, Heading: () => null, Panel: () => null,
-        ErrorBox: () => null, Empty: () => null, Badge: () => null, label: item => item, time: item => item, s: {},
+        ErrorBox: () => null, Empty: () => null, Badge: () => null, FindingCard: () => null, label: item => item, time: item => item, s: {},
     });
     vm.runInContext(script, context);
     const nodes = node => Array.isArray(node) ? node.flatMap(nodes) : node && typeof node === 'object' && node.props ? [node, ...nodes(node.props.children)] : [];
@@ -129,7 +149,7 @@ function candidateFixture() {
         fold() { nodes(tree).find(node => node.type === Diff).props.onCollapsedFilesChange(['0/a.ts']); render(); },
         collapsed: () => JSON.parse(JSON.stringify(nodes(tree).find(node => node.type === Diff).props.collapsedFiles)),
         range(next) { nodes(tree).find(node => node.type === 'select').props.onChange({ target: { value: next } }); render(); },
-        refresh(next = {}) { if ('available' in next) available = next.available; if ('id' in next) id = next.id; if ('revision' in next) meta.currentRevision = next.revision; render(); },
+        refresh(next = {}) { if ('available' in next) available = next.available; if ('id' in next) id = next.id; if ('revision' in next) meta.recordRevision = next.revision; render(); },
     };
 }
 

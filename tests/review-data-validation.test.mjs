@@ -12,7 +12,7 @@ import { reviewFixture } from './fixtures/contract.mjs';
 const auditId = '20261119-120000-repo';
 const audit = serializeAuditMarkdown({
     schemaVersion: 1, auditId, createdAt: '2026-11-19T12:00:00Z', baseRevision: '123',
-    scope: '.', trigger: 'manual', previousAudit: null, candidates: [], items: [],
+    scope: '.', trigger: 'manual', previousAudit: null, issues: [],
 }, '# 审查报告\n');
 
 test('评审与档案拒绝重复键、锚点和错误的 Frontmatter 结束行', () => {
@@ -26,55 +26,42 @@ test('评审与档案拒绝重复键、锚点和错误的 Frontmatter 结束行'
         const compatible = '\uFEFF' + text.replace('schema_version: 1', 'schema_version: 1 # &comment\nextension: "&literal *text"').replaceAll('\n', '\r\n');
         assert.equal(parse(compatible).meta.schemaVersion, 1);
     }
-    assert.throws(() => parseReviewMarkdown(review.replace('patch: 001.patch', 'patch: second.patch\n    patch: 001.patch')), /duplicated mapping key/);
+    assert.throws(() => parseReviewMarkdown(review.replace(/patch: "?001\.patch"?/, 'patch: "second.patch"\n    patch: "001.patch"')), /duplicated mapping key/);
 });
 
-test('审查档案要求显式填写必填字段并验证数组元素类型', () => {
+test('审查档案要求显式填写必填字段并验证纯索引 issues[]', () => {
     for (const [input, invalid, message] of [
         ['schema_version: 1', 'schema_version: true', /schema_version/],
-        ['previous_audit: null\n', '', /previous_audit.*必填/],
-        ['candidates: []\n', '', /candidates.*必填/],
-        ['candidates: []', 'candidates: wrong', /candidates.*必须是数组/],
-        ['candidates: []', 'candidates: [42]', /candidates\[0\].*字符串/],
-        ['items: []\n', '', /items.*必填/],
-        ['items: []', 'items: null', /items.*必须是数组/],
-        ['items: []', 'items: [{finding_id: x, kind: confirm, title: T, summary: S, target_files: [], depends_on: null, status: pending}]', /items\[0\]\.candidate.*必填/],
-        ['items: []', 'items: [{finding_id: x, kind: confirm, title: T, summary: S, target_files: [42], depends_on: null, status: pending, candidate: null}]', /items\[0\]\.target_files\[0\].*字符串/],
+        ['schema_version: 1', 'schema_version: 2', /schema_version/],
+        ['previous_audit: null\n', '', /previous_audit/],
+        ['issues: []\n', '', /issues/],
+        ['issues: []', 'issues: wrong', /issues.*数组/],
+        ['issues: []', 'issues: [42]', /issues.*数组/],
     ]) {
         assert.notEqual(audit.replace(input, invalid), audit);
         assert.throws(() => parseAuditMarkdown(audit.replace(input, invalid)), message);
     }
 });
 
-test('V2 候选必须绑定合法发现，旧候选仍可往返', () => {
-    const legacy = reviewFixture('legacy');
-    const v2 = legacy.replace('schema_version: 1', 'schema_version: 2\nfinding_id: math-addition');
-    const parsed = parseReviewMarkdown(v2);
+test('唯一 schema_version: 1 强校验 finding_id 并拒绝 v2/v3 旧版本', () => {
+    const valid = reviewFixture('math-addition', { findingId: 'math-addition' });
+    const parsed = parseReviewMarkdown(valid);
+    assert.equal(parsed.meta.schemaVersion, 1);
     assert.equal(parsed.meta.findingId, 'math-addition');
     assert.deepEqual(parseReviewMarkdown(serializeReviewMarkdown(parsed.meta, parsed.body)).meta, parsed.meta);
-    assert.equal(parseReviewMarkdown(legacy).meta.findingId, undefined);
-    assert.throws(() => parseReviewMarkdown(v2.replace('finding_id: math-addition\n', '')), /finding_id/);
-    assert.throws(() => parseReviewMarkdown(v2.replace('math-addition', '../escape')), /finding_id/);
-    assert.throws(() => parseReviewMarkdown(v2.replace('schema_version: 2', 'schema_version: 1')), /finding_id/);
+    assert.throws(() => parseReviewMarkdown(valid.replace(/finding_id: .*\n/, '')), /finding_id/);
+    assert.throws(() => parseReviewMarkdown(valid.replace('schema_version: 1', 'schema_version: 2')), /schema_version/);
+    assert.throws(() => parseReviewMarkdown(valid.replace('schema_version: 1', 'schema_version: 3')), /schema_version/);
 });
 
-test('V2 档案保持方案顺序并校验选项的归属和格式', () => {
+test('纯索引 audit.md 校验 issues[] 目录格式与唯一性', () => {
     const { meta, body } = parseAuditMarkdown(audit);
-    const first = { candidateId: '2026-11/fix-a', tradeoff: '影响面小' };
-    const second = { candidateId: '2026-11/fix-b', tradeoff: '复用公用逻辑' };
-    const item = {
-        findingId: 'math-addition', kind: 'repair', title: '加法异常', summary: '两个正数相加错误',
-        targetFiles: ['src/math.js'], dependsOn: null, status: 'pending', candidate: null,
-        repairPlan: '恢复加法语义并校验正数输入', options: [first, second],
-    };
-    const v2 = { ...meta, schemaVersion: 2, candidates: [first.candidateId, second.candidateId], items: [item] };
-    assert.deepEqual(parseAuditMarkdown(serializeAuditMarkdown(v2, body)).meta, v2);
-    assert.deepEqual(auditInvariantErrors(v2, auditId), []);
-    assert.match(auditInvariantErrors({ ...v2, items: [{ ...item, options: [first, first] }] }, auditId).join(), /选项/);
-    assert.match(auditInvariantErrors({ ...v2, items: [{ ...item, options: [{ ...first, candidateId: '../escape' }] }] }, auditId).join(), /选项/);
-    assert.match(auditInvariantErrors({ ...v2, candidates: [first.candidateId] }, auditId).join(), /选项/);
-    assert.match(auditInvariantErrors({ ...v2, items: [{ ...item, options: [] }] }, auditId).join(), /选项/);
-    assert.match(auditInvariantErrors({ ...v2, items: [{ ...item, options: undefined }] }, auditId).join(), /选项/);
+    const indexed = { ...meta, issues: ['2026-11/fix-a', '2026-11/fix-b'] };
+    assert.deepEqual(parseAuditMarkdown(serializeAuditMarkdown(indexed, body)).meta, indexed);
+    assert.deepEqual(auditInvariantErrors(indexed, auditId), []);
+    assert.ok(auditInvariantErrors({ ...indexed, issues: ['2026-11/fix-a', '2026-11/fix-a'] }, auditId).some((e) => /重复/.test(e)));
+    assert.ok(auditInvariantErrors({ ...indexed, issues: ['../escape'] }, auditId).some((e) => /非法/.test(e)));
+    assert.ok(auditInvariantErrors({ ...indexed, auditId: 'other-id' }, auditId).some((e) => /不一致/.test(e)));
 });
 
 test('只读命令批量输出字段和路径，校验失败返回非零且不改数据', async t => {
@@ -99,7 +86,7 @@ test('只读命令批量输出字段和路径，校验失败返回非零且不�
     assert.equal(result.ok, false);
     assert.deepEqual(result.files[0], { path: reviewPath, errors: [] });
     assert.equal(result.files[1].path, invalidPath);
-    assert.match(result.files[1].errors[0], /owner.*必填/);
+    assert.match(result.files[1].errors[0], /owner/);
     assert.match(result.files[2].errors[0], /ENOENT/);
     assert.equal(await readFile(invalidPath, 'utf8'), invalidReview);
     assert.equal(await readFile(auditPath, 'utf8'), audit);

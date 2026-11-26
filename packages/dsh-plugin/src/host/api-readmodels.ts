@@ -1,179 +1,303 @@
-import type { ApiResponse } from './api-context.js';
+/** 只读接口处理器（SPEC §6.2）：/health /settings /queue /candidate /patch /diff /fix-prompt /reviewers /audits /findings。 */
+
 import path from 'node:path';
-import { createHash } from 'node:crypto';
-import { isAiReviewPath, parsePatch } from './patch.js';
-import { loadReviewers } from './reviewers.js';
-import { Runner, loadSystemPrompt, toSessionFixPrompt } from './runner.js';
-import { projectIssue, issueSelection, readIssueSelection, currentReviewPatch, defaultIssueSelection, selectIssuePatch, requireIssueSelection } from './issue-review.js';
-import { AuditArchive, projectFindings, scopeCovers, type CandidateChainInfo } from './audit-archive.js';
-import { loadFindingEvents, type FindingDisposition } from './finding-decisions.js';
-import { FINDING_ID_PATTERN, isRepoRelativePath } from './invariants.js';
-import { matchesReviewFilter } from './store.js';
-import type { ReviewStatus, ApprovalCommitLookup, PatchCheckDiagnostic } from './types.js';
-import { ApiError } from './types.js';
-import type { VcsAdapter } from './vcs.js';
 import {
+  APP_VERSION,
   filterFrom,
   idFrom,
   sendJson,
-  sharedSourceFor,
   sharedViewFor,
   type ApiHost,
+  type ApiRequest,
+  type ApiResponse,
   type Runtime,
 } from './api-context.js';
+import { AuditArchive, scopeCovers } from './audit-archive.js';
+import { buildFindingView, isPatchBanned, resolveOptionSelection } from './issue-review.js';
+import { buildModeBPrompt, loadProposalSystemPrompt, wrapAgentPrompt } from './runner.js';
+import { loadReviewers } from './reviewers.js';
+import { validateSettings } from './settings.js';
+import { emptyStatusCounts } from './store.js';
+import {
+  ApiError,
+  type ApprovalCommitLookup,
+  type FindingDisposition,
+  type OptionPatchCheck,
+  type ReviewCandidate,
+} from './types.js';
 
-interface ReadModelState {
-  approvalLookupCache: Map<string, ApprovalCommitLookup>;
-  projectionCache: Map<string, { findings: ReturnType<typeof projectFindings>['findings']; errors: string[]; snapshot: string }>;
-  patchCheckCache: Map<string, PatchCheckDiagnostic>;
-  patchCheckPending: Set<string>;
-  /** 两个不可变提交间可证明的结果可长期缓存。无法确定时跳过缓存，避免固化瞬时失败。 */
-  baselineCache: Map<string, { state: 'unchanged' } | { state: 'changed'; paths: string[] }>;
-}
+/**
+ * 内存只读缓存（不落盘）：
+ * 1) patchCheck 按 (root, candidateId, recordRevision, optionId, patchId, base) 独立缓存；
+ * 2) approvalCommit 按 (root, candidateId, snapshotKey, approvalKey) 独立缓存。
+ */
+export class ReadModelCaches {
+  private readonly patchChecks = new Map<string, OptionPatchCheck>();
+  private readonly inflightChecks = new Set<string>();
+  private readonly approvalCommits = new Map<string, ApprovalCommitLookup>();
 
-const state: ReadModelState = {
-  approvalLookupCache: new Map(),
-  projectionCache: new Map(),
-  patchCheckCache: new Map(),
-  patchCheckPending: new Set(),
-  baselineCache: new Map(),
-};
-
-export class ReadModels {
-  constructor(private readonly host: ApiHost) {}
-
-  private patchCheckKey(runtime: Runtime, id: string, revision: number, base: string): string {
-    return `${runtime.root}|${id}|${String(revision)}|${base}`;
+  private patchKey(root: string, id: string, recordRevision: number, optionId: string, patchId: number, base: string): string {
+    return `${root}\0${id}\0${String(recordRevision)}\0${optionId}\0${String(patchId)}\0${base}`;
   }
 
-  private async computePatchCheck(
-    runtime: Runtime,
-    id: string,
-    revision: number,
-    base: string,
-    sharedText?: string,
-  ): Promise<PatchCheckDiagnostic> {
-    const checkedAt = new Date().toISOString();
-    const unknown = (): PatchCheckDiagnostic => ({ state: 'unknown', checkedBase: base, checkedAt });
-    const currentBase = await runtime.vcs.getCurrentBase().catch(() => null);
-    if (currentBase !== base) return unknown();
-    let text = sharedText;
-    if (text === undefined) {
-      const source = await sharedSourceFor(runtime);
-      if (!source) return unknown();
-      const { month, slug } = runtime.store.resolveCandidateDir(id);
-      const detail = await runtime.store.get(id, null, source).catch(() => null);
-      const revisionEntry = detail?.candidate.meta.schemaVersion === 3 ? currentReviewPatch(detail.candidate.meta)
-        : detail?.candidate.meta.revisions.find((entry) => entry.id === revision);
-      if (!revisionEntry || detail?.candidate.meta.currentRevision !== revision) return unknown();
-      text = (await source.readPatchText(month, slug, revisionEntry.patch)) ?? undefined;
-    }
-    if (text === undefined) return unknown();
-    const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
-    const os = await import('node:os');
-    const dir = await mkdtemp(path.join(os.tmpdir(), 'dcr-patch-check-'));
-    try {
-      const patchPath = path.join(dir, 'change.patch');
-      await writeFile(patchPath, text, 'utf8');
-      const checked = await runtime.vcs.checkPatch(patchPath).catch(() => null);
-      return {
-        state: checked === null ? 'unknown' : checked.ok ? 'clean' : checked.conflict ? 'conflicted' : 'unknown',
-        checkedBase: base,
-        checkedAt,
-      };
-    } finally {
-      await rm(dir, { recursive: true, force: true }).catch(() => undefined);
-    }
+  getPatchCheck(root: string, id: string, recordRevision: number, optionId: string, patchId: number, base: string): OptionPatchCheck | undefined {
+    return this.patchChecks.get(this.patchKey(root, id, recordRevision, optionId, patchId, base));
   }
 
-  private storePatchCheck(key: string, value: PatchCheckDiagnostic): void {
-    state.patchCheckCache.set(key, value);
-    if (state.patchCheckCache.size > 256) {
-      const first = state.patchCheckCache.keys().next().value;
-      if (first !== undefined) state.patchCheckCache.delete(first);
-    }
+  setPatchCheck(root: string, id: string, recordRevision: number, check: OptionPatchCheck): void {
+    const key = this.patchKey(root, id, recordRevision, check.optionId, check.patchId, check.checkedBase);
+    if (this.patchChecks.size > 2000) this.patchChecks.clear();
+    this.patchChecks.set(key, check);
   }
 
-  private schedulePatchCheck(runtime: Runtime, id: string, revision: number, base: string): void {
-    const key = this.patchCheckKey(runtime, id, revision, base);
-    if (state.patchCheckCache.has(key) || state.patchCheckPending.has(key)) return;
-    state.patchCheckPending.add(key);
+  /** /queue 未命中缓存时调用：低优先级后台异步预检，绝不阻塞 /queue 响应。 */
+  schedulePatchCheck(params: {
+    runtime: Runtime;
+    candidateId: string;
+    recordRevision: number;
+    optionId: string;
+    patchId: number;
+    patchPath: string;
+    base: string;
+  }): void {
+    const key = this.patchKey(params.runtime.root, params.candidateId, params.recordRevision, params.optionId, params.patchId, params.base);
+    if (this.patchChecks.has(key) || this.inflightChecks.has(key)) return;
+    this.inflightChecks.add(key);
     setImmediate(() => {
-      void this.computePatchCheck(runtime, id, revision, base)
-        .then((result) => this.storePatchCheck(key, result))
-        .catch(() => undefined)
-        .finally(() => state.patchCheckPending.delete(key));
+      void (async () => {
+        try {
+          const check = await params.runtime.vcs.checkPatch(params.patchPath);
+          this.setPatchCheck(params.runtime.root, params.candidateId, params.recordRevision, {
+            optionId: params.optionId,
+            patchId: params.patchId,
+            state: check.ok ? 'clean' : check.conflict ? 'conflicted' : 'unknown',
+            checkedBase: params.base,
+            checkedAt: new Date().toISOString(),
+          });
+        } catch {
+          this.setPatchCheck(params.runtime.root, params.candidateId, params.recordRevision, {
+            optionId: params.optionId,
+            patchId: params.patchId,
+            state: 'unknown',
+            checkedBase: params.base,
+            checkedAt: new Date().toISOString(),
+          });
+        } finally {
+          this.inflightChecks.delete(key);
+        }
+      })();
     });
   }
 
-  async queue(res: ApiResponse, url: URL): Promise<void> {
-    let runtime: Runtime;
-    try {
-      runtime = await this.host.runtimeFor(url);
-    } catch (error) {
-      if (error instanceof ApiError && error.code === 'conflict') throw error;
-      sendJson(res, 200, {
-        configured: false,
-        items: [],
-        errors: [error instanceof Error ? error.message : String(error)],
-        currentBase: null,
-        counts: { pending: 0, changes_requested: 0, approved: 0, rejected: 0 },
-        owner: this.host.currentSettings().owner,
-        me: this.host.currentSettings().owner,
-        repoRoot: this.host.currentSettings().repoRoot,
-      });
-      return;
-    }
-    const ownerParam = url.searchParams.get('owner');
-    const owner = ownerParam !== null ? ownerParam.trim() : await this.host.ownerFor(runtime.root);
-    const filter = filterFrom(url, owner);
+  async resolveApprovalCommit(
+    runtime: Runtime,
+    candidate: ReviewCandidate,
+    snapshotKey: string | null,
+  ): Promise<ApprovalCommitLookup | undefined> {
+    if (candidate.meta.status !== 'approved' || !candidate.meta.approval) return undefined;
+    const approval = candidate.meta.approval;
+    const cacheKey = `${runtime.root}\0${candidate.id}\0${snapshotKey ?? 'live'}\0${approval.optionId}\0${String(approval.patchId)}\0${approval.approvedAt}\0${approval.businessCommit ?? ''}`;
+    const cached = this.approvalCommits.get(cacheKey);
+    if (cached) return cached;
+
+    const patchPaths = candidate.meta.patches.map((p) => `.ai-review/${candidate.id}/${p.patch}`);
+    const lookup = await runtime.vcs.deriveApprovalCommit({
+      reviewPath: `.ai-review/${candidate.id}/review.md`,
+      patchPaths,
+      targetFiles: candidate.meta.targetFiles,
+      approval,
+    }).catch((error: unknown): ApprovalCommitLookup => ({
+      revision: null,
+      lookup: 'unknown',
+      diagnostic: error instanceof Error ? error.message : String(error),
+    }));
+    if (this.approvalCommits.size > 1000) this.approvalCommits.clear();
+    this.approvalCommits.set(cacheKey, lookup);
+    return lookup;
+  }
+}
+
+async function businessBehindChecker(runtime: Runtime): Promise<(fromBase: string, currentBase: string) => Promise<boolean>> {
+  const memo = new Map<string, boolean>();
+  return async (fromBase: string, currentBase: string): Promise<boolean> => {
+    if (fromBase === currentBase) return false;
+    const key = `${fromBase}..${currentBase}`;
+    if (memo.has(key)) return memo.get(key)!;
+    const changed = await runtime.vcs.businessChangesBetween(fromBase, currentBase).catch(() => null);
+    // SPEC §5.7：历史不可读/浅克隆返回 null 时保守判 isBaseBehind = true。
+    const behind = changed === null ? true : changed.length > 0;
+    memo.set(key, behind);
+    return behind;
+  };
+}
+
+export async function handleHealth(host: ApiHost, _req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
+  const settings = host.currentSettings();
+  try {
+    const runtime = await host.runtimeFor(url);
     const view = await sharedViewFor(runtime);
-    const base = view?.snapshot ?? await runtime.vcs.getCurrentBase().catch(() => null);
-    const reviewers = await loadReviewers(runtime.root, view?.source);
-    // 同一次扫描可同时生成分页结果和 Owner 范围内的状态计数，避免重复枚举仓库。
-    const all = await runtime.store.list({ owner }, base, reviewers.staleDays, reviewers.rejectionMemoryDays, view?.source);
-    for (const item of all.items) {
-      if (item.local || item.parseError || item.status === 'approved' || item.status === 'rejected' || !base || !item.baseRevision) continue;
-      const business = await this.businessBaselineState(runtime.vcs, item.baseRevision, base);
-      item.isBaseBehind = business.state === 'changed' || business.state === 'unknown';
-    }
-    const items = all.items.filter((item) => matchesReviewFilter(item, filter));
-    for (const item of items) {
-      if (item.local || item.parseError || item.status === 'approved' || item.status === 'rejected' || !base) continue;
-      const key = this.patchCheckKey(runtime, item.id, item.currentRevision, base);
-      const cached = state.patchCheckCache.get(key);
-      if (cached) item.patchCheck = cached;
-      else this.schedulePatchCheck(runtime, item.id, item.currentRevision, base);
-    }
-    const counts = { pending: 0, changes_requested: 0, approved: 0, rejected: 0 } as Record<ReviewStatus, number>;
-    for (const item of all.items) {
-      if (!item.local) counts[item.status] = (counts[item.status] ?? 0) + 1;
-    }
-    // 定位结果仅作诊断，无法定位业务提交仍保留队列项。
-    for (const item of items) {
-      if (item.status === 'approved' && !item.parseError) {
-        const derived = await this.deriveApprovalInfo(runtime, item.id).catch(() => undefined);
-        if (derived) Object.assign(item, derived);
-      }
-    }
-    // 租约是宿主运行态，单独提供给面板的收尾和释放入口。
-    let auditLease:
-      | {
-        auditId: string;
-        state: 'active' | 'releasable';
-        trigger: 'manual' | 'scheduled';
-        createdAt: string;
-        owner: string;
-        baseRevision: string;
-        targetPath: string;
-        sessionId?: string;
-        commitOutcomeUnknown?: true;
-      }
-      | undefined;
+    const currentBase = await runtime.vcs.getCurrentBase();
+    const owner = await host.ownerFor(runtime.root);
+    const counts = await runtime.store.listStatusCounts(undefined, view?.source);
+    const reviewers = await loadReviewers(runtime.root, view?.source).catch(() => null);
+    const lease = host.auditLifecycle.blockingLeaseFor(runtime.root);
+    const diagnostics = [
+      ...host.lastConfigErrors,
+      ...(reviewers && !reviewers.valid ? reviewers.errors : []),
+      ...(lease ? [`审查租约阻塞中：${lease.auditId}（${lease.state}）`] : []),
+    ];
+    sendJson(res, 200, {
+      app: 'dsh-code-review',
+      version: APP_VERSION,
+      configured: true,
+      repoRoot: runtime.root,
+      owner,
+      vcsType: runtime.vcsType,
+      currentBase,
+      diagnostics,
+      counts,
+    });
+  } catch {
+    sendJson(res, 200, {
+      app: 'dsh-code-review',
+      version: APP_VERSION,
+      configured: false,
+      repoRoot: settings.repoRoot,
+      owner: settings.owner,
+      vcsType: host.detectedVcsType,
+      currentBase: null,
+      diagnostics: [...host.lastConfigErrors],
+      counts: emptyStatusCounts(),
+    });
+  }
+}
+
+export async function handleGetSettings(host: ApiHost, _req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
+  const settings = host.currentSettings();
+  const validation = await validateSettings(settings);
+  let suggestedOwner = settings.owner;
+  if (!suggestedOwner && settings.repoRoot) {
     try {
-      const lease = this.host.auditLifecycle.blockingLeaseFor(runtime.root);
-      if (lease) {
-        auditLease = {
+      const runtime = await host.runtimeFor(url);
+      suggestedOwner = await host.ownerFor(runtime.root);
+    } catch {
+    }
+  }
+  sendJson(res, 200, {
+    settings,
+    validation,
+    suggestedOwner,
+    runners: [
+      { value: 'dsh', label: 'DSH Headless（默认）' },
+      { value: 'external', label: '外部命令行执行器' },
+      { value: 'manual', label: '手动提示词模式' },
+    ],
+  });
+}
+
+export async function handleQueue(
+  host: ApiHost,
+  _req: ApiRequest,
+  res: ApiResponse,
+  url: URL,
+  caches: ReadModelCaches,
+): Promise<void> {
+  const settings = host.currentSettings();
+  let runtime: Runtime;
+  try {
+    runtime = await host.runtimeFor(url);
+  } catch (error) {
+    if (error instanceof ApiError && error.status !== 412) throw error;
+    sendJson(res, 200, {
+      configured: false,
+      items: [],
+      errors: [...host.lastConfigErrors],
+      currentBase: null,
+      counts: emptyStatusCounts(),
+      owner: settings.owner,
+      me: settings.owner,
+      repoRoot: settings.repoRoot,
+    });
+    return;
+  }
+
+  const me = await host.ownerFor(runtime.root);
+  const ownerParam = url.searchParams.has('owner') ? (url.searchParams.get('owner') ?? '') : me;
+  const filter = filterFrom(url, ownerParam);
+  const view = await sharedViewFor(runtime);
+  const currentBase = await runtime.vcs.getCurrentBase();
+  const isBehind = await businessBehindChecker(runtime);
+
+  const [{ items, errors }, counts] = await Promise.all([
+    runtime.store.list(filter, currentBase, isBehind, Date.now(), view?.source, view?.source),
+    runtime.store.listStatusCounts(ownerParam || undefined, view?.source),
+  ]);
+
+  // 填充 approved 派生提交与分方案 patchCheck 缓存（/queue 仅读缓存并异步调度未命中项，绝不同步阻塞！）
+  for (const item of items) {
+    if (item.local || item.status === 'broken') continue;
+    if (item.status === 'approved') {
+      const [month, slug] = item.id.split('/');
+      if (month && slug) {
+        const loaded = await runtime.store.loadCandidate(month, slug, view?.source);
+        if (loaded && !loaded.parseError) {
+          const derived = await caches.resolveApprovalCommit(runtime, loaded, view?.snapshot ?? null);
+          if (derived) {
+            if (derived.revision) item.approvalCommitRevision = derived.revision;
+            item.approvalCommitLookup = derived.lookup;
+          }
+        }
+      }
+    }
+    if (currentBase && item.options.length > 0 && ['pending', 'changes_requested', 'repair_failed'].includes(item.status)) {
+      for (const opt of item.options) {
+        const cached = caches.getPatchCheck(runtime.root, item.id, item.recordRevision, opt.id, opt.currentPatch, currentBase);
+        if (cached) {
+          opt.patchCheck = cached;
+        } else {
+          opt.patchCheck = {
+            optionId: opt.id,
+            patchId: opt.currentPatch,
+            state: 'unknown',
+            checkedBase: currentBase,
+            checkedAt: new Date().toISOString(),
+          };
+          const [month, slug] = item.id.split('/');
+          if (month && slug) {
+            const patchFile = `${String(opt.currentPatch).padStart(3, '0')}.patch`;
+            caches.schedulePatchCheck({
+              runtime,
+              candidateId: item.id,
+              recordRevision: item.recordRevision,
+              optionId: opt.id,
+              patchId: opt.currentPatch,
+              patchPath: path.join(runtime.store.dirOf(month, slug), patchFile),
+              base: currentBase,
+            });
+          }
+        }
+      }
+      if (item.options[0]?.patchCheck) {
+        item.patchCheck = item.options[0].patchCheck;
+      }
+    }
+  }
+
+  const lease = host.auditLifecycle.blockingLeaseFor(runtime.root);
+  const fixOccupancy = host.fixSessionGuard.activeFor(runtime.root);
+
+  sendJson(res, 200, {
+    configured: true,
+    items,
+    errors,
+    currentBase,
+    counts,
+    owner: ownerParam,
+    me,
+    repoRoot: runtime.root,
+    ...(lease
+      ? {
+        auditLease: {
           auditId: lease.auditId,
           state: lease.state,
           trigger: lease.trigger,
@@ -182,357 +306,283 @@ export class ReadModels {
           baseRevision: lease.baseRevision,
           targetPath: lease.targetPath,
           ...(lease.sessionId ? { sessionId: lease.sessionId } : {}),
-          ...(lease.commitOutcomeUnknown ? { commitOutcomeUnknown: true as const } : {}),
-        };
+          ...(lease.commitOutcomeUnknown ? { commitOutcomeUnknown: true } : {}),
+        },
       }
-    } catch {
-    }
-    sendJson(res, 200, {
-      configured: true,
-      items,
-      errors: all.errors,
-      currentBase: base,
-      counts,
-      owner,
-      me: owner,
-      repoRoot: runtime.root,
-      ...(auditLease ? { auditLease } : {}),
-    });
+      : {}),
+    ...(fixOccupancy ? { fixSession: fixOccupancy } : {}),
+  });
+}
+
+export async function handleCandidate(
+  host: ApiHost,
+  _req: ApiRequest,
+  res: ApiResponse,
+  url: URL,
+  caches: ReadModelCaches,
+): Promise<void> {
+  const id = idFrom(url);
+  const optionId = url.searchParams.get('optionId')?.trim() || undefined;
+  const rawPatchId = url.searchParams.get('patchId')?.trim();
+  const patchId = rawPatchId ? Number(rawPatchId) : undefined;
+  if (rawPatchId && (!Number.isInteger(patchId) || (patchId ?? 0) <= 0)) {
+    throw new ApiError(400, 'bad_request', 'patchId 必须是正整数');
   }
 
-  async candidate(res: ApiResponse, url: URL): Promise<void> {
-    const runtime = await this.host.runtimeFor(url);
-    const { store, vcs } = runtime;
-    const me = await this.host.ownerFor(store.repoRoot);
-    const id = idFrom(url);
-    const view = await sharedViewFor(runtime);
-    const currentBase = view?.snapshot ?? await vcs.getCurrentBase().catch(() => null);
-    let detail = await store.get(id, currentBase, view?.source);
-    const requestedSelection = readIssueSelection(detail.candidate.meta, Object.fromEntries(url.searchParams));
-    if (requestedSelection) detail = await store.get(id, currentBase, view?.source, requestedSelection);
-    const selection = detail.candidate.meta.schemaVersion === 3 ? requestedSelection ?? defaultIssueSelection(detail.candidate.meta) : undefined;
-    const validation = await store.validateFullCandidate(detail.candidate, view?.source);
-    const revisionStats: Record<number, unknown> = {};
-    for (const revision of detail.candidate.meta.revisions) {
-      try {
-        const text = await store.readPatch(id, revision.patch, view?.source);
-        revisionStats[revision.id] = { patch: revision.patch, baseRevision: revision.baseRevision, stats: parsePatch(text).stats };
-      } catch {
-        revisionStats[revision.id] = { patch: revision.patch, baseRevision: revision.baseRevision, stats: null };
-      }
-    }
-    const patchText = detail.patchText;
-    const patchPaths = parsePatch(patchText).paths.filter((file) => !isAiReviewPath(file));
-    // 补丁预检只对 checkedBase 有效，批准时仍须重新严格应用。
-    let patchCheck: PatchCheckDiagnostic | undefined;
-    if (detail.patchText && !detail.candidate.parseError && !['approved', 'rejected', 'resolved'].includes(detail.candidate.meta.status) && currentBase) {
-      const revision = detail.candidate.meta.currentRevision;
-      const key = this.patchCheckKey(runtime, id, revision, currentBase) + (selection ? '|' + selection.optionId + '|' + String(selection.patchId) : '');
-      const cached = state.patchCheckCache.get(key);
-      if (cached) patchCheck = cached;
-      else {
-        patchCheck = await this.computePatchCheck(runtime, id, revision, currentBase, detail.patchText);
-        this.storePatchCheck(key, patchCheck);
-      }
-    }
-    const comments = [...detail.candidate.meta.comments].sort((left, right) => {
-      const byRevision = left.revision - right.revision;
-      return byRevision !== 0 ? byRevision : left.id.localeCompare(right.id);
-    });
-    let approvalCommitRevision: string | undefined;
-    let approvalCommitLookup: 'found' | 'ambiguous' | 'unknown' | undefined;
-    if (detail.candidate.meta.status === 'approved' && !detail.candidate.parseError) {
-      const derived = await this.deriveApprovalInfo(runtime, id).catch(() => undefined);
-      if (derived) {
-        approvalCommitRevision = derived.approvalCommitRevision;
-        approvalCommitLookup = derived.approvalCommitLookup;
-      }
-    }
-    // 评论或状态变更也会推进 HEAD，须排除评审元数据变化以免误报基线落后。
-    const currentRevisionEntry = currentReviewPatch(detail.candidate.meta, selection);
-    let isBaseBehind = detail.isBaseBehind;
-    if (!detail.candidate.parseError
-      && currentRevisionEntry
-      && detail.currentBase !== null
-      && currentRevisionEntry.baseRevision !== detail.currentBase) {
-      const business = await this.businessBaselineState(runtime.vcs, currentRevisionEntry.baseRevision, detail.currentBase);
-      // 无法证明业务基线时保留落后提示，供人工确认。
-      if (business.state === 'unchanged' || business.state === 'same') isBaseBehind = false;
-    }
-    const finding = detail.candidate.meta.findingId && view ? (await this.findingProjection(runtime, view)).findings
-      .find(item => item.findingId === detail.candidate.meta.findingId) : undefined;
-    if (selection) detail.candidate.meta.gateChecks = selectIssuePatch(detail.candidate.meta, selection).option.gateChecks;
-    sendJson(res, 200, {
-      candidate: detail.candidate,
-      ...(selection ? { selection } : {}),
-      ...(finding ? { finding } : {}),
-      currentBase: detail.currentBase,
-      isBaseBehind,
-      patchText,
-      patchStats: detail.patchStats,
-      patchPaths,
-      comments,
-      validation,
-      revisionStats,
-      ...(approvalCommitRevision !== undefined || approvalCommitLookup !== undefined
-        ? { approvalCommitRevision, approvalCommitLookup }
-        : {}),
-      ...(patchCheck ? { patchCheck } : {}),
-      canAct: detail.candidate.meta.owner === me,
-      me,
-      jobs: this.host.jobManager.list().slice(0, 5),
-    });
-  }
+  const runtime = await host.runtimeFor(url);
+  const me = await host.ownerFor(runtime.root);
+  const view = await sharedViewFor(runtime);
+  const currentBase = await runtime.vcs.getCurrentBase();
+  const isBehind = await businessBehindChecker(runtime);
 
-  /** 派生结果只缓存于内存，供列表和详情共享，避免回写评审档案。 */
-  private async deriveApprovalInfo(
-    runtime: Runtime,
-    id: string,
-  ): Promise<{ approvalCommitRevision?: string; approvalCommitLookup: 'found' | 'ambiguous' | 'unknown' }> {
-    const view = await sharedViewFor(runtime);
-    const cacheKey = view?.snapshot ? `${runtime.root}|${id}|${view.snapshot}` : null;
-    const cached = cacheKey ? state.approvalLookupCache.get(cacheKey) : undefined;
-    if (cached) {
-      return cached.lookup === 'found' && cached.revision
-        ? { approvalCommitRevision: cached.revision, approvalCommitLookup: 'found' }
-        : { approvalCommitLookup: cached.lookup };
-    }
-    const detail = await runtime.store.get(id, null, view?.source);
-    const meta = detail.candidate.meta;
-    if (meta.status !== 'approved') return { approvalCommitLookup: 'found' };
-    const rel = (absolute: string) => path.relative(runtime.root, absolute).replaceAll('\\', '/');
-    const result = await runtime.vcs.deriveApprovalCommit({
-      reviewPath: rel(detail.candidate.reviewPath),
-      patchPaths: meta.revisions.map((revision) => `${rel(detail.candidate.dirPath)}/${revision.patch}`),
-      targetFiles: meta.targetFiles,
-    });
-    if (cacheKey) {
-      state.approvalLookupCache.set(cacheKey, result);
-      if (state.approvalLookupCache.size > 256) {
-        const first = state.approvalLookupCache.keys().next().value;
-        if (first !== undefined) state.approvalLookupCache.delete(first);
-      }
-    }
-    return result.lookup === 'found' && result.revision
-      ? { approvalCommitRevision: result.revision, approvalCommitLookup: 'found' }
-      : { approvalCommitLookup: result.lookup };
-  }
+  const detail = await runtime.store.get(
+    id,
+    currentBase,
+    view?.source,
+    isBehind,
+    optionId || patchId !== undefined ? { ...(optionId ? { optionId } : {}), ...(patchId !== undefined ? { patchId } : {}) } : undefined,
+  );
 
-  async patch(res: ApiResponse, url: URL): Promise<void> {
-    const runtime = await this.host.runtimeFor(url);
-    const id = idFrom(url);
-    const name = url.searchParams.get('name') ?? '';
-    if (!name) throw new ApiError(400, 'bad_request', '缺少补丁文件名');
-    const text = await runtime.store.readPatch(id, name, await sharedSourceFor(runtime));
-    sendJson(res, 200, { name, text });
-  }
-
-  async diff(res: ApiResponse, url: URL): Promise<void> {
-    const runtime = await this.host.runtimeFor(url);
-    const { store, vcs } = runtime;
-    const sharedSource = await sharedSourceFor(runtime);
-    const id = idFrom(url);
-    const detail = await store.get(id, null, sharedSource);
-    const selected = currentReviewPatch(detail.candidate.meta, readIssueSelection(detail.candidate.meta, Object.fromEntries(url.searchParams)));
-    if (detail.candidate.meta.schemaVersion === 3 && !selected && !url.searchParams.has('to')) {
-      sendJson(res, 200, { mode: 'full', unifiedDiff: '', fromRevision: null, toRevision: detail.candidate.meta.currentRevision,
-        fromBase: null, toBase: detail.candidate.meta.issue!.baseRevision, resolutionMode: null, notes: ['本问题为文字方案，没有当前补丁。'] });
-      return;
-    }
-    const current = selected?.id ?? detail.candidate.meta.currentRevision;
-    const to = Number(url.searchParams.get('to') ?? String(current));
-    const from = Number(url.searchParams.get('from') ?? '0');
-    const toRevision = detail.candidate.meta.revisions.find((revision) => revision.id === to);
-    if (!toRevision) throw new ApiError(404, 'not_found', `版本 ${String(to)} 不存在`);
-    if (!from || from === to) {
-      sendJson(res, 200, {
-        mode: 'full',
-        fromRevision: null,
-        toRevision: to,
-        unifiedDiff: await store.readPatch(id, toRevision.patch, sharedSource),
-        fromBase: null,
-        toBase: toRevision.baseRevision,
-        resolutionMode: null,
-        notes: ['显示该版本相对基线的全量补丁。'],
-      });
-      return;
-    }
-    const fromRevision = detail.candidate.meta.revisions.find((revision) => revision.id === from);
-    if (!fromRevision) throw new ApiError(404, 'not_found', `版本 ${String(from)} 不存在`);
-    const fromText = await store.readPatch(id, fromRevision.patch, sharedSource);
-    const toText = await store.readPatch(id, toRevision.patch, sharedSource);
-    const inter = await vcs.computeInterRevisionDiff({
-      fromRevision: from,
-      toRevision: to,
-      fromBase: fromRevision.baseRevision,
-      toBase: toRevision.baseRevision,
-      fromPatchPath: path.join(detail.candidate.dirPath, fromRevision.patch),
-      toPatchPath: path.join(detail.candidate.dirPath, toRevision.patch),
-      fromPatchText: fromText,
-      toPatchText: toText,
-    });
-    sendJson(res, 200, { mode: 'incremental', ...inter });
-  }
-
-  async reviewers(res: ApiResponse, url: URL): Promise<void> {
-    const runtime = await this.host.runtimeFor(url);
-    const config = await loadReviewers(runtime.root, await sharedSourceFor(runtime));
-    sendJson(res, 200, { config });
-  }
-
-  async auditsList(res: ApiResponse, url: URL): Promise<void> {
-    const runtime = await this.host.runtimeFor(url);
-    const archive = new AuditArchive(runtime.root);
-    const view = await sharedViewFor(runtime);
-    const records = await archive.list(view?.source);
-    sendJson(res, 200, {
-      audits: records
-        .filter((record) => !record.parseError)
-        .sort((left, right) => new Date(right.meta.createdAt).getTime() - new Date(left.meta.createdAt).getTime())
-        .map((record) => ({
-          auditId: record.meta.auditId,
-          createdAt: record.meta.createdAt,
-          scope: record.meta.scope,
-          trigger: record.meta.trigger,
-          previousAudit: record.meta.previousAudit,
-          candidates: record.meta.candidates,
-          itemCount: record.meta.items.length,
-          path: `.ai-review/audits/${record.dirName}/audit.md`,
-        })),
-      errors: records.filter((record) => record.parseError).map((record) => `${record.dirName}: ${record.parseError}`),
-    });
-  }
-
-  /** 转换与忽略操作也要使用这份投影，免得以被后来观察覆盖的档案作判断。 */
-  async findingProjection(runtime: Runtime, view?: Awaited<ReturnType<typeof sharedViewFor>>): Promise<{
-    records: Awaited<ReturnType<AuditArchive['list']>>;
-    findings: ReturnType<typeof projectFindings>['findings'];
-    errors: string[];
-  }> {
-    view ??= await sharedViewFor(runtime);
-    const snapshot = view?.snapshot ?? null;
-    const archive = new AuditArchive(runtime.root);
-    if (snapshot) {
-      const cacheKey = `${runtime.root}|${snapshot}`;
-      const cached = state.projectionCache.get(cacheKey);
-      if (cached) {
-        return { records: await archive.list(view?.source), findings: cached.findings, errors: cached.errors };
-      }
-    }
-    const records = await archive.list(view?.source);
-    const queue = await runtime.store.list({}, null, undefined, undefined, view?.source);
-    const sharedItems = queue.items.filter((item) => !item.local);
-    const toChainInfo = (items: typeof queue.items): Map<string, CandidateChainInfo> => new Map(items.map((item) => [item.id, {
-      status: item.status,
-      reopenedFrom: item.reopenedFrom ?? null,
-      broken: item.parseError !== undefined,
-      ...(item.findingId !== undefined ? { findingId: item.findingId } : {}),
-    }]));
-    const infoById = toChainInfo(sharedItems);
-    const v2Info = toChainInfo(queue.items.filter((item) => !item.localOnly));
-    const events = view?.source ? await loadFindingEvents(view.source, records) : new Map();
-    const projected = projectFindings(
-      records,
-      (candidateId) => infoById.get(candidateId) ?? null,
-      sharedItems.map((item) => item.id),
-      view?.source ? { candidateInfo: (id) => v2Info.get(id) ?? null, events } : undefined,
+  // 未命中 patchCheck 缓存时，/candidate 可同步预检所选补丁并写回缓存（SPEC §6.2）。
+  let patchCheck: OptionPatchCheck | undefined;
+  if (!detail.candidate.parseError && detail.selection && detail.patchEntry && currentBase) {
+    patchCheck = caches.getPatchCheck(
+      runtime.root,
+      id,
+      detail.candidate.meta.recordRevision,
+      detail.selection.optionId,
+      detail.selection.patchId,
+      currentBase,
     );
-    const native = new Map<string, ReturnType<typeof projectIssue>>();
-    for (const summary of queue.items.filter(item => !item.localOnly && item.schemaVersion === 3 && !item.parseError)) {
-      const { candidate } = await runtime.store.get(summary.id, null, view?.source);
-      if (!candidate.meta.issue) continue;
-      if (native.has(candidate.meta.findingId!)) throw new ApiError(409, 'conflict', '同一问题存在重复的权威 review.md');
-      const issue = projectIssue(candidate);
-      const patchHashes = await Promise.all(candidate.meta.revisions.map(async revision => {
-        const text = await view?.source?.readPatchText(candidate.month, candidate.slug, revision.patch);
-        return [revision.id, text == null ? null : createHash('sha256').update(text).digest('hex')];
-      }));
-      issue.findingVersion = createHash('sha256').update(JSON.stringify([issue.findingVersion, patchHashes])).digest('hex');
-      native.set(candidate.meta.findingId!, issue);
+    if (!patchCheck) {
+      const check = await runtime.vcs.checkPatch(path.join(detail.candidate.dirPath, detail.patchEntry.patch)).catch(() => null);
+      patchCheck = {
+        optionId: detail.selection.optionId,
+        patchId: detail.selection.patchId,
+        state: check ? (check.ok ? 'clean' : check.conflict ? 'conflicted' : 'unknown') : 'unknown',
+        checkedBase: currentBase,
+        checkedAt: new Date().toISOString(),
+      };
+      caches.setPatchCheck(runtime.root, id, detail.candidate.meta.recordRevision, patchCheck);
     }
-    projected.findings = [...projected.findings.filter(item => !native.has(item.findingId)), ...native.values()];
-    const errors = [
-      ...records.filter((record) => record.parseError).map((record) => `${record.dirName}: ${record.parseError}`),
-      ...projected.errors,
-    ];
-    if (snapshot && ![...events.values()].some(event => event instanceof Error)) {
-      const cacheKey = `${runtime.root}|${snapshot}`;
-      state.projectionCache.set(cacheKey, { findings: projected.findings, errors, snapshot });
-      if (state.projectionCache.size > 32) {
-        const first = state.projectionCache.keys().next().value;
-        if (first !== undefined) state.projectionCache.delete(first);
-      }
-    }
-    return { records, findings: projected.findings, errors };
   }
 
-  async findings(res: ApiResponse, url: URL): Promise<void> {
-    const scope = url.searchParams.get('scope');
-    const findingId = url.searchParams.get('findingId');
-    const dispositions = url.searchParams.get('dispositions')?.split(',').filter(Boolean) ?? [];
-    const valid: FindingDisposition[] = ['undecided', 'accept_as_is', 'defer', 'human_takeover', 'applied', 'resolved'];
-    if ((scope && scope !== '.' && (!isRepoRelativePath(scope) || path.win32.parse(scope).root))
-      || (findingId && !FINDING_ID_PATTERN.test(findingId))
-      || dispositions.some((disposition) => !valid.includes(disposition as FindingDisposition))) {
-      throw new ApiError(422, 'bad_request', '发现查询筛选参数无效');
-    }
-    const runtime = await this.host.runtimeFor(url);
-    const { findings, errors } = await this.findingProjection(runtime);
-    const filtered = findings.filter((finding) => (!scope || scopeCovers(scope, finding.targetFiles))
-      && (!findingId || finding.findingId === findingId)
-      && (dispositions.length === 0 || (finding.disposition !== undefined && dispositions.includes(finding.disposition))));
-    sendJson(res, 200, { findings: filtered, errors });
-  }
+  const derived = !detail.candidate.parseError
+    ? await caches.resolveApprovalCommit(runtime, detail.candidate, view?.snapshot ?? null)
+    : undefined;
 
-  async fixPrompt(res: ApiResponse, url: URL): Promise<void> {
-    const runtime = await this.host.runtimeFor(url);
-    const id = idFrom(url);
-    const detail = await runtime.store.get(id, null, await sharedSourceFor(runtime));
-    const selection = requireIssueSelection(detail.candidate.meta, issueSelection(Object.fromEntries(url.searchParams)));
-    const comments = detail.candidate.meta.comments.filter((comment) => comment.status !== 'resolved');
-    const runner = new Runner({
-      kind: 'manual',
-      settings: this.host.currentSettings(),
-      store: runtime.store,
-      candidate: detail.candidate,
-      mode: 'ADDRESS_FEEDBACK',
-      ...(selection ? { selection } : {}),
-      comments,
-      log: () => undefined,
+  const canAct = !detail.candidate.parseError && detail.candidate.meta.owner === me;
+  const finding = !detail.candidate.parseError ? buildFindingView(detail.candidate) : undefined;
+  const selectedPatchBanned = !detail.candidate.parseError && detail.selection
+    ? isPatchBanned(detail.candidate.meta, detail.selection.optionId, detail.selection.patchId)
+    : false;
+
+  sendJson(res, 200, {
+    candidate: detail.candidate,
+    ...(detail.selection ? { selection: detail.selection } : {}),
+    ...(detail.option ? { selectedOption: detail.option } : {}),
+    ...(detail.patchEntry ? { selectedPatch: detail.patchEntry } : {}),
+    selectedPatchBanned,
+    ...(finding ? { finding } : {}),
+    currentBase: detail.currentBase,
+    isBaseBehind: detail.isBaseBehind,
+    ...(patchCheck ? { patchCheck } : {}),
+    ...(derived?.revision ? { approvalCommitRevision: derived.revision } : {}),
+    ...(derived ? { approvalCommitLookup: derived.lookup } : {}),
+    patchText: detail.patchText,
+    patchStats: detail.patchStats,
+    patchPaths: detail.patchPaths,
+    comments: detail.comments,
+    validation: detail.validation,
+    revisionStats: detail.revisionStats,
+    canAct,
+    me,
+    jobs: host.jobManager.list(),
+  });
+}
+
+export async function handlePatch(host: ApiHost, _req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
+  const id = idFrom(url);
+  const name = url.searchParams.get('name')?.trim() ?? '';
+  if (!name) throw new ApiError(400, 'bad_request', '缺少补丁文件名 name');
+  const runtime = await host.runtimeFor(url);
+  const view = await sharedViewFor(runtime);
+  const text = await runtime.store.readPatch(id, name, view?.source);
+  sendJson(res, 200, { name, text });
+}
+
+/** SPEC §6.2：/diff 按 optionId 与 patchId/to/from 比较同方案补丁，严禁用 record_revision 推算补丁号。 */
+export async function handleDiff(host: ApiHost, _req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
+  const id = idFrom(url);
+  const optionId = url.searchParams.get('optionId')?.trim() || undefined;
+  const rawPatchId = url.searchParams.get('patchId')?.trim();
+  const rawTo = url.searchParams.get('to')?.trim();
+  const rawFrom = url.searchParams.get('from')?.trim();
+
+  const runtime = await host.runtimeFor(url);
+  const view = await sharedViewFor(runtime);
+  const detail = await runtime.store.get(id, null, view?.source);
+  if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
+  const meta = detail.candidate.meta;
+
+  const resolved = resolveOptionSelection(meta, optionId ? { optionId } : undefined);
+  if (!resolved) {
+    sendJson(res, 200, {
+      mode: 'full',
+      unifiedDiff: '',
+      fromRevision: null,
+      toRevision: 0,
+      fromBase: null,
+      toBase: meta.baseRevision,
+      resolutionMode: null,
+      notes: ['该问题为纯文字方案，无补丁差异。'],
     });
-    const result = await runner.run();
-    const mode = url.searchParams.get('mode') === 'session' ? 'session' : 'headless';
-    const rawPrompt = result.prompt ?? result.errorMessage ?? '';
-    const prompt = mode === 'session' && rawPrompt ? toSessionFixPrompt(rawPrompt, await loadSystemPrompt(detail.candidate.meta.schemaVersion)) : rawPrompt;
-    sendJson(res, 200, { prompt, comments, mode, title: detail.candidate.meta.title, revision: detail.candidate.meta.currentRevision });
+    return;
   }
 
-  /** 排除评审元数据后，版本不同仍可能是同一业务基线。若历史不足以证明差异，调用方须保留未知状态。 */
-  async businessBaselineState(
-    vcs: VcsAdapter,
-    fromRevision: string,
-    toRevision: string,
-  ): Promise<
-    | { state: 'same' }
-    | { state: 'unchanged' }
-    | { state: 'changed'; paths: string[] }
-    | { state: 'unknown'; detail: string }
-  > {
-    const from = fromRevision.trim();
-    const to = toRevision.trim();
-    if (!from || !to) return { state: 'unknown', detail: '候选基线或当前基线为空' };
-    if (from === to) return { state: 'same' };
-    const cacheKey = `${vcs.root}|${from}|${to}`;
-    const cached = state.baselineCache.get(cacheKey);
-    if (cached) return cached;
-    const changes = await vcs.businessChangesBetween(from, to).catch(() => null);
-    if (changes === null) return { state: 'unknown', detail: `无法比较 ${from.slice(0, 12)} 与 ${to.slice(0, 12)} 的业务变更` };
-    const result = changes.length === 0 ? { state: 'unchanged' as const } : { state: 'changed' as const, paths: changes };
-    state.baselineCache.set(cacheKey, result);
-    if (state.baselineCache.size > 256) {
-      const first = state.baselineCache.keys().next().value;
-      if (first !== undefined) state.baselineCache.delete(first);
-    }
-    return result;
+  const targetOption = resolved.option;
+  const toId = rawTo ? Number(rawTo) : rawPatchId ? Number(rawPatchId) : targetOption.currentPatch;
+  if (!Number.isInteger(toId) || toId <= 0) throw new ApiError(400, 'bad_request', 'to / patchId 必须是正整数');
+  const toEntry = meta.patches.find((p) => p.id === toId && p.optionId === targetOption.id);
+  if (!toEntry) throw new ApiError(404, 'not_found', `方案 ${targetOption.id} 不存在补丁 #${String(toId)}`);
+
+  const toText = await runtime.store.readPatch(id, toEntry.patch, view?.source);
+  const fromId = rawFrom ? Number(rawFrom) : 0;
+  if (rawFrom && (!Number.isInteger(fromId) || fromId < 0)) {
+    throw new ApiError(400, 'bad_request', 'from 必须是非负整数');
   }
+
+  if (!fromId || fromId === toId) {
+    sendJson(res, 200, {
+      mode: 'full',
+      optionId: targetOption.id,
+      unifiedDiff: toText,
+      fromRevision: null,
+      toRevision: toId,
+      fromBase: null,
+      toBase: toEntry.baseRevision,
+      resolutionMode: null,
+      notes: [],
+    });
+    return;
+  }
+
+  const fromEntry = meta.patches.find((p) => p.id === fromId && p.optionId === targetOption.id);
+  if (!fromEntry) {
+    throw new ApiError(404, 'not_found', `方案 ${targetOption.id} 不存在对比基线补丁 #${String(fromId)}`);
+  }
+  const fromText = await runtime.store.readPatch(id, fromEntry.patch, view?.source);
+  const diff = await runtime.vcs.computeInterRevisionDiff({
+    fromRevision: fromId,
+    toRevision: toId,
+    fromBase: fromEntry.baseRevision,
+    toBase: toEntry.baseRevision,
+    fromPatchPath: path.join(detail.candidate.dirPath, fromEntry.patch),
+    toPatchPath: path.join(detail.candidate.dirPath, toEntry.patch),
+    fromPatchText: fromText,
+    toPatchText: toText,
+  });
+  sendJson(res, 200, {
+    mode: 'incremental',
+    optionId: targetOption.id,
+    ...diff,
+  });
+}
+
+export async function handleFixPrompt(host: ApiHost, _req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
+  const id = idFrom(url);
+  const optionId = url.searchParams.get('optionId')?.trim() || undefined;
+  const rawPatchId = url.searchParams.get('patchId')?.trim();
+  const patchId = rawPatchId ? Number(rawPatchId) : undefined;
+  const mode = url.searchParams.get('mode') === 'session' ? 'session' : 'headless';
+
+  const runtime = await host.runtimeFor(url);
+  const view = await sharedViewFor(runtime);
+  const base = (await runtime.vcs.getCurrentBase()) ?? '';
+  const detail = await runtime.store.get(
+    id,
+    base || null,
+    view?.source,
+    undefined,
+    optionId || patchId !== undefined ? { ...(optionId ? { optionId } : {}), ...(patchId !== undefined ? { patchId } : {}) } : undefined,
+  );
+  if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
+  if (!detail.option || !detail.patchEntry) {
+    throw new ApiError(409, 'conflict', '纯文字问题没有可修订的补丁方案');
+  }
+
+  const systemPrompt = await loadProposalSystemPrompt();
+  const userPrompt = buildModeBPrompt({
+    candidate: detail.candidate,
+    option: detail.option,
+    patchEntry: detail.patchEntry,
+    patchText: detail.patchText,
+    targetBase: base || detail.patchEntry.baseRevision,
+    vcsType: runtime.vcsType,
+    intent: 'revise',
+    mode,
+  });
+  sendJson(res, 200, {
+    id,
+    optionId: detail.option.id,
+    patchId: detail.patchEntry.id,
+    mode,
+    prompt: wrapAgentPrompt(systemPrompt, userPrompt),
+  });
+}
+
+export async function handleReviewers(host: ApiHost, _req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
+  const runtime = await host.runtimeFor(url);
+  const view = await sharedViewFor(runtime);
+  const config = await loadReviewers(runtime.root, view?.source);
+  sendJson(res, 200, {
+    config,
+    valid: config.valid,
+    errors: config.errors,
+  });
+}
+
+export async function handleAudits(host: ApiHost, _req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
+  const runtime = await host.runtimeFor(url);
+  const view = await sharedViewFor(runtime);
+  const archive = new AuditArchive(runtime.root);
+  const records = await archive.list(view?.source);
+  const errors = records.filter((r) => r.parseError).map((r) => `${r.auditId}: ${r.parseError!}`);
+  const audits = records
+    .filter((r) => !r.parseError)
+    .map((r) => ({
+      auditId: r.auditId,
+      createdAt: r.meta.createdAt,
+      baseRevision: r.meta.baseRevision,
+      scope: r.meta.scope,
+      trigger: r.meta.trigger,
+      previousAudit: r.meta.previousAudit,
+      issues: r.meta.issues,
+      issueCount: r.meta.issues.length,
+    }));
+  sendJson(res, 200, { audits, errors });
+}
+
+/** SPEC §6.2：GET /findings 直接从同一共享快照的 review.md 派生，返回 id/findingId/recordRevision/owner/updatedAt/issueStatus/issueKind/dependsOn/deferred 等。 */
+export async function handleFindings(host: ApiHost, _req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
+  const scope = url.searchParams.get('scope')?.trim() || '.';
+  const findingIdFilter = url.searchParams.get('findingId')?.trim() || '';
+  const dispositionsParam = url.searchParams.get('dispositions')?.trim() || '';
+  const wantedDispositions = dispositionsParam
+    ? new Set(dispositionsParam.split(',').map((s) => s.trim()).filter(Boolean) as FindingDisposition[])
+    : null;
+
+  const runtime = await host.runtimeFor(url);
+  const view = await sharedViewFor(runtime);
+  const { candidates, errors } = await runtime.store.listSharedCandidates(view?.source);
+
+  const findings = candidates
+    .filter((c) => !c.parseError)
+    .filter((c) => !findingIdFilter || c.meta.findingId === findingIdFilter)
+    .filter((c) => scopeCovers(scope, c.meta.targetFiles))
+    .map((c) => buildFindingView(c))
+    .filter((item) => !wantedDispositions || wantedDispositions.has(item.disposition))
+    .sort((a, b) => (Date.parse(b.updatedAt) || 0) - (Date.parse(a.updatedAt) || 0) || a.id.localeCompare(b.id));
+
+  sendJson(res, 200, { findings, errors });
 }

@@ -1,1112 +1,1145 @@
-import { readFile, writeFile, rm, stat, readdir } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
-import { tmpdir } from 'node:os';
+/**
+ * 批准编排（SPEC §5.5 11 步原子事务）：
+ * 优先程序应用（严格应用 → 确定性三方合并），受阻按需唤起 Mode C（完整权限、禁改 .ai-review、物理拓扑硬护栏），
+ * 门禁全过落地并关闭（保留补丁），门禁失败还原并记 repair_failed（永久封禁该补丁，绝不自动调用 Agent）。
+ */
+
+import { lstat, readFile, realpath, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { parsePatch, isAiReviewPath } from './patch.js';
-import { runGateChecks } from './validator.js';
-import { gitBlobHash } from './vcs.js';
-import { currentReviewPatch, selectIssuePatch } from './issue-review.js';
+import { createHash } from 'node:crypto';
 import { mergeApprovedText, supportedApprovalMergePatch } from './approval-merge.js';
-import { readApprovalMergeSnapshots, readSvnApprovalBinding, replaceApprovalMergeFile,
-  svnApprovalBinding, SVN_APPROVAL_SOURCE, type ApprovalMergeFile } from './approval-merge-snapshots.js';
-import type { Runner, RunnerRequest } from './runner.js';
-import type { CandidateSource, ReviewStore } from './store.js';
+import {
+  readApprovalMergeSnapshots,
+  replaceApprovalMergeFile,
+  svnApprovalBinding,
+} from './approval-merge-snapshots.js';
+import {
+  buildCommitDetails,
+  buildCommitSubject,
+  composeCommitMessage,
+  type CommitMessageDetail,
+} from './commit-message.js';
+import { parseReviewMarkdown, serializeReviewMarkdown } from './frontmatter.js';
+import { isRepoRelativePath, validateSafeBusinessPath } from './invariants.js';
+import {
+  formatPatchFilename,
+  isDeferred,
+  isPatchBanned,
+  nextUpdatedAt,
+  requireExplicitSelection,
+  sha256Hex,
+} from './issue-review.js';
+import { isAiReviewPath, parsePatch } from './patch.js';
+import {
+  buildModeCPrompt,
+  loadModeCSystemPrompt,
+  parseModeCOutput,
+  runAgent,
+  wrapAgentPrompt,
+  type RunAgentResult,
+} from './runner.js';
+import type { SharedCandidateSource } from './shared-facts.js';
+import type { ReviewStore } from './store.js';
+import { runGateChecks } from './validator.js';
+import { collectCommitEntries, gitBlobHash, type ExpectedCommitEntry, type VcsAdapter } from './vcs.js';
 import type {
-  AppSettings,
-  ApprovalFallbackReason,
-  ApprovalDecisions,
+  ApprovalInfo,
   ApprovalOutcome,
+  AppSettings,
   ConcurrencyGuard,
+  GateCheckResult,
+  PatchEntry,
+  RepairApplyMode,
+  RepairAttempt,
+  RepairOption,
   ReviewCandidate,
-  RunnerExecutionResult,
-  IssueSelection,
+  ReviewFrontmatter,
+  WaivedDecision,
 } from './types.js';
-import { composeCommitMessage } from './commit-message.js';
-import { buildCommitDetails } from './commit-message.js';
-import type { CommitMessageDetail } from './commit-message.js';
-import type { VcsAdapter } from './vcs.js';
 
 export const MAX_COMMIT_RETRIES = 2;
 
-/** I8 要求每项人工判断恰好有一个决定，并记录知悉的理由以便追溯。 */
-export function checkDecisionCoverage(
-  decisions: { id: string; question: string }[],
-  confirmed: string[],
-  waived: { id: string; reason: string }[],
-): string[] {
-  const errors: string[] = [];
-  const validIds = new Set(decisions.map((item) => item.id));
-  const confirmedSeen = new Set<string>();
-  for (const raw of confirmed) {
-    const id = typeof raw === 'string' ? raw.trim() : '';
-    if (!id) {
-      errors.push('确认项 id 不能为空');
-      continue;
-    }
-    if (!validIds.has(id)) errors.push(`确认项 ${id} 不属于当前人工判断项`);
-    if (confirmedSeen.has(id)) errors.push(`确认项 ${id} 重复`);
-    confirmedSeen.add(id);
-  }
-  const waivedSeen = new Set<string>();
-  for (const item of waived) {
-    const id = typeof item.id === 'string' ? item.id.trim() : '';
-    if (!id) {
-      errors.push('知悉项 id 不能为空');
-      continue;
-    }
-    if (!validIds.has(id)) errors.push(`知悉项 ${id} 不属于当前人工判断项`);
-    if (waivedSeen.has(id)) errors.push(`知悉项 ${id} 重复`);
-    if (confirmedSeen.has(id)) errors.push(`判断项 ${id} 同时被确认与知悉`);
-    if (!item.reason.trim()) errors.push(`知悉项 ${id} 缺少理由`);
-    waivedSeen.add(id);
-  }
-  for (const item of decisions) {
-    if (!confirmedSeen.has(item.id) && !waivedSeen.has(item.id)) {
-      errors.push(`人工判断项 ${item.id} 未确认也未标记知悉：${item.question}`);
-    }
-  }
-  return errors;
-}
-
-export function checkCommitMessage(title: string, commitMessage: string): string | null {
-  const firstLine = commitMessage.split('\n')[0]?.trim() ?? '';
-  if (!firstLine) return 'commit_message 为空：批准前必须填写提交信息';
-  if (firstLine !== title.trim()) return `commit_message 首行必须与 title 一致：${JSON.stringify(firstLine)} vs ${JSON.stringify(title)}`;
-  return null;
-}
-
-export interface RunnerLike {
-  run(): Promise<RunnerExecutionResult>;
-}
-
-export interface ApprovalCommitInput {
-  selection?: IssueSelection;
+export interface ApproveInput {
+  id: string;
+  guard: ConcurrencyGuard;
+  optionId: string;
+  patchId: number;
+  confirmedDecisions: string[];
+  waivedDecisions: WaivedDecision[];
   commitMessage?: string;
   commitDetail?: CommitMessageDetail;
-  commitMessageBody?: string;
+  actor: string;
 }
 
 export interface ApprovalDeps {
   store: ReviewStore;
   vcs: VcsAdapter;
   settings: AppSettings;
-  makeRunner: (request: RunnerRequest) => RunnerLike | Runner;
-  resolveCredential?: (reference: string) => Promise<string | undefined>;
-  /** 每次重读都绑定当前共享快照，以免工作区草稿参与批准判定。 */
-  sharedSource?: () => Promise<CandidateSource | undefined>;
-  /** 返回阻止批准的被拒候选 ID。窗口与人工重开豁免由提供者判定。 */
-  checkDuplicate?: () => Promise<string | null>;
-  checkFinding?: (candidate: ReviewCandidate) => Promise<{ reason: 'STATE_CONFLICT' | 'CONCURRENCY_MISMATCH'; message: string } | null>;
-  beginFindingCommit?: (candidate: ReviewCandidate, paths: string[], probe: string | null) => Promise<void>;
-  finishFindingCommit?: (candidate: ReviewCandidate) => Promise<void>;
-  validateNewRevision?: (previous: ReviewCandidate, latest: ReviewCandidate) => Promise<string[]>;
-  /** 只在仍可安全中止的检查点轮询。 */
-  shouldCancel?: () => boolean;
+  jobId: string;
+  log: (line: string) => void;
+  sharedSource: () => Promise<SharedCandidateSource | undefined>;
   signal?: AbortSignal;
+  resolveCredential?: (reference: string) => Promise<string | undefined>;
+  runGates?: typeof runGateChecks;
+  /** 测试可注入受控 Mode C 执行器，验证全部物理拓扑分支。 */
+  runModeC?: (input: { prompt: string; cwd: string; signal?: AbortSignal }) => Promise<RunAgentResult>;
+  isManaged?: boolean;
 }
 
-interface Backup {
-  reviewPath: string;
-  reviewText: string;
-  patches: { path: string; text: string }[];
-}
-
-interface ReloadResult {
-  candidate: ReviewCandidate | null;
-  conflict: 'guard' | 'state' | null;
-  status?: string;
-  /** 当前补丁与评审数据必须取自这次读取绑定的同一快照。 */
-  source?: CandidateSource;
-}
-
-interface BusinessFileSnapshot {
-  blobHash: string;
-  mode: string;
-}
-
-function diffBusinessSnapshot(
-  before: Map<string, BusinessFileSnapshot | null>,
-  after: Map<string, BusinessFileSnapshot | null>,
-): string[] {
-  const changed: string[] = [];
-  for (const [file, snapshot] of before) {
-    const next = after.get(file) ?? null;
-    if (JSON.stringify(snapshot) !== JSON.stringify(next)) changed.push(file);
+/** I10：校验 confirmedDecisions 与 waivedDecisions 构成当前 human_decisions 的精确无重无交划分。 */
+export function validateHumanDecisionsCoverage(
+  meta: ReviewFrontmatter,
+  confirmedDecisions: readonly string[],
+  waivedDecisions: readonly WaivedDecision[],
+): string | null {
+  const declared = new Set(meta.humanDecisions.map((item) => item.id));
+  const confirmed = new Set<string>();
+  for (const id of confirmedDecisions) {
+    if (confirmed.has(id)) return `confirmedDecisions 包含重复判断项：${id}`;
+    if (!declared.has(id)) return `confirmedDecisions 包含未知判断项：${id}`;
+    confirmed.add(id);
   }
-  return changed;
+  const waived = new Set<string>();
+  for (const item of waivedDecisions) {
+    if (!item || typeof item.id !== 'string' || typeof item.reason !== 'string') {
+      return 'waivedDecisions 项格式非法';
+    }
+    if (waived.has(item.id)) return `waivedDecisions 包含重复判断项：${item.id}`;
+    if (!declared.has(item.id)) return `waivedDecisions 包含未知判断项：${item.id}`;
+    if (confirmed.has(item.id)) return `判断项 ${item.id} 同时出现在 confirmedDecisions 与 waivedDecisions`;
+    if (!item.reason.trim()) return `判断项 ${item.id} 的放弃理由（reason）不能为空`;
+    waived.add(item.id);
+  }
+  for (const id of declared) {
+    if (!confirmed.has(id) && !waived.has(id)) {
+      return `遗漏必须处理的人工判断项：${id}`;
+    }
+  }
+  return null;
 }
 
-function relative(root: string, absolute: string): string {
-  return path.relative(root, absolute).replaceAll('\\', '/');
+async function digestAiReviewDir(root: string): Promise<string> {
+  const { entries } = await collectCommitEntries(root, ['.ai-review']);
+  const hash = createHash('sha256');
+  for (const entry of entries.sort((a, b) => a.path.localeCompare(b.path))) {
+    hash.update(entry.path).update('\0').update(entry.blobHash).update('\n');
+  }
+  return hash.digest('hex');
 }
 
-export class ApprovalOrchestrator {
-  constructor(private readonly deps: ApprovalDeps) {}
+async function hasSymlinkEscape(root: string, relPaths: readonly string[]): Promise<boolean> {
+  const resolvedRoot = await realpath(root).catch(() => null);
+  if (!resolvedRoot) return true;
+  for (const rel of relPaths) {
+    if (!isRepoRelativePath(rel) || isAiReviewPath(rel)) return true;
+    const abs = path.join(root, rel);
+    const info = await lstat(abs).catch((error: NodeJS.ErrnoException) => (error.code === 'ENOENT' ? null : 'error'));
+    if (info === 'error') return true;
+    if (info === null) continue;
+    if (info.isSymbolicLink()) return true;
+    const real = await realpath(abs).catch(() => null);
+    if (!real) return true;
+    const checkRel = path.relative(resolvedRoot, real).replaceAll('\\', '/');
+    if (checkRel !== rel) return true;
+  }
+  return false;
+}
 
-  async approve(
-    id: string,
-    guard: ConcurrencyGuard,
-    jobId: string,
-    log: (line: string) => void,
-    decisions: ApprovalDecisions = { confirmed: [], waived: [] },
-    operator?: string,
-    commitMessage?: string,
-    commitInput?: ApprovalCommitInput,
-  ): Promise<ApprovalOutcome> {
-    const messageOverride = commitInput?.commitMessage !== undefined ? commitInput.commitMessage : commitMessage;
-    const businessMessageFor = async (candidate: ReviewCandidate): Promise<string | undefined> => {
-      const detail = commitInput?.commitDetail;
-      if (!detail) return undefined;
-      const body = detail === 'detailed' ? await this.buildDetailBody(candidate, commitInput?.selection) : '';
-      return composeCommitMessage(candidate, detail, body);
-    };
-    const { store, vcs, settings } = this.deps;
-    const maxAttempts = MAX_COMMIT_RETRIES + 1;
-    let lastCommitError = '';
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      log(`批准流程开始（第 ${String(attempt)}/${String(maxAttempts)} 次）`);
-      if (this.deps.shouldCancel?.()) {
-        return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: '已按取消请求中止（未产生共享提交）', jobId };
-      }
-      const pre = await this.runPrechecks(id, guard, decisions, jobId, log, messageOverride);
-      if ('outcome' in pre) return pre.outcome;
-      let candidate = pre.candidate;
-      if (candidate.meta.schemaVersion === 3) {
-        try {
-          if (!commitInput?.selection) throw new Error('批准问题必须显式选择方案和补丁');
-          selectIssuePatch(candidate.meta, commitInput.selection);
-        } catch (error) {
-          return { status: 'ABORTED', reason: 'INVALID_CANDIDATE', message: String(error), jobId };
-        }
-      }
-      let sharedSource = pre.source;
-      const duplicate1 = await this.deps.checkDuplicate?.();
-      if (duplicate1) {
-        return {
-          status: 'ABORTED',
-          reason: 'DUPLICATE_CANDIDATE',
-          message: `该候选与窗口内的被拒候选完全重复（${duplicate1}），不能批准。`,
-          detail: `duplicateOf=${duplicate1}`,
-          jobId,
-        };
-      }
-      const clean = await vcs.ensureCleanWorkspace();
-      if (!clean.clean) {
-        return { status: 'ABORTED', reason: 'DIRTY_WORKSPACE', message: clean.message, jobId };
-      }
-      log('工作区干净，准备同步最新基线');
-      if (settings.syncBeforeApprove) {
-        const sync = await vcs.syncAndGetLatestBase();
-        log(sync.message);
-        if (sync.failed) {
-          return {
-            status: 'ABORTED',
-            reason: 'SYNC_FAILED',
-            message: `同步最新基线失败：${sync.message}`,
-            jobId,
-          };
-        }
-        if (sync.uncertain || sync.base === null || sync.base === undefined) {
-          return {
-            status: 'RECOVERY_REQUIRED',
-            reason: 'SYNC_STATE_UNKNOWN',
-            message: '同步后无法确定当前基线状态，需人工确认 VCS 与工作区。',
-            detail: sync.message,
-            jobId,
-          };
-        }
-        // 同步可能推进共享快照，基于原快照的预检结果随之失效。
-        const resync = await this.runPrechecks(id, guard, decisions, jobId, log, messageOverride);
-        if ('outcome' in resync) return resync.outcome;
-        candidate = resync.candidate;
-        sharedSource = resync.source;
-        const duplicate2 = await this.deps.checkDuplicate?.();
-        if (duplicate2) {
-          return {
-            status: 'ABORTED',
-            reason: 'DUPLICATE_CANDIDATE',
-            message: `同步后该候选与窗口内的被拒候选完全重复（${duplicate2}），不能批准。`,
-            detail: `duplicateOf=${duplicate2}`,
-            jobId,
-          };
-        }
-      }
-      const base = await vcs.getCurrentBase();
-      if (!base) {
-        return { status: 'ABORTED', reason: 'SYNC_FAILED', message: '无法读取当前基线版本', jobId };
-      }
-      const gitTarget = await vcs.getApprovalTarget?.();
-      if (vcs.getApprovalTarget && gitTarget?.base !== base) {
-        return { status: 'ABORTED', reason: 'SYNC_FAILED', message: '无法绑定 Git 审批目标引用和基线', jobId };
-      }
-      const gitTargetMatches = async (): Promise<boolean> => {
-        if (!gitTarget) return true;
-        const current = await vcs.getApprovalTarget?.().catch(() => null);
-        return current?.ref === gitTarget.ref && current.base === gitTarget.base;
-      };
-      const gitTargetRecovery = (detail: string): ApprovalOutcome => ({
-        status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', jobId,
-        message: 'Git 审批目标发生变化，已停止业务提交并保留现场', detail,
-      });
-      const patch = sharedSource
-        ? await store.currentPatch(candidate, sharedSource, commitInput?.selection)
-        : await store.currentPatch(candidate, undefined, commitInput?.selection);
-      const touchedPaths = parsePatch(patch.text).paths;
-      const currentRevision = currentReviewPatch(candidate.meta, commitInput?.selection);
-      const svnSource = vcs.type === 'svn' ? svnApprovalBinding(currentRevision?.extra?.[SVN_APPROVAL_SOURCE]) : null;
-      if (svnSource) {
-        const target = await readSvnApprovalBinding(vcs.root, this.deps.signal).catch(() => null);
-        if (!target || target.uuid !== svnSource.uuid || target.relativeUrl !== svnSource.relativeUrl) {
-          return { status: 'ABORTED', reason: 'SYNC_FAILED', jobId, message: 'SVN 候选来源与当前目标绑定不一致或无法核验' };
-        }
-      }
-      const mergeInput = { sourceRevision: patch.baseRevision, targetRevision: base, files: touchedPaths, svnBinding: svnSource };
-      const verifyMergeTarget = async (files: ApprovalMergeFile[], verifyWorktree: boolean): Promise<boolean> => {
-        if (await vcs.getCurrentBase() !== base) return false;
-        const current = await readApprovalMergeSnapshots(vcs, { ...mergeInput, verifyWorktree });
-        return current.status === 'ready' && files.every((file, index) =>
-          current.files[index]?.targetIdentity === file.targetIdentity);
-      };
-      let merge: { baseFiles: ApprovalMergeFile[]; output: Map<string, Buffer> } | undefined;
-      let restoreNative: (() => Promise<void>) | undefined;
-      const restoreBusiness = async (): Promise<void> => {
-        if (restoreNative) {
-          await restoreNative();
-        } else if (!merge) {
-          await vcs.revertBusinessWorkspace();
-          return;
-        } else {
-          if (!await verifyMergeTarget(merge.baseFiles, false)) throw new Error('原生目标快照已变化');
-          const errors: string[] = [];
-          for (const file of merge.baseFiles) {
-            try {
-              await replaceApprovalMergeFile(vcs.root, file.path, merge.output.get(file.path)!, file.target);
-            } catch (error) {
-              errors.push(String(error));
-            }
-          }
-          if (errors.length) throw new Error(errors.join('\n'));
-        }
-        const restored = await vcs.ensureCleanWorkspace();
-        if (!restored.clean) throw new Error(restored.message);
-      };
-      const rollbackApplied = async (): Promise<ApprovalOutcome | null> => {
-        try {
-          await restoreBusiness();
-          return null;
-        } catch (error) {
-          return { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', jobId,
-            message: '工作区仍有无法确认归属的改动或恢复失败，已保留现场', detail: String(error) };
-        }
-      };
-      const forbiddenPaths = touchedPaths.filter((file) => isAiReviewPath(file));
-      if (forbiddenPaths.length > 0) {
-        return {
-          status: 'ABORTED',
-          reason: 'INVALID_CANDIDATE',
-          message: `补丁包含禁止路径，已在应用前拒绝：\n${forbiddenPaths.join('\n')}`,
-          jobId,
-        };
-      }
-      log(`严格应用版本 ${String(candidate.meta.currentRevision)} 的补丁（基线 ${base.slice(0, 12)}）`);
-      // VCS 接受补丁文件。放在仓库外可避免把中间文件写入业务工作区。
-      const tempPatch = path.join(tmpdir(), `dcr-approval-${String(process.pid)}-${String(Date.now())}.patch`);
-      await writeFile(tempPatch, patch.text, 'utf8');
-      let applied;
-      let nativeAttempt;
-      try {
-        nativeAttempt = await vcs.applyPatchForApproval?.(tempPatch, this.deps.signal);
-        restoreNative = nativeAttempt?.restore;
-        applied = nativeAttempt ?? await vcs.applyPatch(tempPatch, false);
-      } finally {
-        await rm(tempPatch, { force: true }).catch(() => undefined);
-      }
-      if (!applied.ok) {
-        if (nativeAttempt?.workspace === 'unknown') {
-          return { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', jobId,
-            message: '原生补丁应用结果无法核验，已保留现场', detail: applied.message };
-        }
-        if (this.deps.signal?.aborted) {
-          return { status: 'ABORTED', reason: 'COMMIT_FAILED', jobId, message: '已取消补丁应用，未产生共享提交' };
-        }
-        if (nativeAttempt) {
-          if (!applied.conflict) {
-            return { status: 'ABORTED', reason: 'SYNC_FAILED', jobId, message: '原生补丁预检无法核验', detail: applied.message };
-          }
-          const afterCheck = await vcs.ensureCleanWorkspace();
-          if (!afterCheck.clean) {
-            return { status: 'ABORTED', reason: 'DIRTY_WORKSPACE', jobId, message: afterCheck.message };
-          }
-        } else {
-          await vcs.revertBusinessWorkspace().catch(() => undefined);
-        }
-        let failure = applied.message;
-        if (nativeAttempt?.canMerge && (vcs.type === 'git' || svnSource) && supportedApprovalMergePatch(patch.text)) {
-          const inputs = await readApprovalMergeSnapshots(vcs, {
-            ...mergeInput, ...(this.deps.signal ? { signal: this.deps.signal } : {}),
-          });
-          if (inputs.status === 'ready') {
-            log('原生补丁上下文变化，尝试隔离的 Git 三方合并');
-            const result = await mergeApprovedText(patch.text, inputs.files, this.deps.signal);
-            if (this.deps.signal?.aborted) {
-              return { status: 'ABORTED', reason: 'COMMIT_FAILED', jobId, message: '已取消三方合并，未产生共享提交' };
-            }
-            if (result.status === 'merged') {
-              if (!await verifyMergeTarget(inputs.files, true) || !(await vcs.ensureCleanWorkspace()).clean) {
-                return { status: 'ABORTED', reason: 'CONCURRENCY_MISMATCH', jobId, message: '三方合并期间原生目标发生变化' };
-              }
-              merge = { baseFiles: inputs.files, output: result.files };
-              const written: ApprovalMergeFile[] = [];
-              try {
-                for (const file of inputs.files) {
-                  await replaceApprovalMergeFile(vcs.root, file.path, file.target, result.files.get(file.path)!);
-                  written.push(file);
-                }
-              } catch (error) {
-                if (written.length && await verifyMergeTarget(written, false)) {
-                  for (const file of written) {
-                    await replaceApprovalMergeFile(vcs.root, file.path, result.files.get(file.path)!, file.target).catch(() => undefined);
-                  }
-                }
-                return { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', jobId,
-                  message: '写入合并结果时工作副本变化或写入失败，已保留待核验现场', detail: String(error) };
-              }
-              log('三方合并的待交付差异与已审修改相符');
-            } else if (result.status === 'unavailable') {
-              failure = result.detail;
-              return { status: 'ABORTED', reason: 'SYNC_FAILED', jobId, message: '无法完成隔离三方合并', detail: failure };
-            } else {
-              failure = result.detail;
-            }
-          } else if (inputs.status === 'mismatch' || inputs.status === 'unavailable') {
-            if (this.deps.signal?.aborted) {
-              return { status: 'ABORTED', reason: 'COMMIT_FAILED', jobId, message: '已取消来源快照读取，未产生共享提交' };
-            }
-            return { status: 'ABORTED', reason: 'SYNC_FAILED', jobId, message: '无法核验三方合并输入', detail: inputs.detail };
-          }
-        }
-        if (!merge) return this.fixOrFallback('PATCH_CONFLICT', failure, candidate, jobId, log, base, commitInput?.selection);
-      }
-      const businessPaths = touchedPaths.filter((file) => !isAiReviewPath(file));
-      const businessSnapshot = await this.snapshotBusiness(businessPaths);
-      if (merge && [...merge.output].some(([file, contents]) => businessSnapshot.get(file)?.blobHash !== gitBlobHash(contents))) {
-        return { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', jobId,
-          message: '三方合并写入与已验证结果不一致，已保留现场', detail: '实际写入的文件快照在门禁前发生变化' };
-      }
-      log('补丁已应用，开始执行门禁检查');
-      const commands = candidate.meta.schemaVersion === 3
-        ? selectIssuePatch(candidate.meta, commitInput!.selection!).option.gateChecks : candidate.meta.gateChecks;
-      const report = await runGateChecks(commands, {
-        cwd: store.repoRoot,
-        baseRevision: base,
-        timeoutMs: settings.gateTimeoutMs,
-        onLine: (line) => {
-          if (line.trim().length > 0) log(`  ${line.slice(0, 500)}`);
-        },
-        ...(this.deps.signal ? { signal: this.deps.signal } : {}),
-      });
-      log(report.allPassed ? '门禁检查全部通过' : '门禁检查存在失败项');
-      if (!await gitTargetMatches()) return gitTargetRecovery('门禁执行前后 Git 目标引用或基线不一致');
-      if (this.deps.signal?.aborted) {
-        const recovery = await rollbackApplied();
-        if (recovery) return recovery;
-        return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: '门禁已按取消请求终止，未产生共享提交', jobId };
-      }
-      if (!report.allPassed) {
-        const recovery = await rollbackApplied();
-        if (recovery) return recovery;
-        return this.recordVerificationFailure(candidate, guard, report.formattedEvidenceMarkdown, base,
-          operator?.trim() || guard.expectedOwner, jobId, log, commitInput?.selection);
-      }
-      // AC-APPROVE-01 要求门禁后重新验证共享事实和业务内容，防止门禁期间的改动混入提交。
-      const baseAfterGates = await vcs.getCurrentBase();
-      if (baseAfterGates === null || baseAfterGates !== base || (merge && !await verifyMergeTarget(merge.baseFiles, false))) {
-        const recovery = await rollbackApplied();
-        if (recovery) return recovery;
-        return {
-          status: 'ABORTED',
-          reason: 'CONCURRENCY_MISMATCH',
-          message: `门禁执行期间基线发生漂移（${base.slice(0, 12)} → ${baseAfterGates?.slice(0, 12) ?? '(不可读)'}），已回滚业务改动。`,
-          jobId,
-        };
-      }
-      if (this.deps.shouldCancel?.()) {
-        const recovery = await rollbackApplied();
-        if (recovery) return recovery;
-        return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: '已按取消请求中止（提交前，未产生共享提交）', jobId };
-      }
-      const duplicate3 = await this.deps.checkDuplicate?.();
-      if (duplicate3) {
-        const recovery = await rollbackApplied();
-        if (recovery) return recovery;
-        return {
-          status: 'ABORTED',
-          reason: 'DUPLICATE_CANDIDATE',
-          message: `门禁执行期间出现完全重复的被拒候选（${duplicate3}），已回滚业务改动。`,
-          detail: `duplicateOf=${duplicate3}`,
-          jobId,
-        };
-      }
-      const freshReload = await this.reload(id, guard, log);
-      if (!freshReload.candidate) {
-        const recovery = await rollbackApplied();
-        if (recovery) return recovery;
-        return {
-          status: 'ABORTED',
-          reason: 'CONCURRENCY_MISMATCH',
-          message: '门禁执行期间候选被其他人更新，已回滚业务改动。',
-          jobId,
-        };
-      }
-      const fresh = freshReload.candidate;
-      const findingConflict = await this.findingConflict(fresh);
-      if (findingConflict) {
-        const recovery = await rollbackApplied();
-        if (recovery) return recovery;
-        return { status: 'ABORTED', ...findingConflict, jobId };
-      }
-      if (messageOverride !== undefined) {
-        fresh.meta.commitMessage = messageOverride;
-        const replacedMessageError = checkCommitMessage(fresh.meta.title, fresh.meta.commitMessage);
-        if (replacedMessageError) {
-          const recovery = await rollbackApplied();
-          if (recovery) return recovery;
-          return {
-            status: 'ABORTED',
-            reason: 'COMMIT_MESSAGE_MISMATCH',
-            message: replacedMessageError,
-            jobId,
-          };
-        }
-      }
-      const snapshotAfter = await this.snapshotBusiness(businessPaths);
-      const businessChanged = diffBusinessSnapshot(businessSnapshot, snapshotAfter);
-      const dirtyAfter = await vcs.ensureCleanWorkspace();
-      const extraDirty = dirtyAfter.dirtyPaths.filter((file) => !businessPaths.includes(file.replaceAll('\\', '/')));
-      if (businessChanged.length > 0 || extraDirty.length > 0) {
-        const recovery = await rollbackApplied();
-        if (recovery) return recovery;
-        return {
-          status: 'ABORTED',
-          reason: 'BUSINESS_CONTENT_CHANGED',
-          message: `门禁执行期间业务内容发生变化，已回滚：\n${[...businessChanged, ...extraDirty.map((file) => `${file}（额外改动）`)].join('\n')}`,
-          jobId,
-        };
-      }
-      const backup = await this.backup(fresh);
-      const patchPaths = fresh.meta.revisions.map((revision) =>
-        relative(store.repoRoot, path.join(fresh.dirPath, revision.patch)),
+interface ValidatedSnapshot {
+  source: SharedCandidateSource | undefined;
+  candidate: ReviewCandidate;
+  option: RepairOption;
+  patchEntry: PatchEntry;
+  patchText: string;
+  approvedPatchPaths: string[];
+  commitMessage: string;
+}
+
+export async function runApprovalTransaction(deps: ApprovalDeps, input: ApproveInput): Promise<ApprovalOutcome> {
+  const { store, vcs, settings, jobId, log } = deps;
+  const runGatesFn = deps.runGates ?? runGateChecks;
+
+  const abort = (reason: Extract<ApprovalOutcome, { status: 'ABORTED' }>['reason'], message: string, detail?: string): ApprovalOutcome => ({
+    status: 'ABORTED',
+    jobId,
+    reason,
+    ...(detail ? { detail } : {}),
+    message,
+  });
+
+  const recover = (reason: Extract<ApprovalOutcome, { status: 'RECOVERY_REQUIRED' }>['reason'], detail: string, message?: string): ApprovalOutcome => ({
+    status: 'RECOVERY_REQUIRED',
+    jobId,
+    reason,
+    detail,
+    message: message ?? `批准进入恢复态：${detail}`,
+  });
+
+  const validatePreconditions = async (): Promise<ValidatedSnapshot | ApprovalOutcome> => {
+    const source = await deps.sharedSource();
+    const base = await vcs.getCurrentBase();
+    let detail;
+    try {
+      detail = await store.get(input.id, base, source, undefined, { optionId: input.optionId, patchId: input.patchId });
+    } catch (error) {
+      return abort('STATE_CONFLICT', error instanceof Error ? error.message : String(error));
+    }
+    const candidate = detail.candidate;
+    if (candidate.parseError) {
+      return abort('INVALID_CANDIDATE', `问题记录损坏：${candidate.parseError}`);
+    }
+    const meta = candidate.meta;
+
+    // Step 1: guard / status / defer / selection / sha256 / ban / duplicate
+    try {
+      store.checkGuard(meta, input.guard);
+    } catch (error) {
+      return abort('CONCURRENCY_MISMATCH', error instanceof Error ? error.message : String(error));
+    }
+    if (meta.status !== 'pending') {
+      return abort('STATE_CONFLICT', `仅 pending 状态允许批准（当前为 ${meta.status}）`);
+    }
+    if (isDeferred(meta)) {
+      return abort('STATE_CONFLICT', '该问题当前处于延期（defer）暂停态，请先执行 resume_review 解除暂停后再批准');
+    }
+    if (meta.owner !== input.actor) {
+      return abort('CONCURRENCY_MISMATCH', `仅当前共享负责人 ${meta.owner} 可批准（当前操作者：${input.actor}）`);
+    }
+
+    let option: RepairOption;
+    let patchEntry: PatchEntry;
+    try {
+      const resolved = requireExplicitSelection(meta, { optionId: input.optionId, patchId: input.patchId });
+      option = resolved.option;
+      patchEntry = resolved.patch;
+    } catch (error) {
+      return abort('STATE_CONFLICT', error instanceof Error ? error.message : String(error));
+    }
+
+    if (isPatchBanned(meta, option.id, patchEntry.id)) {
+      return abort(
+        'STATE_CONFLICT',
+        `方案 ${option.id} 的补丁 #${String(patchEntry.id)} 曾因门禁验证失败被永久封禁，禁止再次直接批准`,
       );
-      const reviewRelPath = relative(store.repoRoot, fresh.reviewPath);
-      const probePaths = [reviewRelPath, ...patchPaths];
-      const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
-      if (!await gitTargetMatches()) return gitTargetRecovery('读取提交探针期间 Git 目标引用或基线变化');
-      if (fresh.meta.findingId) {
-        try {
-          if (!this.deps.beginFindingCommit || !this.deps.finishFindingCommit) throw new Error('缺少发现审批状态存储');
-          await this.deps.beginFindingCommit(fresh, probePaths, probeBefore);
-        } catch (error) {
-          const recovery = await rollbackApplied();
-          if (recovery) return recovery;
-          return { status: 'ABORTED', reason: 'COMMIT_FAILED', message: error instanceof Error ? error.message : String(error), jobId };
-        }
+    }
+
+    const rawBytes = await store.readPatchBytes(candidate.month, candidate.slug, patchEntry.patch, source);
+    if (rawBytes === null || sha256Hex(rawBytes) !== patchEntry.sha256) {
+      return abort('INVALID_CANDIDATE', `补丁 ${patchEntry.patch} 缺失或 SHA-256 与账本不一致`);
+    }
+    const patchText = rawBytes.toString('utf8');
+    const approvedPatchPaths = parsePatch(patchText).paths;
+    if (approvedPatchPaths.length === 0) {
+      return abort('INVALID_CANDIDATE', `补丁 ${patchEntry.patch} 未包含任何业务文件路径`);
+    }
+
+    const duplicate = await store.findDuplicateForCandidate(candidate, source, source);
+    if (duplicate) {
+      return abort(
+        'DUPLICATE_CANDIDATE',
+        `命中负向记忆重复指纹，窗口期内已由 ${duplicate.candidateId} 拒绝（${duplicate.reason}）`,
+        duplicate.candidateId,
+      );
+    }
+
+    // Step 2: 人工判断项精确覆盖
+    const decisionError = validateHumanDecisionsCoverage(meta, input.confirmedDecisions, input.waivedDecisions);
+    if (decisionError) {
+      return abort('DECISIONS_UNCONFIRMED', decisionError);
+    }
+
+    // Step 3: 提交信息校验
+    const commitMessage = (input.commitMessage !== undefined ? input.commitMessage : meta.commitMessage ?? '').trim();
+    if (!commitMessage) {
+      return abort('COMMIT_MESSAGE_MISMATCH', 'commit_message 不能为空');
+    }
+    const firstLine = commitMessage.replace(/\r\n/g, '\n').split('\n')[0]?.trim() ?? '';
+    if (firstLine !== meta.title.trim()) {
+      return abort('COMMIT_MESSAGE_MISMATCH', `commit_message 首行必须与 title 一致（期望 "${meta.title.trim()}"）`);
+    }
+
+    // Step 4: 完整不变量校验
+    const validation = await store.validateFullCandidate(candidate, source);
+    if (validation.length > 0) {
+      return abort('INVALID_CANDIDATE', `问题记录校验失败：${validation.join('；')}`);
+    }
+
+    return { source, candidate, option, patchEntry, patchText, approvedPatchPaths, commitMessage };
+  };
+
+  // 重试循环：仅在确认撞车且无提交（或 B-已推送 C_meta 撞车）时重试，最多 MAX_COMMIT_RETRIES + 1 次。
+  let pushedCommitCarriedOver: {
+    commit: string;
+    remoteRef: string;
+    treeHash: string | null;
+    summary: string;
+    gateResults: GateCheckResult[];
+    snapshot: ValidatedSnapshot;
+    applyMode: RepairApplyMode;
+    base: string;
+  } | null = null;
+
+  for (let attemptNumber = 0; attemptNumber <= MAX_COMMIT_RETRIES; attemptNumber += 1) {
+    if (deps.signal?.aborted) {
+      return abort('RUNNER_FAILED', '批准任务已取消');
+    }
+
+    // 若上轮在情况 B-已推送中仅 C_meta 提交撞车，绝不回滚至 preHead，直接在 P 上重试 C_meta！
+    if (pushedCommitCarriedOver) {
+      const { commit: pushedHash, snapshot, gateResults, applyMode, base, summary } = pushedCommitCarriedOver;
+      log(`情况 B-已推送：在业务提交 ${pushedHash.slice(0, 12)} 上重试元数据关闭提交 C_meta（第 ${String(attemptNumber + 1)} 次）`);
+      const landed = await landMetaClosingCommitForPushed({
+        deps,
+        input,
+        snapshot,
+        pushedHash,
+        gateResults,
+        applyMode,
+        base,
+        summary,
+      });
+      if (landed.retry) continue;
+      return landed.outcome;
+    }
+
+    log(`步骤 1–4：校验并发守卫、方案选择、人工判断与完整性（尝试 ${String(attemptNumber + 1)}/${String(MAX_COMMIT_RETRIES + 1)}）`);
+    const initial = await validatePreconditions();
+    if ('status' in initial) return initial;
+
+    // Step 5: 检查工作区干净 & 无未完成 Git 操作
+    log('步骤 5：检查业务工作区干净状态');
+    const clean = await vcs.ensureCleanWorkspace();
+    if (!clean.clean) {
+      return abort('DIRTY_WORKSPACE', `批准要求业务工作区干净：${clean.message}`);
+    }
+    if (vcs.type === 'git' && (await vcs.hasActiveGitOperation?.())) {
+      return abort('SYNC_FAILED', 'Git 仓库正处于 merge/rebase/cherry-pick/revert 进行态，已中止批准并保留现场');
+    }
+
+    // Step 6: 按配置同步并重绑共享快照
+    let snapshot = initial;
+    if (settings.syncBeforeApprove) {
+      log('步骤 6：同步远端基线并重绑共享快照');
+      const sync = await vcs.syncAndGetLatestBase();
+      if (sync.uncertain) {
+        return recover('SYNC_STATE_UNKNOWN', sync.message);
       }
-      const finishFinding = async (): Promise<void> => {
-        if (fresh.meta.findingId) await this.deps.finishFindingCommit?.(fresh).catch(error => log(String(error)));
-      };
-      await store.applyApproval(fresh, operator?.trim() || guard.expectedOwner, report, decisions, commitInput?.selection,
-        { baseRevision: base, patchSha256: createHash('sha256').update(patch.text).digest('hex') });
-      const reviewText = await readFile(fresh.reviewPath, 'utf8');
-      const reviewStat = await stat(fresh.reviewPath);
-      const verifyEntries = businessPaths.flatMap((rel) => {
-        const snapshot = snapshotAfter.get(rel);
-        return snapshot ? [{ path: rel, blobHash: snapshot.blobHash, mode: snapshot.mode }] : [];
-      });
-      verifyEntries.push({
-        path: reviewRelPath,
-        blobHash: gitBlobHash(reviewText),
-        mode: (reviewStat.mode & 0o111) !== 0 ? '100755' : '100644',
-      });
-      const deletedPatches = fresh.meta.schemaVersion === 3 ? [] : patchPaths;
-      if (fresh.meta.schemaVersion === 3) {
-        for (const entry of backup.patches) {
-          verifyEntries.push({ path: relative(store.repoRoot, entry.path), blobHash: gitBlobHash(entry.text), mode: '100644' });
-        }
+      if (sync.failed) {
+        return abort('SYNC_FAILED', sync.message);
       }
-      const verifyDeletions = [...new Set([
-        ...deletedPatches,
-        ...businessPaths.filter((rel) => !snapshotAfter.get(rel)),
-      ])];
-      const businessMessage = (await businessMessageFor(fresh))
-        ?? (fresh.meta.commitMessage || `review(${id}): approve rev ${String(fresh.meta.currentRevision)}`);
-      if (commitInput?.commitDetail) log(`提交信息模式：${commitInput.commitDetail === 'detailed' ? '详细（单行综述 + 空行 + 事实正文）' : '简略（单行）'}`);
-      const commit = await vcs.atomicCommit({
-        message: businessMessage,
-        paths: [...businessPaths, relative(store.repoRoot, fresh.dirPath)],
-        deletePaths: deletedPatches,
-        verifyEntries,
-        verifyDeletions,
-        ...(gitTarget ? { gitTarget } : {}),
-      });
-      if (commit.targetChanged) return gitTargetRecovery(commit.errorOutput);
-      if (commit.verificationFailed) return {
-          status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN',
-          message: '提交已执行但完整核验失败，请保留现场并人工核对。', detail: commit.errorOutput, jobId,
-      };
-      if (!commit.success) {
-        lastCommitError = commit.errorOutput;
-        log(`提交失败：${commit.errorOutput}`);
-        const outcome = await this.classifyCommitFailure({
-          probeBefore,
-          probePaths,
-          reviewRelPath,
-          expectedReviewText: reviewText,
-          expectedEntries: verifyEntries,
-          expectedDeletions: verifyDeletions,
-          backup,
-          outOfDate: commit.outOfDate,
-          errorOutput: commit.errorOutput,
-          restorePreparation: commit.restorePreparation,
-          restoreBusiness,
-          canRetry: attempt < maxAttempts,
-          jobId,
-          log,
+      const rechecked = await validatePreconditions();
+      if ('status' in rechecked) return rechecked;
+      snapshot = rechecked;
+    }
+
+    const currentBase = await vcs.getCurrentBase();
+    if (!currentBase) {
+      return recover('SYNC_STATE_UNKNOWN', '无法读取当前 VCS 基线版本');
+    }
+
+    const { candidate, option, patchEntry, patchText, approvedPatchPaths } = snapshot;
+    const patchFileOnDisk = path.join(candidate.dirPath, patchEntry.patch);
+    const preHead = currentBase;
+    const preBranch = vcs.type === 'git' ? (await vcs.getCurrentBranch?.()) ?? null : null;
+    const preRemoteTip = vcs.type === 'git' ? (await vcs.getRemoteTip?.(preBranch ?? undefined)) ?? null : null;
+    const preAiReviewDigest = await digestAiReviewDir(vcs.root);
+
+    // Step 7: 程序优先应用（严格应用 → 确定性三方合并）→ 受阻则 Mode C
+    log(`步骤 7：程序性应用方案 ${option.id} 补丁 ${patchEntry.patch}`);
+    let applyMode: RepairApplyMode = 'program_strict';
+    let applySummary = '程序严格应用成功';
+    let appliedOk = false;
+    let conflictMessage = '';
+    let localModeC: {
+      preHead: string;
+      postHead: string;
+      mergedParents: string[];
+      commitCount: number;
+      expectedTreeHash: string | null;
+    } | null = null;
+    let pushedModeC: {
+      commit: string;
+      remoteRef: string;
+      expectedTreeHash: string | null;
+    } | null = null;
+
+    const strict = vcs.applyPatchForApproval
+      ? await vcs.applyPatchForApproval(patchFileOnDisk, deps.signal)
+      : { ...(await vcs.applyPatch(patchFileOnDisk, false)), workspace: 'unknown' as const, canMerge: true };
+    let patchRestore: (() => Promise<void>) | undefined;
+
+    if (strict.ok) {
+      appliedOk = true;
+      patchRestore = strict.restore;
+    } else {
+      conflictMessage = strict.message;
+      if (strict.workspace === 'unknown') {
+        return recover('SYNC_STATE_UNKNOWN', `程序性应用结果不明，已保留现场：${strict.message}`);
+      }
+      if (strict.workspace !== 'untouched') {
+        await vcs.revertBusinessWorkspace().catch(() => undefined);
+      }
+      // 尝试确定性三方合并
+      if (strict.conflict && supportedApprovalMergePatch(patchText)) {
+        log('严格应用遇到上下文冲突，尝试隔离环境确定性三方合并');
+        const mergeSnapshots = await readApprovalMergeSnapshots(vcs, {
+          sourceRevision: patchEntry.baseRevision,
+          targetRevision: currentBase,
+          files: approvedPatchPaths,
+          svnBinding: vcs.type === 'svn' ? svnApprovalBinding(patchEntry.svnApprovalSource) : null,
+          signal: deps.signal,
         });
-        if (outcome?.status !== 'RECOVERY_REQUIRED') await finishFinding();
-        if (outcome) return outcome;
+        if (mergeSnapshots.status === 'ready') {
+          const merged = await mergeApprovedText(patchText, mergeSnapshots.files, deps.signal);
+          if (merged.status === 'merged') {
+            try {
+              for (const file of mergeSnapshots.files) {
+                const nextContent = merged.files.get(file.path);
+                if (!nextContent) throw new Error(`三方合并缺少文件结果：${file.path}`);
+                await replaceApprovalMergeFile(vcs.root, file.path, file.target, nextContent);
+              }
+              appliedOk = true;
+              applyMode = 'program_3way';
+              applySummary = '程序确定性三方合并应用成功（逐 hunk 核验一致）';
+            } catch (error) {
+              conflictMessage = error instanceof Error ? error.message : String(error);
+              await vcs.revertBusinessWorkspace().catch(() => undefined);
+            }
+          } else {
+            conflictMessage = merged.detail;
+          }
+        } else {
+          conflictMessage = `${strict.message}\n三方合并不可用：${mergeSnapshots.detail}`;
+        }
+      }
+    }
+
+    // 若程序受阻，分流至 FALLBACK 或 Mode C
+    if (!appliedOk) {
+      const modeCPrompt = wrapAgentPrompt(
+        await loadModeCSystemPrompt(),
+        buildModeCPrompt({
+          candidate,
+          option,
+          patchEntry,
+          patchText,
+          approvedPatchPaths,
+          targetBase: currentBase,
+          conflictMessage,
+          vcsType: vcs.type,
+          repoRoot: vcs.root,
+        }),
+      );
+
+      if (!settings.autoFixOnFailure || settings.runner === 'manual') {
+        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        return {
+          status: 'FALLBACK_TO_PENDING',
+          jobId,
+          reason: 'PATCH_CONFLICT',
+          ...(settings.runner === 'manual' ? { manualPrompt: modeCPrompt } : {}),
+          message: `补丁程序性应用受阻（${conflictMessage.slice(0, 300)}），已回退待审核`,
+        };
+      }
+
+      log('程序性应用受阻，唤起修复 Agent（Mode C：完整权限辅助应用 / 分支合并）');
+      applyMode = 'agent_assisted';
+      const modeCResult = deps.runModeC
+        ? await deps.runModeC({ prompt: modeCPrompt, cwd: vcs.root, signal: deps.signal })
+        : await runAgent({
+          kind: settings.runner === 'dsh' ? 'dsh' : 'external',
+          settings,
+          cwd: vcs.root,
+          prompt: modeCPrompt,
+          log,
+          timeoutMs: 30 * 60_000,
+          label: 'Mode C 获批辅助',
+          ...(deps.signal ? { signal: deps.signal } : {}),
+          ...(deps.resolveCredential ? { resolveCredential: deps.resolveCredential } : {}),
+        });
+
+      const verdict = parseModeCOutput(modeCResult.assistantText || modeCResult.outputTail);
+      const postHead = await vcs.getCurrentBase();
+      const postBranch = vcs.type === 'git' ? (await vcs.getCurrentBranch?.()) ?? null : null;
+      const postRemoteTip = (vcs.type === 'git' && preRemoteTip)
+        ? (await vcs.getRemoteTip?.(preBranch ?? undefined)) ?? null
+        : null;
+      const remoteAdvanced = Boolean(preRemoteTip && postRemoteTip && postRemoteTip.tip !== preRemoteTip.tip);
+      const postAiReviewDigest = await digestAiReviewDir(vcs.root);
+      const aiReviewTampered = postAiReviewDigest !== preAiReviewDigest;
+      const activeGitOp = vcs.type === 'git' ? Boolean(await vcs.hasActiveGitOperation?.()) : false;
+      const allowedSet = new Set(approvedPatchPaths);
+
+      const safeRevertToPreHead = async (): Promise<void> => {
+        if (vcs.type === 'git' && vcs.resetHard) {
+          await vcs.resetHard(preHead);
+        } else {
+          await vcs.revertBusinessWorkspace();
+        }
+      };
+
+      const exportNewPatchAndFallback = async (summary: string): Promise<ApprovalOutcome> => {
+        // SPEC §5.5：先相对 preHead 导出新补丁，再还原业务工作区！
+        const changedClean = await vcs.ensureCleanWorkspace();
+        const candidateDiffPaths = new Set<string>([...approvedPatchPaths, ...changedClean.dirtyPaths]);
+        if (vcs.type === 'git' && postHead && postHead !== preHead) {
+          const between = await vcs.businessChangesBetween(preHead, postHead);
+          for (const file of between ?? []) candidateDiffPaths.add(file);
+        }
+        const safePaths = [...candidateDiffPaths].filter((p) => isRepoRelativePath(p) && !isAiReviewPath(p));
+        let exportedDiff = '';
+        try {
+          exportedDiff = await vcs.exportWorkingTreeDiff(preHead, safePaths);
+        } catch (error) {
+          await safeRevertToPreHead().catch(() => undefined);
+          return abort('RUNNER_FAILED', `导出 Mode C 实质变更补丁失败：${error instanceof Error ? error.message : String(error)}`);
+        }
+        await safeRevertToPreHead();
+        if (!exportedDiff.trim()) {
+          return abort('RUNNER_FAILED', 'Mode C 声明实质变化但未产生有效业务 diff');
+        }
+        const parsedNew = parsePatch(exportedDiff);
+        if (parsedNew.paths.length === 0 || parsedNew.paths.some((p) => !isRepoRelativePath(p) || isAiReviewPath(p))) {
+          return abort('RUNNER_FAILED', 'Mode C 导出的新补丁包含非法或禁止路径');
+        }
+
+        const { id: newPatchId, patch: newPatchName } = store.nextPatchNumber(candidate.meta);
+        const newPatchAbs = path.join(candidate.dirPath, newPatchName);
+        const newPatchBytes = Buffer.from(exportedDiff, 'utf8');
+        await writeFile(newPatchAbs, newPatchBytes);
+        const check = await vcs.checkPatch(newPatchAbs);
+        if (!check.ok) {
+          await safeRevertToPreHead().catch(() => undefined);
+          return abort('RUNNER_FAILED', `Mode C 导出的新补丁未通过只读预检：${check.message}`);
+        }
+
+        const at = nextUpdatedAt(candidate.meta.updatedAt);
+        const newPatchEntry: PatchEntry = {
+          id: newPatchId,
+          patch: newPatchName,
+          optionId: option.id,
+          baseRevision: preHead,
+          author: 'ai',
+          sha256: sha256Hex(newPatchBytes),
+        };
+        const mergedTargets = [...new Set([...candidate.meta.targetFiles, ...parsedNew.paths])];
+        const nextMeta: ReviewFrontmatter = {
+          ...candidate.meta,
+          status: 'pending',
+          baseRevision: preHead,
+          targetFiles: mergedTargets,
+          recordRevision: candidate.meta.recordRevision + 1,
+          updatedAt: at,
+          patches: [...candidate.meta.patches, newPatchEntry],
+          options: candidate.meta.options.map((o) => (o.id === option.id ? { ...o, currentPatch: newPatchId } : o)),
+        };
+        const nextBody = `${candidate.body.trimEnd()}\n\n## 记录版本 ${String(nextMeta.recordRevision)}\n- Mode C 实质变化回退重审：方案 \`${option.id}\` 追加补丁 \`${newPatchName}\`（${summary}）。\n`;
+        await store.write({ ...candidate, meta: nextMeta, body: nextBody }, { touchUpdatedAt: false });
+        const metaCommit = await vcs.atomicCommit({
+          message: `review(${candidate.id}): Mode C 实质变更生成新补丁 ${newPatchName} 重新人审 [skip ci]`,
+          paths: [candidate.reviewPath, newPatchAbs],
+        });
+        if (!metaCommit.success) {
+          return recover('COMMIT_OUTCOME_UNKNOWN', `Mode C 新补丁提交失败：${metaCommit.errorOutput}`);
+        }
+        return {
+          status: 'FALLBACK_TO_PENDING',
+          jobId,
+          reason: 'MATERIAL_CHANGE',
+          newRevision: nextMeta.recordRevision,
+          message: `Mode C 辅助产生实质变更（${summary}），已导出新补丁 ${newPatchName}、还原业务并退回重新人审`,
+        };
+      };
+
+      const isCaseA = postHead === preHead && postBranch === preBranch && !remoteAdvanced;
+      if (isCaseA) {
+        // Case A：仅工作区适配
+        const postClean = await vcs.ensureCleanWorkspace();
+        const dirtyPaths = postClean.dirtyPaths;
+        const hasForbidden = dirtyPaths.some((p) => !isRepoRelativePath(p) || isAiReviewPath(p));
+        const symlinkBad = !hasForbidden && (await hasSymlinkEscape(vcs.root, dirtyPaths));
+
+        if (!modeCResult.ok || !verdict || aiReviewTampered || activeGitOp || hasForbidden || symlinkBad || dirtyPaths.length === 0) {
+          await safeRevertToPreHead().catch(() => undefined);
+          const why = aiReviewTampered
+            ? 'Mode C 篡改了 .ai-review/ 目录'
+            : activeGitOp
+              ? 'Mode C 留下未完成 Git 合并/变基状态'
+              : hasForbidden || symlinkBad
+                ? 'Mode C 触及禁止路径或符号链接逃逸'
+                : !verdict
+                  ? 'Mode C 未返回合法结构化 JSON 结果'
+                  : dirtyPaths.length === 0
+                    ? 'Mode C 未产生任何业务代码修改'
+                    : (modeCResult.errorMessage ?? 'Mode C 执行失败');
+          return abort('RUNNER_FAILED', `Mode C 辅助失败并已还原：${why}`);
+        }
+
+        const outOfScope = dirtyPaths.filter((p) => !allowedSet.has(p));
+        if (verdict.verdict === 'material_change' || outOfScope.length > 0) {
+          const reasonText = verdict.verdict === 'material_change'
+            ? verdict.summary
+            : `业务改动超出获批源补丁范围（越界文件：${outOfScope.join(', ')}）`;
+          return exportNewPatchAndFallback(reasonText);
+        }
+
+        applySummary = `Mode C 工作区等价适配：${verdict.summary}`;
+        appliedOk = true;
+      } else {
+        // Case B：本地 commit/merge 或已推送远端
+        if (vcs.type !== 'git' || !postHead || !vcs.computeModeCNetChangedPaths) {
+          if (remoteAdvanced) {
+            return recover('REMOTE_PUSH_UNREVERTIBLE', `远端分支已推进至 ${postRemoteTip?.tip ?? '(未知)'}，无法本地撤销`);
+          }
+          await safeRevertToPreHead().catch(() => undefined);
+          return abort('RUNNER_FAILED', '非 Git 环境不支持 Mode C 拓扑变更');
+        }
+
+        const topology = await vcs.computeModeCNetChangedPaths(preHead, postHead);
+        const hasForbidden = topology.netChangedPaths.some((p) => !isRepoRelativePath(p) || isAiReviewPath(p));
+        const symlinkBad = !hasForbidden && (await hasSymlinkEscape(vcs.root, topology.netChangedPaths));
+        const outOfScope = topology.netChangedPaths.filter((p) => !allowedSet.has(p));
+        const severeViolation = !modeCResult.ok
+          || !verdict
+          || !topology.ok
+          || topology.aiReviewTouched
+          || aiReviewTampered
+          || activeGitOp
+          || hasForbidden
+          || symlinkBad
+          || topology.netChangedPaths.length === 0;
+        const isMaterial = !severeViolation && (verdict!.verdict === 'material_change' || outOfScope.length > 0);
+
+        if (remoteAdvanced) {
+          // 情况 B-已推送：严禁 force push！任何违例或实质变化必须进 RECOVERY_REQUIRED / REMOTE_PUSH_UNREVERTIBLE
+          if (severeViolation || isMaterial) {
+            const detail = [
+              `已推送提交：${postHead}`,
+              `远端引用：${postRemoteTip?.remoteRef ?? '(未知)'}（${preRemoteTip?.tip.slice(0, 12) ?? ''} -> ${postRemoteTip?.tip.slice(0, 12) ?? ''}）`,
+              `原因：${severeViolation ? (topology.diagnostic ?? (aiReviewTampered ? '篡改 .ai-review' : !verdict ? '缺少合法 JSON 裁决' : '硬护栏违例')) : (verdict?.verdict === 'material_change' ? verdict.summary : `越界路径 ${outOfScope.join(', ')}`)}`,
+            ].join('；');
+            return recover('REMOTE_PUSH_UNREVERTIBLE', detail, 'Mode C 已推送远端但未通过硬护栏，严禁强推覆盖，已保留现场待人工恢复');
+          }
+          // 若工作区在已推提交之上仍有未提交业务改动，同样视为不可自动收尾违例
+          const workClean = await vcs.ensureCleanWorkspace();
+          if (!workClean.clean) {
+            return recover(
+              'REMOTE_PUSH_UNREVERTIBLE',
+              `已推送提交 ${postHead} 后工作区仍残留未提交业务改动（${workClean.dirtyPaths.join(', ')}），已保留现场待人工处理`,
+            );
+          }
+          pushedModeC = {
+            commit: postHead,
+            remoteRef: postRemoteTip?.remoteRef ?? 'origin',
+            expectedTreeHash: await vcs.getTreeHash?.('HEAD') ?? null,
+          };
+          applySummary = `Mode C 分支合并/推送等价适配（${postHead.slice(0, 12)}）：${verdict!.summary}`;
+          appliedOk = true;
+        } else {
+          // 情况 B-本地（未 push）
+          if (severeViolation) {
+            await safeRevertToPreHead().catch(() => undefined);
+            return abort(
+              'RUNNER_FAILED',
+              `Mode C 本地提交未通过硬护栏并已回滚至 ${preHead.slice(0, 12)}：${topology.diagnostic ?? (aiReviewTampered ? '篡改 .ai-review' : !verdict ? '缺少合法 JSON' : '违例')}`,
+            );
+          }
+          if (isMaterial) {
+            const reasonText = verdict!.verdict === 'material_change'
+              ? verdict!.summary
+              : `本地提交/合并净改动超出获批源补丁范围（越界：${outOfScope.join(', ')}）`;
+            return exportNewPatchAndFallback(reasonText);
+          }
+          // 确认工作区相对于 postHead 无额外未提交改动（若有，先纳入暂存快照或按 Case A 统一校验）
+          const workClean = await vcs.ensureCleanWorkspace();
+          if (!workClean.clean) {
+            await safeRevertToPreHead().catch(() => undefined);
+            return abort('RUNNER_FAILED', `Mode C 本地提交后工作区仍留有未提交改动（${workClean.dirtyPaths.join(', ')}），已回滚至 ${preHead.slice(0, 12)}`);
+          }
+          localModeC = {
+            preHead,
+            postHead,
+            mergedParents: topology.mergedParents,
+            commitCount: topology.commitCount,
+            expectedTreeHash: await vcs.getTreeHash?.('HEAD') ?? null,
+          };
+          applySummary = `Mode C 本地提交/合并等价适配（${String(topology.commitCount)} 提交）：${verdict!.summary}`;
+          appliedOk = true;
+        }
+      }
+    }
+
+    // 记录步骤 7 业务快照（用于步骤 9 门禁后防篡改核验）
+    const businessPathsToVerify = approvedPatchPaths.filter((p) => isRepoRelativePath(p) && !isAiReviewPath(p));
+    const preGateBusiness = await collectCommitEntries(vcs.root, businessPathsToVerify);
+    const preGateSnapshotMap = new Map(preGateBusiness.entries.map((e) => [e.path, `${e.blobHash}:${e.mode ?? ''}`]));
+    const preGateMissingSet = new Set(preGateBusiness.missing);
+
+    // Step 8: 顺序执行所选方案的全部 gate_checks
+    log(`步骤 8：在仓库根目录执行 ${String(option.gateChecks.length)} 条实际门禁`);
+    const gateResults = await runGatesFn(option.gateChecks, {
+      cwd: vcs.root,
+      timeoutMs: settings.gateTimeoutMs,
+      log,
+      ...(deps.signal ? { signal: deps.signal } : {}),
+    });
+    if (deps.signal?.aborted) {
+      if (pushedModeC) {
+        return recover(
+          'REMOTE_PUSH_UNREVERTIBLE',
+          `门禁执行期间任务被取消，但 Mode C 已推送业务提交 ${pushedModeC.commit} 至 ${pushedModeC.remoteRef}`,
+          '门禁已取消但远端已有推送提交，已保留现场',
+        );
+      }
+      try {
+        if (localModeC && vcs.resetHard) await vcs.resetHard(localModeC.preHead);
+        else if (patchRestore) await patchRestore();
+        else await vcs.revertBusinessWorkspace();
+      } catch (error) {
+        return recover('RESTORE_INCOMPLETE', `取消门禁后还原工作区异常：${error instanceof Error ? error.message : String(error)}`);
+      }
+      const afterCancelClean = await vcs.ensureCleanWorkspace().catch(() => null);
+      if (!afterCancelClean?.clean) {
+        return recover('RESTORE_INCOMPLETE', `取消门禁后业务工作区未完全还原：${afterCancelClean?.dirtyPaths.join(', ') ?? '状态不可读'}`);
+      }
+      return abort('CANCELLED', '门禁执行期间任务已取消，已终止门禁并还原工作区');
+    }
+    const allGatesPassed = gateResults.length === option.gateChecks.length && gateResults.every((r) => r.passed && r.exitCode === 0);
+
+    if (!allGatesPassed) {
+      log('门禁验证失败：绝不自动调用 Agent，开始还原业务并记录 repair_failed');
+      if (pushedModeC) {
+        return recover(
+          'REMOTE_PUSH_UNREVERTIBLE',
+          `Mode C 已推送业务提交 ${pushedModeC.commit} 至 ${pushedModeC.remoteRef}，随后门禁失败且无法本地撤销，请人工处理远端分支`,
+          '门禁失败但远端已被 Mode C 推送，严禁强推，已保留现场',
+        );
+      }
+
+      // 还原业务改动（含 B-本地 commit/merge 回滚至 preHead；若持有补丁级精确还原句柄则避免误删并发草稿）
+      try {
+        if (localModeC && vcs.resetHard) {
+          await vcs.resetHard(localModeC.preHead);
+        } else if (patchRestore) {
+          await patchRestore();
+        } else {
+          await vcs.revertBusinessWorkspace();
+        }
+      } catch (error) {
+        return recover('RESTORE_INCOMPLETE', `门禁失败后还原业务工作区异常：${error instanceof Error ? error.message : String(error)}`);
+      }
+      const afterRestoreClean = await vcs.ensureCleanWorkspace();
+      const restoredBase = await vcs.getCurrentBase();
+      if (!afterRestoreClean.clean || restoredBase !== preHead) {
+        return recover(
+          'RESTORE_INCOMPLETE',
+          `门禁失败后工作区未完全还原至 ${preHead}（当前 ${restoredBase ?? 'null'}，脏文件：${afterRestoreClean.dirtyPaths.join(', ')}）`,
+        );
+      }
+
+      const failedSummary = gateResults
+        .map((r) => `${r.command} -> exit ${String(r.exitCode)} (${String(r.durationMs)}ms)${r.passed ? ' PASS' : ' FAIL'}`)
+        .join('；');
+      const failedAttempt: RepairAttempt = {
+        id: candidate.meta.repairAttempts.length + 1,
+        optionId: option.id,
+        patchId: patchEntry.id,
+        baseRevision: currentBase,
+        actor: input.actor,
+        at: nextUpdatedAt(candidate.meta.updatedAt),
+        applyMode,
+        result: 'verification_failed',
+        restored: true,
+        evidence: `${applySummary}；门禁失败：${failedSummary}；已完整还原业务工作区至 ${preHead}`,
+      };
+      const updatedCandidate = await store.recordRepairFailure(candidate, failedAttempt);
+      const failCommit = await vcs.atomicCommit({
+        message: `review(${candidate.id}): 门禁验证失败已还原，标记 repair_failed [skip ci]`,
+        paths: [updatedCandidate.reviewPath],
+      });
+      if (!failCommit.success || !failCommit.commitRevision) {
+        return recover('COMMIT_OUTCOME_UNKNOWN', `已还原业务但提交 repair_failed 记录失败：${failCommit.errorOutput}`);
+      }
+      return {
+        status: 'REPAIR_FAILED',
+        jobId,
+        reason: 'GATE_CHECK_FAILED',
+        commitRevision: failCommit.commitRevision,
+        gateResults,
+        message: `门禁验证失败，已还原业务改动并将问题置为 repair_failed（补丁 #${String(patchEntry.id)} 已永久封禁）`,
+      };
+    }
+
+    // Step 9: 门禁后二次防篡改核验
+    log('步骤 9：门禁后二次核验共享守卫、负向记忆与业务内容快照');
+    if (vcs.type === 'git' && preBranch !== null) {
+      const branchAfterGate = (await vcs.getCurrentBranch?.()) ?? null;
+      if (branchAfterGate !== preBranch) {
+        return recover('SYNC_STATE_UNKNOWN', `门禁期间当前分支发生切换（${preBranch} -> ${branchAfterGate ?? 'detached'}），已保留现场并停止提交`);
+      }
+    }
+    const postGateRecheck = await validatePreconditions();
+    if ('status' in postGateRecheck) {
+      if (pushedModeC) return recover('REMOTE_PUSH_UNREVERTIBLE', `门禁通过但共享状态已变化（${postGateRecheck.message}），且业务提交 ${pushedModeC.commit} 已推送`);
+      if (localModeC && vcs.resetHard) await vcs.resetHard(localModeC.preHead).catch(() => undefined);
+      else await vcs.revertBusinessWorkspace().catch(() => undefined);
+      return postGateRecheck;
+    }
+
+    const postGateBusiness = await collectCommitEntries(vcs.root, businessPathsToVerify);
+    const postGateMap = new Map(postGateBusiness.entries.map((e) => [e.path, `${e.blobHash}:${e.mode ?? ''}`]));
+    const postGateMissing = new Set(postGateBusiness.missing);
+    let contentChanged = postGateMap.size !== preGateSnapshotMap.size || postGateMissing.size !== preGateMissingSet.size;
+    if (!contentChanged) {
+      for (const [p, sig] of preGateSnapshotMap) {
+        if (postGateMap.get(p) !== sig) { contentChanged = true; break; }
+      }
+    }
+    if (!contentChanged && localModeC && (await vcs.getTreeHash?.('HEAD')) !== localModeC.expectedTreeHash) {
+      contentChanged = true;
+    }
+    if (!contentChanged && pushedModeC && (await vcs.getTreeHash?.('HEAD')) !== pushedModeC.expectedTreeHash) {
+      contentChanged = true;
+    }
+    // 检查门禁是否生成了范围外的额外未追踪业务文件
+    if (!contentChanged && !localModeC && !pushedModeC) {
+      const statusNow = await vcs.ensureCleanWorkspace();
+      const extraDirty = statusNow.dirtyPaths.filter((p) => !businessPathsToVerify.includes(p));
+      if (extraDirty.length > 0) contentChanged = true;
+    }
+
+    if (contentChanged) {
+      if (pushedModeC) {
+        return recover('REMOTE_PUSH_UNREVERTIBLE', `门禁后业务内容快照变化且提交 ${pushedModeC.commit} 已推送远端`);
+      }
+      if (localModeC && vcs.resetHard) await vcs.resetHard(localModeC.preHead).catch(() => undefined);
+      else await vcs.revertBusinessWorkspace().catch(() => undefined);
+      return abort('BUSINESS_CONTENT_CHANGED', '门禁执行期间业务文件内容发生变化，已拒绝提交并还原工作区');
+    }
+
+    // Step 10: 落地提交
+    log('步骤 10：写入批准记录并执行原子落地提交');
+    if (pushedModeC) {
+      const landed = await landMetaClosingCommitForPushed({
+        deps,
+        input,
+        snapshot,
+        pushedHash: pushedModeC.commit,
+        gateResults,
+        applyMode,
+        base: currentBase,
+        summary: applySummary,
+      });
+      if (landed.retry) {
+        pushedCommitCarriedOver = {
+          commit: pushedModeC.commit,
+          remoteRef: pushedModeC.remoteRef,
+          treeHash: pushedModeC.expectedTreeHash,
+          summary: applySummary,
+          gateResults,
+          snapshot,
+          applyMode,
+          base: currentBase,
+        };
         continue;
       }
-      let commitRevision: string = commit.commitRevision ?? '';
-      if (!commitRevision) {
-        // 提交成功但适配器未提供版本号时，用提交探针补充定位。
-        const probeAfter = await vcs.getCommitProbe(probePaths).catch(() => null);
-        if (probeAfter === null || probeAfter === probeBefore) {
-          return {
-            status: 'RECOVERY_REQUIRED',
-            reason: 'COMMIT_OUTCOME_UNKNOWN',
-            message: '业务提交已执行，但无法确定提交版本号；请人工核对 VCS 历史后处理。',
-            detail: `atomicCommit 成功但 commitRevision 为空，且提交探针无法证明版本前进（候选 ${id}）`,
-            jobId,
-          };
-        }
-        commitRevision = probeAfter;
+      return landed.outcome;
+    }
+
+    const approvedAt = nextUpdatedAt(candidate.meta.updatedAt);
+    const successAttempt: RepairAttempt = {
+      id: candidate.meta.repairAttempts.length + 1,
+      optionId: option.id,
+      patchId: patchEntry.id,
+      baseRevision: currentBase,
+      actor: input.actor,
+      at: approvedAt,
+      applyMode,
+      result: 'applied',
+      restored: false,
+      evidence: `${applySummary}；全部 ${String(gateResults.length)} 项门禁通过`,
+    };
+    const approvalInfo: ApprovalInfo = {
+      approvedBy: input.actor,
+      approvedAt,
+      recordRevision: candidate.meta.recordRevision,
+      optionId: option.id,
+      patchId: patchEntry.id,
+      patchSha256: patchEntry.sha256,
+      repairAttemptId: successAttempt.id,
+      baseRevision: currentBase,
+      gateChecks: [...option.gateChecks],
+      gateResults: gateResults.map((r) => ({
+        command: r.command,
+        exitCode: r.exitCode ?? 0,
+        durationMs: r.durationMs,
+      })),
+      confirmedDecisions: [...input.confirmedDecisions],
+      waivedDecisions: input.waivedDecisions.map((w) => ({ id: w.id, reason: w.reason.trim() })),
+    };
+
+    const reviewBackup = await readFile(candidate.reviewPath, 'utf8');
+    const updatedCandidate = await store.applyApproval(candidate, {
+      approval: approvalInfo,
+      attempt: successAttempt,
+      commitMessage: snapshot.commitMessage,
+      now: new Date(approvedAt),
+    });
+
+    const vcsCommitMessage = await assembleFinalCommitMessage({
+      candidate,
+      optionId: option.id,
+      patchId: patchEntry.id,
+      patchText,
+      commitMessage: snapshot.commitMessage,
+      commitDetail: input.commitDetail,
+      vcs,
+    });
+
+    const relReviewPath = `.ai-review/${candidate.id}/review.md`;
+    const updatedReviewBytes = await readFile(updatedCandidate.reviewPath);
+    const expectedReviewBlob = gitBlobHash(updatedReviewBytes);
+
+    let commitResult;
+    let commitThrew = false;
+    const probePaths = [relReviewPath, ...businessPathsToVerify];
+    const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
+    if (vcs.type === 'git' && preBranch !== null) {
+      const branchBeforeCommit = (await vcs.getCurrentBranch?.()) ?? null;
+      if (branchBeforeCommit !== preBranch) {
+        await writeFile(candidate.reviewPath, reviewBackup, 'utf8').catch(() => undefined);
+        return recover('SYNC_STATE_UNKNOWN', `提交前当前分支发生切换（${preBranch} -> ${branchBeforeCommit ?? 'detached'}），已停止提交并保留现场`);
       }
-      log(`批准提交成功：${commitRevision.slice(0, 12)}`);
-      await finishFinding();
+    }
+
+    try {
+      if (localModeC) {
+        if (localModeC.commitCount === 1 && vcs.amendCommitWithReview) {
+          commitResult = await vcs.amendCommitWithReview({
+            reviewPath: relReviewPath,
+            expectedReviewBlob,
+            message: vcsCommitMessage,
+          });
+        } else if (vcs.collapseLocalCommitsWithReview) {
+          commitResult = await vcs.collapseLocalCommitsWithReview({
+            preHead: localModeC.preHead,
+            mergedParents: localModeC.mergedParents,
+            reviewPath: relReviewPath,
+            expectedReviewBlob,
+            message: vcsCommitMessage,
+          });
+        } else {
+          commitResult = { success: false, commitRevision: null, outOfDate: false, errorOutput: '缺少本地提交收拢能力' };
+        }
+      } else {
+        const verifyEntries: ExpectedCommitEntry[] = [
+          ...preGateBusiness.entries,
+          { path: relReviewPath, blobHash: expectedReviewBlob },
+        ];
+        const gitTarget = vcs.type === 'git' ? (await vcs.getApprovalTarget?.()) ?? undefined : undefined;
+        commitResult = await vcs.atomicCommit({
+          message: vcsCommitMessage,
+          paths: [...businessPathsToVerify, relReviewPath],
+          verifyEntries,
+          verifyDeletions: preGateBusiness.missing,
+          ...(gitTarget ? { gitTarget } : {}),
+        });
+      }
+    } catch (error) {
+      commitThrew = true;
+      commitResult = {
+        success: false,
+        commitRevision: null,
+        outOfDate: false,
+        errorOutput: error instanceof Error ? error.message : String(error),
+      };
+    }
+
+    if (commitResult.success && commitResult.commitRevision) {
+      log(`步骤 11：批准原子提交成功（${commitResult.commitRevision.slice(0, 12)}）`);
       return {
         status: 'COMMITTED',
-        message: `已批准并原子提交版本 ${String(fresh.meta.currentRevision)}`,
-        commitRevision,
         jobId,
+        commitRevision: commitResult.commitRevision,
+        gateResults,
+        message: `批准并提交成功：${commitResult.commitRevision.slice(0, 12)}`,
       };
     }
-    return {
-      status: 'ABORTED',
-      reason: 'MAX_RETRIES_EXCEEDED',
-      message: `提交重试次数已用完：${lastCommitError}`,
-      jobId,
-    };
-  }
 
-  /**
-   * 只有证明提交未落地才允许恢复备份。返回 null 表示已经恢复，可安全重试。
-   */
-  private async classifyCommitFailure(input: {
-    probeBefore: string | null;
-    probePaths: string[];
-    reviewRelPath: string;
-    expectedReviewText: string;
-    expectedEntries: { path: string; blobHash: string }[];
-    expectedDeletions: string[];
-    backup: Backup;
-    outOfDate: boolean;
-    errorOutput: string;
-    restorePreparation?: () => Promise<void>;
-    restoreBusiness: () => Promise<void>;
-    canRetry: boolean;
-    jobId: string;
-    log: (line: string) => void;
-  }): Promise<ApprovalOutcome | null> {
-    const { vcs } = this.deps;
-    const probeAfter = await vcs.getCommitProbe(input.probePaths).catch(() => null);
-    if (input.probeBefore === null || probeAfter === null) {
-      return {
-        status: 'RECOVERY_REQUIRED',
-        reason: 'COMMIT_OUTCOME_UNKNOWN',
-        message: '提交失败且无法读取提交探针，不能判定提交是否存在；请人工核对 VCS 状态。',
-        detail: input.errorOutput,
-        jobId: input.jobId,
-      };
+    if (commitResult.verificationFailed) {
+      return recover('COMMIT_OUTCOME_UNKNOWN', `提交后核验失败，现场保留待核对：${commitResult.errorOutput}`);
     }
-    if (probeAfter !== input.probeBefore) {
-      const text = await vcs.readFileAt(probeAfter, input.reviewRelPath).catch(() => null);
-      let complete = text === input.expectedReviewText;
-      for (const entry of input.expectedEntries) {
-        const actual = await vcs.readFileAt(probeAfter, entry.path).catch(() => null);
-        if (actual === null || gitBlobHash(actual) !== entry.blobHash) complete = false;
-      }
-      for (const relPath of input.expectedDeletions) {
-        const actual = await vcs.readFileAt(probeAfter, relPath).catch(() => null);
-        if (actual !== null) complete = false;
-      }
-      if (complete) {
-        input.log(`提交命令报错但提交已落地且完整内容匹配（${probeAfter.slice(0, 12)}），按成功继续`);
+
+    // 三分支恢复判定（SPEC §8.3）
+    const probeAfter = await vcs.getCommitProbe(probePaths).catch(() => null);
+    if (probeBefore !== null && probeAfter !== null && probeAfter !== probeBefore) {
+      const committedReview = await vcs.readFileAt(probeAfter, relReviewPath).catch(() => null);
+      if (committedReview !== null && gitBlobHash(committedReview) === expectedReviewBlob) {
         return {
           status: 'COMMITTED',
-          message: '提交命令超时/报错，但 VCS 中提交已存在且完整内容匹配，按成功处理。',
+          jobId,
           commitRevision: probeAfter,
-          jobId: input.jobId,
+          gateResults,
+          message: `提交命令异常但已核实落地（${probeAfter.slice(0, 12)}）`,
         };
       }
-      return {
-        status: 'RECOVERY_REQUIRED',
-        reason: 'COMMIT_OUTCOME_UNKNOWN',
-        message: '提交失败但提交探针已前进且本次预期完整内容不匹配，无法确认提交归属；禁止回滚，请人工核对。',
-        detail: `probe=${probeAfter.slice(0, 12)}，review/业务内容/删除集合中至少一项不匹配或不可读`,
-        jobId: input.jobId,
-      };
+      return recover('COMMIT_OUTCOME_UNKNOWN', `提交探针已变化但内容无法核对一致：${commitResult.errorOutput}`);
     }
-    input.log('已证明业务提交不存在，恢复操作前快照');
+
+    if (commitThrew || probeBefore === null || probeAfter === null) {
+      return recover('COMMIT_OUTCOME_UNKNOWN', `提交命令异常中断或无法读取探针，现场保留待人工核对：${commitResult.errorOutput}`);
+    }
+
+    // 探针证明未提交：先撤销暂存并还原 review.md 与业务改动，再二次校验工作区干净
     try {
-      await input.restorePreparation?.();
-      await this.restore(input.backup);
-      await input.restoreBusiness();
-      const restored = await vcs.ensureCleanWorkspace();
-      if (!restored.clean) throw new Error(restored.message);
+      await commitResult.restorePreparation?.();
+      await writeFile(candidate.reviewPath, reviewBackup, 'utf8');
+      if (localModeC && vcs.resetHard) await vcs.resetHard(localModeC.preHead);
+      else await vcs.revertBusinessWorkspace();
     } catch (error) {
-      return {
-        status: 'RECOVERY_REQUIRED',
-        reason: 'COMMIT_OUTCOME_UNKNOWN',
-        message: '已确认未提交，但批准前状态未能完整恢复。',
-        detail: String(error),
-        jobId: input.jobId,
-      };
+      return recover('RESTORE_INCOMPLETE', `提交失败后还原不完整：${error instanceof Error ? error.message : String(error)}`);
     }
-    if (input.outOfDate && input.canRetry) {
-      input.log('远端基线前进（撞车），先同步最新基线后重试');
-      return null;
+    const postRevertClean = await vcs.ensureCleanWorkspace().catch(() => null);
+    if (!postRevertClean?.clean) {
+      return recover(
+        'RESTORE_INCOMPLETE',
+        `提交失败后业务工作区未能恢复干净：${postRevertClean?.dirtyPaths.join(', ') ?? '状态不可读'}`,
+      );
     }
+
+    if (commitResult.outOfDate || commitResult.targetChanged) {
+      if (attemptNumber < MAX_COMMIT_RETRIES) {
+        log(`提交撞车（${commitResult.errorOutput}），已还原，准备重试`);
+        continue;
+      }
+      return abort('MAX_RETRIES_EXCEEDED', `提交连续撞车耗尽重试上限：${commitResult.errorOutput}`);
+    }
+
+    return abort('COMMIT_FAILED', `原子提交失败并已完整还原：${commitResult.errorOutput}`);
+  }
+
+  return abort('MAX_RETRIES_EXCEEDED', '批准重试次数耗尽');
+}
+
+async function landMetaClosingCommitForPushed(params: {
+  deps: ApprovalDeps;
+  input: ApproveInput;
+  snapshot: ValidatedSnapshot;
+  pushedHash: string;
+  gateResults: GateCheckResult[];
+  applyMode: RepairApplyMode;
+  base: string;
+  summary: string;
+}): Promise<{ retry: true } | { retry: false; outcome: ApprovalOutcome }> {
+  const { deps, input, snapshot, pushedHash, gateResults, applyMode, base, summary } = params;
+  const { store, vcs, jobId } = deps;
+  const { candidate, option, patchEntry } = snapshot;
+  const relReviewPath = `.ai-review/${candidate.id}/review.md`;
+  const reviewBackup = await readFile(candidate.reviewPath, 'utf8');
+  const approvedAt = nextUpdatedAt(candidate.meta.updatedAt);
+
+  const successAttempt: RepairAttempt = {
+    id: candidate.meta.repairAttempts.length + 1,
+    optionId: option.id,
+    patchId: patchEntry.id,
+    baseRevision: base,
+    actor: input.actor,
+    at: approvedAt,
+    applyMode,
+    result: 'applied',
+    restored: false,
+    evidence: `${summary}；全部 ${String(gateResults.length)} 项门禁通过（已推送业务提交 ${pushedHash}）`,
+  };
+  const approvalInfo: ApprovalInfo = {
+    approvedBy: input.actor,
+    approvedAt,
+    recordRevision: candidate.meta.recordRevision,
+    optionId: option.id,
+    patchId: patchEntry.id,
+    patchSha256: patchEntry.sha256,
+    repairAttemptId: successAttempt.id,
+    baseRevision: base,
+    gateChecks: [...option.gateChecks],
+    gateResults: gateResults.map((r) => ({
+      command: r.command,
+      exitCode: r.exitCode ?? 0,
+      durationMs: r.durationMs,
+    })),
+    confirmedDecisions: [...input.confirmedDecisions],
+    waivedDecisions: input.waivedDecisions.map((w) => ({ id: w.id, reason: w.reason.trim() })),
+    businessCommit: pushedHash,
+  };
+
+  const updatedCandidate = await store.applyApproval(candidate, {
+    approval: approvalInfo,
+    attempt: successAttempt,
+    commitMessage: snapshot.commitMessage,
+    now: new Date(approvedAt),
+  });
+  const expectedReviewBlob = gitBlobHash(await readFile(updatedCandidate.reviewPath));
+  const metaCommit = await vcs.atomicCommit({
+    message: `review(${candidate.id}): 关闭已推送业务提交 ${pushedHash.slice(0, 12)} 的审批记录 [skip ci]`,
+    paths: [relReviewPath],
+    verifyEntries: [{ path: relReviewPath, blobHash: expectedReviewBlob }],
+  });
+
+  if (metaCommit.success && metaCommit.commitRevision) {
+    const pushHint = deps.isManaged
+      ? ''
+      : `（元数据关闭提交 ${metaCommit.commitRevision.slice(0, 12)} 尚未推送，请手动推送至远端）`;
     return {
-      status: 'ABORTED',
-      reason: input.outOfDate ? 'MAX_RETRIES_EXCEEDED' : 'COMMIT_FAILED',
-      message: `原子提交失败，已恢复到批准前状态${input.outOfDate ? '（基线竞争且重试已耗尽）' : ''}：\n${input.errorOutput}`,
-      jobId: input.jobId,
+      retry: false,
+      outcome: {
+        status: 'COMMITTED',
+        jobId,
+        commitRevision: metaCommit.commitRevision,
+        gateResults,
+        message: `批准并关闭成功，业务提交：${pushedHash.slice(0, 12)}，关闭提交：${metaCommit.commitRevision.slice(0, 12)}${pushHint}`,
+      },
     };
   }
 
-  private async reload(
-    id: string,
-    guard: ConcurrencyGuard,
-    log: (line: string) => void,
-  ): Promise<ReloadResult> {
-    try {
-      const source = this.deps.sharedSource ? await this.deps.sharedSource() : undefined;
-      if (source) {
-        const { month, slug } = this.deps.store.resolveCandidateDir(id);
-        if (await source.hasLocalChanges(month, slug)) {
-          log('候选存在本地或暂存改动，共享/本地边界无法证明');
-          return { candidate: null, conflict: 'guard', status: 'local' };
-        }
-      }
-      const detail = await this.deps.store.get(id, null, source);
-      const candidate = detail.candidate;
-      if (candidate.parseError) {
-        log(`候选数据无效：${candidate.parseError}`);
-        return { candidate: null, conflict: 'guard' };
-      }
-      if (candidate.meta.currentRevision !== guard.expectedRevision) {
-        log(`版本已从 ${String(guard.expectedRevision)} 变为 ${String(candidate.meta.currentRevision)}`);
-        return { candidate: null, conflict: 'guard' };
-      }
-      if (candidate.meta.owner !== guard.expectedOwner) {
-        log(`负责人已从 ${guard.expectedOwner} 变为 ${candidate.meta.owner}`);
-        return { candidate: null, conflict: 'guard' };
-      }
-      // 评论等共享写入不会推进补丁版本，仍须用时间戳检出。
-      const expectedAt = new Date(guard.expectedUpdatedAt).getTime();
-      if (expectedAt !== new Date(candidate.meta.updatedAt).getTime()) {
-        log(`候选已在其他写入中更新（updated_at ${candidate.meta.updatedAt}）`);
-        return { candidate: null, conflict: 'guard' };
-      }
-      if (candidate.meta.status !== 'pending') {
-        log(`候选状态是 ${candidate.meta.status}，不是 pending`);
-        return { candidate: null, conflict: 'state', status: candidate.meta.status };
-      }
-      return { candidate, conflict: null, ...(source ? { source } : {}) };
-    } catch (error) {
-      log(`读取候选失败：${error instanceof Error ? error.message : String(error)}`);
-      return { candidate: null, conflict: 'guard' };
-    }
-  }
+  // 仅还原 C_meta 的 review.md 改动回到 P，绝不回滚至 preHead！
+  await metaCommit.restorePreparation?.().catch(() => undefined);
+  await writeFile(candidate.reviewPath, reviewBackup, 'utf8').catch(() => undefined);
 
-  private findingConflict(candidate: ReviewCandidate) {
-    if (!candidate.meta.findingId) return null;
-    return this.deps.checkFinding?.(candidate)
-      ?? { reason: 'STATE_CONFLICT' as const, message: '发现候选缺少同组审批守卫' };
+  if (metaCommit.outOfDate) {
+    return { retry: true };
   }
-
-  private async runPrechecks(
-    id: string,
-    guard: ConcurrencyGuard,
-    decisions: ApprovalDecisions,
-    jobId: string,
-    log: (line: string) => void,
-    commitMessage?: string,
-  ): Promise<{ candidate: ReviewCandidate; source?: CandidateSource } | { outcome: ApprovalOutcome }> {
-    const { store } = this.deps;
-    const reload = await this.reload(id, guard, log);
-    if (!reload.candidate) {
-      if (reload.conflict === 'state') {
-        return {
-          outcome: {
-            status: 'ABORTED',
-            reason: 'STATE_CONFLICT',
-            message: `候选状态不是 pending（当前 ${reload.status ?? '未知'}）；changes_requested 需先产生新版本或由 Owner 显式转回。`,
-            jobId,
-          },
-        };
-      }
-      return {
-        outcome: {
-          status: 'ABORTED',
-          reason: 'CONCURRENCY_MISMATCH',
-          message: '候选已被其他人更新（版本/负责人/updated_at 变化），请重新加载后再批准。',
-          jobId,
-        },
-      };
-    }
-    const candidate = reload.candidate;
-    const findingConflict = await this.findingConflict(candidate);
-    if (findingConflict) return { outcome: { status: 'ABORTED', ...findingConflict, jobId } };
-    if (commitMessage !== undefined) candidate.meta.commitMessage = commitMessage;
-    const decisionErrors = checkDecisionCoverage(candidate.meta.humanDecisions, decisions.confirmed, decisions.waived);
-    if (decisionErrors.length > 0) {
-      return {
-        outcome: {
-          status: 'ABORTED',
-          reason: 'DECISIONS_UNCONFIRMED',
-          message: `人工判断项未全部处理，无法批准：\n${decisionErrors.join('\n')}`,
-          jobId,
-        },
-      };
-    }
-    const messageError = checkCommitMessage(candidate.meta.title, candidate.meta.commitMessage);
-    if (messageError) {
-      return { outcome: { status: 'ABORTED', reason: 'COMMIT_MESSAGE_MISMATCH', message: messageError, jobId } };
-    }
-    const validation = await store.validateFullCandidate(candidate, reload.source);
-    if (validation.length > 0) {
-      return {
-        outcome: {
-          status: 'ABORTED',
-          reason: 'INVALID_CANDIDATE',
-          message: `评审数据不完整，无法批准：\n${validation.join('\n')}`,
-          jobId,
-        },
-      };
-    }
-    return { candidate, ...(reload.source ? { source: reload.source } : {}) };
-  }
-
-  /**
-   * 在锁内且同步重绑后生成正文，避免正文描述旧补丁而提交新补丁。
-   * 部分数据不可读时降级对应小节。
-   */
-  private async buildDetailBody(candidate: ReviewCandidate, selection?: IssueSelection): Promise<string> {
-    const { store, vcs, settings } = this.deps;
-    const source = this.deps.sharedSource ? await this.deps.sharedSource() : undefined;
-    const patch = await store.currentPatch(candidate, source, selection).catch(() => null);
-    const touched = patch ? parsePatch(patch.text).paths : [];
-    const authorStats = await vcs.authorStats(touched).catch(() => undefined);
-    return buildCommitDetails(candidate, {
-      repoRoot: store.repoRoot,
-      ...(authorStats ? { authorStats } : {}),
-      ...(patch ? { patchText: patch.text } : {}),
-      ...(source ? { readReviewersText: () => (source as { readReviewersText?: () => Promise<string | null> }).readReviewersText?.() ?? Promise.resolve(null) } : {}),
-      vcsType: settings.vcsType === 'svn' ? 'svn' : 'git',
-    });
-  }
-
-  private async snapshotBusiness(businessPaths: string[]): Promise<Map<string, BusinessFileSnapshot | null>> {
-    const snapshot = new Map<string, BusinessFileSnapshot | null>();
-    for (const rel of businessPaths) {
-      const absolute = path.join(this.deps.store.repoRoot, rel);
-      try {
-        const [buffer, fileStat] = await Promise.all([readFile(absolute), stat(absolute)]);
-        snapshot.set(rel, {
-          blobHash: gitBlobHash(buffer),
-          mode: (fileStat.mode & 0o111) !== 0 ? '100755' : '100644',
-        });
-      } catch {
-        snapshot.set(rel, null);
-      }
-    }
-    return snapshot;
-  }
-
-  private async backup(candidate: ReviewCandidate): Promise<Backup> {
-    const reviewText = await readFile(candidate.reviewPath, 'utf8');
-    const patches: Backup['patches'] = [];
-    for (const revision of candidate.meta.revisions) {
-      const file = path.join(candidate.dirPath, revision.patch);
-      try {
-        patches.push({ path: file, text: await readFile(file, 'utf8') });
-      } catch {
-        // 缺失补丁已由批准预检处理。
-      }
-    }
-    return { reviewPath: candidate.reviewPath, reviewText, patches };
-  }
-
-  private async restore(backup: Backup): Promise<void> {
-    await writeFile(backup.reviewPath, backup.reviewText, 'utf8');
-    for (const patch of backup.patches) {
-      await writeFile(patch.path, patch.text, 'utf8');
-    }
-  }
-
-  /** Runner 可能创建备份中没有的文件，单纯覆盖备份不能还原候选目录。 */
-  private async restoreWithCleanup(backup: Backup, dirPath: string, entriesBefore: Set<string>): Promise<void> {
-    await this.restore(backup);
-    const after = await readdir(dirPath).catch(() => [] as string[]);
-    for (const name of after) {
-      if (!entriesBefore.has(name)) await rm(path.join(dirPath, name), { force: true }).catch(() => undefined);
-    }
-  }
-
-  private async recordVerificationFailure(
-    candidate: ReviewCandidate, guard: ConcurrencyGuard, evidence: string, base: string, actor: string,
-    jobId: string, log: (line: string) => void, selection?: IssueSelection,
-  ): Promise<ApprovalOutcome> {
-    const { store, vcs } = this.deps;
-    const fresh = (await this.reload(candidate.id, guard, log)).candidate;
-    if (!fresh || !(await vcs.ensureCleanWorkspace()).clean) {
-      return { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', message: '验证失败后无法确认问题版本或工作区还原状态，现场保留', jobId };
-    }
-    const backup = await this.backup(fresh);
-    const reviewRelPath = relative(store.repoRoot, fresh.reviewPath);
-    const probePaths = [reviewRelPath];
-    const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
-    if (fresh.meta.schemaVersion === 3 && selection) {
-      selectIssuePatch(fresh.meta, selection);
-      fresh.meta.status = 'repair_failed';
-      fresh.meta.issue!.repairAttempts.push({ ...selection, baseRevision: base, actor, at: new Date().toISOString(),
-        result: 'verification_failed', restored: true, evidence });
-    } else {
-      fresh.meta.status = 'changes_requested';
-    }
-    fresh.sections.rawBody += `\n\n## 修复验证失败\n\n${actor} · ${new Date().toISOString()}\n\n业务改动已还原，等待人工处理。\n\n${evidence}\n`;
-    if (fresh.meta.findingId) await this.deps.beginFindingCommit?.(fresh, probePaths, probeBefore);
-    await store.write(fresh);
-    const text = await readFile(fresh.reviewPath, 'utf8');
-    const entries = [{ path: reviewRelPath, blobHash: gitBlobHash(text), mode: '100644' }];
-    const commit = await vcs.atomicCommit({ message: `review(${fresh.id}): 修复验证失败，已还原业务改动`, paths: probePaths, verifyEntries: entries });
-    let commitRevision = commit.commitRevision ?? undefined;
-    if (commit.verificationFailed) return { status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN', message: '失败记录提交结果待核验', detail: commit.errorOutput, jobId };
-    if (!commit.success) {
-      const outcome = await this.classifyCommitFailure({ probeBefore, probePaths, reviewRelPath, expectedReviewText: text,
-        expectedEntries: entries, expectedDeletions: [], backup, outOfDate: false, errorOutput: commit.errorOutput,
-        restorePreparation: commit.restorePreparation, restoreBusiness: async () => {}, canRetry: false, jobId, log });
-      if (outcome?.status === 'RECOVERY_REQUIRED') return outcome;
-      await this.deps.finishFindingCommit?.(fresh);
-      if (outcome?.status !== 'COMMITTED') return outcome!;
-      commitRevision = outcome.commitRevision;
-    } else if (fresh.meta.findingId) await this.deps.finishFindingCommit?.(fresh);
-    commitRevision ??= await vcs.getCommitProbe(probePaths) ?? undefined;
-    if (!commitRevision || commitRevision === probeBefore) return { status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN', message: '失败记录的提交版本无法确认，现场保留', jobId };
-    return { status: fresh.meta.schemaVersion === 3 ? 'REPAIR_FAILED' : 'FALLBACK_TO_PENDING', reason: 'GATE_CHECK_FAILED',
-      message: '修复验证失败，业务改动已还原；失败记录已保存，等待人工处理。', jobId, commitRevision };
-  }
-
-  private async fixOrFallback(
-    reason: ApprovalFallbackReason,
-    detail: string,
-    candidate: ReviewCandidate,
-    jobId: string,
-    log: (line: string) => void,
-    baseRevision: string,
-    selection?: IssueSelection,
-  ): Promise<ApprovalOutcome> {
-    const { store, vcs, settings } = this.deps;
-    if (!settings.autoFixOnFailure) {
-      return {
-        status: 'FALLBACK_TO_PENDING',
-        reason,
-        message: `批准中止（${reason}）。候选保持 pending，自动修复已关闭。\n\n${detail}`,
-        jobId,
-      };
-    }
-    log(`批准中止（${reason}），尝试 AI 修复失败原因`);
-    const backup = await this.backup(candidate);
-    const entriesBefore = new Set(await readdir(candidate.dirPath).catch(() => [] as string[]));
-    const runner = this.deps.makeRunner({
-      kind: settings.runner,
-      settings,
-      store,
-      candidate,
-      mode: 'RESOLVE_CONFLICT',
-      comments: candidate.meta.comments.filter((comment) => comment.status !== 'resolved'),
-      failureDetail: detail,
-      baseRevision,
-      workingTree: 'clean_base',
-      ...(selection ? { selection } : {}),
-      log,
-      ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
-      ...(this.deps.signal ? { signal: this.deps.signal } : {}),
-    });
-    let result: RunnerExecutionResult;
-    try {
-      result = await runner.run();
-    } catch (error) {
-      result = { success: false, errorMessage: error instanceof Error ? error.message : String(error) };
-    } finally {
-      await vcs.revertBusinessWorkspace().catch(() => undefined);
-    }
-    if (result.manual) {
-      return {
-        status: 'FALLBACK_TO_PENDING',
-        reason,
-        message: `批准中止（${reason}），已生成手动修复提示，候选保持 pending。`,
-        manualPrompt: result.prompt ?? detail,
-        jobId,
-      };
-    }
-    if (!result.success) {
-      await this.restore(backup);
-      return {
-        status: 'ABORTED',
-        reason: 'RUNNER_FAILED',
-        message: `批准中止（${reason}），AI 修复也失败：${result.errorMessage ?? '未知错误'}${result.outputTail ? `\n\n${result.outputTail.slice(-4000)}` : ''}`,
-        jobId,
-      };
-    }
-    // 新版本必须先成为共享事实，才可通知复核者重新审核。
-    try {
-      const { store } = this.deps;
-      const latest = await store.get(candidate.id, null);
-      const validationErrors: string[] = this.deps.validateNewRevision
-        ? await this.deps.validateNewRevision(candidate, latest.candidate)
-        : [];
-      const nextOption = latest.candidate.meta.issue?.options.find(option => option.id === selection?.optionId);
-      const current = currentReviewPatch(latest.candidate.meta, nextOption ? { optionId: nextOption.id, patchId: nextOption.currentPatch } : undefined);
-      let patchText: string | null = null;
-      if (current) {
-        try {
-          patchText = await readFile(path.join(latest.candidate.dirPath, current.patch), 'utf8');
-        } catch {
-          validationErrors.push(`新补丁不存在：${current.patch}`);
-        }
-      }
-      if (!this.deps.validateNewRevision) {
-        if (latest.candidate.parseError) validationErrors.push(latest.candidate.parseError);
-        if (latest.candidate.meta.status !== 'pending') validationErrors.push('AI 新版本状态必须是 pending');
-        if (latest.candidate.meta.approval !== null) validationErrors.push('AI 新版本的 approval 必须为 null');
-        if (latest.candidate.meta.currentRevision <= candidate.meta.currentRevision) validationErrors.push('AI 未推进版本');
-        validationErrors.push(...await store.validateFullCandidate(latest.candidate));
-        if (patchText !== null && parsePatch(patchText).paths.some((file) => isAiReviewPath(file))) {
-          validationErrors.push('新补丁包含禁止路径');
-        }
-        if (validationErrors.length === 0 && patchText !== null) {
-          const tempFixPatch = path.join(tmpdir(), `dcr-fix-${String(process.pid)}-${String(Date.now())}.patch`);
-          await writeFile(tempFixPatch, patchText, 'utf8');
-          let applied;
-          try {
-            applied = await this.deps.vcs.applyPatch(tempFixPatch, false);
-          } finally {
-            await rm(tempFixPatch, { force: true }).catch(() => undefined);
-          }
-          await this.deps.vcs.revertBusinessWorkspace().catch(() => undefined);
-          if (!applied.ok) validationErrors.push(`AI 新补丁无法在基线干净应用：${applied.message}`);
-        }
-      }
-      if (validationErrors.length > 0 || !current || patchText === null) {
-        await this.restoreWithCleanup(backup, candidate.dirPath, entriesBefore);
-        return {
-          status: 'ABORTED',
-          reason: 'RUNNER_FAILED',
-          message: `AI 生成的新版本未通过提交前校验，已恢复：\n${validationErrors.join('\n')}`,
-          jobId,
-        };
-      }
-      const reviewRelPath = relative(store.repoRoot, latest.candidate.reviewPath);
-      const probePaths = [reviewRelPath];
-      const probeBeforeFix = await this.deps.vcs.getCommitProbe(probePaths).catch(() => null);
-      const writtenReview = await readFile(latest.candidate.reviewPath, 'utf8').catch(() => null);
-      const reviewStat = writtenReview === null ? null : await stat(latest.candidate.reviewPath).catch(() => null);
-      const patchStat = await stat(path.join(latest.candidate.dirPath, current.patch)).catch(() => null);
-      const verifyEntries = [
-        ...(writtenReview !== null && reviewStat !== null
-          ? [{
-              path: reviewRelPath,
-              blobHash: gitBlobHash(writtenReview),
-              mode: (reviewStat.mode & 0o111) !== 0 ? '100755' : '100644',
-            }]
-          : []),
-        {
-          path: relative(store.repoRoot, path.join(latest.candidate.dirPath, current.patch)),
-          blobHash: gitBlobHash(patchText),
-          ...(patchStat ? { mode: (patchStat.mode & 0o111) !== 0 ? '100755' : '100644' } : {}),
-        },
-      ];
-      const commit = await this.deps.vcs.atomicCommit({
-        message: `review(${candidate.id}): fix ${reason} (rev ${String(latest.candidate.meta.currentRevision)})`,
-        paths: [relative(store.repoRoot, latest.candidate.dirPath)],
-        verifyEntries,
-      });
-      if (commit.verificationFailed) return {
-          status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN',
-          message: '新版本提交已执行但完整核验失败，请保留现场并人工核对。', detail: commit.errorOutput, jobId,
-      };
-      if (!commit.success) {
-        const probeAfter = await this.deps.vcs.getCommitProbe(probePaths).catch(() => null);
-        if (probeBeforeFix === null || probeAfter === null) {
-          return {
-            status: 'RECOVERY_REQUIRED',
-            reason: 'COMMIT_OUTCOME_UNKNOWN',
-            message: '新版本提交命令失败且无法读取提交探针，请人工核对 VCS 与工作区。',
-            detail: commit.errorOutput,
-            jobId,
-          };
-        }
-        if (probeAfter !== probeBeforeFix) {
-          const atCommit = writtenReview === null ? null : await this.deps.vcs.readFileAt(probeAfter, reviewRelPath).catch(() => null);
-          if (atCommit !== null && atCommit === writtenReview) {
-            log(`AI 修复新版本提交已落地（${probeAfter.slice(0, 12)}），按成功继续`);
-          } else {
-            return {
-              status: 'RECOVERY_REQUIRED',
-              reason: 'COMMIT_OUTCOME_UNKNOWN',
-              message: '新版本提交命令失败但提交探针已前进且内容不匹配，请人工核对 VCS 与工作区。',
-              detail: commit.errorOutput,
-              jobId,
-            };
-          }
-        } else {
-          await this.restoreWithCleanup(backup, candidate.dirPath, entriesBefore);
-          return {
-            status: 'ABORTED',
-            reason: 'COMMIT_FAILED',
-            message: `AI 已生成新版本，但提交 .ai-review 失败（已恢复）：\n${commit.errorOutput}`,
-            jobId,
-          };
-        }
-      }
-      log(`AI 修复新版本已提交：${commit.commitRevision?.slice(0, 12) ?? ''}`);
-    } catch (error) {
-      await this.restoreWithCleanup(backup, candidate.dirPath, entriesBefore).catch(() => undefined);
-      return {
-        status: 'ABORTED',
-        reason: 'RUNNER_FAILED',
-        message: `AI 修复新版本提交异常：${error instanceof Error ? error.message : String(error)}`,
-        jobId,
-      };
-    }
-    return {
-      status: 'FALLBACK_TO_PENDING',
-      reason,
-      message: `批准中止（${reason}），AI 已生成新版本 ${String(result.newRevisionId)},候选回到 pending，请重新审核。`,
-      ...(result.newRevisionId ? { newRevision: result.newRevisionId } : {}),
+  return {
+    retry: false,
+    outcome: {
+      status: 'RECOVERY_REQUIRED',
       jobId,
-    };
+      reason: 'COMMIT_OUTCOME_UNKNOWN',
+      detail: `业务提交 ${pushedHash} 已推送，但创建元数据关闭提交 C_meta 失败：${metaCommit.errorOutput}`,
+      message: '已推送业务提交但元数据关闭提交失败，请人工确认',
+    },
+  };
+}
+
+async function assembleFinalCommitMessage(params: {
+  candidate: ReviewCandidate;
+  optionId: string;
+  patchId: number;
+  patchText: string;
+  commitMessage: string;
+  commitDetail?: CommitMessageDetail;
+  vcs: VcsAdapter;
+}): Promise<string> {
+  const { candidate, optionId, patchId, patchText, commitMessage, commitDetail, vcs } = params;
+  if (!commitDetail) return commitMessage;
+  if (commitDetail === 'simple') {
+    return buildCommitSubject(candidate, optionId);
   }
+  const authorStats = await vcs.authorStats(parsePatch(patchText).paths).catch(() => undefined);
+  const details = await buildCommitDetails(candidate, {
+    repoRoot: vcs.root,
+    optionId,
+    patchId,
+    patchText,
+    vcsType: vcs.type,
+    ...(authorStats ? { authorStats } : {}),
+  });
+  return composeCommitMessage(candidate, 'detailed', details, optionId);
 }

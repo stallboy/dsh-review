@@ -7,6 +7,7 @@ import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
+import { patchFixture, sha256Hex, writeCandidate } from './fixtures/contract.mjs';
 
 const servers = [];
 after(async () => {
@@ -21,7 +22,6 @@ async function startApi(root, extraDeps = {}, settingsPatch = {}) {
   const api = new ReviewApi({
     settings,
     saveSettings: async (next) => next,
-    // 租约文件留在仓库外，避免测试污染真实 DSH_HOME 或在恢复工作区时被 git clean 清理。
     statePath: path.join(await mkdtemp(path.join(tmpdir(), 'dcr-p9-state-')), 'runtime-state.json'),
     ...extraDeps,
   });
@@ -51,13 +51,11 @@ test('P9: 审查提示词包含 reviewers.yml 路由解析结果', async () => {
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const { base } = await startApi(root);
   const response = await (await fetch(`${base}/audit/prompt?mode=session`)).json();
-  assert.match(response.prompt, /Owner 路由/);
-  assert.match(response.prompt, /default_owner: zhangsan/);
-  assert.match(response.prompt, /owner lisi/);
-  assert.match(response.prompt, /路径命中数 > tag 命中数/);
+  assert.match(response.prompt, /"defaultOwner":\s*"zhangsan"/);
+  assert.match(response.prompt, /"ruleCount":\s*1/);
 });
 
-test('P9: 旧定时配置键被忽略，手动审查会话仍注入 Owner 路由', async () => {
+test('P9: 旧定时配置键被忽略，手动审查会话仍通过 reviewers 校验并注入路由', async () => {
   const root = await createGitFixture();
   await mkdir(path.join(root, '.ai-review'), { recursive: true });
   await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\n', 'utf8');
@@ -70,42 +68,43 @@ test('P9: 旧定时配置键被忽略，手动审查会话仍注入 Owner 路由
       return { sessionId: 'manual-1' };
     },
   });
-  const updated = await fetch(`${base}/settings`, { method: 'PUT', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ scheduleIntervalMinutes: 0.001 }) });
+  const updated = await fetch(`${base}/settings`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ scheduleIntervalMinutes: 0.001 }),
+  });
   assert.equal(updated.status, 200);
-  assert.equal((await updated.json()).settings.scheduleIntervalMinutes, undefined);
-  const started = await fetch(`${base}/audit/session`, { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ targetPath: '', note: '' }) });
+  const started = await fetch(`${base}/audit/session`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ targetPath: '', note: '' }),
+  });
   assert.equal(started.status, 202);
   assert.equal(created.length, 1);
   assert.equal((await started.json()).sessionId, 'manual-1');
-  assert.match(created[0].prompt, /Owner 路由/);
+  assert.match(created[0].prompt, /tester/);
 });
 
-test('P10: 检出级写互斥——并发超时归档串行化，恰好一个成功（只写一次）', async () => {
+test('P10: 检出级写互斥——并发 /finding/decision 串行化，恰好一个成功（只写一次）', async () => {
   const root = await createGitFixture();
-  const dir = path.join(root, '.ai-review', '2026-11', '20261105-net-stale');
-  await mkdir(dir, { recursive: true });
   const staleIso = new Date(Date.now() - 20 * 86_400_000).toISOString();
-  await writeFile(path.join(dir, 'review.md'), [
-    '---', 'schema_version: 1', 'title: "net: stale"', 'module: net', 'audit_type: bugfix',
-    'created_at: "2026-11-01T09:00:00+08:00"',
-    'updated_at: "2026-11-01T09:00:00+08:00"', 'owner: tester',
-    'tags: []', 'status: pending', 'ticket: null', 'target_files: [src/math.js]', 'current_revision: 1',
-    'revisions:', '  - id: 1', '    base_revision: "1"', '    patch: 001.patch', '    author: ai',
-    'gate_checks: []', 'comments: []', 'human_decisions: []', 'approval: null', 'rejection: null',
-    'commit_message: "net: x"', '---', '', '# 问题与影响', '',
-  ].join('\n').replaceAll('"2026-11-01T09:00:00+08:00"', `"${staleIso}"`), 'utf8');
-  await writeFile(path.join(dir, '001.patch'), 'diff --git a/src/math.js b/src/math.js\n', 'utf8');
+  await writeCandidate(root, '20261105-net-stale', {
+    review: { createdAt: staleIso, updatedAt: staleIso },
+  });
   await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nstale_days: 14\n', 'utf8');
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const { base } = await startApi(root);
 
   const results = await Promise.all([1, 2, 3, 4].map(() =>
-    fetch(`${base}/archive-stale`, {
+    fetch(`${base}/finding/decision`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ id: '2026-11/20261105-net-stale', expectedRevision: 1, expectedOwner: 'tester', expectedUpdatedAt: staleIso }),
+      body: JSON.stringify({
+        id: '2026-11/20261105-net-stale',
+        expectedRevision: 1,
+        expectedOwner: 'tester',
+        expectedUpdatedAt: staleIso,
+        action: 'accept_as_is',
+        reason: '并发关闭测试',
+      }),
     })));
   const statuses = results.map((r) => r.status);
   assert.equal(statuses.filter((code) => code === 200).length, 1, statuses.join(','));
@@ -116,20 +115,22 @@ test('P10: 检出级写互斥——并发超时归档串行化，恰好一个成
   assert.equal(item?.status, 'rejected');
 });
 
-test('P10: approved 无可派生提交 → lookup unknown 仅诊断；遗留 commit_revision 不再触发 needsBackfill', async () => {
+test('P10: approved 无可派生提交 → lookup unknown 仅诊断', async () => {
   const root = await createGitFixture();
-  const dir = path.join(root, '.ai-review', '2026-11', '20261105-net-bf');
-  await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, 'review.md'), [
-    '---', 'schema_version: 1', 'title: "net: bf"', 'module: net', 'audit_type: bugfix',
-    'created_at: "2026-11-05T09:00:00+08:00"', 'updated_at: "2026-11-05T09:00:00+08:00"', 'owner: tester',
-    'tags: []', 'status: approved', 'ticket: null', 'target_files: [src/math.js]', 'current_revision: 1',
-    'revisions:', '  - id: 1', '    base_revision: "1"', '    patch: 001.patch', '    author: ai',
-    'gate_checks: []', 'comments: []', 'human_decisions: []',
-    'approval:', '  approved_by: tester', '  approved_at: "2026-11-05T10:00:00+08:00"',
-    '  gate_checks: []', '  gate_results: []', '  confirmed_decisions: []', '  waived_decisions: []', '  commit_revision: null',
-    'rejection: null', 'commit_message: "net: bf"', '---', '', '# 问题与影响', '',
-  ].join('\n'), 'utf8');
+  const patchText = patchFixture();
+  const sha = sha256Hex(patchText);
+  await writeCandidate(root, '20261105-net-bf', {
+    patchText,
+    review: {
+      title: 'net: bf',
+      commitMessage: 'net: bf',
+      status: 'approved',
+      createdAt: '2026-11-05T09:00:00+08:00',
+      updatedAt: '2026-11-05T10:00:00+08:00',
+      repairAttempts: '\n  - id: 1\n    option_id: opt-a\n    patch_id: 1\n    base_revision: "1"\n    actor: tester\n    at: "2026-11-05T10:00:00+08:00"\n    apply_mode: program_strict\n    result: applied\n    restored: false\n    evidence: "ok"',
+      approval: `\n  approved_by: tester\n  approved_at: "2026-11-05T10:00:00+08:00"\n  record_revision: 1\n  option_id: opt-a\n  patch_id: 1\n  patch_sha256: "${sha}"\n  repair_attempt_id: 1\n  base_revision: "1"\n  gate_checks: ["node --version"]\n  gate_results: [{command: "node --version", exit_code: 0, duration_ms: 1}]\n  confirmed_decisions: []\n  waived_decisions: []`,
+    },
+  });
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
   const { base } = await startApi(root);
@@ -137,6 +138,5 @@ test('P10: approved 无可派生提交 → lookup unknown 仅诊断；遗留 com
   const item = queue.items.find((entry) => entry.id.endsWith('net-bf'));
   assert.equal(item?.approvalCommitLookup, 'unknown');
   assert.equal(item?.approvalCommitRevision, undefined);
-  assert.equal(item?.needsBackfill, undefined);
   assert.equal(item?.parseError, undefined);
 });

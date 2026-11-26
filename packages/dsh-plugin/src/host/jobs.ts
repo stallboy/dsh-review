@@ -5,11 +5,26 @@ export type JobType = JobRecord['type'];
 const MAX_JOBS = 40;
 const MAX_LOG_LINES = 4000;
 
+export interface JobContext {
+  id: string;
+  log: (line: string) => void;
+  signal: AbortSignal;
+}
+
+export interface JobIncrementalView {
+  job: JobRecord;
+  log: string[];
+  logOffset: number;
+  totalLogLines: number;
+  earliestLogOffset: number;
+  logResetRequired: boolean;
+}
+
 export class JobManager {
   private readonly jobs = new Map<string, JobRecord>();
   private readonly controllers = new Map<string, AbortController>();
 
-  start(type: JobType, task: (log: (line: string) => void, id: string, signal: AbortSignal) => Promise<unknown>): JobRecord {
+  start(type: JobType, task: (ctx: JobContext) => Promise<unknown>): JobRecord {
     const id = `job-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
     const controller = new AbortController();
     this.controllers.set(id, controller);
@@ -19,13 +34,14 @@ export class JobManager {
       status: 'running',
       startedAt: new Date().toISOString(),
       log: [],
+      logStartOffset: 0,
     };
     this.jobs.set(id, record);
     this.prune();
     const log = (line: string): void => this.appendLog(id, line);
     void (async () => {
       try {
-        record.result = await task(log, id, controller.signal);
+        record.result = await task({ id, log, signal: controller.signal });
         record.status = 'succeeded';
       } catch (error) {
         record.status = 'failed';
@@ -47,7 +63,6 @@ export class JobManager {
     if (record.log.length > MAX_LOG_LINES) {
       const dropped = record.log.length - MAX_LOG_LINES;
       record.log.splice(0, dropped);
-      // G36：截断只移动日志窗口，绝对偏移保持递增以免轮询漏行。
       record.logStartOffset += dropped;
     }
   }
@@ -69,6 +84,43 @@ export class JobManager {
 
   get(id: string): JobRecord | undefined {
     return this.jobs.get(id);
+  }
+
+  /** SPEC §5.7：单调递增绝对行序号，窗口截断时提示 logResetRequired 而非丢行。 */
+  getIncremental(id: string, since?: number): JobIncrementalView | undefined {
+    const job = this.jobs.get(id);
+    if (!job) return undefined;
+    const earliest = job.logStartOffset ?? 0;
+    const total = earliest + job.log.length;
+    if (since === undefined || since < 0) {
+      return {
+        job,
+        log: [...job.log],
+        logOffset: total,
+        totalLogLines: total,
+        earliestLogOffset: earliest,
+        logResetRequired: false,
+      };
+    }
+    if (since < earliest) {
+      return {
+        job,
+        log: [...job.log],
+        logOffset: total,
+        totalLogLines: total,
+        earliestLogOffset: earliest,
+        logResetRequired: true,
+      };
+    }
+    const startIdx = Math.min(job.log.length, Math.max(0, since - earliest));
+    return {
+      job,
+      log: job.log.slice(startIdx),
+      logOffset: total,
+      totalLogLines: total,
+      earliestLogOffset: earliest,
+      logResetRequired: false,
+    };
   }
 
   list(): JobRecord[] {

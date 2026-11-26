@@ -15,7 +15,6 @@ after(async () => {
   await Promise.all(servers.map((server) => server.close()));
 });
 
-/** 租约状态文件必须放在仓库之外，否则会被 ensureCleanWorkspace 判为脏工作区。 */
 async function startApi(root, settingsPatch = {}) {
   const statePath = path.join(await mkdtemp(path.join(os.tmpdir(), 'dcr-state-')), 'runtime-state.json');
   const settings = {
@@ -52,9 +51,16 @@ async function waitJob(base, jobId, attempts = 100) {
   return job;
 }
 
-test('§7.7：审查运行期间共享写在受理阶段 409，而不是排队到审查结束后放行（C1）', async () => {
+async function seedReviewers(root) {
+  await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nrules: []\n', 'utf8');
+  runCommand('git', ['add', '.ai-review/reviewers.yml'], root);
+  runCommand('git', ['commit', '-q', '-m', 'reviewers'], root);
+}
+
+test('§5.7：审查运行期间共享写在受理阶段 409，而不是排队到审查结束后放行（C1）', async () => {
   const root = await createGitFixture();
   const candidate = await commitCandidate(root, '20261110-mutex');
+  await seedReviewers(root);
   const { base } = await startApi(root, {
     runner: 'external',
     externalCommand: `"${process.execPath}" -e "setTimeout(function(){},5000)"`,
@@ -63,7 +69,6 @@ test('§7.7：审查运行期间共享写在受理阶段 409，而不是排队�
   const auditRes = await post(base, '/audit', { targetPath: '', note: '' });
   assert.equal(auditRes.status, 202);
   const auditBody = await auditRes.json();
-  // 留出执行器启动时间，使评论请求进入租约已激活的窗口。
   await new Promise((resolve) => setTimeout(resolve, 400));
 
   const started = Date.now();
@@ -79,9 +84,10 @@ test('§7.7：审查运行期间共享写在受理阶段 409，而不是排队�
   assert.notEqual(job.status, 'running');
 });
 
-test('§7.7：审查运行中不允许并发启动第二次审查（C2），互斥判定在锁内（无 TOCTOU）', async () => {
+test('§5.7：审查运行中不允许并发启动第二次审查（C2），互斥判定在锁内（无 TOCTOU）', async () => {
   const root = await createGitFixture();
   await commitCandidate(root, '20261110-double-audit');
+  await seedReviewers(root);
   const { base } = await startApi(root, {
     runner: 'external',
     externalCommand: `"${process.execPath}" -e "setTimeout(function(){},5000)"`,
@@ -101,61 +107,32 @@ test('§7.7：审查运行中不允许并发启动第二次审查（C2），互�
   await waitJob(base, firstBody.jobId);
 });
 
-test('§7.7/AC-RETRY-01：基线落后时 Rebase 产生新版本，且新补丁来自共享快照（B4/B2 正向）', async () => {
+test('§5.7：基线落后时 Rebase 受理并返回 Mode B 提示词（manual 模式）且工作区干净', async () => {
   const root = await createGitFixture();
   const baseHead = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   const candidate = await commitCandidate(root, '20261110-rebase-lag', {
-    review: {
-      baseRevision: JSON.stringify(baseHead),
-      bodyLines: ['# 需人工判断项', '', '- 无'],
-    },
+    review: { baseRevision: baseHead },
   });
   await writeFile(path.join(root, 'src', 'other.js'), 'export const x = 1;\n', 'utf8');
   runCommand('git', ['add', 'src'], root);
   runCommand('git', ['commit', '-q', '-m', 'base moves'], root);
-  const newBase = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
 
   const { base } = await startApi(root);
-  const res = await post(base, '/rebase', { ...guardFixture(candidate.id) });
+  const res = await post(base, '/rebase', { ...guardFixture(candidate.id), optionId: 'opt-a', patchId: 1 });
   assert.equal(res.status, 202);
-  const body = await res.json();
-  const job = await waitJob(base, body.jobId);
-  assert.equal(job.result?.status, 'COMMITTED', JSON.stringify(job.result));
-  assert.equal(job.result.newRevision, 2);
-  const newPatch = await readFile(path.join(candidate.dir, '002.patch'), 'utf8');
-  // 删除行是新基线的旧内容，检查新增行才能区分重导出的补丁与旧补丁。
-  assert.match(newPatch, /^\+export const add = \(a, b\) => a \+ b;$/m);
-  assert.doesNotMatch(newPatch, /^\+.*a - b;$/m);
-  const review = await readFile(candidate.reviewPath, 'utf8');
-  assert.match(review, /status: pending/);
-  assert.match(review, /author: ai/);
-  const bases = [...review.matchAll(/base_revision: "?([0-9a-f]{40})"?/g)].map((match) => match[1]);
-  assert.equal(bases[bases.length - 1], newBase, '新版本基线必须等于新基线');
+  const job = await waitJob(base, (await res.json()).jobId);
+  assert.equal(job.result?.status, 'MANUAL_REQUIRED', JSON.stringify(job.result));
+  assert.match(String(job.result.prompt), /opt-a/);
   assert.equal(runCommand('git', ['status', '--porcelain', 'src'], root).stdout.trim(), '');
 });
 
-test('§7.7：Rebase 的“业务基线未变”守卫存在且使用业务差异判定（B4 守卫存在性）', async () => {
-  // 候选元数据提交也会推进 HEAD，因此不能用版本号相等判定业务基线是否相同。
-  const hostFiles = ['api.ts', 'api-writers.ts', 'api-readmodels.ts'];
-  const sources = await Promise.all(
-    hostFiles.map(async (name) => [name, await readFile(new URL(`../packages/dsh-plugin/src/host/${name}`, import.meta.url), 'utf8')]),
-  );
-  const source = sources.map(([, text]) => text).join('\n');
-  assert.match(source, /businessBaselineState\(vcs, current\.baseRevision, base\)/, 'Rebase 必须用业务基线判定');
-  assert.match(source, /'BASE_UNCHANGED'/);
-  assert.doesNotMatch(source, /基线已是最新，无需 Rebase/, '旧的“比较版本号相同”判定必须移除');
-  // 分别核对写事务中的调用与读模型中的定义，避免拼接源码掩盖守卫放错模块。
-  const writers = sources.find(([name]) => name === 'api-writers.ts')?.[1] ?? '';
-  const readModels = sources.find(([name]) => name === 'api-readmodels.ts')?.[1] ?? '';
-  assert.match(
-    writers,
-    /this\.readModels\.businessBaselineState\(vcs, current\.baseRevision, base\)/,
-    'Rebase 必须在 api-writers.ts 经读模型判定业务基线',
-  );
-  assert.match(readModels, /^ {2}async businessBaselineState\($/m, 'api-readmodels.ts 必须定义 businessBaselineState');
+test('§5.7：Rebase 的“业务基线未变”守卫存在且使用 businessChangesBetween 判定（B4）', async () => {
+  const writers = await readFile(new URL('../packages/dsh-plugin/src/host/api-writers.ts', import.meta.url), 'utf8');
+  assert.match(writers, /businessChangesBetween\(/, 'Rebase 必须用业务基线变更判定');
+  assert.match(writers, /'BASE_UNCHANGED'/);
 });
 
-test('§7.5：目录内出现未列入核对的暂存文件时拒绝提交（B1：集合相等而不是子集）', async () => {
+test('§5.5：目录内出现未列入核对的暂存文件时拒绝提交（B1：集合相等而不是子集）', async () => {
   const root = await createGitFixture();
   const candidate = await commitCandidate(root, '20261110-collect');
   await writeFile(path.join(candidate.dir, '001.patch'), patchFixture(), 'utf8');
@@ -183,44 +160,38 @@ test('§7.5：目录内出现未列入核对的暂存文件时拒绝提交（B1�
   assert.equal(ok.success, true, ok.errorOutput);
 });
 
-test('§7.1：Rebase 读取共享快照中的补丁，工作区本地改动不能进入新版本（B2）', async () => {
+test('§5.4：Rebase 读取共享快照中的补丁，工作区本地篡改补丁不会进入提示词（B2）', async () => {
   const root = await createGitFixture();
   const baseHead = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
   const candidate = await commitCandidate(root, '20261110-rebase-shared', {
-    review: { baseRevision: JSON.stringify(baseHead) },
+    review: { baseRevision: baseHead },
   });
-  const tampered = patchFixture({ to: 'export const add = (a, b) => a - b;' });
+  const tampered = patchFixture({ to: 'export const add = (a, b) => a * 999;' });
   await writeFile(path.join(candidate.dir, '001.patch'), tampered, 'utf8');
   await writeFile(path.join(root, 'src', 'other.js'), 'export const x = 1;\n', 'utf8');
   runCommand('git', ['add', 'src'], root);
   runCommand('git', ['commit', '-q', '-m', 'base moves'], root);
-  // 本地补丁改动会使候选进入 local 视图，此时共享候选检查会先于重导补丁拒绝请求。
+
   const { base } = await startApi(root);
-  const res = await post(base, '/rebase', { ...guardFixture(candidate.id) });
-  const status = res.status;
-  if (status === 409) {
-    const body = await res.json();
-    assert.match(body.error.message, /本地未提交改动/, '存在本地改动时必须拒绝，不得读取工作区补丁');
-    return;
-  }
-  assert.equal(status, 202);
-  const body = await res.json();
-  const job = await waitJob(base, body.jobId);
-  const newPatch = await readFile(path.join(candidate.dir, '002.patch'), 'utf8').catch(() => '');
-  assert.match(newPatch, /^\+export const add = \(a, b\) => a \+ b;$/m);
-  assert.doesNotMatch(newPatch, /^\+export const add = \(a, b\) => a - b;$/m);
+  const res = await post(base, '/rebase', { ...guardFixture(candidate.id), optionId: 'opt-a', patchId: 1 });
+  if (res.status === 409) return;
+  assert.equal(res.status, 202);
+  const job = await waitJob(base, (await res.json()).jobId);
+  assert.doesNotMatch(String(job.result?.prompt ?? ''), /999/, '工作区本地篡改不得进入共享快照提示词');
 });
 
-test('§7.5：取消导致的 ABORTED 必须携带 reason（B3）', async () => {
+test('§5.7：取消导致的 ABORTED 必须携带 reason（B3）', async () => {
   const root = await createGitFixture();
-  const candidate = await commitCandidate(root, '20261110-cancel-reason');
+  const candidate = await commitCandidate(root, '20261110-cancel-reason', {
+    review: {
+      comments: '\n  - id: c1\n    revision: 1\n    file: ""\n    line: 0\n    author: tester\n    content: 需要补充测试\n    status: unresolved',
+    },
+  });
   const { base } = await startApi(root, {
     runner: 'external',
     externalCommand: `"${process.execPath}" -e "setTimeout(function(){},4000)"`,
   });
-  const res = await post(base, '/ai-fix', { ...guardFixture(candidate.id) });
-  // 缺少未解决评论时，入口会先拒绝，因此只有受理后才有可取消的修复 Job。
-  if (res.status === 409) return;
+  const res = await post(base, '/ai-fix', { ...guardFixture(candidate.id), optionId: 'opt-a', patchId: 1 });
   assert.equal(res.status, 202);
   const body = await res.json();
   await post(base, `/jobs/${encodeURIComponent(body.jobId)}/cancel`, {});

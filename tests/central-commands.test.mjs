@@ -2,69 +2,71 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setupCentral, registerNode, bindProject, approvePayload } from './central-helpers.mjs';
 
-test('中央仅向声明新版发现能力的节点发出处置指令', async t => {
+test('中央对 finding-decision 统一强制校验 ConcurrencyGuard 且拒绝伪造 owner', async t => {
     const { app, headers } = await setupCentral(t);
-    const node = await registerNode(app, 'node-a', 'workspace-a', {});
+    const node = await registerNode(app);
     const project = await bindProject(app, headers, node);
     const url = `/api/v1/projects/${project.projectId}/commands`;
-    const payload = { operation: 'finding-decision', idempotencyKey: 'new-finding', payload: {
-        findingId: 'arithmetic', expectedFindingVersion: 'a'.repeat(64), action: 'human_takeover',
-    } };
-    const submit = () => app.inject({ method: 'POST', url, headers, payload });
-    const register = findingWorkflow => app.inject({ method: 'POST', url: '/node-api/v1/register', headers: node.headers, payload: {
-        protocolVersion: 1, instanceId: node.instanceId, pluginVersion: '0.3.0', dshVersion: '0.2.1', platform: 'linux',
-        workspaces: [{ workspaceId: node.workspaceId, label: node.workspaceId, vcsType: 'git', target: 'main',
-            ...(findingWorkflow ? { findingWorkflow: true } : {}) }],
-    } });
-    assert.equal((await submit()).statusCode, 409);
-    assert.equal((await register(true)).statusCode, 200);
-    const queued = await submit();
-    assert.equal(queued.statusCode, 202, queued.body);
-    assert.equal((await register(false)).statusCode, 200);
-    const poll = await app.inject({ method: 'POST', url: '/node-api/v1/commands/poll', headers: node.headers,
-        payload: { instanceId: node.instanceId } });
-    assert.deepEqual(poll.json().commands, []);
-    const id = queued.json().command.commandId;
-    const result = await app.inject({ url: `/api/v1/commands/${id}`, headers });
-    assert.equal(result.json().command.result.outcome.status, 'ABORTED');
+    const withoutGuard = await app.inject({
+        method: 'POST', url, headers,
+        payload: { operation: 'finding-decision', idempotencyKey: 'no-guard', payload: { id: '2026-11/fix-retry', action: 'human_takeover' } },
+    });
+    assert.equal(withoutGuard.statusCode, 422, withoutGuard.body);
+    assert.match(withoutGuard.json().error.message, /guard/);
+
+    const forgedOwner = await app.inject({
+        method: 'POST', url, headers,
+        payload: {
+            operation: 'finding-decision',
+            idempotencyKey: 'forged-owner',
+            payload: { id: '2026-11/fix-retry', action: 'human_takeover', owner: 'other' },
+            guard: { expectedRevision: 1, expectedOwner: '审核者甲', expectedUpdatedAt: '2026-11-16T06:00:00.000Z' },
+        },
+    });
+    assert.equal(forgedOwner.statusCode, 422, forgedOwner.body);
+
+    const valid = await app.inject({
+        method: 'POST', url, headers,
+        payload: {
+            operation: 'finding-decision',
+            idempotencyKey: 'valid-decision',
+            payload: { id: '2026-11/fix-retry', action: 'human_takeover' },
+            guard: { expectedRevision: 1, expectedOwner: '审核者甲', expectedUpdatedAt: '2026-11-16T06:00:00.000Z' },
+        },
+    });
+    assert.equal(valid.statusCode, 202, valid.body);
 });
 
-test('中央拒绝新建人工补丁任务，节点不收到指令', async t => {
+test('中央拒绝已废止旧操作且节点不会收到非法指令', async t => {
     const { app, headers } = await setupCentral(t);
     const node = await registerNode(app);
     const project = await bindProject(app, headers, node);
     const { payload, ...request } = approvePayload('retired');
-    const response = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.projectId}/commands`, headers,
-        payload: { ...request, operation: 'manual-revision', payload: { ...payload, patchText: 'diff --git a/foo b/foo\n' } } });
-    assert.equal(response.statusCode, 422, response.body);
-    assert.match(response.json().error.message, /operation/);
-    assert.deepEqual((await app.inject({ method: 'POST', url: '/node-api/v1/commands/poll', headers: node.headers,
-        payload: { instanceId: node.instanceId } })).json().commands, []);
+    for (const op of ['manual-revision', 'reject', 'reopen', 'archive-stale', 'convert', 'dismiss-finding']) {
+        const response = await app.inject({
+            method: 'POST', url: `/api/v1/projects/${project.projectId}/commands`, headers,
+            payload: { ...request, idempotencyKey: `retired-${op}`, operation: op, payload },
+        });
+        assert.equal(response.statusCode, 422, `${op}: ${response.body}`);
+        assert.match(response.json().error.message, /operation/);
+    }
+    assert.deepEqual((await app.inject({
+        method: 'POST', url: '/node-api/v1/commands/poll', headers: node.headers,
+        payload: { instanceId: node.instanceId },
+    })).json().commands, []);
 });
 
-test('中央重启后释放未受理的旧人工补丁任务占用，保留已开始执行的记录', async t => {
-    const { app, headers, dataDir, createCentralApp } = await setupCentral(t);
-    const states = ['queued', 'dispatched', 'executing'];
-    const saved = [];
-    for (const state of states) {
-        const node = await registerNode(app, state, `workspace-${state}`);
-        const project = await bindProject(app, headers, node);
-        const response = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.projectId}/commands`, headers, payload: approvePayload() });
-        assert.equal(response.statusCode, 202, response.body);
-        const commandId = response.json().command.commandId;
-        app.database.sql.prepare("UPDATE commands SET state=?,envelope=json_set(envelope,'$.operation','manual-revision') WHERE command_id=?").run(state, commandId);
-        saved.push({ state, commandId });
-    }
-    const upgraded = await createCentralApp({ dataDir });
-    for (const { state, commandId } of saved) {
-        const result = (await upgraded.inject({ url: `/api/v1/commands/${commandId}`, headers })).json().command;
-        if (state === 'executing') assert.equal(result.state, 'executing');
-        else {
-            assert.equal(result.state, 'completed');
-            assert.equal(result.result.outcome.reason, 'CANCELLED');
-            assert.equal(result.result.delivery.state, 'not_required');
-        }
-    }
+test('中央支持 reviewers-init 与 schema_version 1 审查指令且无需旧版能力标志', async t => {
+    const { app, headers } = await setupCentral(t);
+    const node = await registerNode(app, 'node-v1', 'workspace-v1', { auditSelfTest: true });
+    const project = await bindProject(app, headers, node);
+    const url = `/api/v1/projects/${project.projectId}/commands`;
+    const initResp = await app.inject({
+        method: 'POST', url, headers,
+        payload: { operation: 'reviewers-init', idempotencyKey: 'init-1', payload: { defaultOwner: '审核者甲' } },
+    });
+    assert.equal(initResp.statusCode, 202, initResp.body);
+    assert.equal(initResp.json().command.operation, 'reviewers-init');
 });
 
 test('指令幂等、项目写互斥，节点只能领取自己的项目', async t => {
@@ -130,8 +132,10 @@ test('恢复回报不能抹掉已证明的提交或将待交付降为不需交�
     const created = await app.inject({ method: 'POST', url, headers, payload: approvePayload() });
     const commandId = created.json().command.commandId;
     const outcome = { status: 'COMMITTED', commitRevision: 'abc', message: '已提交' };
-    const report = (sequence, result) => app.inject({ method: 'POST', url: '/node-api/v1/events', headers: node.headers,
-        payload: { instanceId: node.instanceId, events: [{ commandId, sequence, type: 'result', result }] } });
+    const report = (sequence, result) => app.inject({
+        method: 'POST', url: '/node-api/v1/events', headers: node.headers,
+        payload: { instanceId: node.instanceId, events: [{ commandId, sequence, type: 'result', result }] },
+    });
     assert.equal((await report(1, { outcome, delivery: { state: 'pending', commitRevision: 'abc' } })).statusCode, 200);
     assert.equal((await report(2, { outcome: { status: 'ABORTED', commitRevision: 'abc' }, delivery: { state: 'not_required' } })).statusCode, 409);
     assert.equal((await report(2, { outcome, delivery: { state: 'not_required', commitRevision: 'abc' } })).statusCode, 409);
@@ -146,27 +150,28 @@ test('恢复控制必须由用户明确请求，不因轮询自动重试交付',
     const project = await bindProject(app, headers, node);
     const created = await app.inject({ method: 'POST', url: `/api/v1/projects/${project.projectId}/commands`, headers, payload: approvePayload() });
     const commandId = created.json().command.commandId;
-    await app.inject({ method: 'POST', url: '/node-api/v1/events', headers: node.headers,
-        payload: { instanceId: node.instanceId, events: [{ commandId, sequence: 1, type: 'result',
-            result: { outcome: { status: 'COMMITTED', commitRevision: 'abc' }, delivery: { state: 'pending', commitRevision: 'abc' } } }] } });
+    await app.inject({
+        method: 'POST', url: '/node-api/v1/events', headers: node.headers,
+        payload: {
+            instanceId: node.instanceId,
+            events: [{ commandId, sequence: 1, type: 'result', result: { outcome: { status: 'COMMITTED', commitRevision: 'abc' }, delivery: { state: 'pending', commitRevision: 'abc' } } }],
+        },
+    });
     const poll = () => app.inject({ method: 'POST', url: '/node-api/v1/commands/poll', headers: node.headers, payload: { instanceId: node.instanceId } });
     assert.deepEqual((await poll()).json().recoveries, []);
     assert.equal((await app.inject({ method: 'POST', url: `/api/v1/commands/${commandId}/recover`, headers, payload: { confirmStopped: true } })).statusCode, 200);
     assert.deepEqual((await poll()).json().recoveries, [commandId]);
 });
 
-test('schema3审查与方案写入要求issueWorkflow且不接受客户端伪造能力', async t => {
+test('中央审计指令不再注入旧版 findingWorkflow 或 issueWorkflow 兼容字段', async t => {
     const { app, headers } = await setupCentral(t);
-    const old = await registerNode(app, 'old-node', 'old-workspace', { findingWorkflow: true });
-    const oldProject = await bindProject(app, headers, old);
-    const post = (project, payload) => app.inject({ method: 'POST', url: `/api/v1/projects/${project.projectId}/commands`, headers, payload });
-    assert.equal((await post(oldProject, { operation: 'audit', idempotencyKey: 'old-audit', payload: { targetPath: '.' } })).statusCode, 409);
-    assert.equal((await post(oldProject, { ...approvePayload('old-selection'), payload: { id: '2026-11/fix-retry', optionId: 'a', patchId: 1 } })).statusCode, 409);
-    const current = await registerNode(app, 'new-node', 'new-workspace');
-    const project = await bindProject(app, headers, current);
-    assert.equal((await post(project, { operation: 'audit', idempotencyKey: 'spoof', payload: { targetPath: '.', issueWorkflow: true } })).statusCode, 422);
-    const started = await post(project, { operation: 'audit', idempotencyKey: 'native', payload: { targetPath: '.' } });
+    const node = await registerNode(app, 'new-node', 'new-workspace');
+    const project = await bindProject(app, headers, node);
+    const started = await app.inject({
+        method: 'POST', url: `/api/v1/projects/${project.projectId}/commands`, headers,
+        payload: { operation: 'audit', idempotencyKey: 'native-v1', payload: { targetPath: '.' } },
+    });
     assert.equal(started.statusCode, 202, started.body);
-    assert.equal(started.json().command.payload.issueWorkflow, true);
-    assert.equal(started.json().command.payload.findingWorkflow, true);
+    assert.equal(started.json().command.payload.issueWorkflow, undefined);
+    assert.equal(started.json().command.payload.findingWorkflow, undefined);
 });

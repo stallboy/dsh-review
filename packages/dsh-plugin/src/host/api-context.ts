@@ -1,88 +1,98 @@
-/** 供各 API 子模块共用的宿主接口和请求上下文。宿主通过 ApiHost 注入，以免形成模块依赖环。 */
+/** 供各 API 子模块共用的宿主接口与请求上下文。宿主通过 ApiHost 注入，避免循环依赖。 */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { IncomingMessage, IncomingHttpHeaders } from 'node:http';
 import type { ManagedCommand } from '@dsh-review/protocol';
 import path from 'node:path';
-import type { AppSettings, ConcurrencyGuard, JobRecord, ReviewFilter, ReviewStatus, VcsType } from './types.js';
-import { ApiError } from './types.js';
+import {
+  ApiError,
+  REVIEW_STATUSES,
+  type AppSettings,
+  type ConcurrencyGuard,
+  type IssueSelection,
+  type JobRecord,
+  type ReviewFilter,
+  type ReviewStatus,
+  type VcsType,
+} from './types.js';
 import type { JobManager } from './jobs.js';
 import type { AuditLifecycle, AuditLeaseRecord } from './audit-lifecycle.js';
-import type { CandidateSource, ReviewStore } from './store.js';
+import type { ReviewStore } from './store.js';
 import type { SharedCandidateSource } from './shared-facts.js';
 import { GitHeadCandidateSource, SvnBaseCandidateSource } from './shared-facts.js';
 import type { VcsAdapter } from './vcs.js';
-
+import type { RunAgentResult } from './runner.js';
 
 export const API_PREFIX = '/dsh-code-review/api';
-export const APP_VERSION = '0.3.0';
+export const APP_VERSION = '1.0.0';
 const BODY_LIMIT = 2 * 1024 * 1024;
-const STATUSES: ReviewStatus[] = ['pending', 'changes_requested', 'approved', 'rejected', 'repair_failed', 'human_takeover', 'awaiting_verification', 'resolved'];
 
 const INTERNAL_BODY = Symbol('internal-body');
 
 export type ApiRequest = IncomingMessage | {
-    method: string;
-    url: string;
-    headers: IncomingHttpHeaders;
-    [INTERNAL_BODY]: Record<string, unknown>;
+  method: string;
+  url: string;
+  headers: IncomingHttpHeaders;
+  [INTERNAL_BODY]: Record<string, unknown>;
 };
 
 export interface ApiResponse {
-    statusCode: number;
-    setHeader(name: string, value: string): unknown;
-    end(value?: string | Uint8Array): unknown;
+  statusCode: number;
+  setHeader(name: string, value: string): unknown;
+  end(value?: string | Uint8Array): unknown;
 }
 
 export interface TrustedActor {
-    userId: string;
-    reviewIdentity: string;
-    commandId?: string;
-    findingWorkflow?: boolean;
-    managedAuditSession?: {
-        signal: AbortSignal;
-        onCreated(auditId: string, sessionId: string): void;
-        reportStopping?: (line: string) => Promise<void>;
-        nodeShutdown?: AbortSignal;
-    };
-    scheduledAudit?: NonNullable<ManagedCommand['scheduledAudit']> & { target: string; signal: AbortSignal };
+  userId: string;
+  reviewIdentity: string;
+  commandId?: string;
+  managedAuditSession?: {
+    signal: AbortSignal;
+    onCreated(auditId: string, sessionId: string): void;
+    reportStopping?: (line: string) => Promise<void>;
+    nodeShutdown?: AbortSignal;
+  };
+  scheduledAudit?: NonNullable<ManagedCommand['scheduledAudit']> & { target: string; signal: AbortSignal };
 }
 
 export interface ApiInvocation {
-    method: 'GET' | 'POST' | 'PUT';
-    path: string;
-    query?: Record<string, string | number | boolean>;
-    body?: Record<string, unknown>;
-    actor?: TrustedActor;
+  method: 'GET' | 'POST' | 'PUT';
+  path: string;
+  query?: Record<string, string | number | boolean>;
+  body?: Record<string, unknown>;
+  actor?: TrustedActor;
 }
 
 export interface ApiInvocationResult {
-    status: number;
-    body: unknown;
-    headers: Record<string, string>;
+  status: number;
+  body: unknown;
+  headers: Record<string, string>;
 }
 
 const actorContext = new AsyncLocalStorage<TrustedActor>();
 const sharedContext = new AsyncLocalStorage<{ root: string; view: SharedView }>();
 
 export function withSharedView<T>(root: string, view: SharedView, task: () => T): T {
-    return sharedContext.run({ root, view }, task);
+  return sharedContext.run({ root, view }, task);
 }
 
-export function currentTrustedActor(): TrustedActor | undefined { return actorContext.getStore(); }
+export function currentTrustedActor(): TrustedActor | undefined {
+  return actorContext.getStore();
+}
 
 export function withTrustedActor<T>(actor: TrustedActor, task: () => T): T {
-    return actorContext.run(Object.freeze({ ...actor }), task);
+  return actorContext.run(Object.freeze({ ...actor }), task);
 }
 
 export function internalRequest(method: string, url: string, body: Record<string, unknown>): ApiRequest {
-    return { method, url, headers: {}, [INTERNAL_BODY]: body };
+  return { method, url, headers: {}, [INTERNAL_BODY]: body };
 }
 
 export interface ApiDeps {
   auditSessionTools?: boolean;
   auditStageExecutor?: import('./audit-stage-runner.js').ExecuteAuditStage;
   auditStageGates?: typeof import('./validator.js').runGateChecks;
+  runModeC?: (input: { prompt: string; cwd: string; signal?: AbortSignal }) => Promise<RunAgentResult>;
   settings: AppSettings;
   saveSettings: (settings: AppSettings) => Promise<AppSettings>;
   resolveCredential?: (reference: string) => Promise<string | undefined>;
@@ -96,23 +106,25 @@ export interface ApiDeps {
     requireWorkspace?: boolean;
     cwdOnly?: true;
     signal?: AbortSignal;
-    /** 新会话继承面板所属会话的权限预设与审批策略。 */
     ownerSessionId?: string;
     onCreated?: (sessionId: string) => Promise<void>;
   }) => Promise<{ sessionId: string }>;
-  /** 未注入时宿主没有交互式修复执行器，受理端会返回诊断。 */
   createFixSession?: (input: {
     cwd: string;
     title: string;
     prompt: string;
     ownerSessionId?: string;
   }) => Promise<{ sessionId: string }>;
-  withAuditSessionIdle?: (sessionId: string, requestId: string, signal: AbortSignal,
-    finalize: (signal: AbortSignal) => Promise<void | false>) => Promise<boolean>;
+  withAuditSessionIdle?: (
+    sessionId: string,
+    requestId: string,
+    signal: AbortSignal,
+    finalize: (signal: AbortSignal) => Promise<void | false>,
+  ) => Promise<boolean>;
   stopAuditSession?: (sessionId: string, signal: AbortSignal, processStopped: Promise<boolean>) => Promise<boolean>;
   onAuditTurnEnd?: (sessionId: string, callback: () => void) => () => void;
   clientEntry?: () => unknown;
-  /** 缺省落在 DSH_HOME/dsh-code-review/runtime-state.json，使未释放的租约在宿主重启后仍能阻塞写入。 */
+  /** 缺省落在 DSH_HOME/dsh-code-review/runtime-state.json，使未释放的租约与占用在宿主重启后仍能阻塞写入。 */
   statePath?: string;
 }
 
@@ -123,25 +135,11 @@ export interface Runtime {
   vcsType: VcsType;
 }
 
-export interface AuditLease {
-  auditId: string;
-  root: string;
-  targetPath: string;
-  trigger: 'manual' | 'scheduled';
-  baseRevision: string;
-  owner: string;
-  createdAt: string;
-  candidateIdsBefore: string[];
-  state: 'active' | 'releasable' | 'released';
-  sessionId?: string;
-}
-
 export interface SharedView {
   source: SharedCandidateSource;
   snapshot: string | null;
 }
 
-/** 一次计算应复用同一份视图读取候选与档案，以免混用不同提交的事实。 */
 export async function sharedViewFor(runtime: Runtime): Promise<SharedView | undefined> {
   const managed = sharedContext.getStore();
   if (managed?.root === runtime.root) return managed.view;
@@ -223,6 +221,24 @@ export function guardFrom(body: Record<string, unknown>): ConcurrencyGuard {
   return { expectedRevision, expectedOwner, expectedUpdatedAt };
 }
 
+export function selectionFrom(body: Record<string, unknown>): IssueSelection | undefined {
+  const optionId = stringField(body, 'optionId').trim();
+  const patchId = numberField(body, 'patchId');
+  if (!optionId && patchId === 0) return undefined;
+  if (!optionId || !Number.isInteger(patchId) || patchId <= 0) {
+    throw new ApiError(400, 'bad_request', '必须同时提供合法的 optionId 与正整数 patchId');
+  }
+  return { optionId, patchId };
+}
+
+export function requireSelectionFrom(body: Record<string, unknown>): IssueSelection {
+  const selection = selectionFrom(body);
+  if (!selection) {
+    throw new ApiError(400, 'bad_request', '必须显式指定 optionId 与 patchId');
+  }
+  return selection;
+}
+
 export function isAnchor(value: unknown): value is { snippet: string; before?: string; after?: string; extra?: Record<string, unknown> } {
   if (typeof value !== 'object' || value === null) return false;
   const record = value as Record<string, unknown>;
@@ -231,15 +247,9 @@ export function isAnchor(value: unknown): value is { snippet: string; before?: s
     && (record['after'] === undefined || typeof record['after'] === 'string');
 }
 
-export function splitId(id: string): [string, string] {
-  const parts = id.replaceAll('\\', '/').split('/');
-  if (parts.length !== 2) throw new ApiError(400, 'bad_request', '候选 id 必须是 YYYY-MM/slug');
-  return [parts[0] ?? '', parts[1] ?? ''];
-}
-
 export function idFrom(url: URL): string {
   const id = url.searchParams.get('id') ?? '';
-  if (!id) throw new ApiError(400, 'bad_request', '缺少候选 id');
+  if (!id) throw new ApiError(400, 'bad_request', '缺少问题 id');
   return id;
 }
 
@@ -247,28 +257,12 @@ export function relative(root: string, absolute: string): string {
   return path.relative(root, absolute).replaceAll('\\', '/');
 }
 
-export function composeSessionPrompt(systemPrompt: string, userPrompt: string): string {
-  return [
-    '# 仓库审查任务（独立 DSH 会话）',
-    '',
-    '下面是本次仓库审查的完整准则与任务上下文。请完整遵守，并在当前仓库中直接执行；不要只输出计划。',
-    '',
-    '---',
-    '',
-    systemPrompt,
-    '',
-    '---',
-    '',
-    userPrompt,
-  ].join('\n');
-}
-
 export function filterFrom(url: URL, owner: string): ReviewFilter {
   const statusParam = url.searchParams.get('statuses') ?? '';
   const statuses = statusParam
     .split(',')
     .map((item) => item.trim())
-    .filter((item): item is ReviewStatus => STATUSES.includes(item as ReviewStatus));
+    .filter((item): item is ReviewStatus => REVIEW_STATUSES.includes(item as ReviewStatus));
   const tag = url.searchParams.get('tag')?.trim();
   const dir = url.searchParams.get('dir')?.trim();
   const text = url.searchParams.get('text')?.trim();
@@ -284,12 +278,10 @@ export function filterFrom(url: URL, owner: string): ReviewFilter {
   return filter;
 }
 
-/** 同一异步调用链内重入会死锁，因此用 AsyncLocalStorage 检查重入。跨请求共享持锁标记会误拒绝正常排队者。 */
 export class RepoLock {
   private writeLocks = new Map<string, Promise<unknown>>();
   private readonly lockContext = new AsyncLocalStorage<string>();
 
-  /** 前一项失败不应使已排队的后续写入失去执行机会。 */
   withWriteLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.writeLocks.get(repoRoot) ?? Promise.resolve();
     const next = previous.then(fn, fn);
@@ -301,7 +293,7 @@ export class RepoLock {
     return runtimeFor(url).then(
       (runtime) => {
         if (this.lockContext.getStore() === runtime.root) {
-          throw new ApiError(500, 'internal', 'repo 锁重入：该路由已在锁定临界区内再次取锁（路由类别与 handler 取锁策略冲突）');
+          throw new ApiError(500, 'internal', 'repo 锁重入：该路由已在锁定临界区内再次取锁');
         }
         return this.lockContext.run(runtime.root, () => this.withWriteLock(runtime.root, fn));
       },
@@ -313,17 +305,25 @@ export class RepoLock {
   }
 }
 
+export interface FixSessionOccupancy {
+  root: string;
+  candidateId: string;
+  optionId: string;
+  patchId: number;
+  sessionId: string;
+  owner: string;
+  createdAt: string;
+  state: 'creating' | 'active' | 'verifying';
+}
+
 export interface ApiHost {
   readonly deps: ApiDeps;
-  /** 重配置会替换设置对象，长生命周期调用方须每次读取。 */
   currentSettings(): AppSettings;
   readonly jobManager: JobManager;
   readonly lastConfigErrors: readonly string[];
   readonly detectedVcsType: VcsType | null;
 
-  /** 未配置仓库或目录不受版本控制时抛出 412。 */
   runtimeFor(url: URL): Promise<Runtime>;
-  /** 显式设置优先于仓库推断的身份。 */
   ownerFor(root: string): Promise<string>;
   withWriteLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T>;
 
@@ -331,10 +331,19 @@ export interface ApiHost {
   ensureNoAuditRunning(root?: string): void;
   leaseLookup(auditId: string): AuditLeaseRecord | undefined;
   leaseTransition(auditId: string, state: 'released' | 'releasable'): Promise<void>;
-  /** 回调只在内存中保存，宿主重启后收尾需创建新 Job。 */
   readonly auditJobFinishes: Map<string, (result?: unknown) => void>;
   readonly auditJobLeases: Map<string, string>;
 
-  startAiFixJob(runtime: Runtime, id: string, guard: ConcurrencyGuard, selection?: import('./types.js').IssueSelection, regenerate?: boolean): Promise<JobRecord>;
-  readonly fixSessionGuard: { activeFor(root: string): { candidateId: string; sessionId: string } | undefined };
+  startAiFixJob(
+    runtime: Runtime,
+    id: string,
+    guard: ConcurrencyGuard,
+    selection: IssueSelection,
+    intent?: 'revise' | 'rebase',
+  ): Promise<JobRecord>;
+
+  readonly fixSessionGuard: {
+    activeFor(root: string): FixSessionOccupancy | undefined;
+    releaseVerified(root: string, runtime: Runtime): Promise<boolean>;
+  };
 }

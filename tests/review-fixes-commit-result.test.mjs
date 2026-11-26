@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFile, rm } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import path from 'node:path';
 import { ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
@@ -15,6 +15,8 @@ async function fixture(t, audit = false) {
     runCommand('git', ['config', 'user.email', 'tester@example.com'], root);
     const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
     await writeCandidate(root, 'verified', { review: { baseRevision: JSON.stringify(base), bodyLines: ['# 需人工判断项', '无。'] } });
+    await mkdir(path.join(root, '.ai-review'), { recursive: true });
+    await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nrules: []\n', 'utf8');
     runCommand('git', ['add', '.ai-review'], root);
     runCommand('git', ['commit', '-qm', 'candidate'], root);
     const api = new ReviewApi({ settings: { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType: 'git',
@@ -31,7 +33,7 @@ async function fixture(t, audit = false) {
     await api.init();
     const detail = (await api.invoke({ method: 'GET', path: '/candidate', query: { id: '2026-11/verified' } })).body;
     const meta = detail.candidate.meta;
-    const guard = { expectedRevision: meta.currentRevision, expectedOwner: meta.owner, expectedUpdatedAt: meta.updatedAt };
+    const guard = { expectedRevision: meta.recordRevision, expectedOwner: meta.owner, expectedUpdatedAt: meta.updatedAt };
     return { root, api, guard };
 }
 
@@ -56,7 +58,7 @@ test('AC-RECOVERY-01 提交已落地但完整核验失败，评论不得弱化�
 
 test('AC-RECOVERY-01 批准完整提交核验失败保留提交并返回恢复状态', async t => {
     const { root, api, guard } = await fixture(t);
-    const outcome = await resultOf(api, await api.invoke({ method: 'POST', path: '/approve', body: { id: '2026-11/verified', ...guard } }));
+    const outcome = await resultOf(api, await api.invoke({ method: 'POST', path: '/approve', body: { id: '2026-11/verified', optionId: 'opt-a', patchId: 1, ...guard } }));
     assert.equal(outcome.status, 'RECOVERY_REQUIRED');
     assert.equal(outcome.reason, 'COMMIT_OUTCOME_UNKNOWN');
     assert.match(await readFile(path.join(root, 'src/math.js'), 'utf8'), /a \+ b/);

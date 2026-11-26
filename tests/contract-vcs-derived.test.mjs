@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
+import { patchFixture, reviewFixture, sha256Hex } from './fixtures/contract.mjs';
 
 function canRun(command) {
   const result = spawnSync(command, ['--version'], { encoding: 'utf8' });
@@ -18,41 +19,51 @@ const CANDIDATE_DIR_REL = '.ai-review/2026-11/20261110-derive';
 const REVIEW_REL = `${CANDIDATE_DIR_REL}/review.md`;
 const PATCH_REL = `${CANDIDATE_DIR_REL}/001.patch`;
 const BUSINESS_REL = 'src/math.js';
+const PATCH_TEXT = patchFixture();
+const PATCH_SHA = sha256Hex(PATCH_TEXT);
 
-function reviewMarkdown(status) {
+function reviewMarkdown(status, extraOverrides = {}) {
   const approved = status === 'approved';
-  return [
-    '---',
-    'schema_version: 1',
-    'title: "net: derive"',
-    'module: net',
-    'audit_type: bugfix',
-    'created_at: "2026-11-05T09:00:00+08:00"',
-    'updated_at: "2026-11-05T09:00:00+08:00"',
-    'owner: tester',
-    'tags: []',
-    `status: ${status}`,
-    'ticket: null',
-    `target_files: [${BUSINESS_REL}]`,
-    'current_revision: 1',
-    'revisions:',
-    '  - id: 1',
-    '    base_revision: "1"',
-    '    patch: 001.patch',
-    '    author: ai',
-    'gate_checks: []',
-    'comments: []',
-    'human_decisions: []',
-    ...(approved
-      ? ['approval:', '  approved_by: tester', '  approved_at: "2026-11-05T10:00:00+08:00"']
-      : ['approval: null']),
-    'rejection: null',
-    'commit_message: "net: derive"',
-    '---',
-    '',
-    '# 问题与影响',
-    '',
-  ].join('\n');
+  return reviewFixture('20261110-derive', {
+    title: 'net: derive',
+    commitMessage: 'net: derive',
+    createdAt: '2026-11-05T09:00:00+08:00',
+    updatedAt: approved ? '2026-11-05T10:00:00+08:00' : '2026-11-05T09:00:00+08:00',
+    status,
+    patchText: PATCH_TEXT,
+    patchSha256: PATCH_SHA,
+    ...(approved ? {
+      repairAttempts: [
+        '',
+        '  - id: 1',
+        '    option_id: opt-a',
+        '    patch_id: 1',
+        '    base_revision: "1"',
+        '    actor: tester',
+        '    at: "2026-11-05T10:00:00+08:00"',
+        '    apply_mode: program_strict',
+        '    result: applied',
+        '    restored: true',
+        '    evidence: "gate ok"',
+      ].join('\n'),
+      approval: [
+        '',
+        '  approved_by: tester',
+        '  approved_at: "2026-11-05T10:00:00+08:00"',
+        '  record_revision: 1',
+        '  option_id: opt-a',
+        '  patch_id: 1',
+        `  patch_sha256: "${PATCH_SHA}"`,
+        '  repair_attempt_id: 1',
+        '  base_revision: "1"',
+        '  gate_checks: ["node --version"]',
+        '  gate_results: [{command: "node --version", exit_code: 0, duration_ms: 1}]',
+        '  confirmed_decisions: []',
+        '  waived_decisions: []',
+      ].join('\n'),
+    } : {}),
+    ...extraOverrides,
+  });
 }
 
 async function writeRepoFile(root, relPath, text) {
@@ -71,10 +82,9 @@ async function createSvnFixture() {
   return { base, repo, url, wc };
 }
 
-/** 提交夹具后先更新工作副本根版本，让后续子路径提交对比使用固定起点。 */
 async function seedSvnCandidate(root) {
   await writeRepoFile(root, REVIEW_REL, reviewMarkdown('pending'));
-  await writeRepoFile(root, PATCH_REL, '--- a/src/math.js\n+++ b/src/math.js\n');
+  await writeRepoFile(root, PATCH_REL, PATCH_TEXT);
   await writeRepoFile(root, BUSINESS_REL, 'export const add = (a, b) => a - b;\n');
   runCommand('svn', ['--non-interactive', 'add', '--force', '.'], root);
   runCommand('svn', ['--non-interactive', 'commit', '-m', 'audit pending'], root);
@@ -92,17 +102,14 @@ test('SVN: getCommitProbe 随目标路径提交前进，getCurrentBase 保持根
 
   await writeRepoFile(wc, REVIEW_REL, reviewMarkdown('approved'));
   await writeRepoFile(wc, BUSINESS_REL, 'export const add = (a, b) => a + b;\n');
-  // 把候选目录纳入 SVN 提交路径，确保已调度删除的补丁随批准提交。
   const commit = await vcs.atomicCommit({
     message: 'net: derive',
-    paths: [REVIEW_REL, BUSINESS_REL, CANDIDATE_DIR_REL],
-    deletePaths: [PATCH_REL],
+    paths: [REVIEW_REL, BUSINESS_REL],
   });
   assert.equal(commit.success, true, commit.errorOutput);
 
   const baseAfter = await vcs.getCurrentBase();
   const probeAfter = await vcs.getCommitProbe([REVIEW_REL, PATCH_REL]);
-  // SVN 工作副本根版本可能停在原处，提交探针必须根据实际提交路径判断。
   assert.equal(baseAfter, baseBefore, 'SVN 根 revision 不随子路径提交前进');
   assert.notEqual(probeAfter, probeBefore, '路径级探针必须随提交前进');
   assert.equal(probeAfter, commit.commitRevision);
@@ -123,7 +130,6 @@ test('SVN: readFileAt(probe) 读到已提交内容；out-of-date 失败提交后
   assert.equal(probeAfter, commit.commitRevision);
   assert.equal(await vcs.readFileAt(probeAfter, REVIEW_REL), reviewMarkdown('approved'));
 
-  // 用第二个工作副本提交同一文件，让待测工作副本落后于仓库并触发 out-of-date 错误。
   const wc2 = path.join(base, 'wc2');
   runCommand('svn', ['--non-interactive', 'checkout', url, wc2], base);
   await writeRepoFile(wc2, REVIEW_REL, reviewMarkdown('approved').replace('approved_by: tester', 'approved_by: concurrent'));
@@ -137,7 +143,7 @@ test('SVN: readFileAt(probe) 读到已提交内容；out-of-date 失败提交后
   assert.equal(await vcs.getCommitProbe([REVIEW_REL]), probeBeforeFailure);
 });
 
-test('SVN: approved review.md + 删除补丁的原子提交派生为 found 且 revision 正确', { skip: !hasSvn }, async () => {
+test('SVN: approved review.md 保留不可变补丁的原子提交派生为 found 且 revision 正确', { skip: !hasSvn }, async () => {
   const { wc } = await createSvnFixture();
   await seedSvnCandidate(wc);
   const vcs = createVcs('svn', wc);
@@ -146,8 +152,7 @@ test('SVN: approved review.md + 删除补丁的原子提交派生为 found 且 r
   await writeRepoFile(wc, BUSINESS_REL, 'export const add = (a, b) => a + b;\n');
   const commit = await vcs.atomicCommit({
     message: 'net: derive',
-    paths: [REVIEW_REL, BUSINESS_REL, CANDIDATE_DIR_REL],
-    deletePaths: [PATCH_REL],
+    paths: [REVIEW_REL, BUSINESS_REL],
   });
   assert.equal(commit.success, true, commit.errorOutput);
   assert.match(commit.commitRevision ?? '', /^\d+$/);
@@ -161,24 +166,22 @@ test('SVN: approved review.md + 删除补丁的原子提交派生为 found 且 r
   assert.equal(derived.revision, commit.commitRevision);
 });
 
-test('Git: 分支上删除补丁后 merge，deriveApprovalCommit 仍 found 且指向批准提交', async () => {
+test('Git: 分支批准提交后 merge，deriveApprovalCommit 仍 found 且指向批准提交（不删除补丁）', async () => {
   const root = await createGitFixture();
   const mainBranch = runCommand('git', ['rev-parse', '--abbrev-ref', 'HEAD'], root).stdout.trim();
 
   await writeRepoFile(root, REVIEW_REL, reviewMarkdown('pending'));
-  await writeRepoFile(root, PATCH_REL, '--- a/src/math.js\n+++ b/src/math.js\n');
+  await writeRepoFile(root, PATCH_REL, PATCH_TEXT);
   runCommand('git', ['add', '-A'], root);
   runCommand('git', ['commit', '-q', '-m', 'audit pending'], root);
 
   runCommand('git', ['checkout', '-q', '-b', 'feat'], root);
   await writeRepoFile(root, REVIEW_REL, reviewMarkdown('approved'));
   await writeRepoFile(root, BUSINESS_REL, 'export const add = (a, b) => a + b;\n');
-  runCommand('git', ['rm', '-q', PATCH_REL], root);
   runCommand('git', ['add', '-A'], root);
   runCommand('git', ['commit', '-q', '-m', 'net: derive'], root);
   const approvalCommit = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
 
-  // 合并也会相对于第一父提交表现为删除补丁，构造这个假阳性来检验派生定位。
   runCommand('git', ['checkout', '-q', mainBranch], root);
   await writeRepoFile(root, 'docs.txt', 'docs\n');
   runCommand('git', ['add', '-A'], root);
@@ -192,7 +195,6 @@ test('Git: 分支上删除补丁后 merge，deriveApprovalCommit 仍 found 且�
     patchPaths: [PATCH_REL],
     targetFiles: [BUSINESS_REL],
   });
-  // 合并的一个父提交已经是 approved，合并本身未产生新的批准状态迁移。
   assert.equal(derived.lookup, 'found', derived.diagnostic);
   assert.equal(derived.revision, approvalCommit);
   assert.notEqual(derived.revision, mergeCommit);

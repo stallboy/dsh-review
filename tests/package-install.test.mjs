@@ -52,22 +52,20 @@ test('独立插件包离线安装后可加载宿主、界面和资源，不携�
         const manifest = require('dsh-code-review/package.json');
         assert.equal(manifest.dsh.client.platform, 'web');
         const packageRoot = path.dirname(require.resolve('dsh-code-review/package.json'));
-        const { buildAuditPrompt, loadAuditSystemPrompt } = await import('./node_modules/dsh-code-review/dist/host/auditor.js');
-        const { loadSystemPrompt } = await import('./node_modules/dsh-code-review/dist/host/runner.js');
-        assert.ok((await loadAuditSystemPrompt()).length > 100);
-        const directPrompt = await buildAuditPrompt({
-            repoRoot: process.cwd(), vcsType: 'git', owner: 'offline', targetPath: '',
-            note: '离线保留 {{baseRevision}}', baseRevision: 'offline-base',
-            reportPath: '.ai-review/audits/offline/audit.md', mode: 'session',
-        });
-        assert.match(directPrompt, /## 会话执行方式/);
-        assert.match(directPrompt, /^schema_version: 2$/m);
-        assert.ok(directPrompt.includes('离线保留 {{baseRevision}}'));
-        assert.ok((await loadSystemPrompt()).length > 100);
+        const { previewAuditPrompt } = await import('./node_modules/dsh-code-review/dist/host/auditor.js');
+        const { loadProposalSystemPrompt, loadModeCSystemPrompt } = await import('./node_modules/dsh-code-review/dist/host/runner.js');
+        const { ReviewStore } = await import('./node_modules/dsh-code-review/dist/host/store.js');
+        const { createVcs } = await import('./node_modules/dsh-code-review/dist/host/vcs.js');
+        assert.ok((await loadProposalSystemPrompt()).length > 100);
+        assert.ok((await loadModeCSystemPrompt()).length > 100);
         assert.match(readFileSync(require.resolve('dsh-code-review/client'), 'utf8'), /__ModuleLoader__/);
         assert.ok(existsSync(require.resolve('dsh-code-review/locale/zh.json')));
         assert.ok(existsSync(require.resolve('dsh-code-review/icon')));
         assert.ok(existsSync(path.join(packageRoot, manifest.dsh.bundle.patch)));
+        assert.ok(existsSync(path.join(packageRoot, 'assets/audit/orchestrator.md')));
+        assert.ok(existsSync(path.join(packageRoot, 'assets/audit/scan/SKILL.md')));
+        assert.ok(existsSync(path.join(packageRoot, 'assets/audit/verify/SKILL.md')));
+        assert.ok(existsSync(path.join(packageRoot, 'assets/audit/patch/SKILL.md')));
         assert.equal(existsSync(path.join(packageRoot, 'apps')), false);
         assert.equal(existsSync('./node_modules/fastify'), false);
         const repo = path.resolve('manual-audit-repo');
@@ -75,19 +73,34 @@ test('独立插件包离线安装后可加载宿主、界面和资源，不携�
         const git = (...args) => execFileSync('git', args, { cwd: repo, windowsHide: true });
         git('init', '-q');
         writeFileSync(path.join(repo, 'README.md'), '# 离线仓库');
-        git('add', 'README.md');
+        mkdirSync(path.join(repo, '.ai-review'), { recursive: true });
+        writeFileSync(path.join(repo, '.ai-review', 'reviewers.yml'), 'default_owner: offline\\nrules: []\\n');
+        git('add', 'README.md', '.ai-review/reviewers.yml');
         git('-c', 'user.name=offline', '-c', 'user.email=offline@example.com', 'commit', '-qm', 'baseline');
         const host = './node_modules/dsh-code-review/dist/host/';
         const { ReviewApi } = await import(host + 'api.js');
         const { DEFAULT_SETTINGS } = await import(host + 'settings.js');
+        const { GitHeadCandidateSource } = await import(host + 'shared-facts.js');
+        const preview = await previewAuditPrompt({
+            store: new ReviewStore(repo),
+            vcs: createVcs('git', repo),
+            settings: { ...DEFAULT_SETTINGS, repoRoot: repo, vcsType: 'git', owner: 'offline' },
+            owner: 'offline',
+            targetPath: '',
+            note: '离线保留 {{baseRevision}}',
+            mode: 'session',
+            source: await GitHeadCandidateSource.create(repo),
+        });
+        assert.ok(preview.prompt.includes('离线保留 {{baseRevision}}'));
+        assert.ok(preview.prompt.length > 200);
         const api = new ReviewApi({
             settings: { ...DEFAULT_SETTINGS, repoRoot: repo, vcsType: 'git', owner: 'offline' },
             saveSettings: async next => next,
             statePath: path.resolve('offline-state.json'),
         });
         await api.init();
-        const task = path.join(packageRoot, 'assets/audit/direct/task.md');
-        renameSync(task, task + '.missing');
+        const orchestrator = path.join(packageRoot, 'assets/audit/orchestrator.md');
+        renameSync(orchestrator, orchestrator + '.missing');
         const failure = await api.invoke({ method: 'POST', path: '/audit/manual', body: {} });
         assert.equal(failure.status, 500);
         const queue = await api.invoke({ method: 'GET', path: '/queue' });

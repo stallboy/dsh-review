@@ -1,13 +1,17 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
-import { buildAuditPrompt } from '../packages/dsh-plugin/dist/host/auditor.js';
+import { AuditArchive, scopeCovers } from '../packages/dsh-plugin/dist/host/audit-archive.js';
+import { previewAuditPrompt } from '../packages/dsh-plugin/dist/host/auditor.js';
 import { GitHeadCandidateSource } from '../packages/dsh-plugin/dist/host/shared-facts.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
+import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
+import { createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
+import { writeCandidate } from './fixtures/contract.mjs';
 
 const servers = [];
 after(async () => {
@@ -31,147 +35,108 @@ async function ensureReviewers(root) {
   await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nrules: []\n', 'utf8');
 }
 
-function candidateFm({ title, status, rejection = false }) {
-  return [
-    '---', 'schema_version: 1', `title: "${title}"`, 'module: net', 'audit_type: bugfix',
-    'created_at: "2026-11-09T10:00:00+08:00"', 'updated_at: "2026-11-09T10:00:00+08:00"', 'owner: tester',
-    'tags: []', `status: ${status}`, 'ticket: null', 'target_files: [src/math.js]', 'current_revision: 1',
-    'revisions:', '  - id: 1', '    base_revision: "1"', '    patch: 001.patch', '    author: ai',
-    'gate_checks: ["node --version"]', 'comments: []', 'human_decisions: []', 'approval: null',
-    ...(rejection ? ['rejection:', '  rejected_by: tester', '  rejected_at: "2026-11-09T10:00:00Z"', '  reason: "已有更简单的实现"'] : ['rejection: null']),
-    `commit_message: "${title}"`, '---', '', '# 问题与影响', '',
-  ].join('\n');
-}
-
-async function writeCandidate(root, slug, { title, status, rejection = false }) {
-  const dir = path.join(root, '.ai-review', '2026-11', slug);
-  await mkdir(dir, { recursive: true });
-  await writeFile(path.join(dir, 'review.md'), candidateFm({ title, status, rejection }), 'utf8');
-  await writeFile(path.join(dir, '001.patch'), [
-    'diff --git a/src/math.js b/src/math.js',
-    '--- a/src/math.js',
-    '+++ b/src/math.js',
-    '@@ -1 +1 @@',
-    '-export const add = (a, b) => a - b;',
-    '+export const add = (a, b) => a + b;',
-    '',
-  ].join('\n'), 'utf8');
-}
-
-async function writeAudit(root, auditId, scope, status, findingId = 'f-aaaaaaaaaa') {
-  const dir = path.join(root, '.ai-review', 'audits', auditId);
-  await mkdir(dir, { recursive: true });
-  const compact = auditId.slice(0, 15);
-  const createdAt = `${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)}T${compact.slice(9, 11)}:${compact.slice(11, 13)}:${compact.slice(13, 15)}Z`;
-  const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  await writeFile(path.join(dir, 'audit.md'), [
-    '---', 'schema_version: 1', `audit_id: ${auditId}`, `created_at: "${createdAt}"`, `base_revision: "${head}"`,
-    `scope: ${scope}`, 'trigger: manual', 'previous_audit: null', 'candidates: []',
-    'items:',
-    `  - finding_id: ${findingId}`,
-    '    kind: confirm',
-    '    title: 认证流程需要确认',
-    '    summary: 影响兼容性',
-    `    target_files: [${scope === '.' ? 'src/math.js' : scope}]`,
-    '    depends_on: null',
-    `    status: ${status}`,
-    '    candidate: null',
-    '---', '', '# 仓库审查报告', '',
-  ].join('\n'), 'utf8');
-}
-
 function commitAll(root, message) {
   runCommand('git', ['add', '-A'], root);
   runCommand('git', ['commit', '-q', '-m', message], root);
 }
 
-test('§7.1/G41：finding 投影读 HEAD 快照，本地篡改不可见；新提交后缓存失效', async () => {
+test('§4.6：/findings 与 /audits 读 HEAD 共享快照，本地篡改不可见；新提交后立即可见', async () => {
   const root = await createGitFixture();
   await ensureReviewers(root);
-  await writeAudit(root, '20261110-100000-repo', '.', 'pending');
+  await writeCandidate(root, '20261110-finding-a', {
+    review: { findingId: 'f-shared', status: 'pending' },
+  });
+  const archive = new AuditArchive(root);
+  const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  await archive.writeAudit({
+    schemaVersion: 1,
+    auditId: '20261110-100000-repo',
+    createdAt: '2026-11-10T10:00:00.000Z',
+    baseRevision: head,
+    scope: '.',
+    trigger: 'manual',
+    previousAudit: null,
+    issues: ['2026-11/20261110-finding-a'],
+  }, '# 仓库审查报告\n');
   commitAll(root, 'audit fixture');
   const { base } = await startApi(root);
 
   const first = await (await fetch(`${base}/findings`)).json();
   assert.equal(first.findings.length, 1);
-  assert.equal(first.findings[0].state, 'open', 'pending item 投影为 open');
+  assert.equal(first.findings[0].issueStatus, 'pending');
 
-  const auditPath = path.join(root, '.ai-review', 'audits', '20261110-100000-repo', 'audit.md');
-  const shared = await (await import('node:fs/promises')).readFile(auditPath, 'utf8');
-  await writeFile(auditPath, shared.replace('status: pending', 'status: dismissed'), 'utf8');
+  // 工作区本地篡改不得污染共享投影
+  const reviewPath = path.join(root, '.ai-review', '2026-11', '20261110-finding-a', 'review.md');
+  const shared = await readFile(reviewPath, 'utf8');
+  await writeFile(reviewPath, shared.replace('status: pending', 'status: human_takeover'), 'utf8');
   const second = await (await fetch(`${base}/findings`)).json();
-  assert.equal(second.findings[0].state, 'open', '本地篡改不得进入投影（必须读共享快照）');
+  assert.equal(second.findings.length, 0, '工作区修改使该候选变为 local，不得直接作为共享事实投影');
 
-  await writeAudit(root, '20261110-110000-local', '.', 'pending', 'f-bbbbbbbbbb');
-  const auditsLocal = await (await fetch(`${base}/audits`)).json();
-  assert.deepEqual(auditsLocal.audits.map((entry) => entry.auditId), ['20261110-100000-repo'], '本地档案不是共享事实');
-
-  // 只提交被修改的共享档案，保留新档案为本地草稿，以区分缓存失效与工作区泄漏。
-  runCommand('git', ['add', '.ai-review/audits/20261110-100000-repo'], root);
-  runCommand('git', ['commit', '-q', '-m', 'dismiss finding'], root);
+  // 提交后新状态立即可见
+  commitAll(root, 'human takeover');
   const third = await (await fetch(`${base}/findings`)).json();
-  assert.equal(third.findings[0].state, 'dismissed', '新提交后投影缓存必须失效');
+  assert.equal(third.findings.length, 1);
+  assert.equal(third.findings[0].issueStatus, 'human_takeover');
 
-  const auditsStillOne = await (await fetch(`${base}/audits`)).json();
-  assert.deepEqual(auditsStillOne.audits.map((entry) => entry.auditId), ['20261110-100000-repo']);
-
-  runCommand('git', ['add', '.ai-review/audits/20261110-110000-local'], root);
-  runCommand('git', ['commit', '-q', '-m', 'second audit'], root);
-  const auditsCommitted = await (await fetch(`${base}/audits`)).json();
-  assert.deepEqual(
-    auditsCommitted.audits.map((entry) => entry.auditId).sort(),
-    ['20261110-100000-repo', '20261110-110000-local'],
-  );
+  // 未提交的新档案不进入共享 /audits
+  await archive.writeAudit({
+    schemaVersion: 1,
+    auditId: '20261110-110000-local',
+    createdAt: '2026-11-10T11:00:00.000Z',
+    baseRevision: head,
+    scope: '.',
+    trigger: 'manual',
+    previousAudit: '20261110-100000-repo',
+    issues: [],
+  }, '# 本地草稿\n');
+  const auditsLocal = await (await fetch(`${base}/audits`)).json();
+  assert.deepEqual(auditsLocal.audits.map((entry) => entry.auditId), ['20261110-100000-repo']);
 });
 
-test('§7.1/G10：非全仓 scope 的空 target_files 会排除 item（buildAuditItems 告警）', async () => {
-  const { buildAuditItems } = await import('../packages/dsh-plugin/dist/host/auditor.js');
-  const warnings = [];
-  const items = buildAuditItems([
-    { label: '需要人工确认', text: '影响 `src/math.js` 的边界', category: 'confirm' },
-    { label: '无路径线索', text: '只描述行为，不写文件', category: 'confirm' },
-  ], warnings, 'src');
-  assert.deepEqual(items[0].targetFiles, ['src/math.js']);
-  assert.deepEqual(items[1].targetFiles, []);
-  assert.equal(warnings.length, 1, JSON.stringify(warnings));
-  assert.match(warnings[0], /target_files/);
-  assert.match(warnings[0], /无路径线索/);
-
-  const warningsAll = [];
-  buildAuditItems([{ label: '全仓问题', text: '无路径', category: 'confirm' }], warningsAll, '.');
-  assert.equal(warningsAll.length, 0);
+test('§3.5：scopeCovers 精确判定非全仓 scope 覆盖', () => {
+  assert.equal(scopeCovers('src', ['src/math.js']), true);
+  assert.equal(scopeCovers('src', ['docs/readme.md']), false);
+  assert.equal(scopeCovers('src', []), false);
+  assert.equal(scopeCovers('.', []), true);
 });
 
-test('§7.1/G10：负向记忆与已存在候选注入只读共享快照（本地草稿不注入）', async () => {
+test('§4.6：负向记忆摘要注入只读共享快照（本地 rejected 草稿不注入）', async () => {
   const root = await createGitFixture();
   await ensureReviewers(root);
-  await writeCandidate(root, '20261109-shared-rejected', { title: 'net: 共享被拒方案', status: 'rejected', rejection: true });
-  await writeCandidate(root, '20261109-shared-pending', { title: 'net: 共享待审方案', status: 'pending' });
+  await writeCandidate(root, '20261109-shared-rejected', {
+    review: {
+      findingId: 'shared-rej',
+      title: 'net: 共享被拒方案',
+      commitMessage: 'net: 共享被拒方案',
+      status: 'rejected',
+      rejection: `\n  rejected_by: tester\n  rejected_at: "${new Date(Date.now() - 86_400_000).toISOString()}"\n  reason: "已有更简单实现"\n  category: intentional_design`,
+    },
+  });
   commitAll(root, 'shared candidates');
-  const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
 
-  await writeCandidate(root, '20261109-local-rejected', { title: 'net: 本地被拒方案', status: 'rejected', rejection: true });
-  await writeCandidate(root, '20261109-local-pending', { title: 'net: 本地待审方案', status: 'pending' });
+  await writeCandidate(root, '20261109-local-rejected', {
+    review: {
+      findingId: 'local-rej',
+      title: 'net: 本地被拒方案',
+      commitMessage: 'net: 本地被拒方案',
+      status: 'rejected',
+      rejection: `\n  rejected_by: tester\n  rejected_at: "${new Date(Date.now() - 86_400_000).toISOString()}"\n  reason: "草稿"\n  category: false_positive`,
+    },
+  });
 
   const source = await GitHeadCandidateSource.create(root);
   assert.ok(source);
-  const prompt = await buildAuditPrompt({
-    repoRoot: root,
-    vcsType: 'git',
+  const preview = await previewAuditPrompt({
+    store: new ReviewStore(root),
+    vcs: createVcs('git', root),
+    settings: { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester' },
     owner: 'tester',
-    targetPath: '',
+    targetPath: '.',
     note: '',
-    baseRevision: head,
-    reportPath: '.ai-review/audits/20261110-120000-repo/audit.md',
     mode: 'headless',
     source,
   });
 
-  const memory = prompt.split('## 负向记忆')[1]?.split('## 仓库结构摘要')[0] ?? '';
-  assert.match(memory, /共享被拒方案/, '共享 rejected 必须注入负向记忆');
-  assert.doesNotMatch(memory, /本地被拒方案/, '本地 rejected 草稿不得注入负向记忆');
-
-  const existing = prompt.split('## 已存在的候选')[1]?.split('## 负向记忆')[0] ?? '';
-  assert.match(existing, /共享待审方案/, '共享 pending 必须列为已存在候选');
-  assert.doesNotMatch(existing, /本地待审方案/, '本地草稿不得列为共享已存在候选');
+  assert.match(preview.prompt, /共享被拒方案/, '共享 rejected 必须注入负向记忆');
+  assert.doesNotMatch(preview.prompt, /本地被拒方案/, '本地 rejected 草稿不得注入负向记忆');
 });

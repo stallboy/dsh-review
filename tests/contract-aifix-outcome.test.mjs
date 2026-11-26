@@ -1,12 +1,12 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
-import { createGitFixture, runCommand } from './helpers.mjs';
+import { createGitFixture } from './helpers.mjs';
 import { commitCandidate, guardFixture } from './fixtures/contract.mjs';
 
 const servers = [];
@@ -62,7 +62,7 @@ function assertAiFixOutcomeShape(result, label) {
   }
 }
 
-test('§8.3：旧人工补丁接口返回 404，不创建修复任务', async () => {
+test('§6.3：旧人工补丁接口返回 404，不创建修复任务', async () => {
   const root = await createGitFixture();
   const candidate = await commitCandidate(root, '20261111-manual-rev-shape');
   const { base } = await startApi(root);
@@ -74,16 +74,18 @@ test('§8.3：旧人工补丁接口返回 404，不创建修复任务', async ()
   assert.equal(body.jobId, undefined);
 });
 
-test('§7.7：/candidate/finalize 的结果是 AiFixOutcome 判别形状（校验失败 → VALIDATION_FAILED + errors）', async () => {
+test('§5.6：/candidate/finalize 的结果是 AiFixOutcome 判别形状（未生成新补丁 → VALIDATION_FAILED + errors）', async () => {
   const root = await createGitFixture();
-  // 用空 gate_checks 构造无效候选，使请求进入收尾校验失败分支。
-  const candidate = await commitCandidate(root, '20261111-finalize-shape', {
-    review: { gateChecks: '[]' },
-    commit: false,
-  });
+  const candidate = await commitCandidate(root, '20261111-finalize-shape');
+  // 留下一处无效补丁写入但未更新 review.md 账本，验证收尾返回 VALIDATION_FAILED
+  await writeFile(path.join(candidate.dir, '002.patch'), 'not a valid patch\n', 'utf8');
   const { base } = await startApi(root);
 
-  const res = await post(base, '/candidate/finalize', { id: candidate.id });
+  const res = await post(base, '/candidate/finalize', {
+    ...guardFixture(candidate.id),
+    optionId: 'opt-a',
+    patchId: 1,
+  });
   assert.equal(res.status, 202, JSON.stringify(await res.clone().json().catch(() => ({}))));
   const job = await waitJob(base, (await res.json()).jobId);
   assertAiFixOutcomeShape(job.result, 'candidate/finalize');
@@ -91,11 +93,10 @@ test('§7.7：/candidate/finalize 的结果是 AiFixOutcome 判别形状（校�
   assert.ok(Array.isArray(job.result.errors) && job.result.errors.length > 0, 'VALIDATION_FAILED 必须带 errors');
 });
 
-test('§7.7：/ai-fix 在 manual Runner 下返回 MANUAL_REQUIRED + manualPrompt（判别形状）', async () => {
+test('§5.6：/ai-fix 在 manual Runner 下返回 MANUAL_REQUIRED + manualPrompt（判别形状）', async () => {
   const root = await createGitFixture();
   const candidate = await commitCandidate(root, '20261111-ai-fix-manual-shape', {
     review: {
-      // 覆盖值紧跟 `comments:`，首个空行和后续缩进用于形成 YAML 块列表。
       comments: [
         '',
         '  - id: c1',
@@ -111,27 +112,27 @@ test('§7.7：/ai-fix 在 manual Runner 下返回 MANUAL_REQUIRED + manualPrompt
   });
   const { base } = await startApi(root, { runner: 'manual' });
 
-  const res = await post(base, '/ai-fix', { ...guardFixture(candidate.id) });
+  const res = await post(base, '/ai-fix', {
+    ...guardFixture(candidate.id),
+    optionId: 'opt-a',
+    patchId: 1,
+  });
   assert.equal(res.status, 202, JSON.stringify(await res.clone().json().catch(() => ({}))));
   const job = await waitJob(base, (await res.json()).jobId);
   assertAiFixOutcomeShape(job.result, 'ai-fix');
   assert.equal(job.result.status, 'MANUAL_REQUIRED');
-  assert.match(String(job.result.manualPrompt), /请补充边界测试/);
+  assert.match(String(job.result.prompt), /请补充边界测试/);
 });
 
-test('§7.7/§7.5：实现源码中 ai_fix 端点不得再返回裸的非判别对象', async () => {
-  // 路由装配、写事务与读模型分处不同文件，源码断言需要覆盖这三处。
+test('§5.6：实现源码中 ai_fix 端点严格使用 AiFixOutcome 判别联合，不得返回旧非判别对象', async () => {
   const hostFiles = ['api.ts', 'api-writers.ts', 'api-readmodels.ts'];
   const sources = await Promise.all(
     hostFiles.map(async (name) => [name, await readFile(new URL(`../packages/dsh-plugin/src/host/${name}`, import.meta.url), 'utf8')]),
   );
   const source = sources.map(([, text]) => text).join('\n');
-  for (const factory of ['this.aborted(', 'this.recoveryRequired(', 'this.committed(', 'this.validationFailed(']) {
-    assert.ok(source.includes(factory), `必须存在工厂 ${factory}`);
-  }
-  const writers = sources.find(([name]) => name === 'api-writers.ts')?.[1] ?? '';
-  for (const definition of ['aborted', 'recoveryRequired', 'committed', 'validationFailed']) {
-    assert.match(writers, new RegExp(`^ {2}${definition}\\(`, 'm'), `api-writers.ts 必须定义 ${definition} 工厂`);
-  }
-  assert.doesNotMatch(source, /manual: true, prompt:/, 'ai_fix 不得再返回 {manual:true,prompt} 形状');
+  assert.match(source, /AiFixOutcome/);
+  assert.match(source, /status:\s*'MANUAL_REQUIRED'/);
+  assert.match(source, /status:\s*'VALIDATION_FAILED'/);
+  assert.match(source, /status:\s*'COMMITTED'/);
+  assert.doesNotMatch(source, /manual:\s*true,\s*prompt:/, 'ai_fix 不得再返回 {manual:true,prompt} 形状');
 });

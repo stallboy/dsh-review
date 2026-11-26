@@ -7,10 +7,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { buildHunkFallbackDiff, isAiReviewPath, parsePatch } from './patch.js';
 import { parseReviewMarkdown } from './frontmatter.js';
 import { runProcess, tailLines, type ProcessResult } from './shell.js';
-import type { ApplyPatchResult, ApprovalCommitLookup, AuthorStatBucket, AuthorStats, InterRevisionDiff, VcsType } from './types.js';
+import type { ApplyPatchResult, ApprovalCommitLookup, ApprovalInfo, AuthorStatBucket, AuthorStats, InterRevisionDiff, VcsType } from './types.js';
 
 const VCS_TIMEOUT_MS = 180_000;
-const IGNORED_PREFIXES = ['.ai-review/', '.tmp/', 'node_modules/'];
+const IGNORED_PREFIXES = ['.ai-review/'];
 
 export interface DiffInput {
   fromRevision: number;
@@ -79,6 +79,18 @@ export interface ApprovalDeriveInput {
   reviewPath: string;
   patchPaths: string[];
   targetFiles: string[];
+  approval?: ApprovalInfo;
+}
+
+export interface ModeCTopologyCheck {
+  ok: boolean;
+  preHead: string;
+  postHead: string;
+  netChangedPaths: string[];
+  mergedParents: string[];
+  commitCount: number;
+  aiReviewTouched: boolean;
+  diagnostic?: string;
 }
 
 export type ApprovalPatchAttempt = ApplyPatchResult & {
@@ -94,6 +106,21 @@ export interface VcsAdapter {
   syncAndGetLatestBase(): Promise<SyncResult>;
   getCurrentBase(): Promise<string | null>;
   getApprovalTarget?(): Promise<GitApprovalTarget | null>;
+  getCurrentBranch?(): Promise<string | null>;
+  getRemoteTip?(branch?: string): Promise<{ remoteRef: string; tip: string } | null>;
+  hasActiveGitOperation?(): Promise<boolean>;
+  getTreeHash?(revision?: string): Promise<string | null>;
+  isAncestor?(ancestor: string, descendant: string): Promise<boolean>;
+  computeModeCNetChangedPaths?(preHead: string, postHead: string): Promise<ModeCTopologyCheck>;
+  resetHard?(revision: string): Promise<void>;
+  amendCommitWithReview?(input: { reviewPath: string; expectedReviewBlob: string; message: string }): Promise<CommitResult>;
+  collapseLocalCommitsWithReview?(input: {
+    preHead: string;
+    mergedParents: string[];
+    reviewPath: string;
+    expectedReviewBlob: string;
+    message: string;
+  }): Promise<CommitResult>;
   /** 相关提交落地时探针必须变化。返回 null 时，调用方无法据此确定提交结果。 */
   getCommitProbe(paths: string[]): Promise<string | null>;
   getRemoteCommitProbe?(path: string): Promise<string | null>;
@@ -123,21 +150,26 @@ function acceptedDirtyPath(value: string): boolean {
   return !IGNORED_PREFIXES.some((prefix) => normalized === prefix.slice(0, -1) || normalized.startsWith(prefix));
 }
 
-function isApprovedReview(text: string): boolean {
-  try {
-    const parsed = parseReviewMarkdown(text);
-    return parsed.meta.status === 'approved' && parsed.meta.approval !== null;
-  } catch {
-    return false;
-  }
+function approvalIdentityKey(approval: ApprovalInfo): string {
+  return JSON.stringify([
+    approval.optionId,
+    approval.patchId,
+    approval.recordRevision,
+    approval.patchSha256,
+    approval.repairAttemptId,
+    approval.approvedAt,
+    approval.baseRevision,
+  ]);
 }
 
-function issueApproval(text: string | null): string | undefined {
-  if (!text) return undefined;
+function extractReviewApproval(text: string | null): ApprovalInfo | null {
+  if (!text) return null;
   try {
-    const { meta } = parseReviewMarkdown(text);
-    return meta.schemaVersion === 3 && meta.approval ? JSON.stringify(meta.approval) : undefined;
-  } catch { return undefined; }
+    const parsed = parseReviewMarkdown(text);
+    return parsed.meta.status === 'approved' ? parsed.meta.approval : null;
+  } catch {
+    return null;
+  }
 }
 
 function toRepoRelative(value: string): string {
@@ -432,51 +464,66 @@ export class GitAdapter implements VcsAdapter {
     };
   }
 
-  /** 合并提交可能包含批准操作，不能只检查首父，也不能把已批准内容的合入误作新批准。 */
+  /** AC-APPROVE-01 / SPEC §4.4：按具体批准快照精确派生业务提交，支持 Mode C B-已推送与多轮重开再批准。 */
   async deriveApprovalCommit(input: ApprovalDeriveInput): Promise<ApprovalCommitLookup> {
-    if (input.patchPaths.length === 0) {
-      return { revision: null, lookup: 'unknown', diagnostic: '候选没有补丁文件，无法派生' };
-    }
-    // Git 默认不为合并提交列出逐文件差异，用 -m 才能发现相对任一父提交删除的补丁。
+    const normalizedTargets = input.targetFiles.map(toRepoRelative).filter(Boolean);
     const reviewProbe = await this.getCommitProbe([input.reviewPath]);
-    const native = issueApproval(reviewProbe ? await this.readFileAt(reviewProbe, input.reviewPath) : null);
-    const deleters = await git(this.root, native ? ['log', '-m', '--format=%H', '--', input.reviewPath] : [
-      'log', '-m', '--diff-filter=D', '--format=%H', '--', ...input.patchPaths,
-    ]);
-    if (deleters.code !== 0) {
-      return { revision: null, lookup: 'unknown', diagnostic: `历史不可读：${describe(deleters)}` };
+    const targetApproval = input.approval ?? extractReviewApproval(reviewProbe ? await this.readFileAt(reviewProbe, input.reviewPath) : null);
+    if (!targetApproval) {
+      return { revision: null, lookup: 'unknown', diagnostic: '无法读取已批准快照，无法派生业务提交' };
     }
-    const commits = [...new Set(deleters.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0))];
+
+    // 特殊路径：Mode C 提前推送分支写入了 business_commit，校验其存在且触及交付业务路径即可。
+    if (targetApproval.businessCommit) {
+      const bizCommit = targetApproval.businessCommit.trim();
+      const verified = await git(this.root, ['rev-parse', '--verify', `${bizCommit}^{commit}`]);
+      if (verified.code !== 0) {
+        return { revision: null, lookup: 'unknown', diagnostic: `business_commit ${bizCommit} 不存在于当前 Git 历史` };
+      }
+      const resolvedCommit = verified.stdout.trim();
+      const paths = await this.listCommitPaths(resolvedCommit);
+      if (!paths || !normalizedTargets.some((file) => paths.includes(file))) {
+        return { revision: null, lookup: 'unknown', diagnostic: `business_commit ${resolvedCommit} 未触及已批准业务路径` };
+      }
+      return { revision: resolvedCommit, lookup: 'found' };
+    }
+
+    const expectedKey = approvalIdentityKey(targetApproval);
+    const history = await git(this.root, ['log', '-m', '--format=%H', '--', input.reviewPath]);
+    if (history.code !== 0) {
+      return { revision: null, lookup: 'unknown', diagnostic: `历史不可读：${describe(history)}` };
+    }
+    const commits = [...new Set(history.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean))];
     const matches: string[] = [];
     for (const commit of commits) {
-      const current = await this.readFileAt(commit, input.reviewPath);
-      if (current === null || !isApprovedReview(current)) continue;
-      if (native && issueApproval(current) !== native) continue;
+      const currentApproval = extractReviewApproval(await this.readFileAt(commit, input.reviewPath));
+      if (!currentApproval || approvalIdentityKey(currentApproval) !== expectedKey) continue;
       const parentList = await git(this.root, ['show', '-s', '--format=%P', commit]);
       if (parentList.code !== 0) continue;
-      const parents = [...new Set(parentList.stdout.split(/\s+/).map((item) => item.trim()).filter((item) => item.length > 0))];
-      let parentApproved = false;
+      const parents = [...new Set(parentList.stdout.split(/\s+/).map((item) => item.trim()).filter(Boolean))];
+      let parentAlreadyApproved = false;
       for (const parent of parents) {
-        const parentReview = await this.readFileAt(parent, input.reviewPath);
-        if (parentReview !== null && (native ? issueApproval(parentReview) === native : isApprovedReview(parentReview))) {
-          parentApproved = true;
+        const parentApproval = extractReviewApproval(await this.readFileAt(parent, input.reviewPath));
+        if (parentApproval && approvalIdentityKey(parentApproval) === expectedKey) {
+          parentAlreadyApproved = true;
           break;
         }
       }
-      if (parentApproved) continue;
-      let patchesDeleted = true;
+      if (parentAlreadyApproved) continue;
+      let allPatchesPresent = true;
       for (const patchPath of input.patchPaths) {
-        const stillThere = await git(this.root, ['cat-file', '-e', `${commit}:${toRepoRelative(patchPath)}`]);
-        if (native ? stillThere.code !== 0 : stillThere.code === 0) {
-          patchesDeleted = false;
+        const exists = await git(this.root, ['cat-file', '-e', `${commit}:${toRepoRelative(patchPath)}`]);
+        if (exists.code !== 0) {
+          allPatchesPresent = false;
           break;
         }
       }
-      if (!patchesDeleted) continue;
-      const tree = await git(this.root, ['diff-tree', '-m', '-r', '--no-commit-id', '--name-only', commit]);
-      if (tree.code !== 0) continue;
-      const changed = new Set(tree.stdout.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0));
-      if (!input.targetFiles.some((file) => changed.has(toRepoRelative(file)))) continue;
+      if (!allPatchesPresent) continue;
+      const changed = await this.listCommitPaths(commit);
+      if (!changed) continue;
+      const changedSet = new Set(changed);
+      if (!changedSet.has(toRepoRelative(input.reviewPath))) continue;
+      if (!normalizedTargets.some((file) => changedSet.has(file))) continue;
       matches.push(commit);
     }
     if (matches.length === 1 && matches[0] !== undefined) return { revision: matches[0], lookup: 'found' };
@@ -484,6 +531,263 @@ export class GitAdapter implements VcsAdapter {
       return { revision: null, lookup: 'ambiguous', diagnostic: `${String(matches.length)} 个提交同时满足派生条件，需人工确认` };
     }
     return { revision: null, lookup: 'unknown', diagnostic: '历史中未找到满足条件的批准提交' };
+  }
+
+  async getCurrentBranch(): Promise<string | null> {
+    const result = await git(this.root, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    if (result.code !== 0) return null;
+    const branch = result.stdout.trim();
+    return branch && branch !== 'HEAD' ? branch : null;
+  }
+
+  async getRemoteTip(branch?: string): Promise<{ remoteRef: string; tip: string } | null> {
+    const remotes = await git(this.root, ['remote']);
+    if (remotes.code !== 0 || !remotes.stdout.trim()) return null;
+    const targetBranch = branch ?? (await this.getCurrentBranch()) ?? undefined;
+    if (!targetBranch) return null;
+    const upstream = await git(this.root, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+    let remoteName = 'origin';
+    let remoteBranch = targetBranch;
+    if (upstream.code === 0 && upstream.stdout.trim().includes('/')) {
+      const full = upstream.stdout.trim();
+      const slash = full.indexOf('/');
+      remoteName = full.slice(0, slash);
+      remoteBranch = full.slice(slash + 1);
+    }
+    const remoteRef = `refs/heads/${remoteBranch}`;
+    const ls = await git(this.root, ['ls-remote', remoteName, remoteRef]);
+    if (ls.code !== 0) return null;
+    const firstLine = ls.stdout.trim().split(/\r?\n/)[0]?.trim() ?? '';
+    const tip = firstLine.split(/\s+/)[0] ?? '';
+    if (!/^[0-9a-f]{40,64}$/i.test(tip)) return null;
+    return { remoteRef: `${remoteName}/${remoteBranch}`, tip };
+  }
+
+  async hasActiveGitOperation(): Promise<boolean> {
+    const sequencer = await git(this.root, [
+      'rev-parse',
+      ...['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'sequencer']
+        .flatMap((file) => ['--git-path', file]),
+    ]);
+    if (sequencer.code !== 0) return true;
+    const paths = sequencer.stdout.trimEnd().split(/\r?\n/);
+    return paths.some((file) => file.length > 0 && existsSync(path.resolve(this.root, file)));
+  }
+
+  async getTreeHash(revision = 'HEAD'): Promise<string | null> {
+    const result = await git(this.root, ['rev-parse', `${revision}^{tree}`]);
+    return result.code === 0 ? result.stdout.trim() : null;
+  }
+
+  async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+    const result = await git(this.root, ['merge-base', '--is-ancestor', ancestor, descendant]);
+    return result.code === 0;
+  }
+
+  private async blobHashAtCommit(revision: string, relPath: string): Promise<string | null> {
+    const result = await git(this.root, ['ls-tree', '-r', '-z', revision, '--', relPath]);
+    if (result.code !== 0 || !result.stdout) return null;
+    const match = /^\d{6} blob ([0-9a-f]+)\t/.exec(result.stdout);
+    return match?.[1] ?? null;
+  }
+
+  /**
+   * AC-REPAIR-ASSIST / SPEC §5.5 情况 B：
+   * 校验 preHead 为 postHead 祖先，借助 mergeBase 排除本地与上游各自无冲突纯继承文件，精确计算 Mode C 净改动集合。
+   */
+  async computeModeCNetChangedPaths(preHead: string, postHead: string): Promise<ModeCTopologyCheck> {
+    const fail = (diagnostic: string, aiReviewTouched = false): ModeCTopologyCheck => ({
+      ok: false,
+      preHead,
+      postHead,
+      netChangedPaths: [],
+      mergedParents: [],
+      commitCount: 0,
+      aiReviewTouched,
+      diagnostic,
+    });
+    if (await this.hasActiveGitOperation()) return fail('存在未完成的 merge/rebase/cherry-pick/revert 操作');
+    if (!(await this.isAncestor(preHead, postHead))) return fail('Mode C 改写了既有提交历史（preHead 不是 postHead 的祖先）');
+
+    // 仅沿 first-parent 链路枚举本地提交，避免将合入的上游分支提交误判为本地区间内提交
+    const revList = await git(this.root, ['rev-list', '--first-parent', '--parents', `${preHead}..${postHead}`]);
+    if (revList.code !== 0) return fail(`无法读取提交拓扑：${describe(revList)}`);
+    const lines = revList.stdout.trim().split(/\r?\n/).filter(Boolean);
+    const inRange = new Set<string>();
+    const parsedCommits: Array<{ oid: string; parents: string[] }> = [];
+    for (const line of lines) {
+      const parts = line.trim().split(/\s+/);
+      const oid = parts[0];
+      if (!oid) continue;
+      inRange.add(oid);
+      parsedCommits.push({ oid, parents: parts.slice(1) });
+    }
+
+    const mergedParents: string[] = [];
+    const seenParents = new Set<string>();
+    for (const commit of parsedCommits) {
+      for (const parent of commit.parents.slice(1)) {
+        if (!inRange.has(parent) && parent !== preHead && !seenParents.has(parent)) {
+          const exists = await git(this.root, ['cat-file', '-e', `${parent}^{commit}`]);
+          if (exists.code !== 0) return fail(`合并父提交 ${parent} 无效或不可追溯`);
+          seenParents.add(parent);
+          mergedParents.push(parent);
+        }
+      }
+    }
+
+    // 检查 .ai-review/ 是否在提交区间或工作区被改动
+    const aiDiff = await git(this.root, ['diff', '--name-only', preHead, '--', '.ai-review']);
+    const aiStatus = await git(this.root, ['status', '--porcelain=v1', '--untracked-files=all', '--', '.ai-review']);
+    const aiReviewTouched = (aiDiff.stdout.trim().length > 0) || (aiStatus.stdout.trim().length > 0);
+
+    // 收集候选差异文件（preHead -> 工作区 + 未跟踪文件）
+    const candidateFiles = new Set<string>();
+    const diffWork = await git(this.root, ['diff', '--name-only', '-z', preHead]);
+    if (diffWork.code !== 0) return fail(`无法读取与 preHead 的差异：${describe(diffWork)}`, aiReviewTouched);
+    for (const entry of diffWork.stdout.split('\0').map((s) => s.trim()).filter(Boolean)) {
+      if (!entry.startsWith('.ai-review/') && entry !== '.ai-review') candidateFiles.add(toRepoRelative(entry));
+    }
+    const untracked = await git(this.root, ['ls-files', '--others', '--exclude-standard', '-z']);
+    if (untracked.code === 0) {
+      for (const entry of untracked.stdout.split('\0').map((s) => s.trim()).filter(Boolean)) {
+        if (!entry.startsWith('.ai-review/') && entry !== '.ai-review') candidateFiles.add(toRepoRelative(entry));
+      }
+    }
+
+    if (mergedParents.length === 0) {
+      return {
+        ok: true,
+        preHead,
+        postHead,
+        netChangedPaths: [...candidateFiles].sort(),
+        mergedParents: [],
+        commitCount: parsedCommits.length,
+        aiReviewTouched,
+      };
+    }
+
+    // 含分支合并：计算每个 mergedParent 对应的 mergeBase，排除本地与上游各自无冲突纯继承文件。
+    const parentBases: Array<{ parent: string; base: string }> = [];
+    for (const parent of mergedParents) {
+      const mb = await git(this.root, ['merge-base', preHead, parent]);
+      if (mb.code !== 0 || !mb.stdout.trim()) return fail(`无法计算 preHead 与 ${parent} 的 merge-base`, aiReviewTouched);
+      parentBases.push({ parent, base: mb.stdout.trim() });
+      const diffParent = await git(this.root, ['diff', '--name-only', '-z', parent]);
+      if (diffParent.code === 0) {
+        for (const entry of diffParent.stdout.split('\0').map((s) => s.trim()).filter(Boolean)) {
+          if (!entry.startsWith('.ai-review/') && entry !== '.ai-review') candidateFiles.add(toRepoRelative(entry));
+        }
+      }
+    }
+
+    const netChangedPaths: string[] = [];
+    for (const file of candidateFiles) {
+      const [preBlob, postBlob] = await Promise.all([
+        this.blobHashAtCommit(preHead, file),
+        this.blobHashAtCommit(postHead, file),
+      ]);
+      const parentStates = await Promise.all(
+        parentBases.map(async ({ parent, base }) => ({
+          parentBlob: await this.blobHashAtCommit(parent, file),
+          baseBlob: await this.blobHashAtCommit(base, file),
+        })),
+      );
+      const inheritedFromLocal = postBlob === preBlob
+        && parentStates.every(({ parentBlob, baseBlob }) => parentBlob === baseBlob);
+      const inheritedFromUpstream = parentStates.some(
+        ({ parentBlob, baseBlob }) => postBlob === parentBlob && preBlob === baseBlob,
+      );
+      if (!inheritedFromLocal && !inheritedFromUpstream) {
+        netChangedPaths.push(file);
+      }
+    }
+
+    return {
+      ok: true,
+      preHead,
+      postHead,
+      netChangedPaths: netChangedPaths.sort(),
+      mergedParents,
+      commitCount: parsedCommits.length,
+      aiReviewTouched,
+    };
+  }
+
+  async resetHard(revision: string): Promise<void> {
+    const res = await git(this.root, ['reset', '--hard', revision]);
+    if (res.code !== 0) throw new Error(`git reset --hard ${revision} 失败：${describe(res)}`);
+    await git(this.root, ['clean', '-fdq', '-e', '.ai-review']);
+    await rm(path.join(this.root, '.tmp'), { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  /** SPEC §5.5 情况 B-本地（单提交/单合并）：将 review.md 并入当前提交，保留合并父关系。 */
+  async amendCommitWithReview(input: { reviewPath: string; expectedReviewBlob: string; message: string }): Promise<CommitResult> {
+    const relReview = normalizeCommitPath(this.root, input.reviewPath);
+    const add = await git(this.root, ['add', '--', relReview]);
+    if (add.code !== 0) return { success: false, commitRevision: null, outOfDate: false, errorOutput: describe(add) };
+    const staged = await git(this.root, ['ls-files', '-s', '-z', '--', relReview]);
+    const parsed = parseStagedIndex(staged.stdout);
+    if (parsed.get(relReview)?.hash !== input.expectedReviewBlob) {
+      await git(this.root, ['reset', '-q', '--', relReview]).catch(() => undefined);
+      return { success: false, commitRevision: null, outOfDate: false, errorOutput: 'amend 前 review.md 暂存内容与已核对快照不一致' };
+    }
+    const amend = await git(this.root, ['commit', '--amend', '-m', input.message]);
+    if (amend.code !== 0) {
+      const output = describe(amend);
+      return {
+        success: false,
+        commitRevision: null,
+        outOfDate: /index\.lock|cannot lock ref|Another git process/i.test(output),
+        errorOutput: output,
+      };
+    }
+    const head = await this.getCurrentBase();
+    return { success: true, commitRevision: head, outOfDate: false, errorOutput: '' };
+  }
+
+  /** SPEC §5.5 情况 B-本地（多提交）：以 preHead 与 mergedParents 为父列表构造单一原子提交。 */
+  async collapseLocalCommitsWithReview(input: {
+    preHead: string;
+    mergedParents: string[];
+    reviewPath: string;
+    expectedReviewBlob: string;
+    message: string;
+  }): Promise<CommitResult> {
+    const relReview = normalizeCommitPath(this.root, input.reviewPath);
+    const target = await this.getApprovalTarget();
+    if (!target) return { success: false, commitRevision: null, outOfDate: false, errorOutput: '无法锁定 Git 目标引用' };
+    const add = await git(this.root, ['add', '--', relReview]);
+    if (add.code !== 0) return { success: false, commitRevision: null, outOfDate: false, errorOutput: describe(add) };
+    const staged = await git(this.root, ['ls-files', '-s', '-z', '--', relReview]);
+    const parsed = parseStagedIndex(staged.stdout);
+    if (parsed.get(relReview)?.hash !== input.expectedReviewBlob) {
+      await git(this.root, ['reset', '-q', '--', relReview]).catch(() => undefined);
+      return { success: false, commitRevision: null, outOfDate: false, errorOutput: 'commit-tree 前 review.md 内容与已核对快照不一致' };
+    }
+    const writtenTree = await git(this.root, ['write-tree']);
+    if (writtenTree.code !== 0) return { success: false, commitRevision: null, outOfDate: false, errorOutput: describe(writtenTree) };
+    const tree = writtenTree.stdout.trim();
+    const parents = [input.preHead, ...input.mergedParents];
+    const parentArgs = parents.flatMap((p) => ['-p', p]);
+    const commitArgs = ['commit-tree', tree, ...parentArgs, '-m', input.message];
+    const created = await git(this.root, commitArgs);
+    const oid = created.stdout.trim();
+    if (created.code !== 0 || !/^[0-9a-f]{40,64}$/i.test(oid)) {
+      return { success: false, commitRevision: null, outOfDate: false, errorOutput: describe(created) };
+    }
+    const updated = await git(this.root, ['update-ref', target.ref, oid, target.base]);
+    if (updated.code !== 0) {
+      const output = describe(updated);
+      return {
+        success: false,
+        commitRevision: null,
+        outOfDate: /cannot lock ref|lock|expected/i.test(output),
+        errorOutput: output,
+      };
+    }
+    await git(this.root, ['reset', '--mixed', '-q', oid]).catch(() => undefined);
+    return { success: true, commitRevision: oid, outOfDate: false, errorOutput: '' };
   }
 
   async syncAndGetLatestBase(): Promise<SyncResult> {
@@ -591,10 +895,11 @@ export class GitAdapter implements VcsAdapter {
 
   async revertBusinessWorkspace(): Promise<void> {
     // checkout 从索引恢复文件，先重置索引以清除门禁或失败提交留下的暂存项。
-    // 恢复和清理时保留 .ai-review/ 文件，修复 Agent 生成的新评审数据还要由 Host 提交。
+    // 恢复和清理时保留 .ai-review/ 文件，同时显式清理 .tmp/（即使它被 .gitignore 忽略）。
     await git(this.root, ['reset', '-q', '--', '.']);
     await git(this.root, ['checkout', '--', '.', ':(exclude).ai-review']);
     await git(this.root, ['clean', '-fdq', '-e', '.ai-review']);
+    await rm(path.join(this.root, '.tmp'), { recursive: true, force: true }).catch(() => undefined);
   }
 
   private async withWorktree<T>(base: string, run: (dir: string) => Promise<T>): Promise<T> {
@@ -868,7 +1173,7 @@ function parseSvnStatusEntries(output: string): { state: string; path: string }[
     .replace(/\r\n/g, '\n')
     .split('\n')
     .filter((line) => line.trim().length > 0 && line.length > 8)
-    .map((line) => ({ state: line.slice(0, 1), path: line.slice(8).trim() }))
+    .map((line) => ({ state: line.slice(0, 1), path: toRepoRelative(line.slice(8).trim()) }))
     .filter((entry) => entry.path.length > 0);
 }
 
@@ -1112,11 +1417,8 @@ export class SvnAdapter implements VcsAdapter {
     return Number.isSafeInteger(revision) && revision > 0 ? revision : null;
   }
 
-  /** 日志路径相对于仓库根。转换为工作副本相对路径后精确比较，避免命中其他分支的同名文件。 */
+  /** AC-APPROVE-01 / SPEC §4.4：SVN 路径历史派生，按快照身份精确匹配且不要求删除补丁。 */
   async deriveApprovalCommit(input: ApprovalDeriveInput): Promise<ApprovalCommitLookup> {
-    if (input.patchPaths.length === 0) {
-      return { revision: null, lookup: 'unknown', diagnostic: '候选没有补丁文件，无法派生' };
-    }
     const relativeUrl = await svn(this.root, ['info', '--show-item', 'relative-url', '--', '.']);
     const prefix = relativeUrl.code === 0 ? relativeUrl.stdout.trim() : '';
     if (!prefix.startsWith('^/')) {
@@ -1124,8 +1426,14 @@ export class SvnAdapter implements VcsAdapter {
     }
     const reviewRepoPath = svnRepoPath(prefix, input.reviewPath);
     const probe = await this.getCommitProbe([input.reviewPath]);
-    const native = issueApproval(probe ? await this.readFileAt(probe, input.reviewPath) : null);
-    const patchRepoPaths = input.patchPaths.map((patch) => svnRepoPath(prefix, patch));
+    const targetApproval = input.approval ?? extractReviewApproval(probe ? await this.readFileAt(probe, input.reviewPath) : null);
+    if (!targetApproval) {
+      return { revision: null, lookup: 'unknown', diagnostic: '无法读取已批准快照，无法派生业务提交' };
+    }
+    if (targetApproval.businessCommit && /^\d+$/.test(targetApproval.businessCommit.trim())) {
+      return { revision: targetApproval.businessCommit.trim(), lookup: 'found' };
+    }
+    const expectedKey = approvalIdentityKey(targetApproval);
     const targetRepoPaths = input.targetFiles.map((target) => svnRepoPath(prefix, target));
     const normalizedReview = toRepoRelative(input.reviewPath);
     const dir = normalizedReview.includes('/') ? normalizedReview.slice(0, normalizedReview.lastIndexOf('/')) : normalizedReview;
@@ -1139,18 +1447,16 @@ export class SvnAdapter implements VcsAdapter {
       const paths = [...body.matchAll(/<path\b[^>]*\baction="([AMDR])"[^>]*>([^<]+)<\/path>/g)]
         .map((match) => ({ action: match[1] ?? '', path: decodeSvnPath((match[2] ?? '').trim()) }));
       const reviewModified = paths.some((item) => item.action === 'M' && item.path === reviewRepoPath);
-      const patchesDeleted = patchRepoPaths.every((patch) => paths.some((item) => item.action === 'D' && item.path === patch));
       const touchesTarget = targetRepoPaths.some((target) => paths.some((item) => item.path === target));
-      if (reviewModified && (native || patchesDeleted) && touchesTarget) matches.push(revision);
+      if (reviewModified && touchesTarget) matches.push(revision);
     }
     const verified: string[] = [];
     for (const revision of matches) {
-      const current = await this.readFileAt(revision, input.reviewPath);
-      if (current === null || !isApprovedReview(current)) continue;
-      if (native && issueApproval(current) !== native) continue;
-      const parent = await this.readFileAt(String(Number(revision) - 1), input.reviewPath);
-      if (parent !== null && (native ? issueApproval(parent) === native : isApprovedReview(parent))) continue;
-      if (native && (await Promise.all(input.patchPaths.map(file => this.readFileAt(revision, file)))).some(text => text === null)) continue;
+      const currentApproval = extractReviewApproval(await this.readFileAt(revision, input.reviewPath));
+      if (!currentApproval || approvalIdentityKey(currentApproval) !== expectedKey) continue;
+      const parentApproval = extractReviewApproval(await this.readFileAt(String(Number(revision) - 1), input.reviewPath));
+      if (parentApproval && approvalIdentityKey(parentApproval) === expectedKey) continue;
+      if ((await Promise.all(input.patchPaths.map((file) => this.readFileAt(revision, file)))).some((text) => text === null)) continue;
       verified.push(revision);
     }
     if (verified.length === 1) return { revision: verified[0] ?? null, lookup: 'found' };
@@ -1281,6 +1587,7 @@ export class SvnAdapter implements VcsAdapter {
       }
     }
     await svn(this.root, ['cleanup']);
+    await rm(path.join(this.root, '.tmp'), { recursive: true, force: true }).catch(() => undefined);
   }
 
   async computeInterRevisionDiff(input: DiffInput): Promise<InterRevisionDiff> {

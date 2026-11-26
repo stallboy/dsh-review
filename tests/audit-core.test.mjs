@@ -1,13 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { buildAuditPrompt, normalizeAuditTarget, parseAuditReport, Auditor } from '../packages/dsh-plugin/dist/host/auditor.js';
+import { normalizeAuditTarget, previewAuditPrompt, resolveAuditTarget, runHeadlessPhasedAudit } from '../packages/dsh-plugin/dist/host/auditor.js';
 import { parseAuditMarkdown } from '../packages/dsh-plugin/dist/host/audit-archive.js';
+import { ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
+import { GitHeadCandidateSource } from '../packages/dsh-plugin/dist/host/shared-facts.js';
 import { createVcs } from '../packages/dsh-plugin/dist/host/vcs.js';
 import { createFakeDshCommand, createGitFixture, failAuditAgentPath, fakeAuditAgentPath, invalidCandidateAgentPath, reportOnlyAgentPath, runCommand } from './helpers.mjs';
+import { writeCandidate } from './fixtures/contract.mjs';
+
+async function seedReviewers(root) {
+  await mkdir(path.join(root, '.ai-review'), { recursive: true });
+  await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nrules: []\n', 'utf8');
+  runCommand('git', ['add', '.ai-review/reviewers.yml'], root);
+  runCommand('git', ['commit', '-q', '-m', 'init reviewers'], root);
+}
 
 test('normalizeAuditTarget maps a relative directory into the repository', () => {
   const root = path.resolve('D:/example/repo');
@@ -29,159 +39,74 @@ test('normalizeAuditTarget rejects paths outside the repository', () => {
   assert.throws(() => normalizeAuditTarget(root, path.resolve(root, '..', 'outside')), /越界|仓库/);
 });
 
-test('parseAuditReport collects B-class confirmation and deferred items', () => {
-  const text = [
-    '# 仓库审查报告',
-    '',
-    '## A 类：已生成候选',
-    '- .ai-review/2026-10/a：修复 A',
-    '',
-    '## B 类：需人工确认（未改代码）',
-    '- **公开 API 语义**：会改变异常输入下的返回。',
-    '- **跨模块拆分**：需要产品确认边界。',
-    '',
-    '## 待前置合入后处理（Deferred）',
-    '- **缓存层重构**：依赖 A 先合入。',
-    '',
-    '## 验证与说明',
-    '- 通过。',
-  ].join('\n');
-  const parsed = parseAuditReport(text);
-  assert.equal(parsed.deferred.length, 3);
-  assert.deepEqual(parsed.deferred.map((item) => item.category), ['confirm', 'confirm', 'deferred']);
-  assert.equal(parsed.deferred[0]?.label, '公开 API 语义');
-  assert.match(parsed.deferred[0]?.text ?? '', /异常输入/);
-  assert.equal(parsed.deferred[2]?.label, '缓存层重构');
+test('normalizeAuditTarget rejects .ai-review itself', () => {
+  const root = path.resolve('D:/example/repo');
+  assert.throws(() => normalizeAuditTarget(root, '.ai-review'), /\.ai-review/);
+  assert.throws(() => normalizeAuditTarget(root, '.ai-review/audits'), /\.ai-review/);
 });
 
-test('parseAuditReport returns no items when the report has no B-class section', () => {
-  const parsed = parseAuditReport('# 仓库审查报告\n\n## A 类：已生成候选\n- 无\n');
-  assert.deepEqual(parsed.deferred, []);
-});
-
-test('parseAuditReport ignores explicit "无" placeholders', () => {
-  const text = [
-    '## B 类：需人工确认（未改代码）',
-    '- 无',
-    '## 待前置合入后处理（Deferred）',
-    '- 无（本轮没有强依赖项）',
-  ].join('\n');
-  assert.deepEqual(parseAuditReport(text).deferred, []);
-});
-
-test('parseAuditReport ignores headings and bullets inside fenced code', () => {
-  const text = [
-    '## 验证与说明',
-    '```markdown',
-    '## B 类：需人工确认（未改代码）',
-    '- **假条目**：这是示例，不是真实 B 类。',
-    '```',
-  ].join('\n');
-  assert.deepEqual(parseAuditReport(text).deferred, []);
-});
-
-test('buildAuditPrompt includes scope, owner routing and existing candidates', async () => {
+test('resolveAuditTarget rejects non-existent relative paths', async () => {
   const root = await createGitFixture();
+  await assert.rejects(resolveAuditTarget(root, 'does-not-exist'), /不存在/);
+});
+
+test('previewAuditPrompt includes scope, owner routing and existing negative memory', async () => {
+  const root = await createGitFixture();
+  await seedReviewers(root);
   const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  await mkdir(path.join(root, '.ai-review', '2026-10', 'existing'), { recursive: true });
-  await writeFile(
-    path.join(root, '.ai-review', 'reviewers.yml'),
-    'default_owner: tester\nrules: []\n',
-    'utf8',
-  );
-  await writeFile(
-    path.join(root, '.ai-review', '2026-10', 'existing', '001.patch'),
-    'diff --git a/src/math.js b/src/math.js\n--- a/src/math.js\n+++ b/src/math.js\n@@ -1 +1 @@\n-export const add = (a, b) => a - b;\n+export const add = (a, b) => a + b;\n',
-    'utf8',
-  );
-  await writeFile(
-    path.join(root, '.ai-review', '2026-10', 'existing', 'review.md'),
-    `---
-schema_version: 1
-title: "existing: 已有候选"
-module: existing
-audit_type: bugfix
-created_at: "2026-10-31T20:00:00+08:00"
-updated_at: "2026-10-31T20:00:00+08:00"
-owner: tester
-tags: [math]
-status: pending
-ticket: null
-target_files: [src/math.js]
-current_revision: 1
-revisions:
-  - id: 1
-    base_revision: "${base}"
-    patch: "001.patch"
-    author: ai
-gate_checks:
-  - "node --version"
-comments: []
-human_decisions: []
-approval: null
-rejection: null
-commit_message: "existing: 已有候选"
----
+  await writeCandidate(root, 'existing-rejected', {
+    month: '2026-10',
+    review: {
+      baseRevision: JSON.stringify(base),
+      status: 'rejected',
+      rejection: '{rejected_by: tester, rejected_at: "2026-11-01T11:00:00Z", reason: "业务特意保留减法"}',
+    },
+  });
+  runCommand('git', ['add', '.ai-review'], root);
+  runCommand('git', ['commit', '-q', '-m', 'rejected history'], root);
+  const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
 
-# 问题与影响
-已有候选。
-
-# 人工判断
-- 无：已有。
-`,
-    'utf8',
-  );
-
-  const prompt = await buildAuditPrompt({
-    repoRoot: root,
-    vcsType: 'git',
+  const preview = await previewAuditPrompt({
+    store: new ReviewStore(root),
+    vcs: createVcs('git', root),
+    settings: { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType: 'git' },
     owner: 'tester',
     targetPath: 'src',
     note: '重点检查边界条件',
-    baseRevision: base,
-    reportPath: '.ai-review/audits/20261031-210000-src.md',
-    now: new Date('2026-10-31T21:00:00+08:00'),
+    mode: 'headless',
+    source: await GitHeadCandidateSource.create(root),
   });
 
-  assert.match(prompt, /仓库根目录/);
-  assert.match(prompt, new RegExp(base));
-  assert.match(prompt, /审查目标.*src/);
-  assert.match(prompt, /重点检查边界条件/);
-  assert.match(prompt, /default_owner: tester/);
-  assert.match(prompt, /existing: 已有候选/);
-  assert.match(prompt, /\.ai-review\/audits\/20261031-210000-src\.md/);
-  assert.match(prompt, /A 类/);
-  assert.match(prompt, /B 类/);
-  assert.match(prompt, /正交|独立地基于/);
-  assert.match(prompt, /严禁执行 `git commit`/);
+  assert.equal(preview.baseRevision, head);
+  assert.match(preview.reportPath, /^\.ai-review\/audits\/.+\/audit\.md$/);
+  assert.match(preview.prompt, new RegExp(head));
+  assert.match(preview.prompt, /重点检查边界条件/);
+  assert.match(preview.prompt, /tester/);
+  assert.match(preview.prompt, /业务特意保留减法/);
 });
 
-test('buildAuditPrompt 任何模式都严禁 Agent 自行提交（§11.4）——会话模式等待 Host 收尾', async () => {
+test('previewAuditPrompt session mode instructs orchestrator without allowing VCS commits', async () => {
   const root = await createGitFixture();
-  const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  const prompt = await buildAuditPrompt({
-    repoRoot: root,
-    vcsType: 'git',
+  await seedReviewers(root);
+  const preview = await previewAuditPrompt({
+    store: new ReviewStore(root),
+    vcs: createVcs('git', root),
+    settings: { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType: 'git' },
     owner: 'tester',
     targetPath: '',
     note: '',
-    baseRevision: base,
-    reportPath: '.ai-review/audits/20261031-220000-repo/audit.md',
     mode: 'session',
-    now: new Date('2026-10-31T22:00:00+08:00'),
+    source: await GitHeadCandidateSource.create(root),
   });
 
-  assert.match(prompt, /会话执行方式/);
-  assert.match(prompt, /侧边栏/);
-  // 会话里的 Agent 只产出待收尾内容，由 Host 负责提交，避免绕过收尾校验。
-  assert.match(prompt, /严禁执行 `git commit`/);
-  assert.match(prompt, /收尾/);
-  assert.doesNotMatch(prompt, /只提交 `\.ai-review`/);
-  assert.match(prompt, /\.ai-review\/audits\/[\w.-]+\/audit\.md/);
-  assert.match(prompt, /不要写 YAML Frontmatter/);
+  assert.match(preview.prompt, /session/);
+  assert.match(preview.prompt, /runAuditStage/);
+  assert.match(preview.prompt, /publishAuditArtifacts/);
 });
 
-function auditorFor(root, overrides = {}) {
+async function runPhased(root, overrides = {}) {
+  const vcs = createVcs('git', root);
+  const base = await vcs.getCurrentBase();
   const settings = {
     ...DEFAULT_SETTINGS,
     repoRoot: root,
@@ -192,41 +117,40 @@ function auditorFor(root, overrides = {}) {
     ...overrides,
   };
   const logs = [];
-  const auditor = new Auditor({
+  const auditId = '20261031-130000-repo';
+  const lease = {
+    auditId,
+    root,
+    targetPath: '',
+    trigger: 'manual',
+    baseRevision: base,
+    owner: 'tester',
+    createdAt: new Date().toISOString(),
+    candidateIdsBefore: [],
+    state: 'active',
+  };
+  const outcome = await runHeadlessPhasedAudit({
     store: new ReviewStore(root),
-    vcs: createVcs('git', root),
+    vcs,
     settings,
     owner: 'tester',
     targetPath: '',
     note: '关注正确性',
+    trigger: 'manual',
+    lease,
     log: (line) => logs.push(line),
+    candidateSource: await GitHeadCandidateSource.create(root),
   });
-  return { auditor, logs };
+  return { outcome, logs, base };
 }
 
-test('进程型审查将结构化补丁和文字方案收尾为新版档案', async () => {
+test('runHeadlessPhasedAudit runs agent, verifies schema1 candidate, writes pure-index audit.md and commits', async () => {
   const root = await createGitFixture();
-  const { auditor } = auditorFor(root, {
-    externalCommand: `"${process.execPath}" "${fakeAuditAgentPath()}" --finding-workflow`,
-  });
-  const outcome = await auditor.run();
-  assert.equal(outcome.status, 'COMMITTED', JSON.stringify(outcome));
-  const committed = runCommand('git', ['show', `HEAD:${outcome.report.path}`], root).stdout;
-  const { meta } = parseAuditMarkdown(committed);
-  assert.equal(meta.schemaVersion, 2);
-  assert.equal(meta.items[0].options[0].candidateId, '2026-10/20261031-math-fix');
-  assert.equal(meta.items[1].repairPlan, '核对既有接口约定并补充验收用例。');
-  assert.deepEqual(meta.candidates, ['2026-10/20261031-math-fix']);
-});
-
-test('Auditor runs an agent, verifies candidates, writes report and commits .ai-review', async () => {
-  const root = await createGitFixture();
-  const base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  const { auditor, logs } = auditorFor(root);
-
-  const outcome = await auditor.run();
+  await seedReviewers(root);
+  const { outcome, base } = await runPhased(root);
 
   assert.equal(outcome.manual, false);
+  assert.equal(outcome.status, 'COMMITTED', JSON.stringify(outcome));
   assert.equal(outcome.baseRevision, base);
   assert.equal(outcome.created.length, 1);
   const created = outcome.created[0];
@@ -234,103 +158,84 @@ test('Auditor runs an agent, verifies candidates, writes report and commits .ai-
   assert.equal(created?.title, 'math: 修复加法实现');
   assert.equal(created?.owner, 'tester');
   assert.deepEqual(created?.errors, []);
-  assert.equal(created?.patchStats.additions, 1);
-  assert.equal(created?.patchStats.deletions, 1);
-
-  assert.equal(outcome.deferred.length, 2);
-  assert.equal(outcome.deferred[0]?.category, 'confirm');
-  assert.equal(outcome.deferred[1]?.category, 'deferred');
-
-  assert.ok(outcome.report);
-  assert.match(outcome.report.path, /^\.ai-review\/audits\/.+\.md$/);
-  assert.match(outcome.report.text, /插件复核/);
-  assert.match(outcome.report.text, /20261031-math-fix/);
   assert.ok(outcome.commitRevision);
 
-  const reviewers = await readFile(path.join(root, '.ai-review', 'reviewers.yml'), 'utf8');
-  assert.match(reviewers, /default_owner: "?tester"?/);
-  const head = runCommand('git', ['show', '--name-only', '--format=%s', 'HEAD'], root).stdout;
-  assert.match(head, /audit\(/);
-  assert.match(head, /\.ai-review\/audits\//);
-  assert.match(head, /20261031-math-fix\/review\.md/);
+  const committedAudit = runCommand('git', ['show', `HEAD:${outcome.report.path}`], root).stdout;
+  const { meta } = parseAuditMarkdown(committedAudit);
+  assert.equal(meta.schemaVersion, 1);
+  assert.deepEqual(meta.issues, ['2026-10/20261031-math-fix']);
   assert.equal(runCommand('git', ['status', '--porcelain'], root).stdout.trim(), '');
-  assert.ok(logs.some((line) => /新增候选/.test(line)));
 });
 
-test('Auditor runs through the DSH headless branch', async () => {
+test('runHeadlessPhasedAudit runs through the DSH headless branch', async () => {
   const root = await createGitFixture();
+  await seedReviewers(root);
   const dshCommand = await createFakeDshCommand();
-  const { auditor, logs } = auditorFor(root, { runner: 'dsh', dshCommand, externalCommand: '' });
+  const { outcome, logs } = await runPhased(root, { runner: 'dsh', dshCommand, externalCommand: '' });
 
-  const outcome = await auditor.run();
-
+  assert.equal(outcome.status, 'COMMITTED', JSON.stringify(outcome));
   assert.equal(outcome.created.length, 1);
   assert.equal(outcome.created[0]?.errors.length, 0);
   assert.ok(logs.some((line) => line.includes('--profile headless')));
-  assert.ok(logs.some((line) => line.includes('状态: done')));
 });
 
-test('an audit with only B-class findings commits the report and no candidate', async () => {
+test('an audit with report only commits the pure-index audit.md and no candidates', async () => {
   const root = await createGitFixture();
-  const { auditor } = auditorFor(root, {
+  await seedReviewers(root);
+  const { outcome } = await runPhased(root, {
     externalCommand: `"${process.execPath}" "${reportOnlyAgentPath()}"`,
   });
 
-  const outcome = await auditor.run();
-
+  assert.equal(outcome.status, 'COMMITTED', JSON.stringify(outcome));
   assert.equal(outcome.created.length, 0);
-  assert.equal(outcome.deferred.length, 1);
-  assert.equal(outcome.deferred[0]?.category, 'confirm');
-  assert.ok(outcome.report?.path.endsWith('.md'));
+  assert.ok(outcome.report?.path.endsWith('/audit.md'));
   assert.ok(outcome.commitRevision);
-  const head = runCommand('git', ['show', '--format=%s', '--name-only', 'HEAD'], root).stdout;
-  assert.match(head, /仅报告/);
-  assert.match(head, /\.ai-review\/audits\//);
 });
 
-test('an audit surfaces validation errors on an invalid candidate', async () => {
+test('an audit with invalid candidate fails validation and does not commit invalid data', async () => {
   const root = await createGitFixture();
-  const { auditor } = auditorFor(root, {
+  await seedReviewers(root);
+  const before = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const { outcome } = await runPhased(root, {
     externalCommand: `"${process.execPath}" "${invalidCandidateAgentPath()}"`,
   });
 
-  const outcome = await auditor.run();
-
-  assert.equal(outcome.created.length, 1);
-  const errors = outcome.created[0]?.errors ?? [];
-  assert.ok(errors.some((error) => /gate_checks/.test(error)), errors.join('；'));
-  assert.ok(errors.some((error) => /需人工判断项/.test(error)), errors.join('；'));
-  assert.ok(outcome.commitRevision);
-});
-
-test('Auditor manual mode returns a prompt and leaves the repository untouched', async () => {
-  const root = await createGitFixture();
-  const { auditor } = auditorFor(root, { runner: 'manual', externalCommand: '' });
-
-  const outcome = await auditor.run();
-
-  assert.equal(outcome.manual, true);
-  assert.match(outcome.prompt ?? '', /审查报告文件/);
-  await assert.rejects(stat(path.join(root, '.ai-review')), /ENOENT/);
-});
-
-test('Auditor refuses to run on a dirty workspace', async () => {
-  const root = await createGitFixture();
-  const before = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  await writeFile(path.join(root, 'src', 'math.js'), 'export const add = (a, b) => a + b;\n', 'utf8');
-  const { auditor } = auditorFor(root);
-
-  await assert.rejects(auditor.run(), /工作区/);
+  assert.equal(outcome.status, 'VALIDATION_FAILED', JSON.stringify(outcome));
+  assert.equal(outcome.commitRevision, null);
   assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), before);
 });
 
-test('a failed audit with no candidates does not create a commit', async () => {
+test('runHeadlessPhasedAudit manual mode returns prompt without committing', async () => {
   const root = await createGitFixture();
+  await seedReviewers(root);
   const before = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  const { auditor } = auditorFor(root, {
+  const { outcome } = await runPhased(root, { runner: 'manual', externalCommand: '' });
+
+  assert.equal(outcome.manual, true);
+  assert.equal(outcome.status, 'MANUAL_REQUIRED');
+  assert.ok(outcome.prompt && outcome.prompt.length > 0);
+  assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), before);
+});
+
+test('audit start refuses dirty workspace and failed runner does not commit', async () => {
+  const root = await createGitFixture();
+  await seedReviewers(root);
+  const before = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  await writeFile(path.join(root, 'src', 'math.js'), 'export const add = (a, b) => a + b;\n', 'utf8');
+
+  const api = new ReviewApi({
+    settings: { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType: 'git', runner: 'external', externalCommand: `"${process.execPath}" "${failAuditAgentPath()}"` },
+    saveSettings: async (v) => v,
+    statePath: path.join(root, '.tmp', 'state.json'),
+  });
+  await api.init();
+  const dirtyRes = await api.invoke({ method: 'POST', path: '/audit', body: {} });
+  assert.equal(dirtyRes.status, 409);
+
+  runCommand('git', ['checkout', '--', 'src/math.js'], root);
+  const { outcome } = await runPhased(root, {
     externalCommand: `"${process.execPath}" "${failAuditAgentPath()}"`,
   });
-
-  await assert.rejects(auditor.run(), /外部命令退出码 1/);
+  assert.equal(outcome.status, 'ABORTED', JSON.stringify(outcome));
   assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), before);
 });

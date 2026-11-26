@@ -1,47 +1,68 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 let prompt = '';
 for await (const chunk of process.stdin) prompt += chunk;
 
-const reportMatch = /审查报告文件（相对仓库根目录）[:：]\s*(\S+)/.exec(prompt);
-const reportPath = reportMatch ? reportMatch[1] : '.ai-review/audits/fallback.md';
+const reportMatch = /审查报告文件（相对仓库根目录）[:：]\s*(\S+)/.exec(prompt)
+  ?? /"reportPath"\s*:\s*"([^"]+)"/.exec(prompt);
+const reportPath = reportMatch ? reportMatch[1] : '.ai-review/audits/20261031-130000-repo/audit.md';
+const trigger = /"trigger"\s*:\s*"scheduled"/.test(prompt) ? 'scheduled' : 'manual';
 const base = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-const findingWorkflow = process.argv.includes('--finding-workflow');
 
 const source = path.join(process.cwd(), 'src', 'math.js');
 writeFileSync(source, 'export const add = (a, b) => a + b;\n', 'utf8');
 const patch = execFileSync('git', ['diff', '--binary'], { encoding: 'utf8' });
+const patchSha = createHash('sha256').update(Buffer.from(patch, 'utf8')).digest('hex');
 
+const candidateId = '2026-10/20261031-math-fix';
 const candidateDir = path.join(process.cwd(), '.ai-review', '2026-10', '20261031-math-fix');
 mkdirSync(candidateDir, { recursive: true });
 writeFileSync(path.join(candidateDir, '001.patch'), patch, 'utf8');
 writeFileSync(
   path.join(candidateDir, 'review.md'),
   `---
-schema_version: ${findingWorkflow ? '2\nfinding_id: addition-operator' : 1}
+schema_version: 1
+finding_id: "addition-operator"
 title: "math: 修复加法实现"
 module: math
 audit_type: bugfix
+issue_kind: repair
+depends_on: null
+priority: P2
+base_revision: "${base}"
 created_at: "2026-10-31T21:00:00+08:00"
 updated_at: "2026-10-31T21:00:00+08:00"
 owner: tester
 tags: [math, bug]
-status: pending
 ticket: null
+status: pending
 target_files: [src/math.js]
-current_revision: 1
-revisions:
+record_revision: 1
+patches:
   - id: 1
-    base_revision: "${base}"
     patch: "001.patch"
+    option_id: opt-a
+    base_revision: "${base}"
     author: ai
-gate_checks:
-  - "node --version"
+    sha256: "${patchSha}"
+options:
+  - id: opt-a
+    title: "修正运算符"
+    tradeoff: "最小改动"
+    confidence: 0.95
+    current_patch: 1
+    gate_checks:
+      - "node --version"
+observations: []
+decisions: []
+repair_attempts: []
 comments: []
 human_decisions: []
 approval: null
+approval_history: []
 rejection: null
 commit_message: "math: 修复加法实现"
 ---
@@ -56,11 +77,11 @@ commit_message: "math: 修复加法实现"
 改为加法。
 
 # 需人工判断项
-- 业务逻辑与产品取舍：无。
+- 无
 
 # 验证证据
 - 验证基线：${base}
-- 执行结果摘要：node --version 通过。
+- 执行结果摘要：仅只读预检。
 
 # 审核记录
 
@@ -74,27 +95,33 @@ execFileSync('git', ['checkout', '--', 'src/math.js']);
 
 const reportFile = path.join(process.cwd(), reportPath);
 mkdirSync(path.dirname(reportFile), { recursive: true });
+const auditDirName = path.basename(path.dirname(reportFile));
+const tsMatch = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-/.exec(auditDirName);
+const createdAtUtc = tsMatch
+  ? `${tsMatch[1]}-${tsMatch[2]}-${tsMatch[3]}T${tsMatch[4]}:${tsMatch[5]}:${tsMatch[6]}.000Z`
+  : '2026-10-31T13:00:00.000Z';
 writeFileSync(
   reportFile,
   [
+    '---',
+    'schema_version: 1',
+    `audit_id: "${auditDirName}"`,
+    `created_at: "${createdAtUtc}"`,
+    `base_revision: "${base}"`,
+    'scope: "."',
+    `trigger: ${trigger}`,
+    'previous_audit: null',
+    'issues:',
+    `  - "${candidateId}"`,
+    '---',
+    '',
     '# 仓库审查报告',
     '',
-    '## A 类：已生成候选',
-    '- .ai-review/2026-10/20261031-math-fix：修复加法实现',
+    '## 优先级总览',
+    '| 优先级 | 问题 | 处置 |',
+    '| --- | --- | --- |',
+    `| P2 | math: 修复加法实现 | repair (${candidateId}) |`,
     '',
-    '## B 类：需人工确认（未改代码）',
-    '- **公开 API 语义**：加法修正会改变异常输入下的返回值，需要产品确认。',
-    '',
-    '## 待前置合入后处理（Deferred）',
-    '- **缓存层重构**：依赖 math 候选先合入。',
-    '',
-    ...(findingWorkflow ? ['## 修复方案数据', '```json', JSON.stringify([
-      { finding_id: 'addition-operator', kind: 'repair', title: '加法错误', summary: '计算用了减号', target_files: ['src/math.js'],
-        depends_on: null, status: 'pending', candidate: null, repair_plan: '改为加法并验证结果。',
-        options: [{ candidate_id: '2026-10/20261031-math-fix', tradeoff: '最小改动' }] },
-      { finding_id: 'arithmetic-contract', kind: 'confirm', title: '异常输入约定', summary: '类型语义需人工确认', target_files: ['src/math.js'],
-        depends_on: null, status: 'pending', candidate: null, repair_plan: '核对既有接口约定并补充验收用例。' },
-    ]), '```', ''] : []),
   ].join('\n'),
   'utf8',
 );

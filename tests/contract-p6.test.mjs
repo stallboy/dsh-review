@@ -5,8 +5,15 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
-import { AuditArchive, auditInvariantErrors, parseAuditMarkdown, projectFindings, serializeAuditMarkdown } from '../packages/dsh-plugin/dist/host/audit-archive.js';
-import { createGitFixture, fakeAuditAgentPath, runCommand } from './helpers.mjs';
+import {
+  AuditArchive,
+  auditInvariantErrors,
+  parseAuditMarkdown,
+  scopeCovers,
+  serializeAuditMarkdown,
+} from '../packages/dsh-plugin/dist/host/audit-archive.js';
+import { createGitFixture, runCommand } from './helpers.mjs';
+import { patchFixture, sha256Hex, writeCandidate } from './fixtures/contract.mjs';
 
 const servers = [];
 after(async () => {
@@ -32,139 +39,111 @@ async function startApi(root) {
 const META = (over = {}) => ({
   schemaVersion: 1,
   auditId: '20261104-020000-src-host',
-  createdAt: '2026-11-04T02:00:00Z',
+  createdAt: '2026-11-04T02:00:00.000Z',
   baseRevision: 'abc123',
   scope: 'src/host',
   trigger: 'manual',
   previousAudit: null,
-  candidates: [],
-  items: [],
+  issues: [],
   ...over,
-});
-
-const ITEM = (over = {}) => ({
-  findingId: 'api-double-approval', kind: 'confirm', title: '并发批准互斥', summary: '需实现串行化',
-  targetFiles: ['src/host/api.ts'], dependsOn: null, status: 'pending', candidate: null, ...over,
 });
 
 const BODY = '# 仓库审查报告\n\n## 本轮范围与执行\n';
 
-test('P6: 序列化往返 + 不变量正例', () => {
-  const meta = META({ items: [ITEM(), ITEM({ findingId: 'auth-legacy', kind: 'deferred', dependsOn: 'auth-isolate', targetFiles: ['src/host/auth/legacy.ts'] })] });
+test('P6: 纯索引 audit.md 序列化往返 + 不变量正例', () => {
+  const meta = META({ issues: ['2026-11/20261104-a', '2026-11/20261104-b'] });
   const text = serializeAuditMarkdown(meta, BODY);
   const parsed = parseAuditMarkdown(text);
   assert.equal(parsed.meta.auditId, meta.auditId);
-  assert.equal(parsed.meta.items.length, 2);
-  assert.equal(parsed.meta.items[1].dependsOn, 'auth-isolate');
-  assert.deepEqual(auditInvariantErrors(parsed.meta, meta.auditId), []);
+  assert.deepEqual(parsed.meta.issues, ['2026-11/20261104-a', '2026-11/20261104-b']);
+  assert.deepEqual(auditInvariantErrors(parsed.meta, meta.auditId, parsed.body), []);
 });
 
-test('P6: I1/I9/I10/I13 反例', () => {
-  assert.ok(auditInvariantErrors(META(), '20261104-020000-other').some((e) => e.startsWith('I1')));
-  assert.ok(auditInvariantErrors(META({ items: [ITEM({ status: 'converted' })] }), META().auditId).some((e) => e.startsWith('I9')));
-  assert.ok(auditInvariantErrors(META({ items: [ITEM({ candidate: '2026-11/x' })] }), META().auditId).some((e) => e.startsWith('I9')));
-  assert.ok(auditInvariantErrors(META({ items: [ITEM({ kind: 'deferred' })] }), META().auditId).some((e) => e.startsWith('I10')));
-  assert.ok(auditInvariantErrors(META({ items: [ITEM({ dependsOn: 'x' })] }), META().auditId).some((e) => e.startsWith('I10')));
-  assert.ok(auditInvariantErrors(META({ createdAt: '2026-11-04T03:00:00Z' }), '20261104-020000-src-host').some((e) => e.startsWith('I13')));
+test('P6: audit.md 不变量反例（目录名/时间戳/scope/重复问题 ID）', () => {
+  assert.ok(auditInvariantErrors(META(), '20261104-020000-other').some((e) => e.includes('不一致')));
+  assert.ok(auditInvariantErrors(META({ issues: ['bad-id'] }), META().auditId).some((e) => e.includes('非法')));
+  assert.ok(auditInvariantErrors(META({ issues: ['2026-11/a', '2026-11/a'] }), META().auditId).some((e) => e.includes('重复')));
+  assert.ok(auditInvariantErrors(META({ scope: '../escape' }), META().auditId).some((e) => e.includes('scope')));
+  assert.ok(auditInvariantErrors(META({ createdAt: '2026-11-04T03:00:00.000Z' }), '20261104-020000-src-host').some((e) => e.includes('UTC')));
 });
 
-test('P6: 档案写入/读取/目录冲突/updateItem 不重写历史', async () => {
+test('P6: 档案写入/读取与非规范平铺文件忽略', async () => {
   const root = await createGitFixture();
   const archive = new AuditArchive(root);
-  const meta = META({ items: [ITEM()] });
-  const record = await archive.write(meta, BODY);
-  assert.equal(record.dirName, meta.auditId);
-  await assert.rejects(() => archive.write(meta, BODY), /已存在/);
-  const updated = await archive.updateItem(meta.auditId, 'api-double-approval', 'converted', '2026-11/20261104-api-mutex');
-  assert.equal(updated.meta.items[0].status, 'converted');
-  assert.equal(updated.meta.items[0].candidate, '2026-11/20261104-api-mutex');
+  const meta = META({ issues: ['2026-11/20261104-api-mutex'] });
+  await archive.writeAudit(meta, BODY);
+  const read = await archive.read(meta.auditId);
+  assert.equal(read.auditId, meta.auditId);
+  assert.deepEqual(read.meta.issues, ['2026-11/20261104-api-mutex']);
   await mkdir(path.join(root, '.ai-review', 'audits'), { recursive: true });
   await writeFile(path.join(root, '.ai-review', 'audits', '20261031-flat.md'), '# 旧报告\n', 'utf8');
   const records = await archive.list();
   assert.equal(records.length, 1);
-  assert.equal(records[0].dirName, meta.auditId);
+  assert.equal(records[0].auditId, meta.auditId);
 });
 
-test('P6: 投影——覆盖判定/最新观察/当前状态/可见性', async () => {
-  const root = await createGitFixture();
-  const archive = new AuditArchive(root);
-  // 首轮限于 src/host，故意加入范围外的 finding，以便验证全仓观察更新覆盖关系。
-  await archive.write(META({
-    items: [
-      ITEM({ findingId: 'api-race' }),
-      ITEM({ findingId: 'net-close', targetFiles: ['src/net/session.ts'] }),
-    ],
-  }), BODY);
-  await archive.write(META({
-    auditId: '20261105-020000-repo', createdAt: '2026-11-05T02:00:00Z', scope: '.',
-    previousAudit: '20261104-020000-src-host',
-    items: [ITEM({ findingId: 'api-race' }), ITEM({ findingId: 'net-close', targetFiles: ['src/net/session.ts'] })],
-  }), BODY);
-  const { findings: projections } = projectFindings(await archive.list(), (candidateId) =>
-    candidateId.endsWith('net-cand') ? { status: 'approved', reopenedFrom: null }
-      : candidateId.endsWith('api-cand') ? { status: 'rejected', reopenedFrom: null }
-        : null,
-    ['2026-11/net-cand', '2026-11/api-cand']);
-  const byId = new Map(projections.map((p) => [p.findingId, p]));
-  assert.equal(byId.get('net-close')?.lastObservedAudit, '20261105-020000-repo');
-  assert.equal(byId.get('api-race')?.lastObservedAudit, '20261105-020000-repo');
-  assert.equal(byId.get('api-race')?.lastObservedAt, '2026-11-05T02:00:00Z');
+test('P6: scopeCovers 覆盖判定', () => {
+  assert.equal(scopeCovers('.', ['src/net/session.ts', 'src/host/api.ts']), true);
+  assert.equal(scopeCovers('src/host', ['src/host/api.ts']), true);
+  assert.equal(scopeCovers('src/host', ['src/host/api.ts', 'src/net/session.ts']), false);
 });
 
-test('P6: API /audits 与 /findings——converted 结合候选状态出 closed/reopened', async () => {
+test('P6: API /audits 与 /findings 统一来自单一问题账本（含 8 状态）', async () => {
   const root = await createGitFixture();
   const archive = new AuditArchive(root);
-  await archive.write(META({
-    items: [
-      ITEM({ findingId: 'f-approved', status: 'converted', candidate: '2026-11/20261104-a' }),
-      ITEM({ findingId: 'f-rejected', status: 'converted', candidate: '2026-11/20261104-b' }),
-      ITEM({ findingId: 'f-open', status: 'converted', candidate: '2026-11/20261104-c' }),
-      ITEM({ findingId: 'f-pending' }),
-      ITEM({ findingId: 'f-dismissed', status: 'dismissed' }),
-      ITEM({ findingId: 'f-resolved', status: 'resolved' }),
-    ],
+  const patchText = patchFixture();
+  const sha = sha256Hex(patchText);
+
+  await writeCandidate(root, '20261104-a', {
+    review: {
+      findingId: 'f-approved',
+      status: 'approved',
+      patchText,
+      patchSha256: sha,
+      repairAttempts: '\n  - id: 1\n    option_id: opt-a\n    patch_id: 1\n    base_revision: "1"\n    actor: tester\n    at: "2026-11-04T10:00:00+08:00"\n    apply_mode: program_strict\n    result: applied\n    restored: false\n    evidence: "ok"',
+      approval: `\n  approved_by: tester\n  approved_at: "2026-11-04T10:00:00+08:00"\n  record_revision: 1\n  option_id: opt-a\n  patch_id: 1\n  patch_sha256: "${sha}"\n  repair_attempt_id: 1\n  base_revision: "1"\n  gate_checks: ["node --version"]\n  gate_results: [{command: "node --version", exit_code: 0, duration_ms: 1}]\n  confirmed_decisions: []\n  waived_decisions: []`,
+    },
+  });
+  await writeCandidate(root, '20261104-b', {
+    review: {
+      findingId: 'f-rejected',
+      status: 'rejected',
+      rejection: '\n  rejected_by: tester\n  rejected_at: "2026-11-04T10:00:00+08:00"\n  reason: "不采用"',
+    },
+  });
+  await writeCandidate(root, '20261104-c', {
+    review: {
+      findingId: 'f-open',
+      status: 'pending',
+    },
+  });
+  await writeCandidate(root, '20261104-d', {
+    review: {
+      findingId: 'f-confirm',
+      issueKind: 'confirm',
+      patches: ' []',
+      options: ' []',
+      commitMessage: null,
+      status: 'pending',
+    },
+  });
+  await archive.writeAudit(META({
+    issues: ['2026-11/20261104-a', '2026-11/20261104-b', '2026-11/20261104-c', '2026-11/20261104-d'],
   }), BODY);
-  for (const [slug, status] of [['20261104-a', 'approved'], ['20261104-b', 'rejected'], ['20261104-c', 'pending']]) {
-    const dir = path.join(root, '.ai-review', '2026-11', slug);
-    await mkdir(dir, { recursive: true });
-    const approval = status === 'approved'
-      ? 'approval:\n  approved_by: tester\n  approved_at: "2026-11-04T10:00:00+08:00"\n  gate_checks: []\n  gate_results: []\n  confirmed_decisions: []\n  waived_decisions: []\n  commit_revision: null' : 'approval: null';
-    const rejection = status === 'rejected'
-      ? 'rejection:\n  rejected_by: tester\n  rejected_at: "2026-11-04T10:00:00+08:00"\n  reason: "不采用"' : 'rejection: null';
-    await writeFile(path.join(dir, 'review.md'), [
-      '---', 'schema_version: 1', `title: "net: ${slug}"`, 'module: net', 'audit_type: bugfix',
-      'created_at: "2026-11-04T09:00:00+08:00"', 'updated_at: "2026-11-04T09:00:00+08:00"', 'owner: tester',
-      'tags: []', `status: ${status}`, 'ticket: null', 'target_files: [src/host/api.ts]', 'current_revision: 1',
-      'revisions:', '  - id: 1', '    base_revision: "1"', '    patch: 001.patch', '    author: ai', 'gate_checks: []',
-      'comments: []', 'human_decisions: []', approval, rejection, 'commit_message: "x: y"',
-      '---', '', '# 问题与影响', '',
-    ].join('\n'), 'utf8');
-    if (status === 'pending') {
-      // 活跃候选缺少补丁或路径不一致会被判为损坏，无法用于验证候选状态对 finding 的投影。
-      await writeFile(path.join(dir, '001.patch'), [
-        'diff --git a/src/host/api.ts b/src/host/api.ts',
-        '--- a/src/host/api.ts',
-        '+++ b/src/host/api.ts',
-        '@@ -1 +1 @@',
-        '-const x = 1;',
-        '+const x = 2;',
-        '',
-      ].join('\n'), 'utf8');
-    }
-  }
-  // 将档案与候选一起提交，确保两个读取端点能在同一共享快照看到它们。
+
   runCommand('git', ['add', '-A'], root);
   runCommand('git', ['commit', '-q', '-m', 'shared audit fixture'], root);
   const { base } = await startApi(root);
+
   const audits = await (await fetch(`${base}/audits`)).json();
   assert.equal(audits.audits.length, 1);
-  assert.equal(audits.audits[0].itemCount, 6);
+  assert.equal(audits.audits[0].issues.length, 4);
+
   const findings = await (await fetch(`${base}/findings`)).json();
-  const states = Object.fromEntries(findings.findings.map((f) => [f.findingId, f.state]));
-  assert.equal(states['f-approved'], 'closed');
-  assert.equal(states['f-rejected'], 'reopened');
-  assert.equal(states['f-open'], 'open');
-  assert.equal(states['f-pending'], 'open');
-  assert.equal(states['f-dismissed'], 'dismissed');
-  assert.equal(states['f-resolved'], 'closed');
+  const byId = Object.fromEntries(findings.findings.map((f) => [f.findingId, f]));
+  assert.equal(byId['f-approved']?.issueStatus, 'approved');
+  assert.equal(byId['f-rejected']?.issueStatus, 'rejected');
+  assert.equal(byId['f-open']?.issueStatus, 'pending');
+  assert.equal(byId['f-confirm']?.issueKind, 'confirm');
+  assert.equal(byId['f-confirm']?.options.length, 0);
 });

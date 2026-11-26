@@ -180,6 +180,25 @@ export function parsePatch(text: string): ParsedPatch {
   return { stats, paths: [...touched], text, binary };
 }
 
+/** AC-MEMORY-01：合并补丁 hunk header 中的函数/结构体符号，去重截断，供负向记忆提示词辅助使用。 */
+export function extractPatchSymbols(patchTexts: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const symbols: string[] = [];
+  for (const patchText of patchTexts) {
+    if (!patchText) continue;
+    for (const line of patchText.replace(/\r\n/g, '\n').split('\n')) {
+      const match = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@[ \t]+(.+)$/.exec(line);
+      if (!match) continue;
+      const symbol = (match[1] ?? '').trim().slice(0, 120);
+      if (!symbol || seen.has(symbol)) continue;
+      seen.add(symbol);
+      symbols.push(symbol);
+      if (symbols.length >= 16) return symbols;
+    }
+  }
+  return symbols;
+}
+
 const FORBIDDEN_PATH_PREFIXES = ['.ai-review/', '.tmp/', 'node_modules/', '.git/', '.svn/'];
 
 export function isAiReviewPath(path: string): boolean {

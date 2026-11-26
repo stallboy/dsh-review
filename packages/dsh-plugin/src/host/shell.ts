@@ -52,6 +52,10 @@ async function waitProcessGroupGone(pid: number): Promise<boolean> {
   return false;
 }
 
+export function killProcessTree(pid: number | undefined, _cwd?: string): Promise<boolean> {
+  return killTree(pid);
+}
+
 function killTree(pid: number | undefined): Promise<boolean> {
   if (pid === undefined) return Promise.resolve(true);
   if (process.platform === 'win32') {

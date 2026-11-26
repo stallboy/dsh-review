@@ -27,10 +27,15 @@ export async function runAuditChannel(prompt, { empty = false } = {}) {
         return result;
     }
     for (const lead of scan.result.leads) {
-        await stage('verify', { subjectId: lead.leadId, scenario: 'reachable_behavior', navigation: lead.navigation, expectationIndexes: [] });
+        await stage('verify', { subjectId: lead.leadId, scenario: 'reachable_behavior', navigation: { path: lead.path, line: lead.line }, expectationIndexes: [] });
     }
-    const patch = await stage('patch', { subjectId: 'local-fix', auditType: 'bugfix', allowedPaths: scan.result.leads[0].navigation.map(item => item.path),
-        acceptance: ['加法返回正确结果'], gateCommands: ['node --version'] });
+    const patch = await stage('patch', {
+        subjectId: 'local-fix',
+        auditType: 'bugfix',
+        allowedPaths: [scan.result.leads[0].path],
+        acceptance: ['加法返回正确结果'],
+        gateCommands: ['node --version'],
+    });
     assert.equal(patch.result.status, 'ready');
     const findings = [
         { subjectId: 'local-fix', title: '加法结果错误', priority: 'P2', kind: 'A', decision: '', dependsOn: '', findingId: 'local-fix' },
@@ -41,9 +46,9 @@ export async function runAuditChannel(prompt, { empty = false } = {}) {
     const invalid = await invoke({ operation: 'publishAuditArtifacts', publication: {
         ...publication, findings: [{ ...findings[0], priority: '' }, ...findings.slice(1)],
     } }, 409);
-    assert.match(invalid.error, /priority/);
+    assert.match(invalid.error, /优先级|priority/);
     const response = await invoke({ operation: 'publishAuditArtifacts', publication });
-    assert.deepEqual(response.result.overview.map(item => item.priority + '/' + item.kind), ['P0/B', 'P1/Deferred', 'P2/A']);
+    assert.deepEqual(response.result.overview.map(item => item.priority + '/' + item.issueKind), ['P0/confirm', 'P1/deferred', 'P2/repair']);
     return response.result;
 }
 
@@ -52,15 +57,14 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.stdin.setEncoding('utf8');
     for await (const chunk of process.stdin) prompt += chunk;
     const checkScheduledNote = process.argv.includes('check-scheduled-note');
-    if (checkScheduledNote && prompt.includes('DSH_AUDIT_RECHECK=')) {
-        assert.doesNotMatch(prompt, /重点核对阶段审查的权限边界/);
-        console.log('已验证历史提示范围');
-        console.log('DSH_AUDIT_RECHECK={"findings":[],"candidates":[]}');
-    } else if (process.argv.includes('cancel-before-publication')) {
+    if (process.argv.includes('cancel-before-publication')) {
         process.stdout.write('Runner 已开始等待取消\n');
         await new Promise(resolve => setTimeout(resolve, 60_000));
     } else {
-        if (checkScheduledNote) assert.match(prompt, /重点核对阶段审查的权限边界/);
+        if (checkScheduledNote) {
+            assert.match(prompt, /重点核对阶段审查的权限边界/);
+            console.log('已验证历史提示范围');
+        }
         const result = await runAuditChannel(prompt, { empty: process.argv.includes('empty') });
         process.stdout.write(JSON.stringify(result) + '\n');
         if (process.argv.includes('hold')) await new Promise(resolve => setTimeout(resolve, 800));

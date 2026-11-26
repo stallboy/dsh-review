@@ -5,7 +5,6 @@ import { stopDshAuditSession, withDshAuditSessionIdle } from './audit-session-id
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from './api.js';
 import { executeAuditCli } from './audit-stage-runner.js';
-import { restrictAuditSession, releaseAuditSessionRestrictions } from './audit-session-permissions.js';
 import type { ApiDeps } from './api-context.js';
 import { registerAuditStageTools, type AuditToolRegistry } from './audit-stage-tools.js';
 import { dshHome, loadSettings, saveSettings } from './settings.js';
@@ -256,10 +255,6 @@ async function createDshSession(
     }
   }
   const inherited: ReturnType<typeof inheritOwnerPolicy> = label === '审查' ? {} : inheritOwnerPolicy(host, input.ownerSessionId ?? '', sessionId);
-  if (label === '审查') {
-    try { await restrictAuditSession(host, sessionId, input.cwd); }
-    catch (error) { throw new ApiError(412, 'not_configured', String(error)); }
-  }
   await input.onCreated?.(sessionId);
   try {
     const prompted = await controller.prompt(
@@ -439,9 +434,6 @@ export function apply(ctx: HostContext): void {
       offCentral();
       const results = await Promise.allSettled([connection.stop(), managed?.stop(), api?.closeAudit(), ready]);
       for (const result of results) if (result.status === 'rejected') logger?.error(`dsh-code-review: 节点停止失败：${String(result.reason)}`);
-      if (results.every(result => result.status === 'fulfilled') && !await releaseAuditSessionRestrictions(ctx)) {
-        logger?.error('dsh-code-review: 无法确认审查会话停止，保留其写权限限制');
-      }
     },
     'dsh-code-review: http routes',
   );

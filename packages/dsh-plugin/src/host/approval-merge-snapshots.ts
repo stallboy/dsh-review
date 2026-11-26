@@ -4,7 +4,7 @@ import { constants } from 'node:fs';
 import { lstat, open, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { isRepoRelativePath } from './invariants.js';
-import type { RevisionEntry } from '@dsh-review/protocol';
+import type { PatchEntry } from '@dsh-review/protocol';
 import type { VcsAdapter } from './vcs.js';
 
 const MAX_INPUT_BYTES = 4 * 1024 * 1024;
@@ -55,14 +55,15 @@ function svnInfo(xml: string): (SvnApprovalBinding & { revision: string; kind: s
 
 export function svnApprovalBinding(value: unknown): SvnApprovalBinding | null {
     if (!value || typeof value !== 'object') return null;
-    const { uuid, relative_url: relativeUrl } = value as { uuid?: unknown; relative_url?: unknown };
-    return typeof uuid === 'string' && /^[0-9a-f-]+$/i.test(uuid)
+    const obj = value as { uuid?: unknown; relative_url?: unknown; relativeUrl?: unknown };
+    const relativeUrl = obj.relativeUrl ?? obj.relative_url;
+    return typeof obj.uuid === 'string' && /^[0-9a-f-]+$/i.test(obj.uuid)
         && typeof relativeUrl === 'string' && relativeUrl.startsWith('^/')
-        ? { uuid, relativeUrl } : null;
+        ? { uuid: obj.uuid, relativeUrl } : null;
 }
 
-export function svnApprovalSourceMetadata(binding: SvnApprovalBinding): { uuid: string; relative_url: string } {
-    return { uuid: binding.uuid, relative_url: binding.relativeUrl };
+export function svnApprovalSourceMetadata(binding: SvnApprovalBinding): { uuid: string; relativeUrl: string } {
+    return { uuid: binding.uuid, relativeUrl: binding.relativeUrl };
 }
 
 export async function readSvnApprovalBinding(root: string, signal?: AbortSignal): Promise<SvnApprovalBinding | null> {
@@ -70,24 +71,24 @@ export async function readSvnApprovalBinding(root: string, signal?: AbortSignal)
     return info && { uuid: info.uuid, relativeUrl: info.relativeUrl };
 }
 
-export async function stampSvnApprovalSource(vcs: VcsAdapter, revision: RevisionEntry, files: string[]): Promise<boolean> {
+export async function stampSvnApprovalSource(vcs: VcsAdapter, patchEntry: PatchEntry, files: string[]): Promise<boolean> {
     if (vcs.type !== 'svn') return false;
-    const previous = revision.extra?.[SVN_APPROVAL_SOURCE];
-    let binding = await vcs.getCurrentBase().catch(() => null) === revision.baseRevision
+    const previous = patchEntry.svnApprovalSource;
+    let binding = await vcs.getCurrentBase().catch(() => null) === patchEntry.baseRevision
         ? await readSvnApprovalBinding(vcs.root).catch(() => null) : null;
     if (binding) {
         const snapshot = await readApprovalMergeSnapshots(vcs, {
-            sourceRevision: revision.baseRevision, targetRevision: revision.baseRevision, files, svnBinding: binding,
+            sourceRevision: patchEntry.baseRevision, targetRevision: patchEntry.baseRevision, files, svnBinding: binding,
         });
         if (snapshot.status !== 'ready' || snapshot.files.some(file => !file.source.equals(file.target))) binding = null;
     }
     if (binding) {
         const metadata = svnApprovalSourceMetadata(binding);
-        revision.extra = { ...revision.extra, [SVN_APPROVAL_SOURCE]: metadata };
+        patchEntry.svnApprovalSource = metadata;
         return JSON.stringify(previous) !== JSON.stringify(metadata);
     }
-    if (!revision.extra || !Object.hasOwn(revision.extra, SVN_APPROVAL_SOURCE)) return false;
-    delete revision.extra[SVN_APPROVAL_SOURCE];
+    if (!patchEntry.svnApprovalSource) return false;
+    delete patchEntry.svnApprovalSource;
     return true;
 }
 

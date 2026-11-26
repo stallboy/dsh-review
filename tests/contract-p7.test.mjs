@@ -1,12 +1,12 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { AuditArchive } from '../packages/dsh-plugin/dist/host/audit-archive.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
+import { writeCandidate } from './fixtures/contract.mjs';
 
 const servers = [];
 after(async () => {
@@ -29,109 +29,135 @@ async function startApi(root) {
   return { base };
 }
 
-async function writeCandidate(root, slug, status = 'pending') {
-  const dir = path.join(root, '.ai-review', '2026-11', slug);
-  await mkdir(dir, { recursive: true });
-  const approval = status === 'approved'
-    ? ['rejection: null', 'approval:', '  approved_by: tester', '  approved_at: "2026-11-04T10:00:00+08:00"', '  gate_checks: []', '  gate_results: []', '  confirmed_decisions: []', '  waived_decisions: []', '  commit_revision: null'].join('\n')
-    : ['approval: null', 'rejection: null'].join('\n');
-  await writeFile(path.join(dir, 'review.md'), [
-    '---', 'schema_version: 1', `title: "net: ${slug}"`, 'module: net', 'audit_type: bugfix',
-    'created_at: "2026-11-04T09:00:00+08:00"', 'updated_at: "2026-11-04T09:00:00+08:00"', 'owner: tester',
-    'tags: []', `status: ${status}`, 'ticket: null', 'target_files: [src/host/api.ts]', 'current_revision: 1',
-    'revisions:', '  - id: 1', '    base_revision: "1"', '    patch: 001.patch', '    author: ai',
-    status === 'pending' ? 'gate_checks: ["node --version"]' : 'gate_checks: []',
-    'comments: []', 'human_decisions: []', approval, 'commit_message: "net: x"',
-    '---', '', '# 问题与影响', '', '# 需人工判断项', '- 无', '',
-  ].join('\n'), 'utf8');
-  if (status === 'pending') {
-    await writeFile(path.join(dir, '001.patch'), 'diff --git a/src/host/api.ts b/src/host/api.ts\n', 'utf8');
-  }
-}
-
-const META = (items) => ({
-  schemaVersion: 1, auditId: '20261104-020000-src-host', createdAt: '2026-11-04T02:00:00Z',
-  baseRevision: 'abc', scope: 'src/host', trigger: 'manual', previousAudit: null, candidates: [], items,
-});
-const ITEM = (over = {}) => ({
-  findingId: 'f1', kind: 'confirm', title: 'T', summary: 'S', targetFiles: ['src/host/api.ts'],
-  dependsOn: null, status: 'pending', candidate: null, ...over,
-});
-
-const convert = (base, payload) => fetch(`${base}/convert`, {
-  method: 'POST',
-  headers: { 'content-type': 'application/json' },
-  body: JSON.stringify(payload),
-});
-
-test('P7: confirm 项转换成功——档案与候选目录同一提交', async () => {
+test('P7: 已废止 POST /convert 与 POST /dismiss-finding 均返回 404（单一问题账本无转换流程）', async () => {
   const root = await createGitFixture();
   const archive = new AuditArchive(root);
-  await archive.write(META([ITEM({ findingId: 'f-confirm' })]), '# 报告\n');
+  await archive.writeAudit({
+    schemaVersion: 1,
+    auditId: '20261104-020000-src-host',
+    createdAt: '2026-11-04T02:00:00.000Z',
+    baseRevision: 'abc',
+    scope: 'src/host',
+    trigger: 'manual',
+    previousAudit: null,
+    issues: [],
+  }, '# 报告\n');
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
-  const commitBefore = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
-  // 故意让候选留在工作区，用来验证转换会原子提交候选和档案。
-  await writeCandidate(root, '20261104-net-a');
 
   const { base } = await startApi(root);
-  const ok = await convert(base, { auditId: '20261104-020000-src-host', findingId: 'f-confirm', candidateId: '2026-11/20261104-net-a' });
-  assert.equal(ok.status, 200);
-  const { audit } = await ok.json();
-  assert.equal(audit.items[0].status, 'converted');
-  assert.equal(audit.items[0].candidate, '2026-11/20261104-net-a');
+  const convertRes = await fetch(`${base}/convert`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ auditId: '20261104-020000-src-host', findingId: 'f1', candidateId: '2026-11/x' }),
+  });
+  assert.equal(convertRes.status, 404);
 
-  const commits = runCommand('git', ['rev-list', `${commitBefore}..HEAD`], root).stdout.trim().split('\n');
-  assert.equal(commits.length, 1);
-  const files = runCommand('git', ['show', '--name-only', '--format=', commits[0]], root).stdout.trim().split('\n');
-  assert.ok(files.some((f) => f.includes('audits/20261104-020000-src-host/audit.md')), files.join(','));
-  assert.ok(files.some((f) => f.includes('20261104-net-a/review.md')), files.join(','));
-
-  const again = await convert(base, { auditId: '20261104-020000-src-host', findingId: 'f-confirm', candidateId: '2026-11/20261104-net-a' });
-  assert.equal(again.status, 409);
+  const dismissRes = await fetch(`${base}/dismiss-finding`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ auditId: '20261104-020000-src-host', findingId: 'f1' }),
+  });
+  assert.equal(dismissRes.status, 404);
 });
 
-test('P7: deferred——前置 resolved/候选 approved 才可转换；pending/rejected 阻塞', async () => {
+test('P7: confirm 与 deferred 纯文字问题直接作为一等候选存在于队列，并支持 /finding/decision 处置', async () => {
   const root = await createGitFixture();
-  const archive = new AuditArchive(root);
-  await archive.write(META([
-    ITEM({ findingId: 'pre-ok', status: 'resolved' }),
-    ITEM({ findingId: 'pre-cand', status: 'converted', candidate: '2026-11/20261104-approved' }),
-    ITEM({ findingId: 'pre-open', status: 'pending' }),
-    ITEM({ findingId: 'dep-ok', kind: 'deferred', dependsOn: 'pre-ok' }),
-    ITEM({ findingId: 'dep-cand', kind: 'deferred', dependsOn: 'pre-cand' }),
-    ITEM({ findingId: 'dep-open', kind: 'deferred', dependsOn: 'pre-open' }),
-    ITEM({ findingId: 'dep-none', kind: 'deferred', dependsOn: 'pre-missing' }),
-  ]), '# 报告\n');
-  await writeCandidate(root, '20261104-approved', 'approved');
-  await writeCandidate(root, '20261104-net-b');
+  await writeCandidate(root, '20261104-pre', {
+    review: {
+      findingId: 'pre-req',
+      issueKind: 'confirm',
+      patches: ' []',
+      options: ' []',
+      commitMessage: null,
+    },
+  });
+  await writeCandidate(root, '20261104-dep', {
+    review: {
+      findingId: 'dep-item',
+      issueKind: 'deferred',
+      dependsOn: 'pre-req',
+      patches: ' []',
+      options: ' []',
+      commitMessage: null,
+    },
+  });
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
-  const { base } = await startApi(root);
 
-  const ok = await convert(base, { auditId: '20261104-020000-src-host', findingId: 'dep-ok', candidateId: '2026-11/20261104-net-b' });
-  assert.equal(ok.status, 200);
-  const ok2 = await convert(base, { auditId: '20261104-020000-src-host', findingId: 'dep-cand', candidateId: '2026-11/20261104-net-b' });
-  assert.equal(ok2.status, 200);
-  const blocked = await convert(base, { auditId: '20261104-020000-src-host', findingId: 'dep-open', candidateId: '2026-11/20261104-net-b' });
-  assert.equal(blocked.status, 409);
-  assert.match((await blocked.json()).error.message, /depends_on 未满足/);
-  const none = await convert(base, { auditId: '20261104-020000-src-host', findingId: 'dep-none', candidateId: '2026-11/20261104-net-b' });
-  assert.equal(none.status, 409);
-  const archived = await convert(base, { auditId: '20261104-020000-src-host', findingId: 'dep-ok', candidateId: '2026-11/20261104-approved' });
-  assert.equal(archived.status, 409);
+  const { base } = await startApi(root);
+  const queue = await (await fetch(`${base}/queue`)).json();
+  const dep = queue.items.find((i) => i.id.endsWith('20261104-dep'));
+  assert.equal(dep?.issueKind, 'deferred');
+  assert.equal(dep?.dependsOn, 'pre-req');
+  assert.equal(dep?.options.length, 0);
+
+  // 纯文字问题拒绝直接程序批准
+  const approveConfirm = await fetch(`${base}/approve`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      id: '2026-11/20261104-pre',
+      expectedRevision: 1,
+      expectedOwner: 'tester',
+      expectedUpdatedAt: '2026-11-01T10:00:00+08:00',
+      optionId: 'opt-a',
+      patchId: 1,
+    }),
+  });
+  assert.equal(approveConfirm.status, 409);
+
+  // 人工接管并标记外部完成 -> awaiting_verification
+  const takeover = await fetch(`${base}/finding/decision`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      id: '2026-11/20261104-pre',
+      expectedRevision: 1,
+      expectedOwner: 'tester',
+      expectedUpdatedAt: '2026-11-01T10:00:00+08:00',
+      action: 'human_takeover',
+      reason: '需跨模块重构，人工处理',
+    }),
+  });
+  assert.equal(takeover.status, 200);
+  const tBody = await takeover.json();
+  assert.equal(tBody.candidate.meta.status, 'human_takeover');
+
+  const extDone = await fetch(`${base}/finding/decision`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      id: '2026-11/20261104-pre',
+      expectedRevision: tBody.candidate.meta.recordRevision,
+      expectedOwner: 'tester',
+      expectedUpdatedAt: tBody.candidate.meta.updatedAt,
+      action: 'external_completed',
+      reason: '已在提交 abc123 修复',
+    }),
+  });
+  assert.equal(extDone.status, 200);
+  assert.equal((await extDone.json()).candidate.meta.status, 'awaiting_verification');
 });
 
-test('P7: 转换后投影联动——converted 候选 pending 视为 open', async () => {
+test('P7: /findings 聚合展示纯文字问题与人工接管状态，无需独立转换步骤', async () => {
   const root = await createGitFixture();
-  const archive = new AuditArchive(root);
-  await archive.write(META([ITEM({ findingId: 'f-x' })]), '# 报告\n');
-  await writeCandidate(root, '20261104-net-c');
+  await writeCandidate(root, '20261104-net-c', {
+    review: {
+      findingId: 'f-x',
+      issueKind: 'confirm',
+      patches: ' []',
+      options: ' []',
+      commitMessage: null,
+      status: 'awaiting_verification',
+    },
+  });
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
+
   const { base } = await startApi(root);
-  await convert(base, { auditId: '20261104-020000-src-host', findingId: 'f-x', candidateId: '2026-11/20261104-net-c' });
   const findings = await (await fetch(`${base}/findings`)).json();
-  assert.equal(findings.findings[0].state, 'open');
-  assert.equal(findings.findings[0].candidateStatus, 'pending');
+  assert.equal(findings.findings.length, 1);
+  assert.equal(findings.findings[0].findingId, 'f-x');
+  assert.equal(findings.findings[0].issueStatus, 'awaiting_verification');
 });

@@ -1,17 +1,45 @@
-import type { AuditPlanSettings, CommandRecord, ProjectRecord, ProjectSnapshot, NodeRecord } from '@dsh-review/protocol';
-import type { CandidateSummary } from '@dsh-review/protocol';
+import type {
+    AuditPlanSettings,
+    CandidateSummary,
+    CommandRecord,
+    IssueFindingView,
+    NodeRecord,
+    ProjectRecord,
+    ProjectSnapshot,
+} from '@dsh-review/protocol';
 import type { QueryClient } from '@tanstack/react-query';
 
-export interface Session { user: { userId: string; username: string; reviewIdentity: string }; csrfToken: string; localAccess?: true }
-export interface ProjectView { project: ProjectRecord; online: boolean; compatible: boolean; freshness: 'not_synced' | 'synced' | 'offline' | 'stale'; writable: boolean; workspaceIssue?: string; lastSyncedAt: string | null; vcsSnapshot: string | null; snapshot?: ProjectSnapshot }
+export interface Session {
+    user: { userId: string; username: string; reviewIdentity: string };
+    csrfToken: string;
+    localAccess?: true;
+}
+export interface ProjectView {
+    project: ProjectRecord;
+    online: boolean;
+    compatible: boolean;
+    freshness: 'not_synced' | 'synced' | 'offline' | 'stale';
+    writable: boolean;
+    workspaceIssue?: string;
+    lastSyncedAt: string | null;
+    vcsSnapshot: string | null;
+    snapshot?: ProjectSnapshot;
+}
 export interface AuditScheduleSettings { enabled: boolean; startTime: string; timeZone: string }
 export interface AuditSchedule extends AuditScheduleSettings {
     nextRunAt: string | null;
     lastRun: { scheduledAt: string; state: CommandRecord['state'] | 'waiting' | 'skipped'; reason: string | null; commandId: string | null } | null;
 }
-export interface AuditPlan extends AuditPlanSettings, Pick<AuditSchedule, 'nextRunAt' | 'lastRun'> { planId: string; version: number }
-export interface ProjectDetail extends ProjectView { auditSchedule: AuditSchedule | null; auditPlans: AuditPlan[] }
+export interface AuditPlan extends AuditPlanSettings, Pick<AuditSchedule, 'nextRunAt' | 'lastRun'> {
+    planId: string;
+    version: number;
+}
+export interface ProjectDetail extends ProjectView {
+    auditSchedule: AuditSchedule | null;
+    auditPlans: AuditPlan[];
+}
 export type QueueItem = CandidateSummary & { projectId: string; projectName: string };
+export type FindingView = IssueFindingView;
 export type { CommandRecord, NodeRecord };
 
 let csrfToken = '';
@@ -30,14 +58,26 @@ export function clearSession(client: QueryClient): void {
 export class ApiError extends Error {
     readonly status: number;
     readonly code: string;
-    constructor(status: number, code: string, message: string) { super(message); this.status = status; this.code = code; }
+    constructor(status: number, code: string, message: string) {
+        super(message);
+        this.status = status;
+        this.code = code;
+    }
 }
 
 export async function request<T>(path: string, method = 'GET', body?: unknown, signal?: AbortSignal, headers?: Record<string, string>): Promise<T> {
     const basePath = typeof document === 'undefined' ? '' : new URL(document.baseURI).pathname.replace(/\/$/, '');
-    const response = await fetch(`${basePath}/api/v1${path}`, { method, credentials: 'same-origin', signal,
-        headers: { ...(body !== undefined ? { 'content-type': 'application/json' } : {}), ...(method !== 'GET' ? { 'x-csrf-token': csrfToken } : {}), ...headers },
-        ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
+    const response = await fetch(`${basePath}/api/v1${path}`, {
+        method,
+        credentials: 'same-origin',
+        signal,
+        headers: {
+            ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+            ...(method !== 'GET' ? { 'x-csrf-token': csrfToken } : {}),
+            ...headers,
+        },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
     const value = await response.json();
     if (!response.ok) throw new ApiError(response.status, value.error?.code ?? 'http_error', value.error?.message ?? `请求失败（${response.status}）`);
     return value;
@@ -105,4 +145,9 @@ export async function command(projectId: string, operation: string, payload: unk
         if (error instanceof ApiError && error.status < 500) intents.delete(intent);
         throw error;
     }
+}
+
+export async function triggerSelfTest(projectId: string) {
+    const idempotencyKey = crypto.randomUUID();
+    return request<{ command: CommandRecord }>('/test', 'POST', { projectId, idempotencyKey });
 }

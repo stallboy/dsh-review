@@ -1,12 +1,11 @@
 import { parsePatch } from './patch.js';
-import { loadReviewers } from './reviewers.js';
 import type { AuthorStats, ReviewCandidate } from './types.js';
 
-/** 批准提交的消息组装层。首行由 Host 按候选生成，正文只采集能从当前评审信息验证的事实。 */
+/** 批准提交的消息组装层（SPEC §4.5）。首行由 Host 按所选方案生成，正文只采集可验证事实。 */
 
 export type CommitMessageDetail = 'simple' | 'detailed';
-
 export type { AuthorStats, AuthorStatBucket } from './types.js';
+
 export const DETAILED_BODY_MAX_CHARS = 6000;
 const DETAILED_TEXT_LIMIT = 900;
 
@@ -14,21 +13,26 @@ export function normalizeCommitDetail(value: unknown): CommitMessageDetail | und
   return value === 'simple' || value === 'detailed' ? value : undefined;
 }
 
-export function buildCommitSubject(candidate: ReviewCandidate): string {
+/** SPEC §4.5：simple/detailed 首行若所选方案存在人工补丁，追加 `@ patch <最新人工补丁编号>`（严禁使用 record_revision）。 */
+export function buildCommitSubject(candidate: ReviewCandidate, optionId?: string): string {
   const title = candidate.meta.title.replace(/\s+/g, ' ').trim();
-  const humanRevisions = candidate.meta.revisions.filter((revision) => revision.author === 'human');
-  const latestHuman = humanRevisions.reduce((max, revision) => Math.max(max, revision.id), 0);
-  const revTag = latestHuman > 0 ? ` @ rev ${String(latestHuman)}` : '';
-  return `review(${candidate.id}): ${title}${revTag}`;
+  const scopedPatches = optionId
+    ? candidate.meta.patches.filter((patch) => patch.optionId === optionId)
+    : candidate.meta.patches;
+  const latestHumanPatch = scopedPatches
+    .filter((patch) => patch.author === 'human')
+    .reduce((max, patch) => Math.max(max, patch.id), 0);
+  const patchTag = latestHumanPatch > 0 ? ` @ patch ${String(latestHumanPatch)}` : '';
+  return `review(${candidate.id}): ${title}${patchTag}`;
 }
 
-/** 详细模式仍保留标准首行，用空行隔开受长度限制的正文。 */
 export function composeCommitMessage(
   candidate: ReviewCandidate,
   detail: CommitMessageDetail,
   body: string,
+  optionId?: string,
 ): string {
-  const subject = buildCommitSubject(candidate);
+  const subject = buildCommitSubject(candidate, optionId);
   if (detail === 'simple') return subject;
   const trimmed = body.trim();
   if (!trimmed) return subject;
@@ -50,8 +54,8 @@ function flatten(text: string, limit = DETAILED_TEXT_LIMIT): string {
 
 export interface CommitMessageContext {
   repoRoot: string;
-  /** 由批准调用方注入同一次批准所用的共享快照读取。 */
-  readReviewersText?: () => Promise<string | null>;
+  optionId?: string;
+  patchId?: number;
   authorStats?: AuthorStats;
   patchText?: string;
   vcsType: 'git' | 'svn';
@@ -63,9 +67,12 @@ export async function buildCommitDetails(
 ): Promise<string> {
   const lines: string[] = [];
   const meta = candidate.meta;
+  const option = context.optionId ? meta.options.find((o) => o.id === context.optionId) : meta.options[0];
+  const patchId = context.patchId ?? option?.currentPatch;
+  const patchEntry = patchId !== undefined ? meta.patches.find((p) => p.id === patchId) : undefined;
+  const gateChecks = option?.gateChecks ?? [];
 
   const unit = context.vcsType === 'git' ? '提交' : 'revision';
-  // 生成消息时补丁尚未应用，工作区状态无法代表本次提交的文件数。
   const committedFiles = context.patchText !== undefined ? parsePatch(context.patchText).stats.files : null;
   if (context.authorStats) {
     const stats = context.authorStats;
@@ -74,9 +81,8 @@ export async function buildCommitDetails(
     } else if (stats.buckets.length === 0) {
       lines.push('作者统计：当前范围内没有可统计的提交');
     } else {
-      lines.push(`作者统计（${stats.scope === 'tracked' ? '本候选触及文件' : '仓库'}）：`);
+      lines.push(`作者统计（${stats.scope === 'tracked' ? '本问题触及文件' : '仓库'}）：`);
       for (const bucket of stats.buckets) {
-        // SVN 作者统计可能没有邮箱，空地址会误导读者。
         const identity = bucket.email ? `${bucket.name || bucket.email} <${bucket.email}>` : (bucket.name || '(未署名)');
         lines.push(`- ${identity}：${String(bucket.commits)} 次${unit}`);
       }
@@ -98,44 +104,44 @@ export async function buildCommitDetails(
   }
 
   const solution = flatten(candidate.sections.solution);
-  lines.push('', '修复方案：', solution || '（候选未填写修复方案）');
+  lines.push('', '修复方案：', solution || '（未填写修复方案）');
   const rootCause = flatten(candidate.sections.rootCause, 400);
   if (rootCause) lines.push('', '根因：', rootCause);
 
-  const currentRevision = meta.revisions.find((revision) => revision.id === meta.currentRevision);
-  const source = [`.ai-review/${candidate.id}（rev ${String(meta.currentRevision)}${currentRevision?.author ? ` · author ${currentRevision.author}` : ''}）`];
-  if (meta.reopenedFrom) source.push(`重开来源 ${meta.reopenedFrom}`);
-  const humanRevisions = meta.revisions.filter((revision) => revision.author === 'human').map((revision) => `rev ${String(revision.id)}`);
-  if (humanRevisions.length > 0) source.push(`人工修订 ${humanRevisions.join(' / ')}`);
+  const source: string[] = [
+    `.ai-review/${candidate.id}（record_revision ${String(meta.recordRevision)} · finding_id ${meta.findingId}）`,
+  ];
+  if (option && patchEntry) {
+    source.push(`所选方案 ${option.id} / 补丁 #${String(patchEntry.id)}（${patchEntry.patch} · author ${patchEntry.author}）`);
+  }
+  const humanPatches = (option
+    ? meta.patches.filter((p) => p.optionId === option.id && p.author === 'human')
+    : meta.patches.filter((p) => p.author === 'human'))
+    .map((p) => `patch ${String(p.id)}`);
+  if (humanPatches.length > 0) source.push(`人工修订 ${humanPatches.join(' / ')}`);
   source.push(`审查类型 ${meta.auditType || '未填写'}`);
   if (meta.ticket) source.push(`工单 ${meta.ticket}`);
-  lines.push('', '来源候选：', ...source.map((item) => `- ${item}`));
+  const auditIds = [...new Set(meta.observations.map((o) => o.auditId).filter(Boolean))];
+  if (auditIds.length > 0) source.push(`审查来源 ${auditIds.join(' / ')}`);
+  lines.push('', '来源元数据：', ...source.map((item) => `- ${item}`));
 
-  // 门禁结果以批准快照为准，提交消息只记录计划执行的命令。
-  lines.push('', `门禁（本次批准重新执行 ${String(meta.gateChecks.length)} 条）：`,
-    ...(meta.gateChecks.length > 0 ? meta.gateChecks.map((command) => `- ${command}`) : ['- （无）']));
+  lines.push(
+    '',
+    `门禁（本次批准实际执行 ${String(gateChecks.length)} 条）：`,
+    ...(gateChecks.length > 0 ? gateChecks.map((command) => `- ${command}`) : ['- （无）']),
+  );
 
   if (meta.humanDecisions.length > 0) {
-    lines.push('', `人工判断项（${String(meta.humanDecisions.length)} 项）：`, ...meta.humanDecisions.map((item) => `- ${item.id}：${flatten(item.question, 160)}`));
+    lines.push(
+      '',
+      `人工判断项（${String(meta.humanDecisions.length)} 项）：`,
+      ...meta.humanDecisions.map((item) => `- ${item.id}：${flatten(item.question, 160)}`),
+    );
   }
   if (meta.comments.length > 0) {
     const resolved = meta.comments.filter((comment) => comment.status === 'resolved').length;
     lines.push('', `审核评论：共 ${String(meta.comments.length)} 条，已处理 ${String(resolved)} 条`);
   }
 
-  try {
-    const reviewers = await loadReviewers(
-      context.repoRoot,
-      context.readReviewersText ? { readReviewersText: context.readReviewersText } : undefined,
-    );
-    if (reviewers.allowedGateCommands.length > 0) {
-      const allowed = meta.gateChecks.filter((command) => reviewers.allowedGateCommands.includes(command.trim())).length;
-      lines.push(`门禁白名单：${String(allowed)}/${String(meta.gateChecks.length)} 条在 reviewers.yml allowed_gate_commands 中`);
-    }
-  } catch {
-    // 这次读取只用于丰富提交消息，批准流程另外负责配置校验。
-  }
-
-  // 候选元数据没有 audit_id，按日期或范围推断可能指向别的审查轮次。
   return lines.join('\n');
 }

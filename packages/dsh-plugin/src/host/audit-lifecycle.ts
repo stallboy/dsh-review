@@ -14,17 +14,13 @@ export interface AuditLeaseRecord {
   svnUrl?: string;
   owner: string;
   createdAt: string;
-  /** 开审时已存在的候选不属于本轮新增产物，收尾须排除。 */
   candidateIdsBefore: string[];
   state: AuditLeaseState;
   sessionId?: string;
   commandId?: string;
-  phased?: boolean;
-  issueWorkflow?: true;
   stageProcessActive?: true;
   stageSeal?: Record<string, string>;
-  stageItems?: import('./audit-archive.js').AuditItem[];
-  stageRecheck?: import('./audit-history.js').AuditRecheck;
+  publishedIssueIds?: string[];
   commitOutcomeUnknown?: true;
 }
 
@@ -76,8 +72,11 @@ export class AuditLifecycle {
     return record;
   }
 
-  /** 已释放是终态，重复释放允许幂等重试。若状态无法持久化，则恢复内存中的原状态。 */
-  async transition(auditId: string, next: AuditLeaseState, commitOutcomeUnknown?: boolean): Promise<{ changed: boolean; lease: AuditLeaseRecord }> {
+  async transition(
+    auditId: string,
+    next: AuditLeaseState,
+    commitOutcomeUnknown?: boolean,
+  ): Promise<{ changed: boolean; lease: AuditLeaseRecord }> {
     const lease = this.find(auditId);
     if (!lease) throw new LeaseTransitionError(`审查租约不存在：${auditId}`);
     if (lease.state === next && (commitOutcomeUnknown === undefined || commitOutcomeUnknown === !!lease.commitOutcomeUnknown)) {
