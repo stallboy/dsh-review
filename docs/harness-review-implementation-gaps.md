@@ -1,232 +1,261 @@
-# 七项设计的实现未对齐清单
+# 当前实现与新版 SPEC 的差距清单
 
-> **任务来源**: 用户重新确认审查与修复的七项设计，要求先全面修订 SPEC.md，随后将尚未对齐设计的实现另写文档并提交。
-> **任务内容**: 对照已修订规格记录当前实现缺口、源码证据、影响、修订方向与验收条件；区分已确认缺口、既有测试通过范围及未完成的真实 Harness 验收。本次不修改实现。
-> **参考文档**:
-> - [SPEC.md](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/SPEC.md) — 提交 `2ea7be3`；七项设计、阶段边界、格式契约及验收基准。
-> - [AGENTS.md](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/AGENTS.md) — 审查后逐条复核、验证和提交纪律。
-> - [原改造方案](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/docs/plans/2026-11-25-harness-review-redesign.md) — 原 17 组实施差异及范围，不能代替本次新规格验收。
-> - [原实施与复审记录](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/docs/harness-review-redesign-validation.md) — 历史测试及真实 CLI 验收限制；其中“无未修复 P0/P1/P2”的判断不能代表当前完整对齐。
-> - [问题工作流测试](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/tests/issue-workflow.test.mjs)、[问题记录测试](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/tests/issue-review.test.mjs)、[Harness 边界测试](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/tests/harness-review-boundaries.test.mjs) — 本次重跑的 23 项专项测试。
-> **生成日期**: 2026-11-26
+> **文档用途**：对照 2026-11-26 定稿的唯一权威规格 [SPEC.md](../SPEC.md)，用通俗易懂的语言说明「目前代码已经做好了什么」「还有哪些地方没对齐」「为什么要改」以及「怎么改、怎么验收」。
+> **核验基准**：实现代码基于提交 `2a6f55e`；规格基于 2026-11-26 新版 [SPEC.md](../SPEC.md)（首版正式契约，统一 `schema_version: 1`，无任何历史格式包袱）。
+> **本次范围**：仅同步修订本差距清单，不修改业务代码；代码改造需按 [AGENTS.md](../AGENTS.md) 在独立 worktree 分支中完成。
 
-## 1. 基准与结论边界
+---
 
-规格基准为 `2ea7be3`，实现基准为 `2a6f55e`；前者只修订 SPEC，没有改变实现。下列源码位置以该实现为准，后续代码变更后须重新核验。
+## 1. 一句话看懂现状
 
-文中链接指向本次核验的工作副本；工作副本回收后，可按基准提交和链接中的仓库内路径从 Git 历史恢复对应源码，不能用后续同名文件的新行号直接替代本次证据。
+先说两个贯穿全文的基础概念：
+- **完整 Harness**：让 AI 自己调用读文件、搜索、执行命令等工具开展多轮调查（而不是程序提前截取几段源码拼进提示词做单轮问答）。
+- **三种 AI 产码模式**：**Mode A**（审查出初始补丁/文字方案）、**Mode B**（人审前按评论改补丁或 Rebase，改完仍待人审）、**Mode C**（人审批准后程序打补丁冲突，唤起 AI 在完整权限下辅助落地或分支合并）。
 
-本次先按七项设计检查实现，再逐条回到实际分支、调用方和校验器复核。确认 **12 组实现缺口，其中 P1 三组、P2 九组**；另列一组真实 Harness 验收受阻项，不将未查明的环境原因直接归为代码缺陷。部分组包含同一机制下的多处入口，不按文件重复计数。
+经过上一轮改造，**系统的大骨架已经跑通了**：多阶段审查、共享工作目录、单问题多方案补丁（如 A 用 `001.patch`、B 用 `002.patch`、修订 A 追加 `003.patch`）、程序性三方合并、批准后保留补丁、以及门禁失败还原不重试，这些核心基础都已有代码和专项测试支撑。
 
-本次仅新增本文。既有实现、测试和原实施记录均不修改；规格完成不表示本清单已修复。旧记录中“全部差异已处理”的表述应结合本文重新判断。
+但对照最新定稿的 [SPEC.md](../SPEC.md)，当前实现还有 **12 处差距（4 处高优先级 P1、8 处中优先级 P2）**，外加 **1 项真机模型实测（R01）尚未补齐**。相比早先清单，2026-11-26 新对齐的 5 项核心变化已全部反映到下文：
+1. **零旧格式包袱**：本项目从未正式发布，不再保留任何 v1/v2 读写兼容、废弃端点或 `expectedFindingVersion`，统一精简为单一格式 `schema_version: 1` 与统一并发守卫（见 D12）；
+2. **去掉门禁白名单拦截**：不再用 `allowed_gate_commands` 卡死补丁产出或批准，批准面板直接明文展示所有待执行门禁命令（见 D04）；
+3. **审查阶段采用「软引导 + Host 强还原」策略**：不靠沙箱硬拦项目目录写入，提示词引导优先在 `.ai-review/` 和 `.tmp/` 工作、允许必要取证，由 Host 在结束与收尾前强制确认停止并彻底还原非 `.ai-review/` 改动（见 D06、D11、R01）；
+4. **获批辅助应用（Mode C）不限制 Harness 权限**：允许编辑业务、分支合并乃至必要 `push`（仅禁改 `.ai-review/`），由 Agent 申报是否实质改了方案 + Host 物理拓扑硬护栏决定直接门禁落地还是导出新补丁回人审（见 D01）；
+5. **外部 Agent 优先，本 Harness 子代理兜底**：Codex / Claude Code 可用时优先调起增强审查效果，调不起时优雅降级给本 Harness 自身独立子代理，不卡死审查或自检（见 D11、R01）。
 
-## 2. 七项设计的实现对照
+---
 
-| 已确认设计 | 当前可保留的基础 | 尚未对齐的部分 |
+## 2. 七项核心设计的完成度总览
+
+| 核心设计 | 目前已经做好的基础 | 还没对齐的地方（对应编号） |
 | --- | --- | --- |
-| 1. 总调度委派独立阶段，完整 Harness 自主调查 | 已有阶段执行通道、独立上下文和原项目 cwd；已移除原源码视图裁剪 | 进程式定时历史复查仍有旧旁路；真实模型读取验收未完成；自检覆盖不完整，见 D10、D11、R01 |
-| 2. 共用 cwd，全项目可读，默认写审查目录，取证归档还原 | 主审查的权限桥、取证归档恢复和停止未知时阻断已有专项测试 | 人审前提案会话没有落实相同写权限及完整占用生命周期，见 D06 |
-| 3. 明确问题交付一至两个 patch 或重大文字方案，审查不应用 | 常规新审查提案与收尾采用只读预检；纯文字问题已支持 | 新项目配置阻断发现过晚；白名单被当成产出补丁的硬门禁；Deferred 信息丢失，见 D03、D04、D07 |
-| 4. 每问题一份跨轮记录，补丁独立编号并保留历史 | 已支持单记录、两个方案、A001/B002 后修订 B003，批准保留 patch | 跨轮身份输入、记录完整性、队列预检、旧格式迁移仍有缺口，见 D02、D07–D09、D12 |
-| 5. 人审后程序优先，Agent 可辅助应用，实质变化才重新人审 | 程序严格应用与确定性三方合并、显式方案批准已有实现 | Agent 辅助仍被强制当作新提案，缺少保持原批准继续应用的路径，见 D01；提案与执行会话边界见 D06 |
-| 6. 验证通过直接关闭；失败还原、记录、待人工，不自动修正 | 常规批准验证失败会还原、提交 repair_failed 记录且不调用 Runner | 待人工状态可被其他入口绕过；定时历史路径仍主动复查已合入候选，见 D05、D10 |
-| 7. 外部接手与完成反馈分开，后续代码证据关闭 | 正常 human_takeover → awaiting_verification → resolved 路径已有测试 | 人工处置状态转换未完整统一，其他提案入口仍接受接手及待核验状态，见 D05、D06 |
-
-## 3. 已确认的实现缺口
-
-### D01 · P1 · 获批辅助应用仍被强制转为新提案
-
-**规格**：SPEC §0.3、§4.10.4、§7.4–§7.5；AC-REPAIR-ASSIST。
-
-**实际代码**：
-
-- [runner.ts:111](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/runner.ts:111) 对全部 schema3 请求返回相同提案分支，不区分 ADDRESS_FEEDBACK 与获批 RESOLVE_CONFLICT；要求追加 patch、回 pending，并禁止业务编辑和 VCS 写操作。
-- [runner.ts:345](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/runner.ts:345) 按 schemaVersion 选系统提示词；[ai-proposal-system.md:10](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/assets/ai-proposal-system.md:10) 一律禁止应用业务补丁。
-- [approval.ts:942](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/approval.ts:942) 冲突后调用上述 Runner，finally 在第 963 行无条件还原业务工作区，成功后在第 1105 行返回 FALLBACK_TO_PENDING，要求重新审核。
-- [runner.ts:381](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/runner.ts:381) 的成功判据要求产生新版本与补丁，也无法接受仅辅助应用成功的结果。
-
-**影响**：即使不改变获批方案，Agent 也不能帮助落地后继续门禁；需要分支合并时没有符合新设计的完整权限及收尾路径。程序三方合并已存在，不等于 Agent 辅助应用已经实现。
-
-**修订方向**：在现有 Runner/批准事务中显式区分任务意图和批准上下文。保持获批方案的辅助结果进入原门禁、内容核验和原子提交；实质变化才还原、追加新 patch 并重新人审。不要另建一套问题存储或恢复框架。
-
-**验收**：程序应用失败后，等价辅助可编辑业务并直接完成本次批准；实质变化回人审；辅助后的门禁失败仍还原待人工。内存取证 P01 已确认两种模式当前生成完全相同的提案提示词。
-
-### D02 · P1 · 跨轮方案身份到发布时才检查，错误产物无法正常替换
-
-**规格**：SPEC §4.10.2、§7.6；AC-ISSUE-OPTIONS。
-
-**证据**：[orchestrator.md:53](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/assets/audit/orchestrator.md:53) 的 patch.task 参数说明没有 optionId；[audit-stages.ts:194](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/audit-stages.ts:194) 仅在它被提供时校验，登记阶段也不核实既有问题的方案身份。候选在第 389 行追加，两个名额及第二方案 approach 检查位于第 209 行。直到 [issue-publication.ts:127](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/issue-publication.ts:127) 才拒绝既有方案修订未带 optionId。
-
-**影响**：按已公开任务说明成功生成的 patch 可以在最终发布时失败；重交正确 patch 不会替换已登记错误候选，旧候选仍随发布进入校验，还可能耗尽两个名额。
-
-**修订方向**：派发时携带问题及已有方案身份；产物登记前核对归属、当前 patch 和 guard。允许修正失败产物，两个名额约束有效方案，不能由无效登记永久占用。
-
-**验收**：修订 A、修订 B、增加第二方案均不按数组位置猜身份；漏传/错传在登记前拒绝，修正后可继续发布。P02 已确认无 optionId 在发布失败，同输入补齐后成功。
-
-### D03 · P2 · 缺少负责人配置未在审查开始前阻止
-
-**规格**：SPEC §4.2、§7.6；AC-ROUTING-01。
-
-**证据**：[reviewers.ts:78](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/reviewers.ts:78) 在配置缺失时返回空配置；[api-audit.ts:575](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/api-audit.ts:575) 建立租约及第 321 行阶段初始化没有验证新问题路由可用。最终 [issue-publication.ts:81](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/issue-publication.ts:81) 才因 owner 为空抛错。
-
-**影响**：已有受信操作者或租约 owner 仍不等于共享路由已配置；新项目可消耗完整审查后连文字问题都不能发布。
-
-**修订方向与验收**：新审查启动前明确检查共享 reviewers.yml/default_owner，并给出配置指引；不能由模型编造 Owner。缺失配置应在进入 Agent Loop 前诊断，已有问题仍保留当前共享 Owner。P03 已复现文字问题的最终发布失败。
-
-### D04 · P2 · 门禁白名单仍是生成及发布 patch 的硬限制
-
-**规格**：SPEC §4.2、§7.6、§12.2；AC-SECURITY-01、AC-AUDIT-01。
-
-**证据**：[audit-stages.ts:239](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/audit-stages.ts:239) 拒绝未命中白名单的任何 gateCommands；[issue-finalize.ts:48](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/issue-finalize.ts:48) 再次阻止新提案提交；总调度参数说明也要求命中白名单。
-
-**影响**：本来可以让人审完整确认的有效验收命令，会导致补丁不能生成或发布。白名单被提升为产物资格条件，超出“降低确认成本”的契约。
-
-**修订方向与验收**：保留命令非空、格式和执行时确认；白名单只产生匹配信息，未命中在人审时明确确认，不能因此拒绝提案或丢掉明确问题。仅声明命令不会触发审查阶段的修复验证。
-
-### D05 · P2 · 人工处置与待人工状态的转换不完整
-
-**规格**：SPEC §4.10.3、§5.1、§8.3；AC-STATE-01、AC-REPAIR-FAILURE。
-
-**证据**：[api-writers.ts:663](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/api-writers.ts:663) 按 disposition 拒绝部分动作，但未禁止 repair_failed 直接 resume_review。第 689–695 行追加决定后，仅显式处理接手、外部完成和恢复审核；accept_as_is 未设置 rejected 或 rejection。
-
-**影响**：
-
-- 本次不修改在读模型中可以显示为接受现状，但底层仍可能是 pending、rejection=null，与状态契约不一致。这里不能据此断言现有审批一定绕过人的决定，审批另有发现处置检查。
-- repair_failed 可以经 resume_review 直接回 pending，绕过规定的人工接手处理边界；两端界面也根据非 undecided 处置展示“重新审核”。
-- [中央界面 App.tsx:116](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/apps/web/src/App.tsx:116) 与 [本地界面 client.ts:740](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/client/client.ts:740) 按 disposition 隐藏已接手项的接手按钮。repair_failed 已被投影为 human_takeover 处置，但外部完成按钮又要求实际 issueStatus=human_takeover，因此失败页缺少正确转入接手再反馈完成的常规入口；“重新审核”不能代替这个转换。
-
-**修订方向与验收**：按新状态表统一动作资格和状态写入，保留人工历史；本次不修改应形成一致的 rejected/rejection，失败问题不能通过通用恢复接口重回审批。P07、P08 已在实际处置分支、持久化之前用内存拦截确认转换结果。
-
-### D06 · P1 · 人审前提案会话缺少权限、guard 和停止核验边界
-
-**规格**：SPEC §0.3、§7.4、§8.1、§11.4；AC-AUDIT-NO-APPLY、AC-LOCK-01。
-
-**证据**：
-
-- [api-fix-session.ts:58](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/api-fix-session.ts:58) 未读取完整问题 guard；第 69 行只拒绝 approved/rejected/resolved，repair_failed、human_takeover、awaiting_verification 未被统一排除。
-- [index.ts:258](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/index.ts:258) 对“修复”标签继承原会话预设，只对“审查”标签安装 restrictAuditSession。当前 /fix-session 实际产物是人审前提案，仍可能继承原会话的宽写权限。
-- [api-fix-session.ts:87](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/api-fix-session.ts:87) 一小时直接释放内存占用；第 114 行 turn-end 也直接释放，没有根/子任务停止和工作区核验。该占用未形成可恢复的持久状态。
-
-**影响**：提案会话的提示词限制不等于实际权限边界；旧页面可以不带 guard 启动会话，待人工状态也能启动；超时、根 turn 结束或 Host 重启后，尚未核实的执行可能失去互斥保护。本次未用真实模型进行越权写入攻击试验，结论是这些保护未在该路径落实，不能把它写成已验证的操作系统隔离失效。
-
-**修订方向**：以提案意图绑定权限，复用审查权限与工作副本占用机制；受理前验证 guard 和允许状态，结束时核验根、子任务及工作区，未知则保留占用。不要把修复阶段放权反向套用于该入口。
-
-**验收**：P06 已确认 repair_failed 且省略 guard 仍可到达创建回调，turn-end 随即清除占用。后续须补充真实会话的写目录限制、迟到子任务、超时和重启恢复测试；不能仅测试创建返回 202。
-
-### D07 · P2 · Deferred 的前置关系没有保存在问题事实中
-
-**规格**：SPEC §3.1、§4.10.3、I10；AC-ISSUE-RECORD。
-
-**证据**：[audit-stages.ts:445](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/audit-stages.ts:445) 要求 Deferred 提供 dependsOn；[issue-publication.ts:147](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/issue-publication.ts:147) 生成问题正文时没有写入分类或 dependsOn；[issue-review.ts:167](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/issue-review.ts:167) 仅由有无 options 推导 repair/confirm，并固定 dependsOn=null。
-
-**影响**：如果模型没有自行将前置 ID 再抄进 repairPlan，入口接受的机器字段会消失；以后难以从唯一问题事实还原为何延迟及依赖谁。
-
-**修订方向与验收**：在同一 review.md 明确保留分类、前置 finding_id 和方案说明，并让读模型及跨轮输入使用它；不在 audit.items 或新 YAML 另建事实。P04 用仅出现在 dependsOn 的唯一标记确认输出问题记录没有保存它。
-
-### D08 · P2 · 记录时间、强制摘要与格式写入口径尚未统一
-
-**规格**：SPEC §4.10.1–§4.10.2、§4.10.5、I4、I13–I14。
-
-**证据与影响**：
-
-- [issue-publication.ts:104](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/issue-publication.ts:104) 直接写当前 now，既有记录时间在未来或时钟回拨时会倒退；正常 [store.ts:617](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/store.ts:617) 已有 nextUpdatedAt，发布没有复用。P05 已确认旧 updated_at=2099 时会写回较早时间。
-- [issue-review.ts:194](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/issue-review.ts:194) 没有要求每个账本项有 sha256；[store.ts:1064](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/store.ts:1064) 仅在摘要已存在时比较。正常发布会生成摘要，但外部提案缺失摘要仍可通过完整校验，P09 已确认。
-- [frontmatter.ts:447](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/frontmatter.ts:447) 沿旧对象追加 schema3 字段，未遵循现行固定键序；[audit-archive.ts:198](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/audit-archive.ts:198) 将内部目录 id 写入 issues，与现行规格的 review.md 相对路径口径不同。这两项属于较低影响的格式对齐，不能与摘要绑定缺失等量视为数据损坏。
-
-**修订方向与验收**：统一记录时间推进；新补丁摘要必填并验证原字节；明确并统一 schema3 的序列化及索引解析。覆盖冻结时钟、回拨、缺失/错摘要、纯文字空账本和索引往返，旧记录保持明确兼容，不通过重写历史掩盖差异。
-
-### D09 · P2 · 队列仍只预检默认方案，未形成按方案的诊断
-
-**规格**：SPEC §8.2、§10.1；AC-ISSUE-OPTIONS、AC-UI-01。
-
-**证据**：[api-readmodels.ts:45](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/api-readmodels.ts:45) 的基础缓存键只有 root/id/revision/base；第 66 行后台预检选择默认 currentReviewPatch；第 143 行队列使用基础键且只返回一个 patchCheck。
-
-**影响与限定**：队列没有分别表达 A/B 的预检，也未标明诊断所属选择。详情第 230 行已经追加 optionId/patchId，因此不能把本问题描述成“所有详情缓存都会串方案”或“已批准了错误补丁”。
-
-**修订方向与验收**：让队列后台任务及缓存使用与详情一致的明确方案身份，诊断与规模标明所属方案/patch；A 可应用、B 冲突时分别显示，纯文字不伪造补丁。仍保持队列请求只读缓存、不在请求内批量执行预检。
-
-### D10 · P2 · 进程式定时审查仍有旧历史复查旁路
-
-**规格**：SPEC §7.6、§16.11；AC-HARNESS-READ、AC-AUDIT-NO-APPLY、AC-ISSUE-HISTORY。
-
-**证据**：[api-audit.ts:974](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/api-audit.ts:974) 在正式 channelPrompt 之前单独 runAgent 执行历史复查；[audit-history.ts:106](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/audit-history.ts:106) 从上一档案收集已批准候选，随后第 119 行提示词要求不得修改任何文件，结果直接交 verifyAuditRecheck 核对。
-
-**影响**：该历史覆盖没有与独立阶段复核、可归档取证及正常发布共用完整流程；已成功程序修复还被主动加入专门复查。schema3 的 issues 被解析到内部 candidates，因此这不只是旧格式恢复代码。
-
-**修订方向与验收**：复用同一总调度与受租约阶段工具，历史阶段只处理适用开放问题、到期延期和外部完成待核验；允许必要取证但必须恢复。程序已关闭问题在正常扫描发现新证据时才重开，不能增加必跑的成功复核。
-
-### D11 · P2 · 提示词残留与自检覆盖仍未跟随现行契约
-
-**规格**：SPEC §11、§16.12；AC-PROMPT-01、AC-ISSUE-COMPAT。
-
-**证据**：[补丁 Skill:3](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/assets/audit/patch/SKILL.md:3) 的 description 仍写“Host 在专用副本验收”，与正文和实际共享 cwd 相反。此处是误导性提示词残留，不能据此断言 Host 实际仍创建副本。
-
-[audit-self-test.ts:90](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/audit-self-test.ts:90) 已通过大文件随机尾行验证读取，但没有要求 Agent 写入审查目录并核对写入结果，或核对默认业务写限制；第 126 行仍生成 schemaVersion=2 且没有问题记录的模拟档案。
-
-**修订方向与验收**：清理矛盾的角色/元数据说明；自检验证真实读取、审查目录写入、默认业务写边界及 schema3 问题/索引读回。保留现有随机样本、停止和清理逻辑，不以模拟执行器通过替代真实模型验收。R01 单独记录实际环境结果。
-
-### D12 · P2 · 旧格式升级及新建入口缺少完整适用范围核验
-
-**规格**：SPEC §0.2、§13.2；AC-ISSUE-COMPAT。
-
-**证据**：[issue-publication.ts:52](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/issue-publication.ts:52) 用 findingId 建立 Map；多个旧 v2 记录同属一 finding 时，第 62 行保留先遇到的旧记录，随后直接升级，未核实唯一承载目录及完整方案映射。P10 已确认调换输入遍历顺序就改变升级目录。
-
-[api-writers.ts:1105](/C:/Users/Administrator/.codex/worktrees/a333/dsh-review/packages/dsh-plugin/src/host/api-writers.ts:1105) 后的独立 finalize 分支仍按本地旧候选、版本 1 等条件收尾，没有证明它是已按旧契约启动的恢复任务。
-
-**影响**：多候选旧问题可能被静默择首升级，其他方案与人工历史的映射未证明完整；另一路仍可作为新建 v1 产物入口，与“旧格式兼容不等于新任务降级”不符。
-
-**修订方向与验收**：唯一且可核验时才原地迁移；多旧记录映射不明交人处理，保留旧读取，不猜测合并。旧任务恢复需有可核验的开始上下文；新问题统一 v3。保留已经通过的旧补丁恢复和旧人工决定迁移用例，再补歧义映射和伪装旧恢复的新任务拒绝用例。
-
-## 4. R01 · 真实 Harness 验收仍受阻
-
-源码已有原 cwd、正常工具事件流及读写权限相关改造，但完整实际执行尚不能标为完成：
-
-- 前一轮在同一实现基准上使用真实 Codex 执行器，要求读取 180 KB 文件末尾未预注入提示词的随机内容，并写 `.ai-review/proof.txt`。执行器确认停止，但文件读取和审查目录写入均未成功，业务原文件未变；模型诊断提到工具不可用或策略拒绝。该诊断不足以单独确定根因，不能直接写成某个模块必然配置错误。
-- 原实施记录中的 150 KB 真实读取 smoke 也未通过。Claude Code 的真实模型读取、写入及边界验收尚未完成。
-- 本轮没有重新运行真实模型 smoke；保留既往观测及来源，不将它写成本轮新产生的失败。当前 23 项专项通过也不能消除此验收阻塞。
-
-后续须在实际部署 Harness/CLI 环境，按 AC-HARNESS-READ、AC-AUDIT-NO-APPLY 和 SPEC §16.12 验证独立阶段、同一 cwd、未注入随机大文件读取、审查目录写入、业务写限制及停止证明；同时核对主调度的真实委派。不得以放开审查业务写权限或复制凭据绕过失败。
-
-## 5. 本轮验证及逐条复核
-
-### 5.1 专项测试
-
-本次执行：
-
-```powershell
-node --test --test-concurrency=1 --test-reporter=tap tests/issue-review.test.mjs tests/issue-workflow.test.mjs tests/harness-review-boundaries.test.mjs
-```
-
-结果为 **23 项通过、0 失败、0 跳过**，约 52.7 秒。测试使用现有构建产物，本轮未重新构建或修改实现；源码和调用分支另行逐条核对。没有重跑原约 30 分钟的全量测试，也不把原 608 项结果登记为本轮新验收。
-
-已验证的基础包括显式选择 B、保留历史补丁、门禁失败还原且不调用 Runner、单方案跨轮修订、旧补丁恢复、当前 Owner 授权、正常外部完成关闭、Windows 进程树清理及权限桥相关行为。
-
-大文件专项使用注入执行器读取文件，权限桥专项也有受控服务依赖；这些测试可以证明相应边界，不能证明真实模型可用。
-
-### 5.2 十组附加内存取证
-
-使用现有 dist 模块直接调用实际函数；问题数据、VCS 视图、创建会话及持久化边界由内存夹具提供。未写项目文件、未启动真实 Agent；处置测试在 store.write 前以哨兵异常中止，恢复临时替换的探针方法。它们证明指定分支的行为，不冒充完整 HTTP/OS 集成验收。
-
-| 编号 | 输入及复现方法 | 实际结果 | 对应缺口 |
-| --- | --- | --- | --- |
-| P01 | 同一 schema3 问题及选择，分别调用 buildFixPrompt 的 ADDRESS_FEEDBACK / RESOLVE_CONFLICT | 两份提案提示词完全相同 | D01 |
-| P02 | 既有 A001，prepareIssuePublication 接收不带 optionId 的新提案，再补齐 a 重试 | 前者最终发布失败，后者成功 | D02 |
-| P03 | 新文字问题、有效租约 owner、空 reviewers 配置 | 问题发布报缺少有效负责人 | D03 |
-| P04 | Deferred 仅在 dependsOn 放唯一前置 ID，repairPlan 不重复该 ID | 生成的 review.md 找不到该 ID | D07 |
-| P05 | 既有记录 updated_at 为 2099，按当前时间生成观察和修订 | 输出 updated_at 比旧值更早 | D08 |
-| P06 | repair_failed 且有未解决评论，不传完整 guard 调 FixSessions.create；模拟 turn-end | 创建回调到达并返回 202，turn-end 清除占用 | D06 |
-| P07 | pending 问题走 findingDecision/accept_as_is，在持久化前截获 | 决定已追加，status 仍 pending、rejection 仍 null | D05 |
-| P08 | repair_failed 问题走 findingDecision/resume_review，在持久化前截获 | status 被置为 pending | D05 |
-| P09 | 正常 schema3 账本删去 sha256，调用 validateFullCandidate 并提供对应 patch | 完整校验错误为空 | D08 |
-| P10 | 同 finding 的两份旧 v2 记录，分别以正序/倒序传给 prepareIssuePublication | 升级目录随首条记录改变，未要求确认映射 | D12 |
-
-所有写入本报告的结论均再次核对了分支、位置及触发条件。已确认正确的详情方案缓存、原生 SVN 批准定位、常规失败回退和外部完成闭环不列为缺陷。上述计数不是对所有实现细节已经穷尽的保证，后续修订仍须执行相同的审查与复核。
-
-## 6. 后续实施顺序与架构约束
-
-1. **先补阶段与执行边界**：D01、D06；复用 Runner、批准事务、权限桥和占用，避免继续按 schema 或“修复”标签推断权限。验证失败分支始终不自动启动 Agent。
-2. **再补问题事实及交付链**：D02–D05、D07–D09、D12；统一稳定身份、时间和摘要校验，前置配置检查，保留单记录和原子提交，不新增第二套发现事实。
-3. **统一历史覆盖与自检**：D10、D11，并完成 R01；历史覆盖复用现有阶段机制，不能为修复效果创建审查副本。
-4. **每组补反例并回归**：将本报告的触发输入转成可复现行为测试，保留既有正向用例；完成后重跑类型、构建、全量测试及真实环境验收，再重新评定七项设计是否全部完成。
-
-不把文档完成、字符串匹配、模拟执行器通过或旧全量测试通过等同于实现已对齐。提交、同步或还原结果不明时继续保留现场与互斥；不引入自动门禁失败修正、额外成功复核、无授权推送或发布。
+| **1. 总调度委派独立阶段 + 完整 Harness + 子代理降级** | 阶段执行通道、独立上下文、共享项目 cwd 已建好，已去掉旧的源码视图裁剪 | 外部 Agent 调不起时缺少自动降级到本 Harness 子代理的配置与自检；定时审查还有旧历史复查旁路；真机实测未补（D10、D11、R01） |
+| **2. 共享 cwd、「软引导 + Host 强还原」** | 主审查的归档还原、进程树清理和停止核验已有基础测试 | 交互式 `/fix-session` 缺并发守卫、状态校验、持久占用和结束还原核验；旧权限桥仍按硬拦写目录思路编写（D06、D11） |
+| **3. 交付 1–2 个补丁或完整文字方案，审查不应用** | 常规审查采用只读预检、不应用补丁；纯文字问题已能表达 | 缺 `reviewers.yml` 时没在开跑前拦住且缺初始化接口；旧白名单仍在拦补丁；Deferred 依赖写入时丢了（D03、D04、D07） |
+| **4. 唯一问题记录 + 不可变补丁账本** | 单 `review.md`、最多 2 方案、补丁递增编号、批准保留补丁已实现 | 跨轮 `optionId` 查得太晚；缺 `issue_kind`/`depends_on`/`approval_history` 且 `module` 被硬编码；`sha256` 未强制、时间可能倒退；仍背着 v1/v2 与 `schema_version: 3` 历史包袱（D02、D07、D08、D09、D12） |
+| **5. 人审后程序优先，Mode C 辅助放开权限** | 程序严格应用、确定性三方合并、显式选方案批准已有实现 | 程序失败唤起 Agent 时，代码仍强行当成“只出新提案”模式，没实现完整权限辅助应用与物理拓扑硬护栏直通门禁（D01） |
+| **6. 门禁通过直接关闭；失败还原封禁待人工** | 常规批准门禁失败会还原业务、写 `repair_failed` 记录且不调 Agent | `repair_failed` 缺失败补丁永久封禁与完整状态机，存在绕过与死锁；UI 缺失败页正确入口；定时审查还会回头查已 `approved` 问题（D05、D10） |
+| **7. 外部人工接手、完成反馈、代码证据关闭** | `human_takeover → awaiting_verification → resolved` 主路径已有测试 | `accept_as_is` 未同步置 `rejected`/`rejection` 与符号提取；`human_takeover` 缺放弃出口；提案入口未排除接手/待核验状态（D05、D06） |
+
+---
+
+## 3. 待修复的 12 项具体差距
+
+### 差距总览速查表
+
+> 说明：编号 `D01–D12` 沿用首轮代码审计序，下文正文按 **P1（高优先）→ P2（中优先）** 分组展开，方便按实施顺序查阅。
+
+| 编号 | 级别 | 所属模块 | 一句话问题 | 建议阶段 |
+| --- | --- | --- | --- | --- |
+| D12 | **P1** | 协议 / API / 存储 | 仍停留在 `schema_version: 3` 并残留 v1/v2 兼容、废弃端点与 `expectedFindingVersion` | 第 1 步 |
+| D01 | **P1** | 批准 / Runner | 程序应用受阻时，Mode C 被强行当成重新出提案，无法完整权限辅助并直通门禁 | 第 2 步 |
+| D06 | **P1** | 提案会话 / 锁 | `/fix-session` 缺完整并发守卫、状态校验、持久占用与结束还原核验 | 第 2 步 |
+| D02 | **P1** | 审查阶段 / 发布 | 跨轮修订 `optionId` 到发布时才检查，错产物会占死 2 个方案名额 | 第 3 步 |
+| D07 | **P2** | 问题记录 / 发布 | 丢了 `Deferred` 依赖、缺新 Frontmatter 字段，且新建问题把 `module` 写死为 `'audit'` | 第 1 步 |
+| D08 | **P2** | 校验 / 序列化 | 发布 `updated_at` 可能倒退、`patches[].sha256` 未强制校验、键序未统一 | 第 1 步 |
+| D04 | **P2** | 审查 / 门禁 | 已废弃的 `allowed_gate_commands` 白名单仍在硬拦截正常补丁生成与发布 | 第 1 步 |
+| D05 | **P2** | 状态机 / 两端 UI | `accept_as_is` 写盘不全、`repair_failed` 缺永久封禁与防死锁流转、失败页缺入口 | 第 2 步 |
+| D03 | **P2** | 配置 / 审查入口 | 缺 `reviewers.yml` 未在审查启动前拦截，且缺少一键初始化接口 | 第 3 步 |
+| D09 | **P2** | 队列读模型 | 队列只预检默认方案未分方案显示，且 `counts` 缺少 4 个新状态计数 | 第 3 步 |
+| D10 | **P2** | 定时审查 | 进程式定时审查仍有旧历史旁路，会回头复查已 `approved` 关闭的问题 | 第 3 步 |
+| D11 | **P2** | 提示词 / 自检 | 提示词残留旧副本描述；自检未接入“外部优先 + 本 Harness 子代理兜底”与新格式验证 | 第 4 步 |
+
+---
+
+### 高优先级（P1）— 直接影响核心主流程与架构边界
+
+#### D01 · P1 · 获批后 Agent 辅助应用（Mode C）被强制当成了“重新出提案”
+- **对应规格**：[SPEC.md](../SPEC.md) §0.2、§5.4、§5.5、§7.3；`AC-REPAIR-ASSIST`
+- **现在代码怎么干的**：
+  - [runner.ts](../packages/dsh-plugin/src/host/runner.ts) 第 111 行把所有请求塞进同一套提案分支，不区分 Mode B（人审前改提案）与 Mode C（人审后解冲突落地）；
+  - [ai-proposal-system.md](../packages/dsh-plugin/assets/ai-proposal-system.md) 第 10 行一刀切禁止修改业务源码和执行 VCS 操作；
+  - [approval.ts](../packages/dsh-plugin/src/host/approval.ts) 第 942–963 行在冲突后调起 Runner，但 `finally` 无条件还原了业务工作区，第 1105 行直接返回 `FALLBACK_TO_PENDING`，逼着人重审一遍。
+- **会导致什么坑**：哪怕冲突只是几行上下文微调、完全没改原方案意图，Agent 也帮不上忙，更没法做分支合并；用户点完批准还是会被踢回“重新审核”。
+- **按新版 SPEC 应该怎么改**：
+  - 彻底拆分 Mode B 与 Mode C；Mode C **不额外限制 Harness 权限（允许修改业务、分支合并乃至必要 `push`）**，仅禁止修改 `.ai-review/`；
+  - 要求 Mode C 输出结构化 JSON（`verdict: equivalent | material_change`、`summary`、`gitActions`），Host 根据进入前快照 `(preHead, preBranch, preRemoteTip, approvedPatchPaths, preAiReviewDigest)` 按物理状态分流：
+    - 净改动非空且全部落在所选补丁原文件集合 `approvedPatchPaths` 内（分支合并自动排除上游父提交未二次修改的文件）、未碰 `.ai-review/` 与禁止路径且声明 `equivalent` → 直接进步骤 8 门禁（未推送走单次原子提交/amend，已推送则创建关闭提交并写 `approval.business_commit`）；
+    - `material_change` 或仅业务文件越界（未推送）→ **先**导出新补丁、**再**还原业务工作区并提交 `.ai-review/` 回 `pending` 重审；
+    - 触犯禁止路径/篡改 `.ai-review/`/非法 JSON → 还原并报 `ABORTED / RUNNER_FAILED`（不出新补丁）；
+    - 已推送远端后遇门禁失败或护栏违例 → 绝不强推覆盖远端，保留现场返回 `RECOVERY_REQUIRED / REMOTE_PUSH_UNREVERTIBLE`。
+- **怎么验证改对了**：覆盖 5 类测试——① 工作区等价适配直通门禁关闭；② 本地分支合并等价适配（含上游无关文件不误杀）经 amend 单次原子提交关闭；③ 实质变化/越界先导补丁再还原回 `pending`；④ 触犯 `.ai-review/` 或非法输出直接报 `RUNNER_FAILED` 不出补丁；⑤ 已推送后门禁失败进入 `RECOVERY_REQUIRED`。
+
+---
+
+#### D02 · P1 · 跨轮修订方案时，`optionId` 查得太晚，错产物还会占死名额
+- **对应规格**：[SPEC.md](../SPEC.md) §5.6；`AC-ISSUE-OPTIONS`
+- **现在代码怎么干的**：
+  - 总调度提示词 [orchestrator.md](../packages/dsh-plugin/assets/audit/orchestrator.md) 第 53 行的 `patch.task` 参数里漏掉了 `optionId`；
+  - [audit-stages.ts](../packages/dsh-plugin/src/host/audit-stages.ts) 第 194 行只在传了 `optionId` 时才校验，第 389 行直接往候选列表里追加；
+  - 直到最后发布 [issue-publication.ts](../packages/dsh-plugin/src/host/issue-publication.ts) 第 127 行才报错说“改旧方案没带 `optionId`”。
+- **会导致什么坑**：Agent 照着任务说明把补丁做完了，最后收尾才炸；而且错误登记的那条记录已经占掉了“最多 2 个方案”的名额，重交正确的也会被卡死。
+- **按新版 SPEC 应该怎么改**：
+  - 派发方案任务时，Host 必须显式传入已有 `finding_id`、已有 `option_id` 列表、各自 `current_patch` 和共享并发守卫（guard）；
+  - 登记产物前就校验 `option_id` 归属与格式，不合法直接拒收且不占名额，允许 Agent 修正后重交。
+- **怎么验证改对了**：测试修订方案 A、修订方案 B、新增第二方案都不靠数组下标猜身份；故意漏传或传错 `optionId` 在登记前被拒，补齐后可正常发布且不超名额。
+
+---
+
+#### D06 · P1 · 交互式提案会话（`/fix-session`）缺并发守卫、状态校验与持久化占用
+- **对应规格**：[SPEC.md](../SPEC.md) §0.2、§5.4、§5.7、§6.3；`AC-AUDIT-NO-APPLY`、`AC-LOCK-01`、`AC-API-01`
+- **现在代码怎么干的**：
+  - [api-fix-session.ts](../packages/dsh-plugin/src/host/api-fix-session.ts) 第 58 行没有校验完整的并发守卫（guard，即 `expectedRevision + expectedOwner + expectedUpdatedAt`）；
+  - 第 69 行只挡掉了 `approved / rejected / resolved`，漏掉了 `human_takeover` 和 `awaiting_verification`；第 72–74 行虽查了是否有未解决评论，但没按“总体或所选方案”过滤，且 `optionId`/`patchId` 拖到第 78 行 `fixPrompt` 内才查；
+  - 第 87 行靠 1 小时内存定时器自动清占用，第 114 行在根会话 `turn-end` 时也直接清占用，既未持久化到磁盘，也没确认子任务停了、业务目录还原干净；
+  - [index.ts](../packages/dsh-plugin/src/host/index.ts) 第 258–262 行对审查会话（第 259–262 行 `restrictAuditSession`）和修复会话（第 258 行 `inheritOwnerPolicy`）的处理仍停留在旧的硬拦截思路。
+- **会导致什么坑**：旧页面能不带并发守卫乱起会话；已人工接手的问题会被莫名拉起 AI 修改；一旦超 1 小时、根 turn 提前结束或插件重启，工作目录互斥占用锁就没了，别的审批或同步可能直接撞上正在干活的 Agent。
+- **按新版 SPEC 应该怎么改**：
+  - 受理前强制校验：完整 `ConcurrencyGuard`、显式 `optionId`/`patchId`、Owner 匹配、至少一条总体或所选方案的未解决评论、工作区干净；合法状态仅限 `pending`、`changes_requested` 或人类显式带评论发起的 `repair_failed`；
+  - 提示词明确 Mode B 的「软引导 + Host 强还原」纪律（优先写 `.ai-review/` 与 `.tmp/`，不应用补丁验证修复，不执行 VCS commit/push/切分支）；
+  - 复用**持久化工作副本占用锁**（重启不丢），仅在确认根会话及子任务树全部停止、且业务目录非 `.ai-review/` 改动归零后才释放占用，取消 1 小时盲目自动释放。
+- **怎么验证改对了**：测试缺 guard 或在 `human_takeover`/`awaiting_verification` 上调用被拒；测试 `repair_failed` 无评论被拒、带评论显式发起可创建；测试迟到子任务、超时、Host 重启后占用锁仍生效，直至确认停止且工作区还原才释放。
+
+---
+
+#### D12 · P1 · 清理未发布历史包袱：统一 `schema_version: 1`、移除 v1/v2 兼容与统一 API 守卫
+- **对应规格**：[SPEC.md](../SPEC.md) 顶部声明、§3、§6.1、§6.3、§10.1（`I2`）；`AC-DATA-01`、`AC-API-01`
+- **现在代码怎么干的**：
+  - 代码目前用 `schema_version: 3` 表示新版记录，同时背着大量 v1/v2 读取、审批、迁移分支（如 [issue-publication.ts](../packages/dsh-plugin/src/host/issue-publication.ts) 第 60–62 / 90–100 行的 v2 自动择首升级、[api-writers.ts](../packages/dsh-plugin/src/host/api-writers.ts) 第 1106 行起的独立 v1 finalize 旁路，以及 `/reject`、`/archive-stale`、`/reopen`、`/convert`、`/dismiss-finding`、`/manual-revision`、`findings/<id>.yml`）；
+  - API 中 `/finding/decision` 与 `/approve` 还残留着旧外置发现时代的 `expectedFindingVersion` 与 `findingId` 寻址，与其余 10 个问题写端点的 `{id, ...guard}` 不统一。
+- **会导致什么坑**：本项目从未正式发布，历史兼容分支让代码和提示词极度臃肿，且不断把新逻辑带偏进旧分支；双套乐观锁字段（`guard` vs `expectedFindingVersion`）也让前端与 AI 极易传混。
+- **按新版 SPEC 应该怎么改**：
+  - 唯一正式格式统一为 **`schema_version: 1`**（`review.md` 与 `audit.md` 一致），读端遇任何非 `1` 版本直接报错拒绝；
+  - 彻底移除 v1/v2 解析、写入、迁移代码、外置 `findings/<id>.yml`、`verify_gate_on_audit_finalize` / `audit_smoke_commands` 及所有废弃端点；
+  - 彻底移除 `findingVersion` / `expectedFindingVersion`，让 `/finding/decision` 与 `/approve` 及全部 11 个问题写端点统一使用 `{id, ...guard}`；
+  - 清理历史 v1/v2 夹具，把有效行为测试全面切换到 `schema_version: 1`。
+- **怎么验证改对了**：全仓仅存一套 `schema_version: 1` 模型；非 `1` 版本文件被拒绝；废弃端点不可达；全部 11 个问题写端点统一使用 `{id, ...guard}`；类型、构建与全量测试通过。
+
+---
+
+### 中优先级（P2）— 数据精确性、配置体验与前后端细节对齐
+
+#### D03 · P2 · 新仓库缺少 `reviewers.yml` 没在开跑前拦住，且缺一键初始化接口
+- **对应规格**：[SPEC.md](../SPEC.md) §3.2、§5.6、§6.3；`AC-ROUTING-01`、`AC-API-01`
+- **现在代码怎么干的**：[reviewers.ts](../packages/dsh-plugin/src/host/reviewers.ts) 第 78 行在文件缺失时返回空配置，[api-audit.ts](../packages/dsh-plugin/src/host/api-audit.ts) 第 321/575 行启动审查时没拦截，跑完全部 Agent 后在 [issue-publication.ts](../packages/dsh-plugin/src/host/issue-publication.ts) 第 81 行才因 `owner` 为空抛错；且目前没有供 UI 一键创建初始 `reviewers.yml` 的写接口。
+- **会导致什么坑**：白耗十几分钟 Token 和时间，最后连纯文字问题都发不出来。
+- **按新版 SPEC 应该怎么改**：审查启动前（进入 Agent Loop 之前）先校验共享 `reviewers.yml` 与有效 `default_owner`，缺失直接返回 412 `not_configured` 并引导配置；新增 `POST /reviewers/init` 接口供 UI 用当前操作者一键初始化并提交 `reviewers.yml`；已有问题继续保留各自共享 `owner`。
+- **怎么验证改对了**：无 `reviewers.yml` 的仓库启动审查在进 Agent Loop 前即返回 412；调用 `POST /reviewers/init` 初始化后可正常开跑审查。
+
+---
+
+#### D04 · P2 · 旧的门禁白名单（`allowed_gate_commands`）仍在拦截正常补丁产出
+- **对应规格**：[SPEC.md](../SPEC.md) §3.2、§6.5、§8.2；`AC-SECURITY-01`
+- **现在代码怎么干的**：[audit-stages.ts](../packages/dsh-plugin/src/host/audit-stages.ts) 第 239 行与 [issue-finalize.ts](../packages/dsh-plugin/src/host/issue-finalize.ts) 第 48 行强行拒绝不在 `allowed_gate_commands` 里的任何门禁命令。
+- **会导致什么坑**：只要 AI 写的单测命令没逐字抄进白名单（比如只跑单个测试文件），合法补丁就直接被拒，根本产不出来。
+- **按新版 SPEC 应该怎么改**：**彻底移除门禁白名单拦截逻辑**（生成、发布、批准均不校验白名单，配置文件若残留该键仅忽略）；只保留 `gate_checks` 非空校验，并确保批准面板明文完整展示全部待执行门禁命令。
+- **怎么验证改对了**：仓库未配置任何白名单时，任意合法非空测试命令均可正常产出补丁、发布并在批准面板明文展示执行。
+
+---
+
+#### D05 · P2 · 人工处置写盘不完整，`repair_failed` 缺永久封禁与防死锁流转，界面缺正确入口
+- **对应规格**：[SPEC.md](../SPEC.md) §4.1、§4.2、§6.5；`AC-STATE-01`、`AC-REPAIR-FAILURE`
+- **现在代码怎么干的**：
+  - [api-writers.ts](../packages/dsh-plugin/src/host/api-writers.ts) 第 663–695 行处理 `accept_as_is` 时，只追加了 `decisions[]`，没同步把 `status` 改为 `rejected`、没填 `rejection` 对象，也没落盘 `category` 与从补丁 hunk header 提取的 `related_symbols`；
+  - 未实现“失败补丁永久封禁”与完整状态门禁，导致 `repair_failed` 能通过 `resume_review` 直接退回 `pending` 重复审批；同时 `human_takeover` 缺少直接转 `accept_as_is` 的出口，形成状态死锁；
+  - 本地界面 [client.ts](../packages/dsh-plugin/src/client/client.ts) 第 740 行和中央界面 [App.tsx](../apps/web/src/App.tsx) 第 116 行把 `repair_failed` 投影成了“已接手”处置，藏掉了接手按钮，而“外部完成”按钮又要求真实状态是 `human_takeover`，导致失败页卡死。
+- **会导致什么坑**：状态机和读模型自相矛盾；失败补丁可绕开人工处理重跑；人工接手后若想放弃修复没有退路；用户在失败页点不到正确按钮。
+- **按新版 SPEC 应该怎么改**：
+  - `accept_as_is` 同步写入 `decisions[]`（含 `category` 和合并当前方案补丁提取的 `related_symbols`）、置 `status: rejected` 并填充 `rejection`，且允许从 `human_takeover` 直接转入；
+  - 落实失败补丁 `(option_id, patch_id)` 永久封禁、`repair_failed` 新增评论保持 `repair_failed`、解除 `defer` 恢复原状态；`repair_failed` 仅当存在另一未失败方案（双方案场景）时才允许 `resume_review` 回到 `pending` 改选另一方案；同时支持 `awaiting_verification → human_takeover` 撤回误点的外部完成；
+  - 修正两端 UI，在 `repair_failed` 页直接提供清晰入口并标明已封禁补丁，绝不显示自动重试按钮。
+- **怎么验证改对了**：覆盖 `accept_as_is` 三字段同步与符号提取；验证单方案 `repair_failed` 拒绝直接/两步 `resume_review` 与基线漂移绕过；验证双方案可改选未失败方案；验证 `human_takeover → accept_as_is` 与两端 UI 按钮一致。
+
+---
+
+#### D07 · P2 · `Deferred` 依赖与新 Frontmatter 字段缺失，且新问题把 `module` 写死了
+- **对应规格**：[SPEC.md](../SPEC.md) §3.3、§10.1（`I7`–`I9`）；`AC-DATA-01`、`AC-ISSUE-RECORD`
+- **现在代码怎么干的**：
+  - [audit-stages.ts](../packages/dsh-plugin/src/host/audit-stages.ts) 第 445 行要求 Deferred 提供 `dependsOn`，但 [issue-publication.ts](../packages/dsh-plugin/src/host/issue-publication.ts) 第 147 行写 `review.md` 时根本没存；[issue-review.ts](../packages/dsh-plugin/src/host/issue-review.ts) 第 165 行读取时直接写死 `dependsOn: null`；
+  - [issue-publication.ts](../packages/dsh-plugin/src/host/issue-publication.ts) 第 84 行把所有新建问题的 `module` 硬编码为 `'audit'`、标题硬拼 `'audit: '` 前缀；
+  - 尚未落地 `issue_kind`、`approval_history`、`repair_attempts[].id` 及纯文字零补丁允许 `commit_message: null`。
+- **会导致什么坑**：延迟问题写完就丢依赖；按 `module` 分组的负向记忆和筛选全部失灵；已关闭问题重开时历史批准无处存放；纯文字问题被迫凑假提交信息。
+- **按新版 SPEC 应该怎么改**：在 `review.md` 正式读写 `issue_kind`、`depends_on`、`approval_history: []`、`repair_attempts[].id` 与可空 `commit_message`，并按真实模块名写入 `module` 与 `title` 前缀（不再硬编码 `'audit'`）；已 `approved` 问题重开时清空旧活跃补丁。
+- **怎么验证改对了**：新建 A 类、B 类纯文字、Deferred 与重开问题，核对 Frontmatter 往返、`module` 准确性、`depends_on` 与 `approval_history` 保留。
+
+---
+
+#### D08 · P2 · 发布时间可能倒退、补丁 `sha256` 未强制校验、键序与小写 `slug` 未统一
+- **对应规格**：[SPEC.md](../SPEC.md) §3.1、§3.3、§3.5、§10.1（`I1`、`I4`、`I13`）；`AC-DATA-01`、`AC-LOCK-01`
+- **现在代码怎么干的**：
+  - [issue-publication.ts](../packages/dsh-plugin/src/host/issue-publication.ts) 第 104 行直接填当前系统时间 `now`，没复用 [store.ts](../packages/dsh-plugin/src/host/store.ts) 第 617 行的单调递增 `nextUpdatedAt`，时钟回拨或旧时间靠后时会倒退；
+  - [issue-review.ts](../packages/dsh-plugin/src/host/issue-review.ts) 第 208–211 行校验补丁账本时未强制要求 `sha256` 必填，[store.ts](../packages/dsh-plugin/src/host/store.ts) 第 1064 行只在摘要存在时才比对，删掉 `sha256` 竟能通过完整校验；
+  - [frontmatter.ts](../packages/dsh-plugin/src/host/frontmatter.ts) 第 447 行未按新版固定顶层键序序列化；目录 `slug` 正则仍允许大写字母（跨平台易碰撞）。
+  - *(注：[audit-archive.ts](../packages/dsh-plugin/src/host/audit-archive.ts) 第 198 行已将目录 ID `YYYY-MM/<slug>` 写入 `audit.md.issues`，与新版 SPEC §3.5 一致，只需同步 `schema_version: 1`。)*
+- **会导致什么坑**：时间倒退会破坏乐观锁并发校验；缺 `sha256` 可能导致补丁文件被静默替换却不被察觉；大小写目录在 Windows/macOS 下易撞名。
+- **按新版 SPEC 应该怎么改**：全部写入口统一走 `nextUpdatedAt`；校验器强制 `patches[].sha256` 必填且与文件原始字节一致；按新版 SPEC §3.3 固定键序输出 Frontmatter；将问题目录 `slug` 统一收紧为小写 `^[a-z0-9][a-z0-9._-]*$`。
+- **怎么验证改对了**：用冻结时钟/未来时钟测试发布时间严格递增；测试删掉或篡改 `sha256` 被完整校验拒绝；测试大写 `slug` 被拒、固定键序与纯文字空账本往返。
+
+---
+
+#### D09 · P2 · 队列页只预检默认方案，且状态统计 `counts` 漏了 4 个新状态
+- **对应规格**：[SPEC.md](../SPEC.md) §6.2、§6.5；`AC-ISSUE-OPTIONS`、`AC-UI-01`、`AC-API-01`
+- **现在代码怎么干的**：[api-readmodels.ts](../packages/dsh-plugin/src/host/api-readmodels.ts) 第 45、66、143 行的队列缓存键只有 `root/id/revision/base`，后台预检只跑默认补丁，列表只返回一个笼统的 `patchCheck`（详情页第 230 行已分方案，队列没跟上）；同时第 148 行的 `counts` 只初始化了 4 个旧状态，缺少 `repair_failed / human_takeover / awaiting_verification / resolved`。
+- **会导致什么坑**：方案 A 干净、方案 B 冲突时，队列页看不出哪个冲突；队列顶部各状态筛选统计缺项。
+- **按新版 SPEC 应该怎么改**：队列缓存键与后台异步预检统一按 `(candidateId, recordRevision, optionId, patchId, base)` 分方案保存与展示；`counts` 补齐全部 8 个规范状态键（统计非 `local` 共享问题）；仍保持队列请求只读缓存、后台低优先级异步预检。
+- **怎么验证改对了**：双方案一干净一冲突时队列分别返回准确诊断；纯文字不伪造预检；`counts` 准确包含全部 8 个状态计数。
+
+---
+
+#### D10 · P2 · 进程式定时审查仍保留旧的历史复查旁路，会回头查已 `approved` 关闭的问题
+- **对应规格**：[SPEC.md](../SPEC.md) §9.11；`AC-CENTRAL-SCHEDULE-01..06`、`AC-ISSUE-HISTORY`
+- **现在代码怎么干的**：[api-audit.ts](../packages/dsh-plugin/src/host/api-audit.ts) 第 974 行在正式总调度之前单独跑了一轮 `runAgent` 做历史复查；[audit-history.ts](../packages/dsh-plugin/src/host/audit-history.ts) 第 106 行把上一轮**已经程序批准关闭**的候选也捞出来重新复查，还给了一条“禁止修改任何文件”的旧提示词。
+- **会导致什么坑**：违背“程序修复门禁通过即关闭、不追加复核”的原则，而且没走统一总调度和独立复核阶段。
+- **按新版 SPEC 应该怎么改**：删掉这条旧历史旁路，定时审查全程复用同一总调度与受租约阶段工具；历史覆盖阶段只处理本轮范围内的开放问题、到期延期项和 `awaiting_verification`（外部完成待核验项）；已 `approved` 关闭的问题仅在正常全仓扫描发现新证据时才沿原记录重开。
+- **怎么验证改对了**：定时审查用例确认不再主动复查已 `approved` 问题；外部完成项经独立代码证据关闭为 `resolved`，仍存在回 `human_takeover`。
+
+---
+
+#### D11 · P2 · 提示词残留旧副本描述，且自检未接入“外部优先 + 子代理兜底”与新格式验证
+- **对应规格**：[SPEC.md](../SPEC.md) §5.4、§6.4、§7、§9.12；`AC-PROMPT-01`、`AC-SELF-TEST-01`
+- **现在代码怎么干的**：
+  - [patch/SKILL.md](../packages/dsh-plugin/assets/audit/patch/SKILL.md) 第 3 行元数据还写着“Host 在专用副本验收”，和现行共享 cwd 矛盾；
+  - [audit-self-test.ts](../packages/dsh-plugin/src/host/audit-self-test.ts) 第 90–126 行只测了大文件读取，没有验证写入 `.ai-review/` 和临时文件还原，生成的模拟档案还是旧的 `schemaVersion=2` 且没有问题记录，也未实现 `stageExecutors` 优先尝试 Codex/Claude Code 并在不可用时优雅降级给本 Harness 独立子代理的逻辑。
+- **会导致什么坑**：误导模型行为；节点即使本 Harness 自己完全能跑，也会因为没装或跑不通某个外部 CLI 而被自检误判不可用，或测不出 `schema_version: 1` 读写问题。
+- **按新版 SPEC 应该怎么改**：
+  - 清理提示词里所有旧副本、旧版本号和旧白名单残留，按新版 SPEC 展开 Mode A/B/C 与「软引导 + Host 强还原」指引；
+  - 落地 `stageExecutors` 探测与优雅降级（Codex / Claude Code 可用时优先调起，不可用时自动降级给本 Harness 独立子代理并如实记录状态）；
+  - 更新 `POST /api/v1/test` 自检：必验「大文件未预注入读取 + `.ai-review/` 写入 + 临时文件还原零残留 + `schema_version: 1` 问题与索引写入读回」。
+- **怎么验证改对了**：验证外部执行器不可用时降级本 Harness 子代理仍能走通完整自检并返回 `SUCCEEDED`（附降级状态）；任一必验项失败返回 `ABORTED`。
+
+---
+
+## 4. R01 · 真实 Harness 端到端验收尚未完成
+
+除了上面 12 项代码差距，还有一项**真机验收**不能跳过：
+
+- **既往观测**：此前在同一代码基线上用真实 Codex alpha 执行器跑 180 KB 大文件读取 + 写 `.ai-review/proof.txt` 时失败了（模型回报工具不可用或策略拒绝），Claude Code 真机也未实测。
+- **新设计已消除的架构阻力**：
+  1. 新版 SPEC 明确审查阶段采用 **「软引导 + Host 强还原」策略**（不靠沙箱硬拦项目写、提示词引导优先 `.ai-review/` 与 `.tmp/`、Host 收尾强还原），消除了权限沙箱与工具循环打架的隐患；
+  2. 新版 SPEC 明确 **Codex / Claude Code 为优先增强执行器，不可用时优雅降级为本 Harness 独立子代理**，不再被单一 alpha CLI 环境卡死。
+- **待补验收**：完成上述代码改造后，必须在真实部署环境中端到端跑通 `AC-HARNESS-READ`、`AC-AUDIT-NO-APPLY` 与 `AC-SELF-TEST-01`——至少实测通过「本 Harness 独立子代理完整链路（大文件尾部读取 + `.ai-review/` 写入 + 临时取证还原 + `schema_version: 1` 发布）」；同时在具备 Codex / Claude Code 的环境实测其优先调起与降级上报。绝不用 mock 执行器冒充真机通过。
+
+---
+
+## 5. 既有测试与代码复现验证（供回归参考）
+
+在代码基准 `2a6f55e` 上，此前已跑过 23 项专项测试（[issue-review.test.mjs](../tests/issue-review.test.mjs)、[issue-workflow.test.mjs](../tests/issue-workflow.test.mjs)、[harness-review-boundaries.test.mjs](../tests/harness-review-boundaries.test.mjs)，23/23 通过），并用 10 组直接调用真实模块函数的复现验证用例（不启动外部模型，仅检验代码分支行为）证实了上述问题真实存在：
+
+| 复现用例 | 复现出的代码行为 | 对应差距项 |
+| --- | --- | --- |
+| Case 1 | `buildFixPrompt` 对评论修订（Mode B）与冲突辅助（Mode C）生成完全相同的提案提示词 | D01 |
+| Case 2 | 修订既有方案不带 `optionId` 到发布阶段才报错，补齐后成功 | D02 |
+| Case 3 | 空 `reviewers.yml` 配置下，纯文字问题到最终发布才报缺负责人 | D03 |
+| Case 4 | Deferred 只填 `dependsOn` 时，落盘的 `review.md` 里完全丢失该依赖 ID | D07 |
+| Case 5 | 旧记录 `updated_at` 靠后时，审查发布写回了一个更早的时间戳 | D08 |
+| Case 6 | `repair_failed` 不传并发守卫仍可创建 `/fix-session`，且 `turn-end` 直接清除占用 | D06 |
+| Case 7 / 8 | `accept_as_is` 未置 `rejected`/`rejection`；`repair_failed` 走 `resume_review` 被改回 `pending` | D05 |
+| Case 9 | 删掉补丁 `sha256` 仍能通过 `validateFullCandidate` | D08 |
+| Case 10 | 同 `finding_id` 多份旧 v2 记录升级目录随输入顺序摇摆 *(新版已彻底取消 v1/v2 兼容，由 D12 直接移除)* | D12 |
+
+---
+
+## 6. 建议的落地实施顺序
+
+按风险与依赖关系，建议分 4 步推进（每步都在独立 worktree 分支开发、独立审查并跑全量验证）：
+
+1. **第一步：减负与定型（D12、D07、D08、D04）**
+   先把格式统一为 `schema_version: 1`，删掉所有 v1/v2 兼容代码、废弃端点、`expectedFindingVersion` 和门禁白名单拦截，补齐 `issue_kind / depends_on / approval_history / repair_attempts[].id / commit_message`、修正 `module` 硬编码、强制 `sha256`、收紧小写 `slug` 和严格递增 `updated_at`。先卸掉历史包袱，后面所有改动都会干净很多。
+2. **第二步：打通执行与权限核心边界（D01、D06、D05）**
+   落实 Mode C 完整权限获批辅助应用与物理拓扑硬护栏直通门禁（含情况 A、B-本地、B-已推送闭环）；加固 `/fix-session` 的并发守卫、状态校验、持久化占用锁与结束还原；补全 `repair_failed` 永久封禁与无死锁状态机、同步 `accept_as_is` 落盘并修复两端 UI 失败页入口。
+3. **第三步：补齐审查体验与统一调度（D02、D03、D09、D10）**
+   前置 `reviewers.yml` 检查并新增 `POST /reviewers/init`、前置 `optionId` 登记校验、队列按方案异步预检并补齐 8 状态 `counts`、清理定时审查旧历史旁路。
+4. **第四步：提示词、自检降级与真机收口（D11、R01）**
+   清理提示词残留，接入 `stageExecutors` 的“外部 Agent 优先 + 本 Harness 独立子代理兜底”及 `POST /api/v1/test` 完整自检；把所有差距项写成可复现自动化测试，跑通 `npm run typecheck`、`npm run build`、全量测试以及真实环境端到端验收。
