@@ -54,6 +54,8 @@ function candidateFixture(extra = {}) {
             const slot = index++;
             if (!hooks[slot] || deps.some((item, i) => !Object.is(item, hooks[slot][i]))) { hooks[slot] = deps; effects.push(effect); }
         },
+        useSearchParams: () => [new URLSearchParams()],
+        URLSearchParams,
         useParams: () => ({ projectId: 'p', '*': 'candidate-a' }),
         useContext: () => ({ userId: 'u', reviewIdentity: '张三' }), UserContext: {},
         useQueryClient: () => ({ invalidateQueries: () => {} }), useNavigate: () => () => {},

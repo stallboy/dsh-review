@@ -1,5 +1,11 @@
 import type { InterRevisionDiff, PatchFileStat, PatchStats } from './types.js';
 
+export function isRepoRelativePath(value: string): boolean {
+    if (!value || value.includes('\\') || value.includes('..') || value.startsWith('/') || value.endsWith('/')) return false;
+    if (value.includes('./')) return false;
+    return true;
+}
+
 export interface ParsedPatch {
   stats: PatchStats;
   /** 包含重命名和删除的旧路径，以便校验补丁触及的完整范围。 */

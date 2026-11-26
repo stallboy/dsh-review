@@ -4,7 +4,7 @@ import { setupCentral, registerNode, bindProject, approvePayload } from './centr
 
 test('中央仅向声明新版发现能力的节点发出处置指令', async t => {
     const { app, headers } = await setupCentral(t);
-    const node = await registerNode(app);
+    const node = await registerNode(app, 'node-a', 'workspace-a', {});
     const project = await bindProject(app, headers, node);
     const url = `/api/v1/projects/${project.projectId}/commands`;
     const payload = { operation: 'finding-decision', idempotencyKey: 'new-finding', payload: {
@@ -153,4 +153,20 @@ test('恢复控制必须由用户明确请求，不因轮询自动重试交付',
     assert.deepEqual((await poll()).json().recoveries, []);
     assert.equal((await app.inject({ method: 'POST', url: `/api/v1/commands/${commandId}/recover`, headers, payload: { confirmStopped: true } })).statusCode, 200);
     assert.deepEqual((await poll()).json().recoveries, [commandId]);
+});
+
+test('schema3审查与方案写入要求issueWorkflow且不接受客户端伪造能力', async t => {
+    const { app, headers } = await setupCentral(t);
+    const old = await registerNode(app, 'old-node', 'old-workspace', { findingWorkflow: true });
+    const oldProject = await bindProject(app, headers, old);
+    const post = (project, payload) => app.inject({ method: 'POST', url: `/api/v1/projects/${project.projectId}/commands`, headers, payload });
+    assert.equal((await post(oldProject, { operation: 'audit', idempotencyKey: 'old-audit', payload: { targetPath: '.' } })).statusCode, 409);
+    assert.equal((await post(oldProject, { ...approvePayload('old-selection'), payload: { id: '2026-11/fix-retry', optionId: 'a', patchId: 1 } })).statusCode, 409);
+    const current = await registerNode(app, 'new-node', 'new-workspace');
+    const project = await bindProject(app, headers, current);
+    assert.equal((await post(project, { operation: 'audit', idempotencyKey: 'spoof', payload: { targetPath: '.', issueWorkflow: true } })).statusCode, 422);
+    const started = await post(project, { operation: 'audit', idempotencyKey: 'native', payload: { targetPath: '.' } });
+    assert.equal(started.statusCode, 202, started.body);
+    assert.equal(started.json().command.payload.issueWorkflow, true);
+    assert.equal(started.json().command.payload.findingWorkflow, true);
 });

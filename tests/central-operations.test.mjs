@@ -97,7 +97,7 @@ function auditCommand(project) {
     return {
         commandId: 'audit-desktop', requestHash: 'b'.repeat(64), projectId: project.projectId, nodeId: project.nodeId,
         bindingGeneration: 1, projectConfigRevision: 1, operation: 'audit',
-        actor: { userId: 'user-a', reviewIdentity: 'tester' }, payload: { targetPath: '.', note: '复核绑定项目' },
+        actor: { userId: 'user-a', reviewIdentity: 'tester' }, payload: { issueWorkflow: true, findingWorkflow: true, targetPath: '.', note: '复核绑定项目' },
         createdAt: new Date().toISOString(),
     };
 }
@@ -149,8 +149,10 @@ test('中央桌面节点使用绑定会话访问共享阶段工具', async t => 
     const completed = Promise.withResolvers();
     const sessionId = 'desktop-phased';
     const capabilities = {
-        auditStageExecutor: async ({ prompt }) => {
-            assert.match(prompt, /固定基线只读视图/);
+        auditStageExecutor: async ({ prompt, onProcessTreeStopped }) => {
+            onProcessTreeStopped?.(true);
+            assert.doesNotMatch(prompt, /固定基线只读视图/);
+            assert.match(prompt, /Harness.*自主读取/);
             return { leads: [], coverage: ['确认走共享阶段'], limits: [] };
         },
         async createAuditSession(input) {
@@ -196,7 +198,8 @@ test('桌面审查会话结束且两个执行器均初审失败时回报待核�
     const finalIdleResult = Promise.withResolvers();
     const signal = new AbortController().signal;
     const { operations, project, journal, root, remote, target } = await fixture(t, {
-        auditStageExecutor: async ({ executor }) => {
+        auditStageExecutor: async ({ executor, onProcessTreeStopped }) => {
+            onProcessTreeStopped?.(true);
             if (executor === 'codex') throw new Error('codex 无法启动');
             throw new AuditExecutorAuthenticationError(executor, 1);
         },
@@ -351,6 +354,7 @@ test('本机中央先收到真实子进程的超时日志，再等待主会话�
     const { app, headers } = await setupCentral(t);
     const credential = app.database.createNode('本机超时回执节点');
     const node = new ManagedNode({
+        workspaceIssues: () => operations.workspaceIssues(),
         config: { centerUrl: 'http://127.0.0.1:3081', ...credential, workspaces: operations.registrations() },
         journal, execute: (...args) => operations.execute(...args),
         read: () => { throw new Error('未预期的查询'); },
@@ -436,7 +440,8 @@ for (const timing of ['已注册 Job', '尚未注册 Job', '租约保存失败',
             await phaseFailure;
         };
         const setup = await fixture(t, {
-            auditStageExecutor: async ({ executor, location }) => {
+            auditStageExecutor: async ({ executor, location, onProcessTreeStopped }) => {
+                if (executor !== 'claude-code') onProcessTreeStopped?.(true);
                 if (executor === 'claude-code') {
                     t.after(() => rm(location, { recursive: true, force: true }));
                     executorStarted.resolve();
@@ -469,6 +474,7 @@ for (const timing of ['已注册 Job', '尚未注册 Job', '租约保存失败',
             const credential = app.database.createNode('超时恢复节点');
             let dropReceipt = true;
             const node = new ManagedNode({
+                workspaceIssues: () => operations.workspaceIssues(),
                 config: { centerUrl: 'http://127.0.0.1:3081', ...credential, workspaces: operations.registrations() },
                 journal, execute: (...args) => operations.execute(...args),
                 read: () => { throw new Error('未预期的查询'); },

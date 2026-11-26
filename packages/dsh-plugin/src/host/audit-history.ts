@@ -5,6 +5,7 @@ import { runProcess } from './shell.js';
 import type { SharedCandidateSource } from './shared-facts.js';
 import type { ReviewStore } from './store.js';
 import type { VcsAdapter } from './vcs.js';
+import { projectIssue } from './issue-review.js';
 
 const RECHECK_RESULT = 'DSH_AUDIT_RECHECK=';
 
@@ -50,9 +51,28 @@ export async function loadAuditHistory(store: ReviewStore, source: SharedCandida
     const { findings: projected } = projectFindings(records, candidateInfo, [...shared.keys()], {
         candidateInfo, events: await loadFindingEvents(source, records),
     });
+    const native = [];
+    for (const summary of queue.items.filter(item => !item.localOnly && item.schemaVersion === 3 && !item.parseError)) {
+        native.push(projectIssue((await store.get(summary.id, null, source)).candidate));
+    }
+    const nativeIds = new Set(native.map(item => item.findingId));
+    projected.splice(0, projected.length, ...projected.filter(item => !nativeIds.has(item.findingId)), ...native);
     const findings = new Map<string, HistoricalFinding>();
     const protectedFindings: AuditItem[] = [];
     for (const finding of projected) {
+        if (finding.schemaVersion === 3) {
+            if (!scopeCovers(scope, finding.targetFiles)) continue;
+            const context: HistoricalFinding = { findingId: finding.findingId, title: finding.title, summary: finding.summary,
+                targetFiles: finding.targetFiles, kind: finding.kind, dependsOn: null, status: finding.state === 'closed' ? 'resolved' : 'pending',
+                candidate: finding.reviewId ?? null, observedIn: finding.lastObservedAudit, originalBase: finding.baseRevision,
+                disposition: finding.disposition, repairPlan: finding.repairPlan, repairHints: finding.repairHints };
+            if (finding.decision) context.decision = finding.decision;
+            protectedFindings.push(context);
+            const due = finding.decision?.action === 'defer' && Boolean(
+                finding.decision.reviewAfter && finding.decision.reviewAfter <= new Date().toISOString().slice(0, 10) || finding.decision.reviewWhen);
+            if (finding.state !== 'closed' && (finding.disposition === 'human_takeover' || finding.disposition === 'undecided' || due)) findings.set(finding.findingId, context);
+            continue;
+        }
         const last = byId.get(finding.lastObservedAudit)?.meta.items.find(item => item.findingId === finding.findingId);
         if (!last || !scopeCovers(scope, finding.targetFiles)) continue;
         if (finding.findingVersion) {

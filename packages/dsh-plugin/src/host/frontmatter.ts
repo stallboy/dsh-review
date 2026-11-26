@@ -14,6 +14,7 @@ import type {
   RevisionEntry,
 } from './types.js';
 import { AUDIT_TYPES } from './types.js';
+import { issueReviewFields, parseIssueReview } from './issue-review.js';
 
 const STATUSES: ReviewStatus[] = ['pending', 'changes_requested', 'approved', 'rejected'];
 const COMMENT_STATUSES: CommentStatus[] = ['unresolved', 'partial', 'resolved'];
@@ -214,6 +215,7 @@ function parseApproval(value: unknown): ApprovalMeta | null {
   };
 }
 
+const ISSUE_KEYS = new Set(['record_revision', 'patches', 'priority', 'base_revision', 'options', 'observations', 'decisions', 'repair_attempts']);
 const KNOWN_KEYS = new Set([
   'schema_version',
   'finding_id',
@@ -256,29 +258,35 @@ export function parseReviewMarkdown(text: string): ParsedReview {
 
   const field = (key: string): unknown => requiredField(doc, key);
   const schemaVersion = asNumber(field('schema_version'), 'schema_version');
-  if (schemaVersion !== 1 && schemaVersion !== 2) {
-    throw new ReviewFormatError(`不支持的 schema_version：${String(schemaVersion)}（当前支持 1 和 2）`);
+  if (schemaVersion !== 1 && schemaVersion !== 2 && schemaVersion !== 3) {
+    throw new ReviewFormatError(`不支持的 schema_version：${String(schemaVersion)}（当前支持 1、2 和 3）`);
   }
-  const findingId = schemaVersion === 2 ? asString(field('finding_id'), 'finding_id') : undefined;
+  if (schemaVersion === 3 && (Object.hasOwn(doc, 'current_revision') || Object.hasOwn(doc, 'revisions'))) {
+    throw new ReviewFormatError('schema3 使用独立的 record_revision 和 patches，不得混入旧版本字段');
+  }
+  const findingId = schemaVersion >= 2 ? asString(field('finding_id'), 'finding_id') : undefined;
   if ((findingId !== undefined && !FINDING_ID_PATTERN.test(findingId))
     || (schemaVersion === 1 && Object.hasOwn(doc, 'finding_id'))) {
     throw new ReviewFormatError('finding_id 只能作为 v2 候选的合法发现编号');
   }
   const status = asString(field('status'), 'status');
-  if (!STATUSES.includes(status as ReviewStatus)) {
+  if (!(schemaVersion === 3 ? [...STATUSES, 'repair_failed', 'human_takeover', 'awaiting_verification', 'resolved'] : STATUSES).includes(status as ReviewStatus)) {
     throw new ReviewFormatError(`status 只能是 ${STATUSES.join(' | ')}`);
   }
-  const revisions = asArray(field('revisions'), 'revisions').map(parseRevision);
-  if (revisions.length === 0) throw new ReviewFormatError('revisions 不能为空');
-  const currentRevision = asNumber(field('current_revision'), 'current_revision');
+  const revisions = asArray(field(schemaVersion === 3 ? 'patches' : 'revisions'), 'revisions').map(parseRevision);
+  if (schemaVersion !== 3 && revisions.length === 0) throw new ReviewFormatError('revisions 不能为空');
+  const currentRevision = asNumber(field(schemaVersion === 3 ? 'record_revision' : 'current_revision'), 'current_revision');
   const current = revisions.find((revision) => revision.id === currentRevision);
-  if (!current) throw new ReviewFormatError(`current_revision=${String(currentRevision)} 在 revisions 中不存在`);
-  if (!current.patch.trim()) throw new ReviewFormatError(`revision ${String(currentRevision)} 缺少 patch 文件名`);
+  if (schemaVersion !== 3 && !current) throw new ReviewFormatError(`current_revision=${String(currentRevision)} 在 revisions 中不存在`);
+  if (current && !current.patch.trim()) throw new ReviewFormatError(`revision ${String(currentRevision)} 缺少 patch 文件名`);
+  let issue;
+  try { issue = schemaVersion === 3 ? parseIssueReview(doc) : undefined; }
+  catch (error) { throw new ReviewFormatError(error instanceof Error ? error.message : String(error)); }
 
   const tags = [...new Set(asStringArray(field('tags'), 'tags')
     .map((tag) => tag.trim().toLowerCase())
     .filter((tag) => tag.length > 0))];
-  const gateChecks = asStringArray(field('gate_checks'), 'gate_checks').map((check) => check.trim());
+  const gateChecks = issue ? [...issue.options[0]?.gateChecks ?? []] : asStringArray(field('gate_checks'), 'gate_checks').map((check) => check.trim());
   const comments = asArray(field('comments'), 'comments').map(parseComment);
   const humanDecisions = asArray(field('human_decisions'), 'human_decisions').map(parseHumanDecision);
   const ticket = asNullableString(field('ticket'), 'ticket');
@@ -303,12 +311,13 @@ export function parseReviewMarkdown(text: string): ParsedReview {
 
   const extra: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(doc)) {
-    if (!KNOWN_KEYS.has(key)) extra[key] = value;
+    if (!KNOWN_KEYS.has(key) && !(issue && ISSUE_KEYS.has(key))) extra[key] = value;
   }
 
   return {
     meta: {
       schemaVersion,
+      ...(issue ? { issue } : {}),
       ...(findingId !== undefined ? { findingId } : {}),
       title,
       module: moduleField,
@@ -435,6 +444,15 @@ export function serializeReviewMarkdown(meta: ReviewFrontmatter, body: string): 
       : {}),
     ...meta.extra,
   };
+  if (meta.schemaVersion === 3) {
+    if (!meta.issue) throw new ReviewFormatError('schema3 缺少问题字段');
+    doc['record_revision'] = meta.currentRevision;
+    doc['patches'] = doc['revisions'];
+    delete doc['current_revision'];
+    delete doc['revisions'];
+    delete doc['gate_checks'];
+    Object.assign(doc, issueReviewFields(meta.issue));
+  }
   const yamlText = dump(doc, { lineWidth: -1, noRefs: true, sortKeys: false }).replace(/\n$/, '');
   return `---\n${yamlText}\n---\n${body.startsWith('\n') ? body : `\n${body}`}`;
 }

@@ -105,12 +105,13 @@ function candidateFixture() {
         return [hooks[slot], next => { hooks[slot] = typeof next === 'function' ? next(hooks[slot]) : next; }];
     };
     const context = vm.createContext({
-        require: () => jsx, exports: {}, useState,
+        require: () => jsx, exports: {}, useState, URLSearchParams,
         useRef: initial => useState({ current: initial })[0],
         useEffect(effect, deps) {
             const slot = index++;
             if (!hooks[slot] || deps.some((item, i) => !Object.is(item, hooks[slot][i]))) { hooks[slot] = deps; effects.push(effect); }
         },
+        useSearchParams: () => [new URLSearchParams()],
         useParams: () => ({ projectId: 'p', '*': id }), useContext: () => ({ userId: 'u', reviewIdentity: '张三' }), UserContext: {},
         useQueryClient: () => ({}), useNavigate: () => () => {}, useMutation: () => ({}),
         useQuery: options => options.queryKey[0] === 'project' ? { data: { project: { name: 'test' }, writable: true, vcsSnapshot: 'snapshot', freshness: 'synced' } }

@@ -3,6 +3,7 @@ import type { ApiRequest, ApiResponse } from './api-context.js';
 import path from 'node:path';
 import process from 'node:process';
 import { ApprovalOrchestrator } from './approval.js';
+import { currentReviewPatch, issueSelection, requireIssueSelection } from './issue-review.js';
 import { FindingApprovalState } from './finding-approval-state.js';
 import type { AuditLifecycle, AuditLeaseRecord } from './audit-lifecycle.js';
 import { JobManager } from './jobs.js';
@@ -342,12 +343,12 @@ export class ReviewApi implements ApiHost {
   private async health(res: ApiResponse, url: URL): Promise<void> {
     const diagnostics: string[] = [];
     let currentBase: string | null = null;
-    let counts: Record<ReviewStatus, number> = {
+    let counts = {
       pending: 0,
       changes_requested: 0,
       approved: 0,
       rejected: 0,
-    };
+    } as Record<ReviewStatus, number>;
     let runtime: Runtime | null = null;
     let owner = this.settings.owner;
     try {
@@ -480,12 +481,18 @@ export class ReviewApi implements ApiHost {
       commitDetail = normalized;
     }
     const expectedFindingVersion = stringField(body, 'expectedFindingVersion');
+    const selection = body['optionId'] === undefined && body['patchId'] === undefined ? undefined
+      : { optionId: stringField(body, 'optionId'), patchId: Number(body['patchId']) };
+    if (selection && (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(selection.optionId) || !Number.isSafeInteger(selection.patchId) || selection.patchId < 1)) {
+      throw new ApiError(422, 'bad_request', '方案和补丁编号无效');
+    }
     const findingState = (findingId: string) => new FindingApprovalState(runtime.root, findingId, this.deps.statePath);
     const checkFinding = async (candidate: ReviewCandidate, verifyRecovery: boolean) => {
       if (!candidate.meta.findingId) return null;
       const { findings } = await this.readModels.findingProjection(runtime);
       const finding = findings.find((item) => item.findingId === candidate.meta.findingId);
-      if (finding?.disposition !== 'undecided' || !finding.options?.some(option => option.candidateId === id && option.status === 'pending')) {
+      if (finding?.disposition !== 'undecided' || !finding.options?.some(option => option.candidateId === id && option.status === 'pending'
+        && (candidate.meta.schemaVersion !== 3 || option.optionId === selection?.optionId && option.patchId === selection?.patchId))) {
         return { reason: 'STATE_CONFLICT' as const, message: '发现已处置、已有获批补丁或此候选已退出选项' };
       }
       if (finding.findingVersion !== expectedFindingVersion) {
@@ -498,9 +505,9 @@ export class ReviewApi implements ApiHost {
     };
     await this.writers.requireOwnerOf(store, id);
     await this.writers.requireSharedCandidate(runtime, id);
-    const approvalCommitInput = commitDetail === undefined && commitMessage === undefined
+    const approvalCommitInput = commitDetail === undefined && commitMessage === undefined && selection === undefined
       ? undefined
-      : { ...(commitMessage !== undefined ? { commitMessage } : {}), ...(commitDetail ? { commitDetail } : {}) };
+      : { ...(commitMessage !== undefined ? { commitMessage } : {}), ...(commitDetail ? { commitDetail } : {}), ...(selection ? { selection } : {}) };
     let findingId: string | undefined;
     {
       const detail = await store.get(id, null, await sharedSourceFor(runtime));
@@ -549,7 +556,7 @@ export class ReviewApi implements ApiHost {
         checkFinding: candidate => checkFinding(candidate, true),
         beginFindingCommit: (candidate, paths, probe) => findingState(candidate.meta.findingId!).begin(paths, probe),
         finishFindingCommit: candidate => findingState(candidate.meta.findingId!).clear(),
-        validateNewRevision: (previous, latest) => this.writers.validateNewRevision(runtime, previous, latest),
+        validateNewRevision: (previous, latest) => this.writers.validateNewRevision(runtime, previous, latest, selection),
         sharedSource: () => sharedSourceFor(runtime),
         shouldCancel: () => Boolean((job as { cancelRequested?: boolean }).cancelRequested),
         ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
@@ -577,29 +584,30 @@ export class ReviewApi implements ApiHost {
     const body = await readJson(req);
     const id = stringField(body, 'id');
     const guard = guardFrom(body);
-    const job = await this.startAiFixJob(runtime, id, guard);
+    const job = await this.startAiFixJob(runtime, id, guard, issueSelection(body));
     sendJson(res, 202, { jobId: job.id, job });
   }
 
   /** 显式修复与总体意见触发的自动修复共用此入口，确保采用相同的校验和执行规则。 */
-  async startAiFixJob(runtime: Runtime, id: string, guard: ConcurrencyGuard): Promise<JobRecord> {
+  async startAiFixJob(runtime: Runtime, id: string, guard: ConcurrencyGuard, selection?: import('./types.js').IssueSelection, regenerate = false): Promise<JobRecord> {
     const { store, vcs } = runtime;
     const acceptedSource = await sharedSourceFor(runtime);
     if (!acceptedSource) throw new ApiError(409, 'conflict', '无法建立共享 VCS 快照，AI 修复已中止');
     const detail = await store.get(id, null, acceptedSource);
+    requireIssueSelection(detail.candidate.meta, selection);
     if (detail.candidate.parseError) throw new ApiError(422, 'bad_request', detail.candidate.parseError);
     const me = await this.ownerFor(store.repoRoot);
     if (detail.candidate.meta.owner !== me) throw new ApiError(403, 'forbidden', `当前操作者 ${me} 不是候选 Owner`);
     await this.writers.requireSharedCandidate(runtime, id);
     const actionable = detail.candidate.meta.comments.filter((comment) => comment.status !== 'resolved');
-    if (actionable.length === 0) {
+    if (actionable.length === 0 && !regenerate) {
       throw new ApiError(409, 'conflict', '没有未解决的评论可作为 AI 修复输入；请先提出具体意见');
     }
     if (detail.candidate.meta.currentRevision !== guard.expectedRevision || detail.candidate.meta.owner !== guard.expectedOwner
       || new Date(guard.expectedUpdatedAt).getTime() !== new Date(detail.candidate.meta.updatedAt).getTime()) {
       throw new ApiError(409, 'stale', '候选已被更新，请重新加载');
     }
-    if (detail.candidate.meta.status === 'approved' || detail.candidate.meta.status === 'rejected') {
+    if (detail.candidate.meta.status === 'approved' || detail.candidate.meta.status === 'rejected' || detail.candidate.meta.status === 'resolved') {
       throw new ApiError(409, 'conflict', '已归档的候选不能再触发 AI 修复');
     }
     const clean = await vcs.ensureCleanWorkspace();
@@ -621,16 +629,18 @@ export class ReviewApi implements ApiHost {
       if (candidate.meta.status !== 'pending' && candidate.meta.status !== 'changes_requested') {
         return this.writers.aborted('STATE_CONFLICT', `当前状态 ${candidate.meta.status} 不允许 AI 修复`, jobId);
       }
-      const comments = candidate.meta.comments.filter((comment) => comment.status !== 'resolved');
-      if (comments.length === 0) return this.writers.aborted('STATE_CONFLICT', '锁内复核时没有未解决评论', jobId);
+      const comments = candidate.meta.comments.filter((comment) => comment.status !== 'resolved'
+        && (!comment.extra?.['option_id'] || comment.extra['option_id'] === selection?.optionId));
+      if (comments.length === 0 && !regenerate) return this.writers.aborted('STATE_CONFLICT', '锁内复核时没有未解决评论', jobId);
       const cleanNow = await vcs.ensureCleanWorkspace();
       if (!cleanNow.clean) return this.writers.aborted('DIRTY_WORKSPACE', `锁内复核发现业务工作区不干净：${cleanNow.message}`, jobId);
-      const patch = await store.currentPatch(candidate, source);
+      requireIssueSelection(candidate.meta, selection);
+      const patch = await store.currentPatch(candidate, source, selection);
       const { readFile: readFs, readdir } = await import('node:fs/promises');
       const reviewBackup = await readFs(candidate.reviewPath, 'utf8');
       const entriesBefore = new Set(await readdir(candidate.dirPath).catch(() => [] as string[]));
       let workingTree: 'clean_base' | 'current_patch_applied' = 'clean_base';
-      if (this.settings.runner !== 'manual') {
+      if (this.settings.runner !== 'manual' && candidate.meta.schemaVersion !== 3) {
         const applied = await this.writers.applyPatchText(vcs, patch.text, false);
         if (!applied.ok) {
           await vcs.revertBusinessWorkspace().catch(() => undefined);
@@ -644,7 +654,9 @@ export class ReviewApi implements ApiHost {
         settings: this.settings,
         store,
         candidate,
-        mode: 'ADDRESS_FEEDBACK',
+        mode: regenerate ? 'RESOLVE_CONFLICT' : 'ADDRESS_FEEDBACK',
+        ...(selection ? { selection } : {}),
+        ...(candidate.meta.schemaVersion === 3 ? { baseRevision: await vcs.getCurrentBase() ?? patch.baseRevision } : {}),
         comments,
         workingTree,
         log,
@@ -652,11 +664,14 @@ export class ReviewApi implements ApiHost {
         signal,
       });
       let result;
+      let nativeDirty = false;
       try {
         result = await runner.run();
       } finally {
-        await vcs.revertBusinessWorkspace().catch(() => undefined);
+        if (candidate.meta.schemaVersion === 3) nativeDirty = !(await vcs.ensureCleanWorkspace()).clean;
+        else await vcs.revertBusinessWorkspace().catch(() => undefined);
       }
+      if (nativeDirty) return this.writers.recoveryRequired('COMMIT_OUTCOME_UNKNOWN', '提案 Agent 修改了业务工作区，现场保留待核验', jobId, '业务目录必须由人类核验后恢复');
       if (result.manual) return { status: 'MANUAL_REQUIRED', message: 'AI 修复生成了人工执行提示', manualPrompt: result.prompt ?? '', jobId } satisfies AiFixOutcome;
       if (!result.success) {
         await this.writers.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
@@ -668,7 +683,7 @@ export class ReviewApi implements ApiHost {
         );
       }
       const latest = await store.get(id, null);
-      const validationErrors = await this.writers.validateNewRevision(runtime, candidate, latest.candidate);
+      const validationErrors = await this.writers.validateNewRevision(runtime, candidate, latest.candidate, selection);
       if (validationErrors.length > 0) {
         await this.writers.restoreAppendedRevision(candidate, reviewBackup, entriesBefore);
         return this.writers.aborted('INVALID_CANDIDATE', `AI 新版本未通过提交前校验，已恢复：\n${validationErrors.join('\n')}`, jobId);
@@ -679,7 +694,7 @@ export class ReviewApi implements ApiHost {
       if (beforeSnapshot !== null && afterSnapshot !== beforeSnapshot) {
         return this.writers.recoveryRequired('COMMIT_OUTCOME_UNKNOWN', 'Runner 期间 VCS 快照发生变化，禁止覆盖或猜测恢复', jobId, `before=${beforeSnapshot}; after=${afterSnapshot ?? 'unknown'}`);
       }
-      const current = latest.candidate.meta.revisions.find((revision) => revision.id === latest.candidate.meta.currentRevision);
+      const current = latest.candidate.meta.schemaVersion === 3 ? latest.candidate.meta.revisions.at(-1) : currentReviewPatch(latest.candidate.meta);
       const writtenReview = await readFs(latest.candidate.reviewPath, 'utf8').catch(() => null);
       const writtenPatch = current ? await readFs(path.join(latest.candidate.dirPath, current.patch), 'utf8').catch(() => null) : null;
       const expectedFiles = [

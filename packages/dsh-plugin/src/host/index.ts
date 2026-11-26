@@ -5,7 +5,7 @@ import { stopDshAuditSession, withDshAuditSessionIdle } from './audit-session-id
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from './api.js';
 import { executeAuditCli } from './audit-stage-runner.js';
-import { configuredAuditStageGates } from './audit-stage-gates.js';
+import { restrictAuditSession, releaseAuditSessionRestrictions } from './audit-session-permissions.js';
 import type { ApiDeps } from './api-context.js';
 import { registerAuditStageTools, type AuditToolRegistry } from './audit-stage-tools.js';
 import { dshHome, loadSettings, saveSettings } from './settings.js';
@@ -44,6 +44,7 @@ export interface HostContext {
   effect(callback: () => void | (() => void | Promise<void>), label?: string): void;
   inject(services: string[], callback: (ctx: HostContext) => void): void;
   get(name: string): unknown;
+  on?(event: string, listener: (...args: any[]) => void): (() => void) | void;
   logger?: HostLogger;
 }
 
@@ -102,6 +103,7 @@ interface ApprovalLike {
 
 export interface AuditSessionHost {
   get(name: string): unknown;
+  on?(event: string, listener: (...args: any[]) => void): (() => void) | void;
   logger?: HostLogger;
 }
 
@@ -223,17 +225,18 @@ async function createDshSession(
       candidate, directory: await realpath(candidate.path).catch(() => null),
     })));
     const exact = paths.filter(({ directory }) => directory === root);
-    const matches = exact.length ? exact : (await Promise.all(paths.map(async entry => {
+    const matches = label === '审查' || exact.length ? exact : (await Promise.all(paths.map(async entry => {
       if (!entry.directory || !entry.directory.startsWith(root.endsWith(path.sep) ? root : root + path.sep)) return null;
       const worktree = await resolveWorktree(entry.directory).catch(() => null);
       return worktree?.root === root ? entry : null;
     }))).filter(entry => entry !== null);
     if (matches.length !== 1) {
-      const detail = matches.length ? 'DSH 中有多个项目匹配同一审查工作副本' : 'DSH 中找不到审查工作副本所属的项目';
+      const detail = matches.length ? 'DSH 中有多个项目匹配同一审查工作副本' : 'DSH 中找不到审查工作副本所属的项目，请登记工作副本根目录';
       throw new ApiError(412, 'not_configured', `${detail}：${input.cwd}`);
     }
     workspace = matches[0]!.candidate;
   }
+  if (label === '审查' && workspace && await realpath(workspace.path).catch(() => null) !== await realpath(input.cwd)) workspace = undefined;
   input.signal?.throwIfAborted();
   let created: { sessionId?: unknown };
   try {
@@ -252,7 +255,11 @@ async function createDshSession(
       host.logger?.warn(`dsh-code-review: ${label}会话改名失败：${describeSessionError(error)}`);
     }
   }
-  const inherited = inheritOwnerPolicy(host, input.ownerSessionId ?? '', sessionId);
+  const inherited: ReturnType<typeof inheritOwnerPolicy> = label === '审查' ? {} : inheritOwnerPolicy(host, input.ownerSessionId ?? '', sessionId);
+  if (label === '审查') {
+    try { await restrictAuditSession(host, sessionId, input.cwd); }
+    catch (error) { throw new ApiError(412, 'not_configured', String(error)); }
+  }
   await input.onCreated?.(sessionId);
   try {
     const prompted = await controller.prompt(
@@ -298,7 +305,7 @@ export function apply(ctx: HostContext): void {
   };
 
   const tools = ctx.get('tools') as AuditToolRegistry | undefined;
-  const stageCapabilities = { auditStageExecutor: executeAuditCli, auditStageGates: configuredAuditStageGates() };
+  const stageCapabilities = { auditStageExecutor: executeAuditCli };
   const auditSessions: ManagedAuditSessions = {
     ...stageCapabilities,
     auditSessionTools: typeof tools?.register === 'function',
@@ -432,6 +439,9 @@ export function apply(ctx: HostContext): void {
       offCentral();
       const results = await Promise.allSettled([connection.stop(), managed?.stop(), api?.closeAudit(), ready]);
       for (const result of results) if (result.status === 'rejected') logger?.error(`dsh-code-review: 节点停止失败：${String(result.reason)}`);
+      if (results.every(result => result.status === 'fulfilled') && !await releaseAuditSessionRestrictions(ctx)) {
+        logger?.error('dsh-code-review: 无法确认审查会话停止，保留其写权限限制');
+      }
     },
     'dsh-code-review: http routes',
   );

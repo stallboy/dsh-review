@@ -1,9 +1,11 @@
 import { readFile, writeFile, rm, stat, readdir } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parsePatch, isAiReviewPath } from './patch.js';
 import { runGateChecks } from './validator.js';
 import { gitBlobHash } from './vcs.js';
+import { currentReviewPatch, selectIssuePatch } from './issue-review.js';
 import { mergeApprovedText, supportedApprovalMergePatch } from './approval-merge.js';
 import { readApprovalMergeSnapshots, readSvnApprovalBinding, replaceApprovalMergeFile,
   svnApprovalBinding, SVN_APPROVAL_SOURCE, type ApprovalMergeFile } from './approval-merge-snapshots.js';
@@ -17,6 +19,7 @@ import type {
   ConcurrencyGuard,
   ReviewCandidate,
   RunnerExecutionResult,
+  IssueSelection,
 } from './types.js';
 import { composeCommitMessage } from './commit-message.js';
 import { buildCommitDetails } from './commit-message.js';
@@ -77,6 +80,7 @@ export interface RunnerLike {
 }
 
 export interface ApprovalCommitInput {
+  selection?: IssueSelection;
   commitMessage?: string;
   commitDetail?: CommitMessageDetail;
   commitMessageBody?: string;
@@ -153,7 +157,7 @@ export class ApprovalOrchestrator {
     const businessMessageFor = async (candidate: ReviewCandidate): Promise<string | undefined> => {
       const detail = commitInput?.commitDetail;
       if (!detail) return undefined;
-      const body = detail === 'detailed' ? await this.buildDetailBody(candidate) : '';
+      const body = detail === 'detailed' ? await this.buildDetailBody(candidate, commitInput?.selection) : '';
       return composeCommitMessage(candidate, detail, body);
     };
     const { store, vcs, settings } = this.deps;
@@ -167,6 +171,14 @@ export class ApprovalOrchestrator {
       const pre = await this.runPrechecks(id, guard, decisions, jobId, log, messageOverride);
       if ('outcome' in pre) return pre.outcome;
       let candidate = pre.candidate;
+      if (candidate.meta.schemaVersion === 3) {
+        try {
+          if (!commitInput?.selection) throw new Error('批准问题必须显式选择方案和补丁');
+          selectIssuePatch(candidate.meta, commitInput.selection);
+        } catch (error) {
+          return { status: 'ABORTED', reason: 'INVALID_CANDIDATE', message: String(error), jobId };
+        }
+      }
       let sharedSource = pre.source;
       const duplicate1 = await this.deps.checkDuplicate?.();
       if (duplicate1) {
@@ -237,10 +249,10 @@ export class ApprovalOrchestrator {
         message: 'Git 审批目标发生变化，已停止业务提交并保留现场', detail,
       });
       const patch = sharedSource
-        ? await store.currentPatch(candidate, sharedSource)
-        : await store.currentPatch(candidate);
+        ? await store.currentPatch(candidate, sharedSource, commitInput?.selection)
+        : await store.currentPatch(candidate, undefined, commitInput?.selection);
       const touchedPaths = parsePatch(patch.text).paths;
-      const currentRevision = candidate.meta.revisions.find(revision => revision.id === candidate.meta.currentRevision);
+      const currentRevision = currentReviewPatch(candidate.meta, commitInput?.selection);
       const svnSource = vcs.type === 'svn' ? svnApprovalBinding(currentRevision?.extra?.[SVN_APPROVAL_SOURCE]) : null;
       if (svnSource) {
         const target = await readSvnApprovalBinding(vcs.root, this.deps.signal).catch(() => null);
@@ -283,7 +295,6 @@ export class ApprovalOrchestrator {
           await restoreBusiness();
           return null;
         } catch (error) {
-          if (!merge && !restoreNative) return null;
           return { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', jobId,
             message: '工作区仍有无法确认归属的改动或恢复失败，已保留现场', detail: String(error) };
         }
@@ -374,7 +385,7 @@ export class ApprovalOrchestrator {
             return { status: 'ABORTED', reason: 'SYNC_FAILED', jobId, message: '无法核验三方合并输入', detail: inputs.detail };
           }
         }
-        if (!merge) return this.fixOrFallback('PATCH_CONFLICT', failure, candidate, jobId, log, base);
+        if (!merge) return this.fixOrFallback('PATCH_CONFLICT', failure, candidate, jobId, log, base, commitInput?.selection);
       }
       const businessPaths = touchedPaths.filter((file) => !isAiReviewPath(file));
       const businessSnapshot = await this.snapshotBusiness(businessPaths);
@@ -383,7 +394,9 @@ export class ApprovalOrchestrator {
           message: '三方合并写入与已验证结果不一致，已保留现场', detail: '实际写入的文件快照在门禁前发生变化' };
       }
       log('补丁已应用，开始执行门禁检查');
-      const report = await runGateChecks(candidate.meta.gateChecks, {
+      const commands = candidate.meta.schemaVersion === 3
+        ? selectIssuePatch(candidate.meta, commitInput!.selection!).option.gateChecks : candidate.meta.gateChecks;
+      const report = await runGateChecks(commands, {
         cwd: store.repoRoot,
         baseRevision: base,
         timeoutMs: settings.gateTimeoutMs,
@@ -402,7 +415,8 @@ export class ApprovalOrchestrator {
       if (!report.allPassed) {
         const recovery = await rollbackApplied();
         if (recovery) return recovery;
-        return this.fixOrFallback('GATE_CHECK_FAILED', report.formattedEvidenceMarkdown, candidate, jobId, log, base);
+        return this.recordVerificationFailure(candidate, guard, report.formattedEvidenceMarkdown, base,
+          operator?.trim() || guard.expectedOwner, jobId, log, commitInput?.selection);
       }
       // AC-APPROVE-01 要求门禁后重新验证共享事实和业务内容，防止门禁期间的改动混入提交。
       const baseAfterGates = await vcs.getCurrentBase();
@@ -500,7 +514,8 @@ export class ApprovalOrchestrator {
       const finishFinding = async (): Promise<void> => {
         if (fresh.meta.findingId) await this.deps.finishFindingCommit?.(fresh).catch(error => log(String(error)));
       };
-      await store.applyApproval(fresh, operator?.trim() || guard.expectedOwner, report, decisions);
+      await store.applyApproval(fresh, operator?.trim() || guard.expectedOwner, report, decisions, commitInput?.selection,
+        { baseRevision: base, patchSha256: createHash('sha256').update(patch.text).digest('hex') });
       const reviewText = await readFile(fresh.reviewPath, 'utf8');
       const reviewStat = await stat(fresh.reviewPath);
       const verifyEntries = businessPaths.flatMap((rel) => {
@@ -512,8 +527,14 @@ export class ApprovalOrchestrator {
         blobHash: gitBlobHash(reviewText),
         mode: (reviewStat.mode & 0o111) !== 0 ? '100755' : '100644',
       });
+      const deletedPatches = fresh.meta.schemaVersion === 3 ? [] : patchPaths;
+      if (fresh.meta.schemaVersion === 3) {
+        for (const entry of backup.patches) {
+          verifyEntries.push({ path: relative(store.repoRoot, entry.path), blobHash: gitBlobHash(entry.text), mode: '100644' });
+        }
+      }
       const verifyDeletions = [...new Set([
-        ...patchPaths,
+        ...deletedPatches,
         ...businessPaths.filter((rel) => !snapshotAfter.get(rel)),
       ])];
       const businessMessage = (await businessMessageFor(fresh))
@@ -522,7 +543,7 @@ export class ApprovalOrchestrator {
       const commit = await vcs.atomicCommit({
         message: businessMessage,
         paths: [...businessPaths, relative(store.repoRoot, fresh.dirPath)],
-        deletePaths: patchPaths,
+        deletePaths: deletedPatches,
         verifyEntries,
         verifyDeletions,
         ...(gitTarget ? { gitTarget } : {}),
@@ -791,10 +812,10 @@ export class ApprovalOrchestrator {
    * 在锁内且同步重绑后生成正文，避免正文描述旧补丁而提交新补丁。
    * 部分数据不可读时降级对应小节。
    */
-  private async buildDetailBody(candidate: ReviewCandidate): Promise<string> {
+  private async buildDetailBody(candidate: ReviewCandidate, selection?: IssueSelection): Promise<string> {
     const { store, vcs, settings } = this.deps;
     const source = this.deps.sharedSource ? await this.deps.sharedSource() : undefined;
-    const patch = await store.currentPatch(candidate, source).catch(() => null);
+    const patch = await store.currentPatch(candidate, source, selection).catch(() => null);
     const touched = patch ? parsePatch(patch.text).paths : [];
     const authorStats = await vcs.authorStats(touched).catch(() => undefined);
     return buildCommitDetails(candidate, {
@@ -853,6 +874,50 @@ export class ApprovalOrchestrator {
     }
   }
 
+  private async recordVerificationFailure(
+    candidate: ReviewCandidate, guard: ConcurrencyGuard, evidence: string, base: string, actor: string,
+    jobId: string, log: (line: string) => void, selection?: IssueSelection,
+  ): Promise<ApprovalOutcome> {
+    const { store, vcs } = this.deps;
+    const fresh = (await this.reload(candidate.id, guard, log)).candidate;
+    if (!fresh || !(await vcs.ensureCleanWorkspace()).clean) {
+      return { status: 'RECOVERY_REQUIRED', reason: 'SYNC_STATE_UNKNOWN', message: '验证失败后无法确认问题版本或工作区还原状态，现场保留', jobId };
+    }
+    const backup = await this.backup(fresh);
+    const reviewRelPath = relative(store.repoRoot, fresh.reviewPath);
+    const probePaths = [reviewRelPath];
+    const probeBefore = await vcs.getCommitProbe(probePaths).catch(() => null);
+    if (fresh.meta.schemaVersion === 3 && selection) {
+      selectIssuePatch(fresh.meta, selection);
+      fresh.meta.status = 'repair_failed';
+      fresh.meta.issue!.repairAttempts.push({ ...selection, baseRevision: base, actor, at: new Date().toISOString(),
+        result: 'verification_failed', restored: true, evidence });
+    } else {
+      fresh.meta.status = 'changes_requested';
+    }
+    fresh.sections.rawBody += `\n\n## 修复验证失败\n\n${actor} · ${new Date().toISOString()}\n\n业务改动已还原，等待人工处理。\n\n${evidence}\n`;
+    if (fresh.meta.findingId) await this.deps.beginFindingCommit?.(fresh, probePaths, probeBefore);
+    await store.write(fresh);
+    const text = await readFile(fresh.reviewPath, 'utf8');
+    const entries = [{ path: reviewRelPath, blobHash: gitBlobHash(text), mode: '100644' }];
+    const commit = await vcs.atomicCommit({ message: `review(${fresh.id}): 修复验证失败，已还原业务改动`, paths: probePaths, verifyEntries: entries });
+    let commitRevision = commit.commitRevision ?? undefined;
+    if (commit.verificationFailed) return { status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN', message: '失败记录提交结果待核验', detail: commit.errorOutput, jobId };
+    if (!commit.success) {
+      const outcome = await this.classifyCommitFailure({ probeBefore, probePaths, reviewRelPath, expectedReviewText: text,
+        expectedEntries: entries, expectedDeletions: [], backup, outOfDate: false, errorOutput: commit.errorOutput,
+        restorePreparation: commit.restorePreparation, restoreBusiness: async () => {}, canRetry: false, jobId, log });
+      if (outcome?.status === 'RECOVERY_REQUIRED') return outcome;
+      await this.deps.finishFindingCommit?.(fresh);
+      if (outcome?.status !== 'COMMITTED') return outcome!;
+      commitRevision = outcome.commitRevision;
+    } else if (fresh.meta.findingId) await this.deps.finishFindingCommit?.(fresh);
+    commitRevision ??= await vcs.getCommitProbe(probePaths) ?? undefined;
+    if (!commitRevision || commitRevision === probeBefore) return { status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN', message: '失败记录的提交版本无法确认，现场保留', jobId };
+    return { status: fresh.meta.schemaVersion === 3 ? 'REPAIR_FAILED' : 'FALLBACK_TO_PENDING', reason: 'GATE_CHECK_FAILED',
+      message: '修复验证失败，业务改动已还原；失败记录已保存，等待人工处理。', jobId, commitRevision };
+  }
+
   private async fixOrFallback(
     reason: ApprovalFallbackReason,
     detail: string,
@@ -860,6 +925,7 @@ export class ApprovalOrchestrator {
     jobId: string,
     log: (line: string) => void,
     baseRevision: string,
+    selection?: IssueSelection,
   ): Promise<ApprovalOutcome> {
     const { store, vcs, settings } = this.deps;
     if (!settings.autoFixOnFailure) {
@@ -883,6 +949,7 @@ export class ApprovalOrchestrator {
       failureDetail: detail,
       baseRevision,
       workingTree: 'clean_base',
+      ...(selection ? { selection } : {}),
       log,
       ...(this.deps.resolveCredential ? { resolveCredential: this.deps.resolveCredential } : {}),
       ...(this.deps.signal ? { signal: this.deps.signal } : {}),
@@ -920,9 +987,8 @@ export class ApprovalOrchestrator {
       const validationErrors: string[] = this.deps.validateNewRevision
         ? await this.deps.validateNewRevision(candidate, latest.candidate)
         : [];
-      const current = latest.candidate.meta.revisions.find(
-        (revision) => revision.id === latest.candidate.meta.currentRevision,
-      );
+      const nextOption = latest.candidate.meta.issue?.options.find(option => option.id === selection?.optionId);
+      const current = currentReviewPatch(latest.candidate.meta, nextOption ? { optionId: nextOption.id, patchId: nextOption.currentPatch } : undefined);
       let patchText: string | null = null;
       if (current) {
         try {

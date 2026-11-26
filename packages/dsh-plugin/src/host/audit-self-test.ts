@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { ApiDeps } from './api-context.js';
@@ -85,11 +85,14 @@ export async function runAuditSelfTest({ deps, settings, signal: commandSignal, 
                 })) throw new Error('自检阶段参数必须使用固定空数组');
                 invoked.add(runner);
                 return track(runner, '正在调用 ' + runner, async () => {
-                    const location = path.join(directory, runner);
-                    await mkdir(location);
+                    const location = path.join(cwd, '.ai-review', 'runtime', runner);
+                    await mkdir(location, { recursive: true });
+                    const samplePath = path.join(cwd, runner + '-sample.txt');
+                    await writeFile(samplePath, 'x'.repeat(150_000) + '\n' + sample + '\n');
                     const result = await execute({
-                        executor: runner, location, schema, signal: active, timeoutMs: STAGE_TIMEOUT_MS,
-                        prompt: '只处理下面的样本。把其中的小写字母改成大写，保持数字和顺序不变。按给定 JSON 格式返回 value。样本：' + sample,
+                        executor: runner, location, repoRoot: cwd, schema, signal: active, timeoutMs: STAGE_TIMEOUT_MS,
+                        prompt: '使用 Harness 文件读取工具或 shell 读取工作目录文件 ' + samplePath
+                            + ' 的最后一个非空行，把其中的小写字母改成大写，保持数字和顺序不变，按给定 JSON 格式返回 value。不得改写该文件。',
                     });
                     active.throwIfAborted();
                     validateAuditValue(schema, result);

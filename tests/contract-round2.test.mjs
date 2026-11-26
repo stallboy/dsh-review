@@ -1,7 +1,7 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { API_PREFIX, ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
@@ -143,7 +143,7 @@ test('G30：/jobs/:id/cancel 已结束 Job 幂等返回原结果', async () => {
   assert.equal((await fetch(`${base}/jobs/job-x/cancel`, { method: 'POST' })).status, 404);
 });
 
-test('G42：verify_gate_on_audit_finalize=declared 时收尾复算门禁并留痕', async () => {
+test('AC-AUDIT-NO-APPLY：遗留declared配置也不在审查收尾执行修复门禁', async () => {
   const root = await createGitFixture();
   await mkdir(path.join(root, '.ai-review', 'audits'), { recursive: true });
   await writeFile(path.join(root, '.ai-review', 'reviewers.yml'),
@@ -161,8 +161,12 @@ test('G42：verify_gate_on_audit_finalize=declared 时收尾复算门禁并留�
     body: JSON.stringify({ auditId: manual.auditId }),
   });
   const job = await waitJob(base, (await start.json()).jobId);
-  assert.equal(job.result.status, 'VALIDATION_FAILED', JSON.stringify(job.result));
+  assert.equal(job.result.status, 'COMMITTED', JSON.stringify(job.result));
+  assert.deepEqual(job.result.created[0].errors, []);
+  assert.match(await readFile(path.join(root, 'src/math.js'), 'utf8'), /=> a - b/);
+  assert.equal(runCommand('git', ['status', '--porcelain=v1'], root).stdout.trim(), '?? .tmp/');
+  assert.deepEqual(await readdir(path.join(root, '.tmp')), ['state.json']);
   const auditText = await readFile(path.join(root, '.ai-review', 'audits', manual.auditId, 'audit.md'), 'utf8');
-  assert.match(auditText, /门禁已由 Host 复算（declared）/);
-  assert.equal(runCommand('git', ['ls-files', '.ai-review/2026-11'], root).stdout.trim(), '');
+  assert.doesNotMatch(auditText, /门禁已由 Host 复算/);
+  assert.match(runCommand('git', ['ls-files', '.ai-review/2026-11'], root).stdout, /001\.patch/);
 });

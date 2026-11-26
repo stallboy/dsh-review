@@ -2,6 +2,12 @@ import type { DiffResolutionMode, GateCheckResult, PatchStats, ReviewStatus, Vcs
 
 export { AUDIT_TYPES } from '@dsh-review/protocol';
 export type {
+    IssueReview,
+    IssueSelection,
+    RepairOption,
+    IssueObservation,
+    IssueDecision,
+    RepairAttempt,
     ReviewStatus,
     CommentStatus,
     VcsType,
@@ -68,7 +74,7 @@ export interface RunnerExecutionResult {
   aborted?: boolean;
 }
 
-export type ApprovalOutcomeStatus = 'COMMITTED' | 'FALLBACK_TO_PENDING' | 'ABORTED' | 'RECOVERY_REQUIRED';
+export type ApprovalOutcomeStatus = 'COMMITTED' | 'REPAIR_FAILED' | 'FALLBACK_TO_PENDING' | 'ABORTED' | 'RECOVERY_REQUIRED';
 export type ApprovalFallbackReason = 'PATCH_CONFLICT' | 'GATE_CHECK_FAILED';
 export type ApprovalAbortReason =
   | 'CONCURRENCY_MISMATCH'

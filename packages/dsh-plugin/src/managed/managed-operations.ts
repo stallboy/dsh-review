@@ -227,6 +227,8 @@ export class ManagedOperations {
             return result;
         }
         if (command.payload.autoFix === true) return { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT', message: '托管模式请先提交评论，再单独启动 AI 修复' }, delivery: { state: 'not_required' } };
+        if (command.operation === 'audit' && command.payload.issueWorkflow !== true) return { outcome: { status: 'ABORTED', reason: 'STATE_CONFLICT',
+            message: '中央尚未确认问题记录与方案选择能力，请先升级中央服务' }, delivery: { state: 'not_required' } };
         if (command.scheduledAudit && !runtime.registration.supportsScheduledAudit) {
             return { outcome: { status: 'ABORTED', reason: 'RUNNER_UNAVAILABLE', message: '此工作副本未配置进程型审查 Runner' }, delivery: { state: 'not_required' } };
         }
@@ -459,7 +461,7 @@ export class ManagedOperations {
                 return new AuditArchive(runtime.root).read(id, pinned.source);
             }
             const params: Record<string, string> = {};
-            for (const name of ['id', 'name', 'from', 'to', 'mode']) if (query.params[name] !== undefined) params[name] = String(query.params[name]);
+            for (const name of ['id', 'name', 'from', 'to', 'mode', 'optionId', 'patchId']) if (query.params[name] !== undefined) params[name] = String(query.params[name]);
             const response = await runtime.api.invoke({ method: 'GET', path: `/${query.kind}`, query: params });
             if (response.status !== 200) throw new Error(String(object(object(response.body).error).message ?? '详情读取失败'));
             const value = object(response.body);

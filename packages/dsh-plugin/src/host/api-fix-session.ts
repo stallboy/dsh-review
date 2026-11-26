@@ -1,5 +1,6 @@
 import type { ApiRequest, ApiResponse } from './api-context.js';
 import { Runner, loadSystemPrompt, toSessionFixPrompt } from './runner.js';
+import { issueSelection, requireIssueSelection } from './issue-review.js';
 import { ApiError, type ReviewCandidate } from './types.js';
 import {
   readJson,
@@ -30,7 +31,8 @@ export class FixSessions {
     }
   }
 
-  async fixPrompt(runtime: Runtime, candidate: ReviewCandidate): Promise<string> {
+  async fixPrompt(runtime: Runtime, candidate: ReviewCandidate, selection?: import('./types.js').IssueSelection): Promise<string> {
+    requireIssueSelection(candidate.meta, selection);
     const comments = candidate.meta.comments.filter((comment) => comment.status !== 'resolved');
     const runner = new Runner({
       kind: 'manual',
@@ -38,13 +40,14 @@ export class FixSessions {
       store: runtime.store,
       candidate,
       mode: 'ADDRESS_FEEDBACK',
+      ...(selection ? { selection } : {}),
       comments,
       log: () => undefined,
     });
     const result = await runner.run();
     const manualPrompt = result.prompt ?? result.errorMessage;
     if (!manualPrompt) throw new ApiError(500, 'internal', '无法生成修复提示词');
-    return toSessionFixPrompt(manualPrompt, await loadSystemPrompt());
+    return toSessionFixPrompt(manualPrompt, await loadSystemPrompt(candidate.meta.schemaVersion));
   }
 
   async create(req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
@@ -63,7 +66,7 @@ export class FixSessions {
     if (candidate.meta.owner !== me) {
       throw new ApiError(403, 'forbidden', `当前操作者 ${me} 不是候选 Owner`);
     }
-    if (candidate.meta.status === 'approved' || candidate.meta.status === 'rejected') {
+    if (candidate.meta.status === 'approved' || candidate.meta.status === 'rejected' || candidate.meta.status === 'resolved') {
       throw new ApiError(409, 'conflict', '已归档的候选不能再启动修复会话');
     }
     if (candidate.meta.comments.filter((comment) => comment.status !== 'resolved').length === 0) {
@@ -72,7 +75,7 @@ export class FixSessions {
     // 已有工作区改动可能被误收进会话生成的补丁。
     const clean = await runtime.vcs.ensureCleanWorkspace();
     if (!clean.clean) throw new ApiError(409, 'conflict', `启动修复会话要求业务工作区干净。\n${clean.message}`);
-    const prompt = await this.fixPrompt(runtime, candidate);
+    const prompt = await this.fixPrompt(runtime, candidate, issueSelection(body));
     const title = `AI 修复 · ${candidate.meta.title}`.replace(/\s+/g, ' ').slice(0, 60);
     const ownerSessionId = url.searchParams.get('sessionId') ?? '';
     // 检查与占位之间不能让出执行权，否则并发请求都可能通过检查。

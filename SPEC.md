@@ -3,6 +3,7 @@
 > **任务来源**: 团队需要一份能用于内部交流、实现和验收的现行规格。
 > **任务内容**: 说明本地和中央托管的设计，规定审查、审批、查询、交付和复查的行为。
 > **参考文档**:
+> - `docs/plans/2026-11-25-harness-review-redesign.md` — 用户重新对齐的审查/修复边界、17 项差异及实现方案。
 > - `AGENTS.md` — 协作、审查和验证流程。
 > - `docs/superpowers/specs/2026-11-16-central-review-web-design.md` — 本次认可的设计来源；契约以本文为准。
 > - `docs/superpowers/specs/2026-11-17-plugin-central-design.md` — 插件连接、项目接入与本机中央生命周期。
@@ -16,8 +17,10 @@
 
 本文是实现与验收的权威规格。提示词依照 §11 维护。初次了解项目可以先读[团队说明](SPEC_for_human.md)。
 
+**2026-11-25 审查流程重订**：新问题采用 §4.10 的 schema3，以问题级 `review.md` 为唯一可编辑事实。§4.3–§4.9 中按独立候选、外置发现处置和补丁删除描述的规则仅用于旧 v1/v2 兼容读取及已有任务恢复；新任务按本次重订执行。审查和人工批准后的修复是两个阶段，审查不得应用业务补丁或宣称修复效果已验证。
+
 - 插件标识为 `dsh-code-review`。仓库另有独立中央服务、中央 Web 和共享协议包，部署边界见 §16。
-- 旧版档案和独立候选继续使用 v1。绑定到发现的新版档案和候选使用 v2，发现处置文件使用自己的 v1 格式。
+- 新审查使用 schema3 问题记录及索引档案；v1/v2 档案、候选及外置处置文件保留兼容读取和既有任务恢复。
 - **规范用语**：“必须 / 不得”表示强制要求；“应”表示无正当理由不得偏离；“可”表示可选能力。
 - **命名约定**：仓库内 YAML 使用 `snake_case`，HTTP API 与 TypeScript 使用 `camelCase`。例如 `commit_message` 对应 `commitMessage`，`base_revision` 对应 `baseRevision`。
 - 附录 A 记录现行能力的运行条件。早期差距表可从 Git 历史追溯。
@@ -37,7 +40,7 @@
 ```mermaid
 flowchart TD
     AUDIT["AI 审查仓库"] --> TRIAGE{"已确认的问题能否独立修复和验证？"}
-    TRIAGE -->|"A 类：可验证修复"| CAND["生成一个或多个互斥补丁"]
+    TRIAGE -->|"A 类：可验证修复"| CAND["生成一至两个互斥补丁提案"]
     TRIAGE -->|"B 类：需要拍板"| REPORT["记录文字修复方案"]
     TRIAGE -->|"Deferred：等待前置合入"| REPORT
     REPORT --> QUEUE["人类审核发现"]
@@ -46,6 +49,7 @@ flowchart TD
     DETAIL -->|"按意见 AI 修复 / Rebase"| FIX["生成新的完整补丁版本"]
     FIX --> QUEUE
     DETAIL -->|"选择补丁并批准"| GATE["在批准时基线上应用补丁<br/>重新执行全部门禁"]
+    GATE -->|"验证失败"| FAILED["还原本次业务修改、记录失败<br/>等待人工处理"]
     GATE -->|"全部通过"| COMMIT["原子提交业务代码与批准记录<br/>业务提交由 VCS 历史派生"]
     DETAIL -->|"本次不修改 / 人工接手"| RECHECK["记录人的决定，供跨轮复查"]
     RECHECK -.->|"历史发现与人的结论"| AUDIT
@@ -107,15 +111,15 @@ flowchart TD
 
 ### 3.1 仓库审查与候选生产
 
-每次审查必须有明确的目标范围、开始基线和触发方式。Agent 先阅读构建配置、入口、核心数据流和现有测试，再开始判断或修改代码。
+每次审查必须有明确的目标范围、开始基线和触发方式。Agent 先阅读构建配置、入口、核心数据流和现有测试，再开始判断。审查阶段只生成提案，业务修复在人审批准后执行。
 
-新版审查以已确认的发现为审核单位。每条发现使用跨轮稳定的 `finding_id`，按 §4.9 交付补丁选项或文字方案。问题证据不足时仅记录覆盖说明；修复复杂或难验证时，已确认的发现仍可交付文字方案。
+新版审查以已确认的发现为审核单位。每条发现使用跨轮稳定的 `finding_id`，按 §4.10 在同一问题记录中交付补丁选项或文字方案。问题证据不足时仅记录覆盖说明；修复复杂或难验证时，已确认的发现仍可交付文字方案。
 
 审查发现按下列规则分流：
 
 | 分类 | 判定标准 | 产物 |
 | --- | --- | --- |
-| **A 类** | 问题确定；能消除根因；影响面收敛；不破坏公开 API、协议或持久化格式；可通过自动化门禁自证 | 生成一个推荐补丁；有实质取舍时可给二至三个互斥选项 |
+| **A 类** | 问题确定；能消除根因；影响面收敛；不破坏公开 API、协议或持久化格式；可通过自动化门禁自证 | 选择置信度最高的一至两个互斥方案，生成完整补丁 |
 | **B 类 / confirm** | 涉及业务取舍、跨模块重大调整、公开协议、数据迁移或无法本地验证 | 写入文字修复方案，供人工接手 |
 | **Deferred** | 明确依赖另一个 finding 先闭合；该 finding 可已通过候选合入 | 记录文字方案与 `depends_on`，本轮不生成依赖链补丁 |
 
@@ -129,15 +133,15 @@ flowchart TD
 
 所有同轮 A 类候选必须独立基于审查开始时固定的同一业务快照。Git 绑定提交，SVN 绑定仓库身份、目标路径及 revision。后续 Rebase 或修复产生的候选版本各自绑定其生成基线，审批以当前候选版本的基线为准：
 
-1. **互不重叠则拆分**：不同模块、不同文件，或同文件中上下文与逻辑均独立的修复，分别生成候选。每导出一个补丁后立即还原业务工作区。
+1. **互不重叠则拆分**：不同模块、不同文件，或同文件中上下文与逻辑均独立的修复，分别生成候选。直接生成完整补丁，不在业务源码应用；必要临时取证另按 §7.6 归档及恢复。
 2. **同处耦合则合并**：若根因修复必须同时清理同一函数或结构体内的冗余代码，且分开会产生直接冲突，应合并为一个候选。
 3. **跨阶段强依赖则 Deferred**：不得生成必须按顺序应用的候选链。
 
-同一发现的备选补丁是互斥选项，允许触及相同路径。各选项必须独立基于同一审查基线生成和验证，分别写为一个候选，每次导出后还原业务工作区。不同发现之间仍遵循上述正交性规则。
+同一发现的备选补丁是互斥选项，允许触及相同路径。各选项独立基于同一审查基线生成并做只读预检，写入同一问题目录，由 options 引用各自当前补丁。不同发现之间仍遵循上述正交性规则。
 
 ### 3.3 人工审核循环
 
-新版发现详情展示三项处置：有可审批补丁时可「接受并应用」，其余两项为「本次不修改」和「人工接手」。处置写在发现上，批准绑定选中的候选版本，详见 §4.9、§7.5 和 §10.2。以下候选操作仍可从对应详情或需要处理的情境进入：
+新版发现详情展示三项处置：有可审批补丁时可「接受并应用」，其余两项为「本次不修改」和「人工接手」。处置写入该问题的 review.md，批准绑定问题记录版本、所选方案和补丁，详见 §4.10、§7.5 和 §10.2。以下候选操作仍可从对应详情或需要处理的情境进入：
 
 1. Owner 查看问题、根因、当前方案、人工判断项、门禁证据和代码差异。
 2. Owner 可添加总体或行内评论；新增未解决评论使 `pending` 变为 `changes_requested`。
@@ -153,14 +157,14 @@ flowchart TD
 2. 检查工作区，按设置同步并取得批准时生效基线。
 3. 按 §7.5 验证当前补丁在目标基线上的交付内容，记录业务内容快照并重新执行全部门禁。
 4. 再次检查 guard 和业务快照，防止候选或业务代码在门禁期间被更新。
-5. 原子提交业务代码、`review.md` 批准记录和过程补丁删除。
+5. 原子提交业务代码和 `review.md` 批准记录，schema3 保留全部补丁；旧格式沿用其归档兼容规则。
 6. 提交成功后，Host 记录本次提交版本用于响应；后续读取从 VCS 历史派生该候选的业务提交版本；不向 `review.md` 写入提交哈希。
 
 原子提交成功即表示业务批准生效。中央还要单独报告远端交付结果。提交结果不明时按 §7.5 和 §12.3 核验 VCS，结论明确前保留现场。
 
 ### 3.5 拒绝、超时与重开
 
-本节为独立候选的处理规则。绑定发现的候选使用 §4.9 的处置和恢复审核流程。
+本节仅用于旧独立候选。schema3 问题使用 §4.10 的处置和跨轮重开，不删除补丁或创建替代问题记录。
 
 - 人工拒绝必须填写具体原因；超时归档使用系统身份 `system:stale`。
 - 拒绝或超时在同一提交中更新 `review.md` 并删除过程补丁，永久保留审核记录。
@@ -611,9 +615,64 @@ Host 可以在内存中缓存同一 VCS 快照的投影结果，但缓存不是�
 
 ---
 
+### 4.10 问题级 review.md（schema3）
+
+每个问题只有一份可编辑的 `review.md`，沿用首次建立的 `.ai-review/YYYY-MM/<slug>/` 路径及稳定 `finding_id`。跨轮观察、人工处置、方案、补丁历史和修复记录均存于该文件。审查档案只引用问题，不再向 `items` 或 `findings/<id>.yml` 重复写新问题事实。同一 finding 出现 schema3 权威记录后，旧记录仅作历史兼容；重复权威记录须报错，不可任意择一。
+
+共有标题、负责人、时间、目标文件、评论、人工判断、批准、拒绝及提交信息沿用既有类型。新格式另规定：
+
+| 字段 | 契约 |
+| --- | --- |
+| `schema_version` | 数字 `3`；历史 v1/v2 保持原格式读取。 |
+| `record_revision` | 问题记录版本，从 1 递增，独立于补丁数；纯文字问题初始也是 1。API 的 `currentRevision` 仅是该字段的兼容映射，审批 guard 绑定记录版本及 updated_at。 |
+| `base_revision` / `priority` | 最近核验的业务基线及 P0–P3 影响等级。 |
+| `patches[]` | 不可变的完整补丁账本，每项含连续 `id`、`base_revision`、`patch`、`author`、`option_id`。文件名从 `001.patch` 递增，不覆盖、不删除；可以为空。 |
+| `options[]` | 零至两个当前有效互斥方案；每项含稳定 `id`、`title`、`tradeoff`、0–1 的 `confidence`、`current_patch` 和非空 `gate_checks`。每个方案引用所属方案的现有 patch。门禁是人审后实际应用时才执行的命令，不能因写入该字段声称已通过。 |
+| `observations[]` | 审查 ID、基线、时间、confirmed/resolved/unverified、理由及路径/行号/原文证据。新观察不得删除已有观察。 |
+| `decisions[]` | 人工处置的动作、操作者、时间、理由及可选复查条件，按发生顺序保留。 |
+| `repair_attempts[]` | 所选方案及补丁、执行基线、操作者、时间、applied/verification_failed、还原结果和实际验证证据。 |
+| `status` | pending、changes_requested、approved（已解决）、rejected（本次不修改）、repair_failed（待人工）、human_takeover、awaiting_verification、resolved（外部修复经后续审查确认解决）。 |
+
+例如，初始纯文字问题为 `record_revision: 1`、`patches: []`、`options: []`。后续给出 A/B，补丁 001 属于 A、002 属于 B；再次修订 A 时新增 003，A 的 current_patch 指向 3，B 仍指向 2；record_revision 独立增加。有效方案仍为两个，历史补丁不计入上限。评论的 revision 绑定问题记录版本，不绑定 patch 编号。行内评论另以 option_id、patch_id 绑定所见补丁；不同方案的行内意见不能混用，历史仍保留原身份。
+
+人工批准必须显式传入 `optionId` 和 `patchId`，并绑定问题版本、共享内容和所选 patch 原字节。不得以修改问题记录版本来伪装选中较早的补丁。纯文字问题可审核、交外部处理，但不能申请程序应用。
+
+人工批准后由程序优先应用并验证，应用失败才可唤起修复 Agent 辅助；涉及分支合并时给 Agent 完整 Harness 权限。辅助应用实质改变业务行为、范围或方案，须追加新补丁并回到人审，不沿用旧批准。
+
+应用成功但验证失败：不调用 Agent，先恢复本次业务改动，再持久化失败证据与恢复结果，status 改为 repair_failed。恢复失败或记录提交不明时保留现场并返回恢复状态。应用成功且门禁全部通过：status 改为 approved，原子提交业务改动及问题记录，保留全部历史 patch，不追加复核。
+
+外部人工接手记为 human_takeover，反馈完成记为 awaiting_verification；后续审查以实际代码证据确认解决后转为 resolved；仍存在则回到 human_takeover，证据不足保持待复核。程序修复已关闭的问题，下轮再次发现时沿用原记录、追加观察并重开，不额外增加成功复核阶段。
+
+中央以 issueWorkflow: true 与节点协商新格式能力。仅有 findingWorkflow 不代表支持 schema3，审查指令、显式方案写入和外部完成反馈均要求 issueWorkflow。新格式快照不得发送给不支持的中央。新格式需由中央与节点协商支持。未支持方可以继续读取其已理解的历史格式，但不得接收被静默降级的新问题写入或省略方案身份的批准。
+
+schema3 的关键字段示例（其余共有字段沿用 §4.3；哈希在实际产物中为完整值）：
+
+```yaml
+schema_version: 3
+finding_id: math-addition
+record_revision: 7
+status: pending
+base_revision: <审查业务基线>
+priority: P1
+patches:
+  - {id: 1, patch: 001.patch, author: ai, option_id: a, base_revision: <基线>}
+  - {id: 2, patch: 002.patch, author: ai, option_id: b, base_revision: <基线>}
+  - {id: 3, patch: 003.patch, author: ai, option_id: a, base_revision: <基线>}
+options:
+  - {id: a, title: 直接修正, tradeoff: 最小改动, confidence: 0.98, current_patch: 3, gate_checks: [node --test]}
+  - {id: b, title: 显式转换, tradeoff: 增加输入转换, confidence: 0.9, current_patch: 2, gate_checks: [node --test]}
+observations: []
+decisions: []
+repair_attempts: []
+```
+
+新增验收标识：`AC-HARNESS-READ`（完整工具及大文件）、`AC-AUDIT-NO-APPLY`（审查不应用）、`AC-ISSUE-RECORD`（唯一跨轮记录）、`AC-ISSUE-OPTIONS`（两个方案与补丁账本）、`AC-ISSUE-APPROVAL`（明确选择）、`AC-REPAIR-FAILURE`（回退后待人工）、`AC-ISSUE-HISTORY`（保留补丁与业务提交派生）、`AC-ISSUE-EXTERNAL`（外部完成与复核）、`AC-ISSUE-COMPAT`（新旧协议）。
+
 ## 5. 生命周期与审核记录
 
 ### 5.1 候选状态机
+
+schema3 的状态及转换由 §4.10 定义；以下旧候选图仅用于 v1/v2。成功批准即已解决，不新增成功复核；验证失败还原后等待人工。
 
 ```text
 [*] ──新建──> pending
@@ -633,6 +692,8 @@ rejected ──人工重开──> 另一活跃候选记录 reopened_from
 - 补丁冲突或门禁失败时按 §7.5 处理；产生新版本后，本次批准失效并回到 `pending`。
 
 ### 5.2 版本与作者
+
+schema3 的 record_revision 与 patch 账本独立。以下 current_revision 等于最高补丁编号的规则仅用于 v1/v2。
 
 - AI 修复和 AI Rebase 的 revision `author` 为 `ai`。
 - 既有 `author: human` 的历史版本继续参与读取、展示和提交说明。
@@ -668,7 +729,7 @@ AI 必须把无法自证的业务语义、架构/性能折中、兼容性和未�
 
 1. 该提交中的 `review.md` 为 `approved` 且 `approval != null`；
 2. 该提交的父提交中同一文件不存在或不是 `approved`（即该提交是状态迁移提交）；
-3. 该提交删除了候选当前 `revisions[]` 的全部补丁；
+3. 旧格式提交删除了候选的全部过程补丁；schema3 提交保留补丁，并且 approval 的 option_id、patch_id、record_revision、patch_sha256、base_revision 与已应用内容一致；
 4. 该提交包含 `target_files` 中至少一个业务路径的改动。
 
 Git 在触及该候选目录 `review.md` 的提交历史中（如 `git log -- <candidate_dir>`）查找满足上述 4 个条件的提交，再用 `git show <c>:<path>` 与各父提交的 `git show <p>:<path>` 验证状态迁移；不限定 first-parent，因为条件 1–4 加 `ambiguous` 兜底已具备足够的唯一性过滤。验证 Merge 提交时必须显式展开其改动列表（如 `git diff-tree -m -r <c>`）：默认 diff 输出对 Merge 提交不列文件，直接沿用会导致漏检；条件 2 的"父提交"在 Merge 场景下须对所有父提交均不满足 `approved` 才算状态迁移。SVN 在对应路径历史中查找同一 revision 的 `M review.md` 与 `D` 补丁，再用 `svn cat -r <c>` 与 `-r <c-1>` 验证。Host 必须把结果归为三态：
@@ -777,6 +838,8 @@ VCS 子进程统一超时 180 秒，输出采用有界流式缓冲，最多保�
 
 ### 7.4 Runner
 
+schema3 使用提案模式：必须显式绑定方案及旧补丁，只追加该方案的下一份完整 patch，推进 record_revision，保留另一方案、旧补丁、人类决定、观察及修复记录。只写 .ai-review，不应用业务补丁或执行修复门禁。反馈只消费所选方案及问题总体意见。交互式会话或导出提示词的产物通过 /candidate/finalize 携带原共享 guard 和方案选择收尾；Host 复用 validateNewRevision、只读预检和精确文件提交，不直接应用提案。以下旧 Runner 执行过程只用于 v1/v2 兼容。
+
 | 类型 | 行为 |
 | --- | --- |
 | `dsh` | 默认；dshCommand 非空时作为可执行文件或命令前缀，否则自动探测 dsh。Host 追加 `--profile headless --json -`，提示词经 stdin 投递，解析 JSON 事件流；不创建或复用交互式会话。 |
@@ -817,9 +880,9 @@ Runner 模式：
 5. **工作区检查**：不干净返回 `ABORTED / DIRTY_WORKSPACE`。Git 正在合并、变基、挑拣或撤销时无法建立本次审批目标，返回 `ABORTED / SYNC_FAILED` 并保留进行中的操作。
 6. **同步与基线**：默认先同步。已知且可安全恢复的失败返回 `ABORTED / SYNC_FAILED`；部分同步或基线状态无法确定时返回 `RECOVERY_REQUIRED / SYNC_STATE_UNKNOWN`，禁止自动重试。随后重新绑定同步后的共享快照，重跑步骤 1–4（包括负向记忆）；后续补丁、门禁与批准记录均使用该快照。
 7. **重建并验证同一共享快照中的当前补丁**：按下述规则计算当前补丁在目标基线上的交付结果。严格应用路径必须检测 SVN 部分应用。发生文本冲突或无法证明合并保留已审修改时，进入 `PATCH_CONFLICT` 回退。正式工作区只写入已验证的结果，随后记录所有目标业务文件的内容、存在性与模式快照。
-8. **重新执行门禁**：失败则终止完整进程树、还原业务工作区并进入门禁失败回退。
+8. **重新执行门禁**：失败则终止并确认完整进程树停止，还原本次业务修改，持久化失败证据和还原结果；schema3 转为 repair_failed 并返回 REPAIR_FAILED，不调用 Agent。无法确认还原或记录提交时进入 RECOVERY_REQUIRED。
 9. **再次校验共享事实、guard、工作区与提交内容**：确认 HEAD/相关事实未变化并重新执行 §6 重复检查；候选变化返回 `ABORTED / CONCURRENCY_MISMATCH`，新重复返回 `ABORTED / DUPLICATE_CANDIDATE`。重新计算业务工作区快照，必须与步骤 7 完全一致且没有额外业务文件变化。业务提交还必须从已验证内容构造提交树，并逐路径核对暂存 blob、模式与删除集合；可使用临时 index，或强制重新暂存后核验。工作区、索引或提交树任一不一致均返回 `ABORTED / BUSINESS_CONTENT_CHANGED` 并恢复，防止门禁通过索引或 clean filter 夹带未审核代码。
-10. **原子提交**：写入 approval（不含提交哈希），提交业务代码、review.md 和补丁删除：
+10. **原子提交**：写入 approval（不含提交哈希），提交业务代码和 review.md；schema3 保留补丁，旧格式按兼容规则删除：
     - 明确因撞车且提交不存在：恢复快照后重试；实际耗尽返回 `ABORTED / MAX_RETRIES_EXCEEDED`。
     - 明确的非撞车失败且提交不存在：撤销本次 VCS 暂存或调度，恢复候选文件与业务工作区并确认恢复结果，再返回 `ABORTED / COMMIT_FAILED`。恢复不完整时返回 `RECOVERY_REQUIRED / COMMIT_OUTCOME_UNKNOWN`。
     - 超时、断连或结果不明：先查询 HEAD/远端并核对候选批准内容。提交存在则按成功继续；证明不存在才可恢复并返回 COMMIT_FAILED；仍无法确定则返回 `RECOVERY_REQUIRED / COMMIT_OUTCOME_UNKNOWN`，禁止恢复备份或重试。
@@ -830,11 +893,11 @@ Runner 模式：
 - 优先检查原生严格应用能力。严格应用能完整落地时复用原生路径。SVN 的拒绝块、跳过及部分或全部已生效均不得视为完整应用。SVN 报告以非零 fuzz 忽略上下文时按上下文失配处理。严格应用遇到文本上下文失配时，符合首期范围的候选以当前版本的 `base_revision` 重建源快照，再严格应用补丁得到候选快照。以实际使用的原生目标快照为另一侧，在独立临时 Git 环境执行三方合并。已提交的其他候选通过目标快照参与本次合并。
 - 首期三方合并覆盖已有普通文本文件的内容修改，路径、文件类型、模式、字节表示和原生属性须保持一致且可核验。范围之外的变更继续使用原生严格应用。旧候选缺少可验证来源、浅克隆缺少历史，或 SVN 环境未安装 Git 时，允许继续使用可完整应用的原生路径。若原生路径不能完整应用，则按具体原因报告冲突或 `ABORTED / SYNC_FAILED`。已确认的来源绑定不匹配必须中止。合并结果经核验被拒绝后禁止改走原生路径继续提交。正式工作副本的同步结果或状态无法确定时，按 `RECOVERY_REQUIRED / SYNC_STATE_UNKNOWN` 保留现场。
 - 合并无冲突后，Host 比较候选相对源快照的修改与合并结果相对目标快照的修改。路径、修改定位和增删内容须一一对应。允许行号偏移与上下文漂移，重复文本导致位置映射歧义、部分改动已生效、空结果或额外修改均进入 `PATCH_CONFLICT` 回退。修复产生的新版本须重新审批。
-- 正式写入前及门禁后再次校验工作副本和目标快照，Git 核对 HEAD 所在引用，SVN 核对工作副本绑定及涉及路径的基线与属性。写入后须确认实际内容与计算结果一致。门禁对实际待交付内容运行，批准记录、业务内容和补丁删除仍在原生 Git 或 SVN 中原子提交。Git 审批从已核验的基线构造提交，引用事务锁定并比较目标引用及旧版本后才更新。SVN 原生审批按本次应用前后的范围快照撤销，保留范围外及归属无法证明的变更。目标变化时按既有并发与恢复流程重新校验，远端交付遵循 §16.7。
+- 正式写入前及门禁后再次校验工作副本和目标快照，Git 核对 HEAD 所在引用，SVN 核对工作副本绑定及涉及路径的基线与属性。写入后须确认实际内容与计算结果一致。门禁对实际待交付内容运行，批准记录与业务内容仍在原生 Git 或 SVN 中原子提交；schema3 保留 patch，旧格式兼容删除。Git 审批从已核验的基线构造提交，引用事务锁定并比较目标引用及旧版本后才更新。SVN 原生审批按本次应用前后的范围快照撤销，保留范围外及归属无法证明的变更。目标变化时按既有并发与恢复流程重新校验，远端交付遵循 §16.7。
 
 Backup 只能用于已证明业务提交不存在的路径和 AI 修复失败路径。业务提交成功或结果无法确定时，不得恢复旧 review.md、撤销业务内容或返回普通 ABORTED。
 
-冲突与门禁失败的回退规则：
+仅应用冲突的回退规则（门禁失败按步骤 8 还原并记录，不进入下表）：
 
 | 条件 | 结果 |
 | --- | --- |
@@ -848,7 +911,8 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 | status | 特有字段 |
 | --- | --- |
 | `COMMITTED` | 必含非空 `commitRevision`（本次业务提交的 VCS 版本号）。 |
-| `FALLBACK_TO_PENDING` | 必含 `reason: PATCH_CONFLICT \| GATE_CHECK_FAILED`；可含正整数 `newRevision` 与 `manualPrompt`。 |
+| `REPAIR_FAILED` | schema3 验证失败且业务已还原、失败记录已提交；reason 为 GATE_CHECK_FAILED，含记录提交版本。 |
+| `FALLBACK_TO_PENDING` | 必含 `reason: PATCH_CONFLICT \| GATE_CHECK_FAILED`（后者仅旧格式兼容）；可含正整数 `newRevision` 与 `manualPrompt`。 |
 | `ABORTED` | 必含 reason：`CONCURRENCY_MISMATCH / STATE_CONFLICT / DUPLICATE_CANDIDATE / DECISIONS_UNCONFIRMED / COMMIT_MESSAGE_MISMATCH / INVALID_CANDIDATE / DIRTY_WORKSPACE / SYNC_FAILED / BUSINESS_CONTENT_CHANGED / COMMIT_FAILED / MAX_RETRIES_EXCEEDED / RUNNER_FAILED`；可含 `detail`。 |
 | `RECOVERY_REQUIRED` | 必含 `reason: COMMIT_OUTCOME_UNKNOWN \| SYNC_STATE_UNKNOWN` 与非空 `detail`；必须由人工确认 VCS 与工作区状态。 |
 
@@ -864,21 +928,23 @@ ApprovalOutcome 以 `status` 为判别字段，公共字段为 `message: string`
 
 DSH 会话、Headless Runner 和外部手动提示词共用 Host 的初审、独立复核、候选、发布和收尾流程，支持 Git 和 SVN。DSH 会话使用 Host 注册的阶段工具，工具仅接受有效租约绑定的审查会话。进程及外部 Agent 通过该轮租约专属的本机回环入口调用同样的阶段，访问凭据只限本轮，停止、超时或收尾后撤销。只预览时不启动端口、不颁发凭据。阶段执行器由 Host 从受信配置解析。基线、范围、阶段状态、权限、临时目录和截止时间由 Host 绑定。宿主无法建立所需的阶段能力时须报错或记录受阻，不能沿用旧的无阶段交付。已有租约仍按开始时记录的契约收尾或恢复。用户关注点可转换为范围内的覆盖目标。额外要求只向适用阶段投影，且不得覆盖基线、范围、权限、输出目录或强制门禁。
 
-初审和复核使用 Host 从固定基线提取的有界只读文本，排除历史评审、未提交文件和其他任务产物。执行器独立启动并禁用会话恢复、记忆与本地工具。超出视图容量时记录覆盖缺口。每条复核启动独立执行；优先选不同的执行器，同一执行器也须重新启动。复核提示词只含任务身份、基线、范围、必要契约、中性问题、导航和带来源的业务预期。初审推理、分级、修复建议和用户原始备注均不得传入。隔离能力无法建立时，阶段失败且不得延用总会话替代复核。
+总调度、初审、独立复核和方案 Agent 使用同一个项目工作目录，阶段串行运行，审查期间不并行开展其他独立工作。每个阶段运行于完整 Harness Agent Loop，可按需读取项目内任何内容；报告范围不限制读取调用方、配置和测试。Host 传入任务、基线、工作目录、产物位置和权限，不枚举或裁剪源码来替代 Agent 调查。不得禁用读取、搜索和必要命令工具，也不得将正常工具事件判为阶段失败。每条复核使用独立上下文，不继承初审推理、分级和修复建议；不恢复前次会话。
 
-只有已确认并完成基线证据校验的 A 类任务可生成补丁。首版执行器提出文本编辑，Host 在专用副本应用并导出补丁。生成和收尾门禁都须使用受限执行环境。缺少该环境时记录候选受阻，确认的发现可进入 B 类。阶段执行结果和候选先由 Host 暂存，总调度发布后由 Host 依照本节收尾。中间轮结束、未发布结果、尚有活动阶段、基线漂移或不可确认的执行停止状态下，不得自动提交。外部进程超时或取消时必须终止并核验进程树。托管 DSH 分阶段审查的 Codex 或 Claude Code 执行器达到阶段时限，或整轮审查达到总时限时，Host 先停止接受该轮的后续阶段工具调用，并以进度事件上报超时。收到中央日志确认后，Host 请求停止绑定的主会话。主会话及执行器进程树均确认停止前，中央任务保持执行中，项目租约继续阻塞写入。确认后回报待核验，人工释放继续遵守工作区核验。其他无法核验的执行保留租约并进入恢复。
+审查默认写入 `.ai-review`，新增运行材料优先留在本轮目录。必要取证可临时写项目其他位置，Agent 须归档取证代码、数据及可复现步骤并恢复临时业务改动，Host 在阶段结束及发布前核对基线和工作目录。权限能力须如实声明，提示词约束不等于操作系统隔离；不具备已声明的权限边界时不得伪报可用。DSH 主会话及原生子会话的文件和命令服务必须继承逐会话权限；无法继承权限或改变 cwd 的外部 subagent_oar、worktree 写操作由工具准入拒绝，普通读取和受控阶段工具保持可用。源码读取不设单文件大小上限；阶段预算和最终结果大小可以有界，但不能用最终 JSON 上限拒绝正常的多轮工具事件流。
+
+只有已确认并完成基线证据校验的问题可生成提案。方案 Agent 直接在问题目录生成一个或两个互斥完整 patch，重大取舍可以只写明确的文字方案。Host 检查格式、路径、基线和不写业务代码的可应用性；审查生成、发布和收尾均不得应用业务 patch、创建基线副本执行修复或运行修复效果门禁。阶段结构化结果只作为任务交付和证据，不由 Host 将 before/after 编辑转成业务修复。新问题及既有问题的更新都须封存涉及文件，保留人工决定和历史 patch 原字节，审查档案仅索引问题及记录本轮覆盖。中间轮结束、未发布结果、尚有活动阶段、基线漂移或不可确认的执行停止状态下，不得自动提交。外部进程超时或取消时必须终止并核验进程树。托管 DSH 分阶段审查的 Codex 或 Claude Code 执行器达到阶段时限，或整轮审查达到总时限时，Host 先停止接受该轮的后续阶段工具调用，并以进度事件上报超时。收到中央日志确认后，Host 请求停止绑定的主会话。主会话及执行器进程树均确认停止前，中央任务保持执行中，项目租约继续阻塞写入。确认后回报待核验，人工释放继续遵守工作区核验。其他无法核验的执行保留租约并进入恢复。
 
 提示词必须由 Host 展开 §1.5、§3、§4 与 §11 中所有适用规则的最终文本，并附加 owner 路由、负向记忆、目标范围、基线和输出路径；不得只复制带内部章节引用的 §11。提示词文件只能物化本文规则，不得成为规范上游。审查执行超时上限 3 小时。Agent 不负责提交，Host 统一在收尾提交。
 
-收尾前须复核业务基线和工作区；不可确认时保留现场。收尾时 Host 必须验证每个 A 类候选：Frontmatter 合法、status=pending、rev1、approval=null、基线与本轮一致、补丁可在基线干净应用且不越界，并通过全部适用不变量。owner 必须等于 Host 按同一共享快照中的 reviewers.yml、target_files 和 tags 计算的路由结果，否则不得提交。新版的 A/B/Deferred 发现均写入档案 items 和插件复核块。校验失败的候选不得提交，其错误必须写入本轮复核结果。Host 从组中移除失败选项，零有效选项时仅发布文字方案；合法候选与本轮 audit 目录仍可继续。
+收尾前复核业务基线、工作区、进程停止状态和所有封存文件。schema3 的新问题从 record_revision=1 开始；既有问题允许沿用路径追加观察和方案，必须与共享原文做 CAS 比较。所有 A/B/Deferred 问题都由 review.md 承载，档案只含 schema_version: 3、审查元数据和 issues 路径索引。新问题负责人按同一共享 reviewers.yml 路由；既有问题必须保留共享记录中的当前 Owner，不因人工接管后偏离默认路由而拒绝更新。schema3 的人工处置也按该共享 Owner 授权，不能借审查更新改写 Owner。文件格式、方案引用、门禁声明、补丁摘要或历史保留校验不通过则不提交，保留现场供处理，不漏报已确认问题。
 
-收尾必须对本轮新候选的 `review.md` 和 Host 生成的正式 `audit.md` 执行与只读校验命令相同的文件格式检查。Job 通过 `result.dataValidation` 按文件返回 `path` 和 `errors`，全局评审工作台按工作副本展示其中的格式错误。候选文件格式错误沿用候选排除规则。正式档案校验失败时阻止本轮收尾提交，会话和手动收尾保留现有租约。
+新 pending 方案使用 Git 原生 check 或 SVN dry-run 预检；历史已获批或外部已修复补丁不要求重新可应用，也不因旧门禁已移出当前白名单而阻止记录复查；当前白名单校验用于新提案。`verify_gate_on_audit_finalize` 和 `audit_smoke_commands` 作为历史配置可读取，但在审查收尾不再执行。任何模式均不得为检查修复效果应用业务补丁。取证实验不等于获批方案的修复验证。
 
-若 `reviewers.yml` 的 `verify_gate_on_audit_finalize` 为 `smoke` 或 `declared`，Host 还必须对每个通过前述校验的新候选，在其补丁应用后的工作区执行对应命令（`smoke` 执行 `audit_smoke_commands`，`declared` 执行候选 `gate_checks`）；执行后须仅还原本轮应用的补丁，保留 `.ai-review/`；出现并发业务改动或无法确认回退范围时保留现场并进入恢复。门禁失败的候选不提交，错误写入复核块。收尾重跑必须串行逐候选执行，并在 audit / finalize Job 日志中实时输出当前复核的候选 ID 与门禁命令进度；单条命令同样受 §9 的 `gateTimeoutMs` 约束，超时按失败处理。默认 `none`：审计期门禁是 AI 报告，批准时 Host 仍会重新执行全部门禁。复核块必须明确区分“补丁可应用/Frontmatter 与不变量通过”和“门禁是否由 Host 复算”；未复算时不得写成“通过全部适用检查”。
+原子提交只纳入封存的本轮档案、证据、新问题或已有问题的记录更新及新补丁。对历史补丁保留原字节并验证摘要。定时扫描同样允许已封存的问题更新和证据子目录，其余评审文件改动仍拒绝。提交失败按已提交、已证明未提交、结果不明三分支处理；结果不明保留租约和现场，不自动还原或重复提交。
 
-提交前 `candidates[]` 必须只包含实际通过校验并纳入本次共享提交的候选 id，A 类正文列表也必须同步过滤；不得保留仅本地或非法候选引用。收尾提交必须是一次仅包含本轮 audit 目录、合法新候选目录和复核块的共享提交；即使无合法候选也可提交审查档案。提交失败或结果不明必须按 §5.6 的三分支处理，不得无条件恢复或返回成功。会话或手动收尾的提交结果不明时，租约继续阻塞共享写，禁止重试收尾；人工核验结果并确认外部执行停止后方可释放。业务工作区必须已还原。
+旧独立 Fixer Mode A 无 auditId 时，/candidate/finalize 仍可收尾新的 v1 候选，但仅做只读补丁预检。已有 schema3 问题的外部反馈提案通过同一入口携带原共享 guard、optionId、patchId 收尾：恰好追加一个 patch、只推进所选方案、保留人类历史、业务工作区干净且共享快照不变，再仅提交 review.md 和该新 patch。失败不删除外部产物，供人工核对或重试。
 
-独立 Fixer Mode A 没有 auditId 时，必须通过 `POST /candidate/finalize` 指定候选 id，由 Host 以 ai_fix Job 执行同一套完整校验，成功后仅提交该新候选目录；未收尾的独立候选不参与共享流程。
+以下 convert/dismiss 仅用于旧档案兼容，不得为 schema3 建立第二份事实。
 
 `/convert` 与 `/dismiss-finding` 只能修改该 finding 的**最新有效观察**中的 pending item；指定旧档案或当前投影不是 pending 时返回 409，不得修改后仍被更新观察覆盖。
 
@@ -897,7 +963,7 @@ DSH 会话、Headless Runner 和外部手动提示词共用 Host 的初审、独
 - 定时审查由中央管理并默认关闭（§16.11）。节点检查租约、活动 Job、工作区和基线后才启动执行。
 - `POST /jobs/:id/cancel` 只请求停止后续执行，不强行把业务结果改为 ABORTED。Host 终止完整进程树或结束会话并等待清理后：已证明共享提交不存在才返回 ABORTED；普通共享提交已存在则返回对应 COMMITTED/VALIDATION_FAILED；批准业务提交已存在则返回 COMMITTED，并返回该提交的 VCS 版本号；结果不明返回 RECOVERY_REQUIRED 且禁止恢复。已结束 Job 直接返回原结果。手动租约不得随取消自动释放，必须按 §7.6 经人工确认停止后释放。不得靠 Host 重启释放锁。
 
-Rebase 由插件自身以 ai_fix Job 执行：读取当前基线，基线未变则 ABORTED；工作区必须干净。执行分两段：先尝试确定性的 VCS three-way 应用与门禁重跑——干净应用且门禁通过时无需调用 Runner，直接进入导出步骤（author 仍记为 `ai`）；应用冲突或门禁失败时，按 §7.4 转入 `RESOLVE_CONFLICT`（Mode C），由 Runner 从干净的新基线开始消解冲突并生成新版本，`runner` 为 `manual` 时不自动调用，返回 `ABORTED / REBASE_CONFLICT` 并在 message 携带人工修复提示词。门禁通过后必须基于新基线导出包含实际冲突解决结果的完整 `--binary` diff，并验证该新补丁能在新基线干净应用。只有该验证通过才追加 author=ai 的新 revision、回到 pending 并提交 `.ai-review/`。不得复用旧补丁文本。已证明未提交的明确失败不产生新版本并还原工作区；提交结果不明时返回 RECOVERY_REQUIRED，不得按普通失败还原。
+schema3 Rebase 由 ai_fix Job 直接在当前业务基线生成所选方案的新提案，只读预检后提交 .ai-review，仍须人工审核；不应用旧补丁、不运行门禁。以下 Rebase 算法仅用于旧格式兼容。Rebase 由插件自身以 ai_fix Job 执行：读取当前基线，基线未变则 ABORTED；工作区必须干净。执行分两段：先尝试确定性的 VCS three-way 应用与门禁重跑——干净应用且门禁通过时无需调用 Runner，直接进入导出步骤（author 仍记为 `ai`）；应用冲突或门禁失败时，按 §7.4 转入 `RESOLVE_CONFLICT`（Mode C），由 Runner 从干净的新基线开始消解冲突并生成新版本，`runner` 为 `manual` 时不自动调用，返回 `ABORTED / REBASE_CONFLICT` 并在 message 携带人工修复提示词。门禁通过后必须基于新基线导出包含实际冲突解决结果的完整 `--binary` diff，并验证该新补丁能在新基线干净应用。只有该验证通过才追加 author=ai 的新 revision、回到 pending 并提交 `.ai-review/`。不得复用旧补丁文本。已证明未提交的明确失败不产生新版本并还原工作区；提交结果不明时返回 RECOVERY_REQUIRED，不得按普通失败还原。
 
 **有效业务基线（2026-11-10 澄清）**：候选元数据（`review.md`、补丁、审查档案）本身存放在 `.ai-review/` 并随版本库提交，因此任何评论、状态变更、拒绝或审查收尾都会推进 Git `HEAD` / SVN `revision`。判定“基线未变”、以及 §8.2 中 `/candidate` 与 `/queue` 的 `isBaseBehind`，一律指**业务代码基线**是否变化，而不是直接比较包含 `.ai-review/` 元数据提交的顶层版本号：
 
@@ -906,9 +972,11 @@ Rebase 由插件自身以 ai_fix Job 执行：读取当前基线，基线未变�
 - 若差异中**只有** `.ai-review/` 变更，判定为业务基线未变：`isBaseBehind = false`，且 `/rebase` 命中“基线未变”分支返回 `ABORTED / BASE_UNCHANGED`；
 - 无法证明是否变化（浅克隆、版本不可读等）时不得猜测为“未变”，`/rebase` 按无法确定处理并中止。
 
-**ai_fix Job 的 Outcome 边界（2026-11-10 澄清）**：§7.5 的 `ApprovalOutcome`（含其封闭的 ABORTED 原因表）**只属于 approve Job**；批准流程中遇到补丁冲突或门禁失败必须返回 `FALLBACK_TO_PENDING`（reason 为 `PATCH_CONFLICT` / `GATE_CHECK_FAILED`），绝不返回 ABORTED。`/rebase`、`/candidate/finalize` 与显式 `/ai-fix` 运行在 ai_fix Job 下，使用 §7.7 第二条的通用业务取值（`COMMITTED / MANUAL_REQUIRED / VALIDATION_FAILED / ABORTED / RECOVERY_REQUIRED`），其 ABORTED 的 reason 取值为 `REBASE_CONFLICT / GATE_CHECK_FAILED / BASE_UNCHANGED / DIRTY_WORKSPACE / CONCURRENCY_MISMATCH / STATE_CONFLICT / INVALID_CANDIDATE / SYNC_FAILED / COMMIT_FAILED / RUNNER_FAILED / CANCELLED`。因此 `REBASE_CONFLICT` 与 `BASE_UNCHANGED` **不属于** §7.5 的审批原因枚举，实现不得把它们写进 ApprovalOutcome。
+**ai_fix Job 的 Outcome 边界（2026-11-10 澄清）**：§7.5 的 `ApprovalOutcome`（含其封闭的 ABORTED 原因表）**只属于 approve Job**；应用冲突按 §7.5 返回 FALLBACK_TO_PENDING；schema3 门禁失败还原并提交失败记录后返回 REPAIR_FAILED，旧格式仍用 FALLBACK_TO_PENDING/GATE_CHECK_FAILED。`/rebase`、`/candidate/finalize` 与显式 `/ai-fix` 运行在 ai_fix Job 下，使用 §7.7 第二条的通用业务取值（`COMMITTED / MANUAL_REQUIRED / VALIDATION_FAILED / ABORTED / RECOVERY_REQUIRED`），其 ABORTED 的 reason 取值为 `REBASE_CONFLICT / GATE_CHECK_FAILED / BASE_UNCHANGED / DIRTY_WORKSPACE / CONCURRENCY_MISMATCH / STATE_CONFLICT / INVALID_CANDIDATE / SYNC_FAILED / COMMIT_FAILED / RUNNER_FAILED / CANCELLED`。因此 `REBASE_CONFLICT` 与 `BASE_UNCHANGED` **不属于** §7.5 的审批原因枚举，实现不得把它们写进 ApprovalOutcome。
 
 ### 7.8 会话级仓库解析
+
+桌面审查要求 DSH 项目的真实路径精确匹配审查工作副本根目录。仅登记上层或子目录项目时，在创建会话前明确拒绝并提示登记根目录；不得借此改变审查 cwd。允许不挂项目的入口直接使用原根目录 cwd，修复会话沿用其权限和工作区行为。
 
 全局评审工作台的请求不携带会话 ID，本地模式使用设置中显式保存的 `repoRoot`。工作台将加载时确认的仓库根作为 `expectedRepoRoot` 随仓库操作发送；Host 解析出的目标与之不一致时，操作返回 409 `conflict`。API 仍支持显式传入 `sessionId` 的调用，优先尝试解析其会话 cwd，再回退到 `repoRoot`。每请求解析并缓存，缓存最多 8 个仓库。仍无法解析时，操作型接口返回 412 `not_configured`；`/health`、`/settings` 与 `/queue` 返回 200 诊断/空队列响应，其中 `configured: false`，以便 Client 展示设置入口。
 
@@ -917,6 +985,8 @@ Rebase 由插件自身以 ai_fix Job 执行：读取当前基线，基线未变�
 ## 8. HTTP API
 
 ### 8.1 通用约定
+
+schema3 的 approve、ai-fix、rebase、行内 comments 和既有问题 candidate/finalize 必须携带显式 optionId、patchId；所有写入仍使用问题记录 guard。只读 candidate/diff 可只传 optionId 以读取该方案最新 patch；传入完整但过时的选择必须拒绝，不静默改变写入目标。
 
 - 前缀为 `/dsh-code-review/api`，请求与响应均为 JSON；带 body 的请求使用 `Content-Type: application/json`。
 - 响应包含 `cache-control: no-store`；请求体上限 2 MiB，超限返回 413 `bad_request`。
@@ -1015,7 +1085,7 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 | `baseBranch` | string，`''` | 主干分支名。 |
 | `runner` | `dsh / manual / external`，`dsh` | AI 修复执行器。 |
 | `dshCommand` / `externalCommand` | string，`''` | Runner 命令行。 |
-| `autoFixOnFailure` | boolean，`true` | 批准冲突或门禁失败后是否自动修复。 |
+| `autoFixOnFailure` | boolean，`true` | 仅控制应用冲突时是否让 Agent 生成辅助提案；门禁失败不自动调用 Agent。 |
 | `gateTimeoutMs` | number，`600000` | 有限数值且 >1000 时保留并夹至 3600000，否则回退默认值。 |
 | `syncBeforeApprove` | boolean，`true` | 批准前是否同步远端。 |
 
@@ -1032,6 +1102,8 @@ code 取值：`bad_request / not_configured / not_found / stale / forbidden / co
 stale、duplicate、local 和基线冲突必须使用不同徽标；local 不计入共享 KPI。local 中的 local-only（候选目录整体未进入共享快照）条目不可进入详情，卡片需提示"审查收尾提交后才可查看详情与批准"；队列头部需汇总本地未提交条目数。`/queue` 返回 `auditLease` 时，队列页必须展示阻塞审查租约横幅：`active` 提示审查执行中并提供收尾入口；`releasable` 额外提供经两段式确认的释放入口，并说明释放不提交本地候选。基线落后时提示批准将在新基线重放（“落后”同样按 §7.7「有效业务基线」判定，排除 `.ai-review/` 评审元数据提交，避免每次评论后所有候选集体显示落后）；`patchCheck.state == conflicted` 时提示可先 Rebase，但不得单独阻止查看或批准；批准 Job 仍须按 §7.5 验证交付内容，遇到冲突时按该节回退。无批量批准，整卡点击进入详情（local-only 卡除外）。
 
 ### 10.2 详情页
+
+schema3 一页展示同一问题的证据、文字方案、有效方案入口、不可变 patch 账本及人类处置。差异比较按所选方案的 patch 编号和所属方案历史，不能用 record_revision 推算。方案迭代后重新读取当前 patch，旧确认和草稿定位需要重新核对。问题记录版本仅用于 guard/评论版本；行内意见区分方案。repair_failed 显示“修复失败，等待人工”；human_takeover 可反馈外部完成，awaiting_verification 等待后续审查代码核验。
 
 本地全局工作台和中央 Web 使用同一套发现处置。多补丁先选方案，再查看该版本的差异、判断项和门禁。单补丁打开后即可进入审核。未处置的纯文字发现可选择「本次不修改」或「人工接手」。已暂缓的发现可恢复审核，终态仅供查看。交接内容可复制，包括发现编号、基线、相关文件、问题证据、方案和验收条件。修复线索可选。候选级评论和修订从候选详情进入。
 
@@ -1087,6 +1159,8 @@ stale、duplicate、local 和基线冲突必须使用不同徽标；local 不计
 
 ### 11.2 Fixer：三种执行模式
 
+schema3 的初始生成、反馈和 Rebase 均遵循 §4.10、§7.4 的提案模式：读全项目，写审查目录，直接生成完整 diff，不改业务源码、不应用补丁、不执行修复门禁。只有应用冲突允许辅助生成新提案，仍回到人工审核；门禁失败不得唤醒 Fixer。下面 Mode A/B/C 的业务修改过程仅用于旧 v1/v2 兼容任务。
+
 #### Mode A：初始生成
 
 当目标候选不存在 review.md 时：
@@ -1130,12 +1204,12 @@ Auditor 必须遵循 §1.5 的优先级和 §3.1 的分流规则，并执行以�
 
 1. **建立地图**：阅读构建配置、入口、核心数据流与现有测试，明确预期负载和运行环境。
 2. **收集证据**：为每个问题建立具体案例；没有证据的品味建议直接丢弃。
-3. **自动分流**：按 §3.1 交付一至三个可验证的补丁选项，或交付文字方案；Deferred 记录稳定 depends_on。
+3. **自动分流**：按 §3.1 选择置信度最高的一至两个互斥完整 patch，或交付明确文字方案及取舍；Deferred 记录依赖。
 4. **保持正交**：按 §3.2 拆分、合并或延迟；同轮 A 类候选独立基于同一基线。
-5. **生成候选**：每个 A 类选项独立修改代码、执行门禁、导出 001.patch、还原业务工作区并生成 review.md。
-6. **记录 finding**：初始观察与历史复查按 §4.9 写入 items，未核实的发现保留既有投影。用户处置由 Host 管理。
-7. **生成报告**：正文包含 A/B/Deferred、历史复查、验证与说明；B 类必须有位置、风险和需要决定，Deferred 必须有依赖。
-8. **不得伪造插件结论**：插件复核块只能由 Host 写入。
+5. **生成提案**：为每个问题维护一份 review.md；直接生成编号递增的完整 patch，审查阶段不应用、不运行修复效果门禁。
+6. **记录问题**：初始观察、历史复查和修订按 §4.10 追加在原问题记录。用户处置由 Host 写入同一记录，不能由 Agent 重写。
+7. **生成报告**：档案只含问题索引、覆盖、限制和历史复查说明；事实与方案放在问题 review.md 中。
+8. **验证诚实**：只读预检不等于修复已生效或门禁通过；未执行的验证必须明确。
 
 三种启动入口通过同一总调度模板、初审 Skill、复核 Skill 和补丁 Skill 实现上述过程。在任务启动及每次阶段派发时按本阶段白名单单次渲染。规则文本来自 Host，任务数据以结构化形式注入。用户输入和前序结果按数据处理，不能触发模板二次替换。阶段结构化结果必须按阶段类型核验，缺失、畸形和跨任务引用按阶段失败处理。总调度记录覆盖情况和用户额外要求处理结果。阶段结果与命令的成功须以实际执行与证据为准。
 

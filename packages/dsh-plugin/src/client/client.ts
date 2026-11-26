@@ -130,6 +130,7 @@
     side?: 'LEFT' | 'RIGHT';
     /** 版本变化后可用原文锚点找回行号失配的评论。 */
     anchor?: { snippet: string; before?: string; after?: string };
+    extra?: Record<string, unknown>;
   }
   interface QueueItem {
     findingId?: string;
@@ -158,11 +159,12 @@
     ticket: string | null; currentRevision: number;
     /** AC-UI-01：用 Frontmatter 的判断项 ID 收集确认与知悉，避免正文改写影响批准校验。 */
     humanDecisions?: { id: string; question: string; note?: string }[];
-    revisions: { id: number; baseRevision: string; patch: string; author?: 'ai' | 'human' }[];
+    revisions: { id: number; baseRevision: string; patch: string; author?: 'ai' | 'human'; extra?: Record<string, unknown> }[];
     gateChecks: string[]; comments: Comment[];
     approval: { approvedBy: string; approvedAt: string } | null;
   }
   interface Detail {
+    selection?: { optionId: string; patchId: number };
     finding?: FindingView;
     candidate: {
       id: string; month: string; slug: string; dirPath: string; reviewPath: string; meta: CandidateMeta;
@@ -183,7 +185,8 @@
   interface FindingView {
     findingId: string; findingVersion: string; title: string; summary: string; disposition: string;
     baseRevision?: string; repairPlan?: string; targetFiles: string[];
-    options: { candidateId: string; tradeoff: string; status: string }[];
+    options: { candidateId: string; optionId?: string; patchId?: number; tradeoff: string; status: string }[];
+    reviewId?: string; issueStatus?: string;
     decision?: { reason?: string; reviewAfter?: string; reviewWhen?: string };
     repairHints?: string[]; repairRevisions?: string[];
   }
@@ -703,7 +706,7 @@
       return h('div', { className: `dcr-rt ${props.className ?? ''}`.trim() }, ...blocks);
     }
 
-    function FindingCard(props: { finding: FindingView; currentId?: string; busy: boolean; choose(id: string): void; save(body: Record<string, unknown>): void }) {
+    function FindingCard(props: { finding: FindingView; currentId?: string; currentOption?: string; busy: boolean; choose(id: string, selection?: { optionId: string; patchId: number }): void; save(body: Record<string, unknown>): void }) {
       const { finding, currentId, busy, choose, save } = props;
       const [form, setForm] = useState('');
       const [reason, setReason] = useState('');
@@ -721,15 +724,16 @@
       return h('section', { className: 'dcr-card', 'aria-label': finding.title },
         h('h2', null, finding.title),
         h('p', null, finding.summary),
-        h('span', { className: 'dcr-chip' }, dispositionText[finding.disposition]),
+        h('span', { className: 'dcr-chip' }, ({ repair_failed: '修复失败，等待人工', awaiting_verification: '外部完成，等待复核', human_takeover: '人工接手', resolved: '已解决' } as Record<string, string>)[finding.issueStatus ?? ''] ?? dispositionText[finding.disposition]),
+        finding.reviewId ? h('button', { className: 'dcr-btn', onClick: () => choose(finding.reviewId!) }, '查看问题、证据与历史') : null,
         finding.decision?.reason ? h('p', null, finding.decision.reason) : null,
         finding.decision?.reviewAfter || finding.decision?.reviewWhen
           ? h('p', null, [finding.decision.reviewAfter, finding.decision.reviewWhen].filter(Boolean).join(' · ')) : null,
         finding.repairRevisions?.length ? h('p', null, `修复提交 ${finding.repairRevisions.join('、')}`) : null,
         finding.repairPlan ? h('details', null, h('summary', null, '修复方案与验收'), h(RichText, { text: finding.repairPlan })) : null,
         finding.options.length ? h('div', { className: 'dcr-row' }, ...finding.options.map((option, index) =>
-          h('button', { key: option.candidateId, className: 'dcr-btn', disabled: option.candidateId === currentId,
-            onClick: () => choose(option.candidateId) },
+          h('button', { key: option.candidateId + (option.optionId ?? ''), className: 'dcr-btn', disabled: option.candidateId === currentId && option.optionId === props.currentOption,
+            onClick: () => choose(option.candidateId, option.optionId && option.patchId ? { optionId: option.optionId, patchId: option.patchId } : undefined) },
           `${finding.options.length === 1 ? '查看补丁' : `方案 ${String(index + 1)}`} · ${option.tradeoff}`))) : null,
         h('div', { className: 'dcr-row' },
           !closed && finding.disposition === 'undecided' ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('accept_as_is') }, '本次不修改') : null,
@@ -737,6 +741,7 @@
             onClick: () => submit('human_takeover') }, '人工接手') : null,
           !closed && finding.disposition !== 'undecided' ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('resume_review') }, '重新审核') : null,
           finding.disposition === 'human_takeover' ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('add_repair_hint') }, '提交修复线索') : null,
+          finding.issueStatus === 'human_takeover' ? h('button', { className: 'dcr-btn', disabled: busy, onClick: () => setForm('external_completed') }, '反馈外部完成') : null,
           h('button', { className: 'dcr-btn', onClick: () => {
             const text = [finding.title, finding.findingId, `基线 ${finding.baseRevision ?? ''}`, finding.targetFiles.join('\n'),
               finding.summary, finding.repairPlan ?? ''].join('\n\n');
@@ -1345,6 +1350,8 @@
       const [allowedGates, setAllowedGates] = useState<string[] | null>(null);
       const [job, setJob] = useState<Job | null>(null);
       const [panel, setPanel] = useState<'' | 'approve' | 'reject'>('');
+      const [selectedIssue, setSelectedIssue] = useState<{ id: string; optionId: string; patchId: number } | null>(null);
+      const detailFetch = useRef(0);
       const [approvalFindingVersion, setApprovalFindingVersion] = useState<string | undefined>(undefined);
       const [ack, setAck] = useState<Record<string, boolean>>({});
       const [waiveReason, setWaiveReason] = useState<Record<string, string>>({});
@@ -1439,7 +1446,10 @@
       const loadDetail = useCallback(async (id: string): Promise<void> => {
         setLoading(true);
         try {
-          const value = await api.get<Detail>(`/candidate?id=${encodeURIComponent(id)}`);
+          const requestId = ++detailFetch.current;
+          const selected = selectedIssue?.id === id ? `&optionId=${encodeURIComponent(selectedIssue.optionId)}` : '';
+          const value = await api.get<Detail>(`/candidate?id=${encodeURIComponent(id)}${selected}`);
+          if (requestId !== detailFetch.current) return;
           void api.get<{ config?: { allowedGateCommands?: string[] } }>('/reviewers')
             .then((reviewers) => setAllowedGates(reviewers.config?.allowedGateCommands ?? []))
             .catch(() => setAllowedGates([]));
@@ -1447,7 +1457,7 @@
           setError('');
         } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
         finally { setLoading(false); }
-      }, [api]);
+      }, [api, selectedIssue]);
 
       const reloadCurrent = (): void => {
         if (!selectedId) return;
@@ -1459,11 +1469,11 @@
         setDiffLoading(true);
         try {
           const query = mode === 'full' ? `?id=${encodeURIComponent(id)}&from=0` : `?id=${encodeURIComponent(id)}&from=${String(from)}`;
-          setDiff(await api.get<DiffResult>(`/diff${query}`));
+          setDiff(await api.get<DiffResult>(`/diff${query}${selectedIssue?.id === id ? `&optionId=${encodeURIComponent(selectedIssue.optionId)}` : ''}`));
         } catch (e) {
           setDiff({ mode, unifiedDiff: '', fromRevision: null, toRevision: 0, fromBase: null, toBase: '', resolutionMode: null, notes: [e instanceof Error ? e.message : String(e)] });
         } finally { setDiffLoading(false); }
-      }, [api]);
+      }, [api, selectedIssue]);
 
       useEffect(() => {
         void (async () => {
@@ -1565,7 +1575,7 @@
         try {
           jobLogRef.current = [];
           jobLogOffsetRef.current = null;
-          const response = await api.post<{ jobId: string; job: Job }>(path, body);
+          const response = await api.post<{ jobId: string; job: Job }>(path, typeof body === 'object' && body !== null && ['/approve', '/ai-fix', '/rebase'].includes(path) ? { ...body, ...(detail?.selection ?? {}) } : body);
           setJob(response.job);
         } catch (e) { setBusy(false); setError(e instanceof Error ? e.message : String(e)); }
       };
@@ -1581,7 +1591,7 @@
 
       const rebaseCandidate = async (): Promise<void> => {
         if (!detail) return;
-        await startJob('/rebase', { id: detail.candidate.id, ...guard() });
+        await startJob('/rebase', { id: detail.candidate.id, ...guard(), ...(detail.selection ?? {}) });
       };
 
       const afterWrite = async (): Promise<void> => {
@@ -1594,7 +1604,7 @@
         setBusy(true); setError('');
         try {
           const response = await api.post<{ job?: Job; autoFixError?: string }>('/comments', {
-            id: detail.candidate.id, ...guard(), file, line, content: text, autoFix,
+            id: detail.candidate.id, ...guard(), ...(detail.selection ?? {}), file, line, content: text, autoFix,
             ...(file !== '' && line !== 0 ? { side } : {}),
             ...(file !== '' && line !== 0 && anchor ? { anchor } : {}),
           });
@@ -1718,6 +1728,7 @@
         void startJob('/approve', {
           id: detail.candidate.id, ...guard(), confirmedDecisions, waivedDecisions,
           ...(approvalFindingVersion ? { expectedFindingVersion: approvalFindingVersion } : {}),
+          ...(detail.selection ?? {}),
           commitDetail,
         });
       };
@@ -1751,7 +1762,7 @@
         setFixLaunching(true); setError('');
         try {
           const value = await api.post<{ sessionId: string; title: string; revision: number }>('/fix-session', {
-            id: detail.candidate.id,
+            id: detail.candidate.id, ...(detail.selection ?? {}),
           });
           setFixSession({ sessionId: value.sessionId, title: value.title, revision: value.revision });
           setFixPrompt(null);
@@ -1767,6 +1778,7 @@
         setFixPromptLoading(true); setError('');
         try {
           const query = new URLSearchParams({ id: detail.candidate.id, mode: 'session' });
+          if (detail.selection) { query.set('optionId', detail.selection.optionId); query.set('patchId', String(detail.selection.patchId)); }
           const value = await api.get<{ prompt: string }>(`/fix-prompt?${query.toString()}`);
           setFixPrompt({ text: value.prompt, revision: detail.candidate.meta.currentRevision });
         } catch (e) {
@@ -1939,7 +1951,9 @@
         if (auditId && findingId && reason?.trim()) await runWrite('/dismiss-finding', { auditId, findingId, reason });
       };
 
-      const openCandidate = (id: string): void => {
+      const openCandidate = (id: string, selection?: { optionId: string; patchId: number }): void => {
+        detailFetch.current++;
+        setSelectedIssue(selection ? { id, ...selection } : null);
         setPanel('');
         setAck({});
         setWaiveReason({});
@@ -2184,12 +2198,15 @@
         const waivedCount = items.filter((item) => !ack[item.id] && (waiveReason[item.id] ?? '').trim().length > 0).length;
         const allAck = items.length === 0 || ackCount + waivedCount === items.length;
         const files = diffFiles;
-        const baseRevision = candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision)?.baseRevision ?? '';
+        const currentPatchId = detail.selection?.patchId ?? candidate.meta.currentRevision;
+        const currentPatch = candidate.meta.revisions.find(revision => revision.id === currentPatchId);
+        const previousPatches = candidate.meta.revisions.filter(revision => revision.id < currentPatchId && (!detail.selection || revision.extra?.['option_id'] === detail.selection.optionId));
+        const baseRevision = currentPatch?.baseRevision ?? '';
         const steps = [
           { title: '同步基线', desc: settings?.syncBeforeApprove ? '先 pull --ff-only / svn update；失败即中止。' : '按当前基线验证，不自动同步远端。' },
-          { title: '应用补丁', desc: `严格应用 rev ${String(candidate.meta.currentRevision)} 的 ${candidate.meta.revisions.find((revision) => revision.id === candidate.meta.currentRevision)?.patch ?? '补丁'}。` },
+          { title: '应用补丁', desc: `应用方案 ${detail.selection?.optionId ?? ''} 的 ${currentPatch?.patch ?? '补丁'}。` },
           { title: '执行门禁', desc: `${String(candidate.meta.gateChecks.length)} 条命令逐条执行，任一失败即回滚。` },
-          { title: '原子提交', desc: '业务代码、review.md 状态与补丁清理进入同一个提交。' },
+          { title: '原子提交', desc: candidate.meta.schemaVersion === 3 ? '业务代码与问题记录进入同一个提交，保留历史补丁。' : '业务代码、review.md 状态与补丁清理进入同一个提交。' },
         ];
         /** 预览首行须与 Host 的 buildCommitSubject 同步；实际提交信息由 Host 生成。 */
         const commitPreview = (): string => {
@@ -2306,7 +2323,7 @@
         const threadNode = (comment: Comment): any => h('div', { key: comment.id, className: `dcr-thread${splitView ? ' split' : ''}` },
           h('div', { className: 'dcr-thread-head' },
             h('span', null, comment.author),
-            h('span', null, `rev ${String(comment.revision)}`),
+            h('span', null, `记录 ${String(comment.revision)}${comment.extra?.['option_id'] ? ` / ${String(comment.extra['option_id'])} / patch ${String(comment.extra['patch_id'])}` : ''}`),
             h('span', { className: comment.status === 'resolved' ? 'dcr-st-resolved' : comment.status === 'partial' ? 'dcr-st-partial' : 'dcr-st-unresolved' }, commentText(comment.status)),
             h('span', { className: 'dcr-grow' }),
             canAct ? h('select', { className: 'dcr-select', style: { padding: '0 3px', fontSize: 11 }, value: comment.status, onChange: (e: any) => { void setCommentStatus(comment.id, e.target.value); } },
@@ -2321,7 +2338,7 @@
           side: 'LEFT' | 'RIGHT',
           rowNo: number | null,
         ): Comment[] => rowNo === null ? [] : detail.comments.filter((comment) => {
-          if (comment.file !== file.path) return false;
+          if (comment.file !== file.path || (detail.selection && comment.extra?.['option_id'] !== detail.selection.optionId)) return false;
           const exact = comment.line === rowNo && (comment.side ?? 'RIGHT') === side;
           const re = relocated.get(comment.id);
           const relocatedHere = re !== undefined && re.line === rowNo && re.side === side;
@@ -2427,7 +2444,7 @@
                   }, panel === 'approve' ? '收起审批' : candidate.meta.findingId ? '接受并应用' : '批准并提交') : null,
                 ),
               ),
-              detail.finding ? h(FindingCard, { key: detail.finding.findingVersion, finding: detail.finding, currentId: candidate.id,
+              detail.finding ? h(FindingCard, { key: detail.finding.findingVersion, finding: detail.finding, currentId: candidate.id, currentOption: detail.selection?.optionId,
                 busy, choose: openCandidate, save: (body: Record<string, unknown>) => { void runWrite('/finding/decision', body); } }) : null,
               h('div', { className: 'dcr-kpis' },
                 h('div', { className: 'dcr-kpi' },
@@ -2505,6 +2522,7 @@
                     ? '新建一个可见的 DSH 会话并投递修复提示词；会话只产出候选新版本，`.ai-review/` 仍由你在面板上收尾提交。'
                     : '生成新会话口径的修复提示词，复制后粘贴到外部 Agent（如 codex exec）；完成后回到这里收尾。'),
               ),
+              candidate.meta.schemaVersion === 3 ? h('button', { className: 'dcr-btn', disabled: !canAct || busy, onClick: () => { void startJob('/candidate/finalize', { id: candidate.id, ...guard(), ...(detail.selection ?? {}) }); } }, '校验并提交修订提案') : null,
               batchDrafts.length > 0 ? h('div', { className: 'dcr-banner info', style: { marginTop: 6 } },
                 h('div', { className: 'dcr-small' }, `草稿 ${String(batchDrafts.length)} 条：`),
                 ...batchDrafts.map((draft, index) => h('div', { key: index, className: 'dcr-row', style: { alignItems: 'center', marginTop: 2 } },
@@ -2570,11 +2588,11 @@
               h('div', { className: 'dcr-diff-bar' },
                 h('strong', null, '代码差异'),
                 h('button', { className: `dcr-btn ${diffMode === 'full' ? 'p' : ''}`, onClick: () => setDiffMode('full') }, '完整差异'),
-                candidate.meta.currentRevision >= 2 ? h('button', { className: `dcr-btn ${diffMode === 'incremental' ? 'p' : ''}`, onClick: () => { setDiffFrom(Math.max(1, candidate.meta.currentRevision - 1)); setDiffMode('incremental'); } }, '版本增量') : null,
+                previousPatches.length > 0 ? h('button', { className: `dcr-btn ${diffMode === 'incremental' ? 'p' : ''}`, onClick: () => { setDiffFrom(previousPatches.at(-1)!.id); setDiffMode('incremental'); } }, '版本增量') : null,
                 diffMode === 'incremental' ? h('select', { className: 'dcr-select', value: String(diffFrom), onChange: (e: any) => setDiffFrom(Number(e.target.value)) },
-                  ...candidate.meta.revisions.filter((r) => r.id < candidate.meta.currentRevision).map((r) => h('option', { key: r.id, value: String(r.id) }, `rev ${String(r.id)}`)),
+                  ...previousPatches.map((r) => h('option', { key: r.id, value: String(r.id) }, `rev ${String(r.id)}`)),
                 ) : null,
-                diffMode === 'incremental' ? h('span', { className: 'dcr-small dcr-muted' }, `→ rev ${String(candidate.meta.currentRevision)}`) : null,
+                diffMode === 'incremental' ? h('span', { className: 'dcr-small dcr-muted' }, `→ patch ${String(currentPatchId)}`) : null,
                 h('span', { className: 'dcr-grow' }),
                 crossBaseFallback ? null : h('span', { className: 'dcr-small dcr-muted' }, '布局'),
                 crossBaseFallback ? null : h('button', {
@@ -2598,7 +2616,7 @@
                   const lineKeys = new Set(file.lines.map((l) => `${rowSideOf(l)}:${String(rowNoOf(l))}`));
                   const relocated = new Map<string, { side: 'LEFT' | 'RIGHT'; line: number }>();
                   for (const comment of detail.comments) {
-                    if (comment.file !== file.path || !comment.anchor) continue;
+                    if (comment.file !== file.path || !comment.anchor || (detail.selection && comment.extra?.['option_id'] !== detail.selection.optionId)) continue;
                     const key = `${comment.side ?? 'RIGHT'}:${String(comment.line)}`;
                     if (lineKeys.has(key)) continue;
                     const target = file.lines.find((l) => l.text === comment.anchor?.snippet);
@@ -2706,7 +2724,7 @@
         // G21：Job 执行成功也可能产生已中止或待人工处理的业务结果。
         const outcome = typeof result?.status === 'string' ? result.status : null;
         const outcomeText: Record<string, string> = {
-          COMMITTED: '业务提交成功', FALLBACK_TO_PENDING: '退回待审核', ABORTED: '已中止',
+          COMMITTED: '业务提交成功', REPAIR_FAILED: '修复失败，已还原', FALLBACK_TO_PENDING: '退回待审核', ABORTED: '已中止',
           RECOVERY_REQUIRED: '需人工恢复', MANUAL_REQUIRED: '需手动执行', VALIDATION_FAILED: '校验未全部通过',
         };
         const outcomeChip = outcome === 'COMMITTED' ? 'approved' : outcome && outcome !== 'MANUAL_REQUIRED' ? 'rejected' : 'pending';

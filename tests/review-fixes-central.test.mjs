@@ -64,7 +64,7 @@ test('AC-CENTRAL-07 本机执行配置摘要随设置变化，未决指令阻止
         const operations = new ManagedOperations({ dataDir: directory, journal, workspaces: [{ workspaceId: 'workspace-a', label: 'A', root, target, settings: { runner } }] });
         instances.push(operations);
         await operations.init();
-        return operations.registrations();
+        return operations.registrations().map(workspace => ({ ...workspace, issueWorkflow: true }));
     };
     const manual = await registrations('manual');
     const external = await registrations('external');

@@ -21,7 +21,7 @@ function commandFor(id, scheduled = true) {
     const now = Date.now();
     return {
         commandId: id, requestHash: 'b'.repeat(64), projectId, nodeId,
-        bindingGeneration: 1, projectConfigRevision: 1, operation: 'audit', payload: { targetPath: '.' },
+        bindingGeneration: 1, projectConfigRevision: 1, operation: 'audit', payload: { issueWorkflow: true, findingWorkflow: true, targetPath: '.' },
         actor: { userId: scheduled ? 'system-scheduled-audit' : 'user-a', reviewIdentity: '配置人' },
         createdAt: new Date(now).toISOString(),
         ...(scheduled ? { scheduledAudit: { scheduledAt: new Date(now - 1000).toISOString(), expiresAt: new Date(now - 1000 + 30 * 60 * 1000).toISOString() } } : {}),
@@ -62,8 +62,10 @@ async function setup(t, runner = 'external', runnerArg = '', auditSessions, runn
 
 test('中央定时 Runner 使用阶段通道并交付 Host 生成的报告', async t => {
     const runner = fileURLToPath(new URL('./fixtures/phased-audit-agent.mjs', import.meta.url));
-    const capabilities = { auditStageExecutor: async ({ prompt }) => {
-        assert.match(prompt, /固定基线只读视图/);
+    const capabilities = { auditStageExecutor: async ({ prompt, onProcessTreeStopped }) => {
+            onProcessTreeStopped?.(true);
+        assert.doesNotMatch(prompt, /固定基线只读视图/);
+            assert.match(prompt, /Harness.*自主读取/);
         return { leads: [], coverage: ['中央定时共享阶段'], limits: [] };
     } };
     const { execute, root, writer, remote, target } = await setup(t, 'external', 'empty check-scheduled-note', capabilities, runner);
@@ -165,6 +167,7 @@ test('托管定时审查同步绑定分支，在同一基线上先复查，再�
     const centerUrl = await app.listen({ host: '127.0.0.1', port: 0 });
     const snapshotStarted = Promise.withResolvers(), snapshotCanFinish = Promise.withResolvers();
     const node = new ManagedNode({
+        workspaceIssues: () => operations.workspaceIssues(),
         config: { centerUrl, ...credential, workspaces: operations.registrations() }, journal, clock,
         execute: operations.execute.bind(operations), read: operations.read.bind(operations),
         snapshot: async project => {

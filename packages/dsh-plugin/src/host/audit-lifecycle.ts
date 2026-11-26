@@ -20,6 +20,7 @@ export interface AuditLeaseRecord {
   sessionId?: string;
   commandId?: string;
   phased?: boolean;
+  issueWorkflow?: true;
   stageProcessActive?: true;
   stageSeal?: Record<string, string>;
   stageItems?: import('./audit-archive.js').AuditItem[];

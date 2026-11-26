@@ -5,6 +5,7 @@ export type FindingDecision =
     | { action: 'accept_as_is'; reason: string }
     | { action: 'defer'; reason: string; reviewAfter?: string; reviewWhen?: string }
     | { action: 'human_takeover'; reason?: string }
+    | { action: 'external_completed'; reason: string }
     | { action: 'add_repair_hint'; hint: string }
     | { action: 'resume_review'; reason: string };
 
@@ -32,6 +33,7 @@ function parseDecision(input: Record<string, unknown>): FindingDecision {
     switch (input['action']) {
         case 'accept_as_is':
         case 'resume_review':
+        case 'external_completed':
             return { action: input['action'], reason: nonEmpty(input['reason'], 'reason') };
         case 'defer': {
             const date = input['review_after'];
@@ -109,7 +111,7 @@ export function parseFindingEvents(text: string, findingId: string): FindingEven
             if (disposition === 'undecided') throw new Error('发现已经处于待审核状态');
             disposition = 'undecided';
         } else {
-            disposition = decision.action;
+            disposition = decision.action === 'external_completed' ? 'human_takeover' : decision.action;
         }
         return { revision, auditId, actor, at, ...decision };
     });

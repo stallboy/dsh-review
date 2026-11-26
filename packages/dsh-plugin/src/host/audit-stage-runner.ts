@@ -53,6 +53,8 @@ export function validateAuditValue(schema: Schema, value: unknown, field = 'resu
 export interface AuditExecution {
     executor: AuditExecutor;
     location: string;
+    repoRoot?: string;
+    forensicPaths?: string[];
     prompt: string;
     schema: Schema;
     timeoutMs: number;
@@ -178,7 +180,7 @@ export async function resolveAuditCliLaunch(executor: AuditExecutor, signal = ne
     return { exe: override || defaultExe, env };
 }
 
-export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, prompt, schema, timeoutMs, signal, logProcessExit, onTimeout, onProcessTreeStopped }) => {
+export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, repoRoot = location, forensicPaths = [], prompt, schema, timeoutMs, signal, logProcessExit, onTimeout, onProcessTreeStopped }) => {
     const resultPath = path.join(location, 'result.json');
     const schemaPath = path.join(location, 'schema.json');
     const schemaText = JSON.stringify(schema);
@@ -186,25 +188,43 @@ export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, p
     const codex = executor === 'codex';
     const now = Date.now();
     const launchDeadline = AbortSignal.timeout(timeoutMs);
-    const { exe, env } = await resolveAuditCliLaunch(executor, AbortSignal.any([signal, launchDeadline])).catch(error => {
+    let { exe, env } = await resolveAuditCliLaunch(executor, AbortSignal.any([signal, launchDeadline])).catch(error => {
         onProcessTreeStopped?.(true);
         if (launchDeadline.aborted && !signal.aborted) throw new AuditStageTimedOut(executor, true);
         throw error;
     });
+    const roots = [path.join(repoRoot, '.ai-review'), ...forensicPaths.map(file => path.resolve(repoRoot, file))];
+    const policy = 'permissions.dsh-audit=' + '{extends=":read-only",filesystem={'
+        + roots.map(root => JSON.stringify(root.replaceAll('\\', '/')) + '="write"').join(',') + '},network={enabled=true}}';
+    const platformPolicy = process.platform === 'win32' ? ['-c', 'windows.sandbox="unelevated"'] : [];
     const args = codex ? [
         '--ask-for-approval', 'never', 'exec', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check',
-        '--sandbox', 'read-only', '--json', '--output-schema', schemaPath, '--output-last-message', resultPath,
-        '-c', 'features.shell_tool=false', '-c', 'features.unified_exec=false',
-        '-c', 'features.code_mode=false', '-c', 'features.apply_patch_freeform=false',
-        '-c', 'features.multi_agent=false', '-c', 'features.memory_tool=false',
-        '-c', 'features.js_repl=false', '-c', 'mcp_servers={}', '-c', 'web_search="disabled"', '-',
+        '-c', 'default_permissions="dsh-audit"', '-c', policy,
+        '--json', '--output-schema', schemaPath, '--output-last-message', resultPath, '-',
     ] : [
-        '--print', '--no-session-persistence', '--setting-sources', '', '--strict-mcp-config',
-        '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands', '--tools', '',
-        '--output-format', 'json', '--json-schema', schemaText,
+        '--print', '--no-session-persistence', '--permission-mode', 'bypassPermissions',
+        '--output-format', 'stream-json', '--verbose', '--json-schema', schemaText,
     ];
+    if (!codex) {
+        const sandbox = (await resolveAuditCliLaunch('codex', signal)).exe;
+        args.unshift('sandbox', '-P', 'dsh-audit', '-c', policy, ...platformPolicy, '-C', repoRoot, '--', exe);
+        exe = sandbox;
+    }
+    let authenticationFailure = false;
+    let claudeResult: Record<string, unknown> | undefined;
     const result = await runProcess(exe, args, {
-        cwd: location, timeoutMs: Math.max(1, timeoutMs - (Date.now() - now)), signal, input: prompt, killTreeOnExit: true, maxBytes: MAX_OUTPUT, ...(onTimeout ? { onTimeout } : {}),
+        cwd: repoRoot, timeoutMs: Math.max(1, timeoutMs - (Date.now() - now)), signal, input: prompt, killTreeOnExit: true, maxBytes: MAX_OUTPUT,
+        onLine: (line, stream) => {
+            if (isAuditAuthenticationFailure(executor, stream === 'stdout' ? line : '', stream === 'stderr' ? line : '')) authenticationFailure = true;
+            if (stream === 'stdout' && codex) {
+                const event = diagnosticObject(line);
+                const item = event?.['item'] as Record<string, unknown> | undefined;
+                if (item && typeof item['type'] === 'string') logProcessExit?.('Harness 事件：' + item['type']);
+            } else if (stream === 'stdout') {
+                const event = diagnosticObject(line);
+                if (event?.['type'] === 'result') claudeResult = event;
+            }
+        }, ...(onTimeout ? { onTimeout } : {}),
         env: { ...env, CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1', CLAUDE_CODE_SKIP_PROMPT_HISTORY: '1' },
     });
     onProcessTreeStopped?.(result.processTreeStopped === true || Boolean(result.error) && result.code === null);
@@ -221,27 +241,19 @@ export const executeAuditCli: ExecuteAuditStage = async ({ executor, location, p
     const diagnostic = auditCliDiagnostic([result.error, result.stderr, result.stdout].filter(Boolean).join('\n'), false);
     if (result.error) throw new Error(executor + ' 无法启动' + (diagnostic ? '：' + diagnostic : ''));
     if (result.code !== 0) {
-        if (isAuditAuthenticationFailure(executor, result.stdout, result.stderr)) throw new AuditExecutorAuthenticationError(executor, result.code);
+        if (authenticationFailure || isAuditAuthenticationFailure(executor, result.stdout, result.stderr)) throw new AuditExecutorAuthenticationError(executor, result.code);
         throw new Error(executor + ' 阶段执行失败（退出码 ' + String(result.code) + '）' + (diagnostic ? '：' + diagnostic : ''));
     }
     if (result.stdinError) throw new Error(executor + ' 执行器未接收完整提示词（' + result.stdinError + '）');
-    if (Buffer.byteLength(result.stdout) >= MAX_OUTPUT) throw new Error(executor + ' 阶段输出过长');
+    if (!result.processTreeStopped) throw new AuditStopUnknown(executor + ' 执行器进程树停止状态无法核验');
     let value: unknown;
     if (codex) {
-        for (const line of result.stdout.trim().split(/\r?\n/).filter(Boolean)) {
-            const event = auditObject(JSON.parse(line));
-            if (event['item']) {
-                const item = auditObject(event['item']);
-                if (!['agent_message', 'reasoning', 'todo_list', 'error'].includes(String(item['type']))) {
-                    throw new Error('Codex 阶段出现未授权的工具事件：' + String(item['type']).slice(0, 100));
-                }
-            }
-        }
         const output = await readFile(resultPath, 'utf8');
         if (Buffer.byteLength(output) >= MAX_OUTPUT) throw new Error('Codex 阶段结果过长');
         value = JSON.parse(output);
     } else {
-        const response = auditObject(JSON.parse(result.stdout));
+        const response = claudeResult ?? auditObject(JSON.parse(result.stdout));
+        if (Buffer.byteLength(JSON.stringify(response)) >= MAX_OUTPUT) throw new Error('Claude Code 最终结果过长');
         if (response['is_error'] === true || response['subtype'] !== 'success') throw new Error('Claude Code 未返回成功结果');
         value = response['structured_output'];
     }

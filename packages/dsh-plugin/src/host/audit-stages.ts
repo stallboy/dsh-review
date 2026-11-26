@@ -1,13 +1,12 @@
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { readFile, realpath, writeFile, rm, rmdir, lstat, chmod } from 'node:fs/promises';
 import path from 'node:path';
 import { AUDIT_TIMEOUT_MS, type AuditLeaseRecord } from './audit-lifecycle.js';
 import type { AuditItem } from './audit-archive.js';
-import { findingIdOf } from './auditor.js';
-import { parseReviewMarkdown, serializeReviewMarkdown } from './frontmatter.js';
 import { FINDING_ID_PATTERN } from './invariants.js';
 import { renderAuditTemplate, type AuditStage } from './audit-prompts.js';
-import { compatibleAuditBase, listAuditSources, oneLine, readAuditSource, prepareStageCandidate, validSourcePath, withinScope, type StageCandidate, type StageEdit } from './audit-stage-artifacts.js';
+import { compatibleAuditBase, createArtifactDirectory, validSourcePath, withinScope, type StageCandidate } from './audit-stage-artifacts.js';
+import { parsePatch, isAiReviewPath } from './patch.js';
+import { prepareIssuePublication } from './issue-publication.js';
 import {
     arraySchema, AUDIT_EXECUTORS, auditObject, AuditExecutorAuthenticationError, AuditStageTimedOut, AuditStopUnknown, enumSchema, integerSchema,
     objectSchema, stringSchema, validateAuditValue, type AuditExecutor, type ExecuteAuditStage,
@@ -16,7 +15,6 @@ import type { SharedCandidateSource } from './shared-facts.js';
 import type { ReviewersConfig } from './reviewers.js';
 import type { VcsAdapter } from './vcs.js';
 import { AUDIT_TYPES, type AuditType } from './types.js';
-import type { runGateChecks } from './validator.js';
 
 const strings = arraySchema(stringSchema);
 const navigation = { path: stringSchema, line: integerSchema };
@@ -50,8 +48,8 @@ const resultSchemas = {
         observedBehavior: stringSchema, impact: stringSchema, evidence: arraySchema(evidence), limits: strings,
     }),
     patch: objectSchema({
-        status: enumSchema('ready', 'blocked'), edits: arraySchema(objectSchema({ path: stringSchema, before: stringSchema, after: stringSchema })),
-        summary: stringSchema, reason: stringSchema,
+        status: enumSchema('ready', 'blocked'), patchPath: stringSchema, confidence: integerSchema,
+        summary: stringSchema, reason: stringSchema, tradeoff: stringSchema, humanDecisions: strings,
     }),
 };
 const priorityValues = ['P0', 'P1', 'P2', 'P3'] as const;
@@ -88,8 +86,6 @@ interface Finding extends AuditPriorityEntry {
 }
 
 const SUBJECT = /^[a-z0-9][a-z0-9-]{0,47}$/;
-const MAX_SOURCE = 96 * 1024;
-const MAX_FILE = 32 * 1024;
 const common = (lease: AuditLeaseRecord, vcsType: VcsAdapter['type']) => ({
     auditId: lease.auditId, baseRevision: lease.baseRevision, scope: lease.targetPath || '.', vcsType,
 });
@@ -153,9 +149,7 @@ export class AuditStages {
         readonly vcs: VcsAdapter,
         private readonly reviewers: ReviewersConfig,
         private readonly execute: ExecuteAuditStage,
-        private readonly gateTimeoutMs: number,
         private readonly userExpectations: string[] = [],
-        private readonly gate?: typeof runGateChecks,
         readonly historySource?: SharedCandidateSource,
         readonly findingWorkflow?: boolean,
         private readonly log?: (line: string) => void,
@@ -163,32 +157,22 @@ export class AuditStages {
 
     cancel(): void { this.abort.abort(); }
 
-    private async sources(preferred: string[], signal: AbortSignal): Promise<{ files: Array<{ path: string; text: string }>; omittedCount: number }> {
-        const entries = await listAuditSources(this.lease, this.vcs.type, signal);
-        const selected = preferred.length ? entries.filter(entry => preferred.some(pick => withinScope(pick, entry.file))) : entries;
-        const fallback = new Set(selected.map(entry => entry.file));
-        const manifest = [...selected, ...entries.filter(item => !fallback.has(item.file))];
-        let total = 0;
-        const files: Array<{ path: string; text: string }> = [];
-        for (const { file, bytes } of manifest) {
-            signal.throwIfAborted();
-            if (files.length >= 48 || bytes > MAX_FILE || total + bytes > MAX_SOURCE) continue;
-            const text = await readAuditSource(this.lease, this.vcs, file, signal);
-            if (text === null || text.includes('\0') || text.includes('\ufffd')) continue;
-            total += Buffer.byteLength(text);
-            files.push({ path: file, text });
-        }
-        if (!files.length) throw new Error('本任务没有可用的基线文本');
-        return { files, omittedCount: entries.length - files.length };
+    private async source(file: string): Promise<string | null> {
+        if (!validSourcePath(file)) return null;
+        const absolute = await realpath(path.join(this.lease.root, file)).catch(() => null);
+        const root = await realpath(this.lease.root);
+        if (!absolute || !absolute.startsWith(root + path.sep)) return null;
+        return readFile(absolute, 'utf8').catch(() => null);
     }
 
-    private async verify(value: Record<string, unknown>, visiblePaths: Set<string>, signal: AbortSignal): Promise<Verification> {
+    private async verify(value: Record<string, unknown>, signal: AbortSignal): Promise<Verification> {
         const verdict = value as unknown as Verification;
         if (verdict.verdict === 'insufficient_evidence') return verdict;
         const evidenceValid = verdict.evidence.length > 0 && (await Promise.all(verdict.evidence.map(async item => {
-            if (!visiblePaths.has(item.path) || !validSourcePath(item.path) || !withinScope(this.lease.targetPath, item.path)
+            signal.throwIfAborted();
+            if (!validSourcePath(item.path)
                 || item.line < 1 || !item.excerpt.trim() || item.excerpt.length > 1000 || !item.reason.trim()) return false;
-            const text = await readAuditSource(this.lease, this.vcs, item.path, signal);
+            const text = await this.source(item.path);
             return text?.split(/\r?\n/)[item.line - 1]?.includes(item.excerpt) === true;
         }))).every(Boolean);
         if (evidenceValid && verdict.reason.trim() && (verdict.verdict !== 'confirmed'
@@ -207,18 +191,23 @@ export class AuditStages {
             throw new Error(executor + ' 认证失败，本轮已停止派发' + (alternative ? '，可独立启动 ' + alternative : '，当前没有可用执行器'));
         }
         const raw = auditObject(task);
-        const { approach, ...patchTask } = raw;
+        const { approach, optionId, forensicPaths: requestedForensics, ...patchTask } = raw;
+        if (optionId !== undefined && (stage !== 'patch' || typeof optionId !== 'string' || !SUBJECT.test(optionId))) throw new Error('修订方案编号无效');
+        const forensicPaths = requestedForensics === undefined ? [] : requestedForensics;
+        if (!Array.isArray(forensicPaths) || forensicPaths.length > 10 || forensicPaths.some(file => typeof file !== 'string' || !validSourcePath(file))) {
+            throw new Error('临时取证路径须为不超过十个项目内具体文件');
+        }
         if (stage === 'patch' && approach !== undefined && (typeof approach !== 'string' || !approach.trim())) {
             throw new Error('备选补丁必须说明修复方法');
         }
-        validateAuditValue(schema, stage === 'patch' ? patchTask : task, 'task');
-        let input = stage === 'patch' ? patchTask : raw;
+        validateAuditValue(schema, patchTask, 'task');
+        let input = patchTask;
         const subject = String(input['subjectId'] ?? '');
         const existingCandidates = this.candidates.get(subject) ?? [];
         if (stage !== 'scan' && !this.leads.has(subject)) throw new Error('请使用本轮已登记的线索 ID');
         if ((stage === 'verify' && existingCandidates.length > 0)
-            || (stage === 'patch' && (existingCandidates.length >= (this.findingWorkflow === false ? 1 : 3) || (existingCandidates.length > 0 && !approach)))) {
-            throw new Error('同一发现最多生成三个独立补丁；备选补丁需要说明方法');
+            || (stage === 'patch' && (existingCandidates.length >= 2 || (existingCandidates.length > 0 && !approach)))) {
+            throw new Error('同一发现最多生成两个独立补丁；备选补丁需要说明方法');
         }
         if (stage === 'patch' && this.reviews.get(subject)?.verdict !== 'confirmed') throw new Error('候选需要 Host 核验通过的复核');
         if (stage === 'verify') {
@@ -244,9 +233,8 @@ export class AuditStages {
         const preferred = stage === 'verify'
             ? (input['navigation'] as Array<{ path: string }>).map(item => item.path)
             : input[stage === 'scan' ? 'taskScope' : 'allowedPaths'] as string[];
-        if (preferred.some(file => (file !== '.' && !validSourcePath(file)) || !withinScope(this.lease.targetPath, file))
+        if (preferred.some(file => (file !== '.' && !validSourcePath(file)) || (stage !== 'verify' && !withinScope(this.lease.targetPath, file)))
             || (stage === 'patch' && (!preferred.length || preferred.includes('.')))) throw new Error('阶段路径超出审查范围');
-        if (stage === 'patch' && !this.gate) return { status: 'blocked', reason: '未配置受限的 Host 门禁环境' };
         const commands = stage === 'patch' ? input['gateCommands'] as string[] : [];
         if (stage === 'patch' && (!commands.length || commands.some(command => !this.reviewers.allowedGateCommands.includes(command)))) {
             throw new Error('候选门禁需要命中本轮共享快照的允许列表');
@@ -259,10 +247,49 @@ export class AuditStages {
         const taskId = stage + '-' + String(++this.taskCounter);
         const log = (line: string) => this.log?.(taskId + ' ' + executor + ' ' + line);
         let scratch: string | undefined;
+        let evidenceDir: string | undefined;
+        const forensics = new Map<string, { bytes: Buffer | null; mode?: number }>();
         let executorInvoked = false;
         let processTreeStopped = true;
         let recordStop!: (confirmed: boolean) => void;
         this.stageStopConfirmed = new Promise(resolve => { recordStop = resolve; });
+        let restored = false;
+        const restoreForensics = async (): Promise<void> => {
+            if (restored || this.uncertain || !scratch) return;
+            restored = true;
+            if (!this.uncertain && scratch) {
+                for (const [file, before] of forensics) {
+                    try {
+                        const absolute = path.join(this.lease.root, file);
+                        const info = await lstat(absolute).catch(() => null);
+                        if (info && (!info.isFile() || info.isSymbolicLink())) throw new Error('取证文件已被替换为链接或目录');
+                        const bytes = await readFile(absolute).catch(() => null);
+                        if (bytes) {
+                            const archived = path.join(evidenceDir!, 'forensics', file);
+                            await createArtifactDirectory(this.lease.root, path.relative(this.lease.root, path.dirname(archived)).split(path.sep).join('/'));
+                            await writeFile(archived, bytes, { flag: 'wx' });
+                        }
+                        if (before.bytes) {
+                            await writeFile(absolute, before.bytes);
+                            if (before.mode !== undefined) await chmod(absolute, before.mode);
+                        }
+                        else await rm(absolute, { force: true });
+                    } catch {
+                        this.execution = { state: 'uncertain', stage, runner: executor, detail: '取证文件归档或还原失败，请核验工作副本。' };
+                    }
+                }
+                if (!(await this.vcs.ensureCleanWorkspace()).clean) this.execution = { state: 'uncertain', stage, runner: executor, detail: '阶段结束后业务工作区未还原，现场保留待核验。' };
+                if (!this.uncertain) {
+                    await rm(scratch, { recursive: true, force: true });
+                    await rmdir(path.dirname(scratch)).catch(() => undefined);
+                    await rmdir(path.dirname(path.dirname(scratch))).catch(() => undefined);
+                    if (evidenceDir) {
+                        await rmdir(evidenceDir).catch(() => undefined);
+                        await rmdir(path.dirname(evidenceDir)).catch(() => undefined);
+                    }
+                }
+            }
+        };
         try {
             if (!await compatibleAuditBase(this.vcs, this.lease.baseRevision, this.lease.svnUrl)) throw new AuditStopUnknown('阶段执行前业务基线已变化');
             const verification = this.reviews.get(subject);
@@ -273,31 +300,46 @@ export class AuditStages {
                 ...(stage === 'patch' ? {
                     confirmedFact: verification!.observedBehavior, evidence: verification!.evidence,
                     ownerRouting: { rules: this.reviewers.rules, defaultOwner: this.reviewers.defaultOwner },
-                    candidate: { id, createdAt: this.lease.createdAt, ...(typeof approach === 'string' ? { approach } : {}) },
+                    candidate: { id, createdAt: this.lease.createdAt,
+                        artifactDir: '.ai-review/audits/' + this.lease.auditId + '/evidence/' + taskId,
+                        ...(typeof optionId === 'string' ? { optionId } : {}),
+                        ...(typeof approach === 'string' ? { approach } : {}) },
                 } : {}),
             };
             const template = await renderAuditTemplate(stage, stageData);
-            const executionDir = await mkdtemp(path.join(tmpdir(), 'dsh-audit-cli-'));
-            scratch = executionDir;
-            const snapshot = await this.sources(preferred, signal);
-            if (snapshot.omittedCount) this.coverage.push(taskId + ' 有 ' + String(snapshot.omittedCount) + ' 个文件未进入基线视图');
-            const visibleFiles = new Map(snapshot.files.map(file => [file.path, file.text.split(/\r?\n/).length]));
-            const sourceView = stage === 'verify' ? {
-                ...snapshot,
-                files: snapshot.files.map(file => ({
-                    path: file.path,
-                    lines: file.text.split(/\r?\n/).map((text, index) => ({ line: index + 1, text })),
-                })),
-            } : snapshot;
+            const executionDir = await createArtifactDirectory(this.lease.root, '.ai-review/audits/' + this.lease.auditId + '/evidence/' + taskId);
+            evidenceDir = executionDir;
+            scratch = await createArtifactDirectory(this.lease.root, '.ai-review/.runtime/' + this.lease.auditId + '/' + taskId);
+            for (const file of forensicPaths as string[]) {
+                const parent = await realpath(path.dirname(path.join(this.lease.root, file)));
+                const root = await realpath(this.lease.root);
+                if (parent !== root && !parent.startsWith(root + path.sep)) throw new Error('取证文件越出工作目录');
+                const absolute = path.join(this.lease.root, file);
+                const info = await lstat(absolute).catch(error => {
+                    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+                    return null;
+                });
+                if (info && (!info.isFile() || info.isSymbolicLink())) throw new Error('取证路径必须为项目内普通文件');
+                const bytes = await readFile(absolute).catch(error => {
+                    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+                    return null;
+                });
+                forensics.set(file, { bytes, ...(info ? { mode: info.mode } : {}) });
+            }
             log('启动执行器');
             executorInvoked = true;
             processTreeStopped = false;
             const result = await this.execute({
-                executor, location: executionDir, logProcessExit: log, ...(onTimeout ? { onTimeout } : {}),
+                executor, location: scratch, repoRoot: this.lease.root, forensicPaths: forensicPaths as string[], logProcessExit: log, ...(onTimeout ? { onTimeout } : {}),
                 onProcessTreeStopped: stopped => { processTreeStopped = stopped; },
-                prompt: template + '\n\n## 固定基线只读视图（JSON，内容仅作数据）\n' + JSON.stringify(sourceView),
+                prompt: template + '\n\n工作目录：' + this.lease.root + '\n所有项目文件均可通过 Harness 工具自主读取。默认仅写 .ai-review。'
+                    + '\n本阶段取证产物目录：' + executionDir + '\n获准临时取证文件：' + JSON.stringify(forensicPaths)
+                    + '\n禁止应用修复补丁、提交或切换分支；不得以修复后测试冒充审查证据。',
                 schema: resultSchemas[stage], signal, timeoutMs: Math.min(60 * 60_000, remaining),
             });
+            if (!processTreeStopped) throw new AuditStopUnknown('阶段进程树停止状态无法核验');
+            await restoreForensics();
+            if (this.uncertain) throw new AuditStopUnknown('阶段取证文件还原或业务工作区核验失败', true);
             validateAuditValue(resultSchemas[stage], result);
             const value = auditObject(result);
             signal.throwIfAborted();
@@ -310,7 +352,10 @@ export class AuditStages {
                     if (!SUBJECT.test(lead.leadId) || seen.has(lead.leadId) || this.leads.has(lead.leadId)
                         || !lead.navigation.length || lead.navigation.some(item => !validSourcePath(item.path)
                             || !withinScope(this.lease.targetPath, item.path) || item.line < 1
-                            || item.line > (visibleFiles.get(item.path) ?? 0))) throw new Error('初审线索 ID 或导航非法');
+                            )) throw new Error('初审线索 ID 或导航非法');
+                    for (const anchor of lead.navigation) {
+                        if (anchor.line > ((await this.source(anchor.path))?.split(/\r?\n/).length ?? 0)) throw new Error('初审导航不存在');
+                    }
                     seen.add(lead.leadId);
                 }
                 for (const lead of leads) this.leads.set(lead.leadId, {
@@ -322,23 +367,25 @@ export class AuditStages {
                 return value;
             }
             if (stage === 'verify') {
-                const checked = await this.verify(value, new Set(visibleFiles.keys()), signal);
+                const checked = await this.verify(value, signal);
                 this.reviews.set(subject, checked);
                 this.coverage.push(...checked.limits.map(line => taskId + ' 限制：' + line));
                 return checked;
             }
             if (value['status'] === 'blocked') return { status: 'blocked', reason: value['reason'] };
             if (!String(value['summary']).trim()) throw new Error('候选方案缺少修复说明');
-            const executorStopped = processTreeStopped;
-            processTreeStopped = false;
-            const candidate = await prepareStageCandidate({
-                lease: this.lease, vcsType: this.vcs.type, id, scratch, edits: value['edits'] as StageEdit[], allowedPaths: preferred, commands,
-                reviewers: this.reviewers, auditType: input['auditType'] as AuditType, confirmed: oneLine(verification!.observedBehavior), summary: String(value['summary']),
-                evidence: verification!.evidence.map(item => '- ' + item.path + ':' + String(item.line) + ' ' + oneLine(item.reason)).join('\n'),
-                gateTimeoutMs: this.gateTimeoutMs, signal, gate: this.gate!,
-            });
+            const proposed = String(value['patchPath']);
+            const absolute = await realpath(path.resolve(this.lease.root, proposed));
+            if (!absolute.startsWith((await realpath(executionDir)) + path.sep)) throw new Error('补丁必须写在本阶段产物目录');
+            const patch = await readFile(absolute, 'utf8');
+            const paths = parsePatch(patch).paths;
+            if (!paths.length || paths.some(file => !preferred.includes(file) || isAiReviewPath(file)) || Number(value['confidence']) < 0 || Number(value['confidence']) > 100) throw new Error('提案补丁路径或置信度无效');
+            const checked = await this.vcs.checkPatch(absolute);
+            if (!checked.ok) throw new Error('提案补丁未通过原生只读预检：' + checked.message);
+            const candidate: StageCandidate = { id, title: String(value['summary']), patch, review: '',
+                proposal: { ...(typeof optionId === 'string' ? { optionId } : {}), auditType: input['auditType'] as AuditType, commands, confidence: Number(value['confidence']) / 100,
+                    tradeoff: String(value['tradeoff']), humanDecisions: value['humanDecisions'] as string[] } };
             if (existingCandidates.some(option => option.patch === candidate.patch)) throw new Error('备选补丁与先前方案相同');
-            processTreeStopped = executorStopped;
             this.candidates.set(subject, [...existingCandidates, candidate]);
             return { status: 'ready', candidateId: candidate.id };
         } catch (error) {
@@ -351,7 +398,7 @@ export class AuditStages {
                 log(signal.aborted ? '阶段已取消或超时' : '阶段未完成');
             }
             if (error instanceof AuditStopUnknown && error.processTreeStopped) processTreeStopped = true;
-            if (error instanceof AuditStopUnknown || signal.aborted) {
+            if (error instanceof AuditStopUnknown || signal.aborted || executorInvoked && !processTreeStopped) {
                 this.execution = { state: 'uncertain', stage, runner: executor,
                     detail: error instanceof AuditStopUnknown ? error.message : '无法确认审查阶段已安全停止，请核验执行器与工作副本。',
                     ...(error instanceof AuditStageTimedOut ? { timedOut: error } : {}) };
@@ -360,16 +407,14 @@ export class AuditStages {
             }
             throw error;
         } finally {
-            if (scratch && !this.uncertain) await rm(scratch, { recursive: true, force: true }).catch(() => {
-                this.execution = { state: 'uncertain', stage, runner: executor, detail: '阶段临时目录清理失败，请核验工作副本。' };
-            });
+            await restoreForensics();
             if (!this.uncertain) delete this.execution;
             this.busy = false;
             recordStop(processTreeStopped);
         }
     }
 
-    publication(input: unknown): { path: string; body: string; candidates: StageCandidate[]; items: AuditItem[]; overview: AuditPriorityEntry[] } {
+    async publication(input: unknown, recheck?: import('./audit-history.js').AuditRecheck, recheckEvidence?: unknown[]): Promise<{ path: string; body: string; candidates: StageCandidate[]; items: AuditItem[]; overview: AuditPriorityEntry[] }> {
         if (this.busy || this.uncertain || this.abort.signal.aborted || this.lease.state !== 'active' || this.lease.stageSeal || !this.scanned) {
             throw new Error('发布需要完成初审、停止阶段执行并且没有恢复事项');
         }
@@ -378,8 +423,7 @@ export class AuditStages {
         const rawFindings = value['findings'].map(auditObject);
         validateAuditValue(publicationSchema, { ...value, findings: rawFindings.map(({ repairPlan, findingId, ...item }) => item) }, 'publication');
         const findings = value['findings'] as Finding[];
-        const versioned = this.findingWorkflow === true
-            || findings.some(item => item.repairPlan !== undefined || (this.candidates.get(item.subjectId)?.length ?? 0) > 1);
+        const versioned = true;
         if (versioned && this.findingWorkflow === false) throw new Error('报告须使用当前节点与中央共同支持的档案格式');
         const selected = new Set<string>();
         for (const finding of findings) {
@@ -407,61 +451,16 @@ export class AuditStages {
         const sorted = findings.map((finding, index) => ({ finding, index })).sort((left, right) =>
             priorityValues.indexOf(left.finding.priority) - priorityValues.indexOf(right.finding.priority)
             || left.index - right.index || left.finding.subjectId.localeCompare(right.finding.subjectId)).map(item => item.finding);
-        const findingId = (item: Finding): string => item.findingId
-            ?? findingIdOf(versioned ? 'confirm' : item.kind === 'Deferred' ? 'deferred' : 'confirm', oneLine(item.title));
-        const a = sorted.filter(item => item.kind === 'A').flatMap(item =>
-            (this.candidates.get(item.subjectId) ?? []).map(option => {
-                if (!versioned) return option;
-                const { meta, body } = parseReviewMarkdown(option.review);
-                return { ...option, review: serializeReviewMarkdown({ ...meta, schemaVersion: 2, findingId: findingId(item) }, body) };
-            }));
-        const b = sorted.filter(item => item.kind === 'B');
-        const deferred = sorted.filter(item => item.kind === 'Deferred');
-        const list = (items: string[]) => items.length ? items.map(item => '- ' + oneLine(item)) : ['- 无'];
-        const tableCell = (text: string) => oneLine(text).replaceAll('|', '\\|');
-        const coverage = [
-            ...value['coverage'] as string[], ...this.coverage,
-            ...[...this.leads.keys()].filter(id => !this.reviews.has(id)).map(id => id + ' 未复核'),
-            ...[...this.reviews].filter(([, result]) => result.verdict !== 'confirmed')
-                .map(([id, result]) => id + '：' + (result.verdict === 'refuted' ? '已排除。' : '证据不足。') + result.reason),
-            ...value['requirements'] as string[],
-        ];
-        const body = [
-            '# 仓库审查报告', '', '- 基线：' + this.lease.baseRevision, '- 范围：' + (this.lease.targetPath || '.'),
-            '', '## 优先级总览', '', '| 优先级 | 问题 | 处置 |', '| --- | --- | --- |',
-            ...(sorted.length ? sorted.map(item => '| ' + item.priority + ' | ' + tableCell(item.title) + ' | '
-                + (item.kind === 'A' ? 'A · ' + (this.candidates.get(item.subjectId) ?? []).map(option => option.id).join('、') : item.kind) + ' |') : ['', '- 无']),
-            '', '## A 类：已生成候选', '', ...list(a.map(item => '.ai-review/' + item.id + '/：' + item.title)),
-            '', '## B 类：需人工确认', '', ...(b.length ? b.flatMap(item => {
-                const review = this.reviews.get(item.subjectId)!;
-                return ['- **' + oneLine(item.title).replace(/[:：]/g, ' ') + '**：' + oneLine(review.observedBehavior),
-                    '  - 位置：' + review.evidence.map(anchor => anchor.path + ':' + String(anchor.line)).join('、'),
-                    '  - 风险：' + oneLine(review.impact), '  - 需要决定：' + oneLine(item.decision)];
-            }) : ['- 无']),
-            '', '## 待前置合入后处理（Deferred）', '', ...(deferred.length ? deferred.flatMap(item => [
-                '- **' + oneLine(item.title).replace(/[:：]/g, ' ') + '**：' + oneLine(this.reviews.get(item.subjectId)!.observedBehavior),
-                '  - 依赖：' + item.dependsOn,
-            ]) : ['- 无']), '', '## 历史问题复查', '', ...list(value['history'] as string[]),
-            '', '## 验证证据与未覆盖风险', '', ...list(coverage), '',
-        ].join('\n');
-        const items = (versioned ? sorted : [...b, ...deferred]).map((item): AuditItem => {
-            const review = this.reviews.get(item.subjectId)!;
-            const kind = item.kind === 'A' ? 'repair' : item.kind === 'B' ? 'confirm' : 'deferred';
-            const target = (versioned ? sorted : [...b, ...deferred]).find(candidate => candidate.subjectId === item.dependsOn);
-            const dependsOn = target ? findingId(target) : item.dependsOn;
-            return {
-                kind, findingId: findingId(item), title: oneLine(item.title),
-                summary: oneLine(review.observedBehavior) + '。' + (kind === 'deferred' ? '等待 ' + dependsOn : oneLine(item.decision)),
-                targetFiles: [...new Set(review.evidence.map(anchor => anchor.path))],
-                dependsOn: kind === 'deferred' ? dependsOn : null, status: 'pending', candidate: null,
-                ...(item.repairPlan !== undefined ? { repairPlan: item.repairPlan } : {}),
-                ...(kind === 'repair' ? { options: (this.candidates.get(item.subjectId) ?? []).map(option => ({
-                    candidateId: option.id, tradeoff: option.title,
-                })) } : {}),
-            };
-        });
-        if (new Set(items.map(item => item.findingId)).size !== items.length) throw new Error('重复的正式问题标识');
-        const overview = sorted.map(({ title, priority, kind }) => ({ title: oneLine(title), priority, kind }));
-        return { path: reportPath(this.lease), body, candidates: a, items, overview };
+        this.busy = true;
+        try { return await prepareIssuePublication({
+            lease: this.lease, findings: sorted, reviews: this.reviews, proposals: this.candidates,
+            reviewers: this.reviewers, source: this.historySource, vcs: this.vcs,
+            recheck, recheckEvidence,
+            coverage: [...value['coverage'] as string[], ...this.coverage, ...value['requirements'] as string[],
+                ...[...this.leads.keys()].filter(id => !this.reviews.has(id)).map(id => id + ' 未复核'),
+                ...[...this.reviews].filter(([, result]) => result.verdict !== 'confirmed').map(([id, result]) => id + '：'
+                    + (result.verdict === 'refuted' ? '已排除。' : '证据不足。') + result.reason)],
+            history: value['history'] as string[],
+        }); } finally { this.busy = false; }
     }
 }

@@ -17,7 +17,7 @@ import type { VcsAdapter } from './vcs.js';
 export const API_PREFIX = '/dsh-code-review/api';
 export const APP_VERSION = '0.3.0';
 const BODY_LIMIT = 2 * 1024 * 1024;
-const STATUSES: ReviewStatus[] = ['pending', 'changes_requested', 'approved', 'rejected'];
+const STATUSES: ReviewStatus[] = ['pending', 'changes_requested', 'approved', 'rejected', 'repair_failed', 'human_takeover', 'awaiting_verification', 'resolved'];
 
 const INTERNAL_BODY = Symbol('internal-body');
 
@@ -335,6 +335,6 @@ export interface ApiHost {
   readonly auditJobFinishes: Map<string, (result?: unknown) => void>;
   readonly auditJobLeases: Map<string, string>;
 
-  startAiFixJob(runtime: Runtime, id: string, guard: ConcurrencyGuard): Promise<JobRecord>;
+  startAiFixJob(runtime: Runtime, id: string, guard: ConcurrencyGuard, selection?: import('./types.js').IssueSelection, regenerate?: boolean): Promise<JobRecord>;
   readonly fixSessionGuard: { activeFor(root: string): { candidateId: string; sessionId: string } | undefined };
 }

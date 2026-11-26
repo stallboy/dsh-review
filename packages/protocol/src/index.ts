@@ -100,6 +100,7 @@ export interface WorkspaceRegistration {
     supportsScheduledAudit?: true;
     auditSelfTest?: true;
     findingWorkflow?: true;
+    issueWorkflow?: true;
 }
 
 export interface NodeRegistration {
@@ -140,6 +141,7 @@ export interface ArtifactManifest {
 
 export interface ProjectSnapshot {
     findingWorkflow?: boolean;
+    issueWorkflow?: boolean;
     projectId: string;
     bindingGeneration: number;
     projectConfigRevision: number;
@@ -252,10 +254,10 @@ export function validateCommand(value: unknown, allowRetiredManualRevision = fal
 
 function validatePayload(operation: ManagedOperation, payload: JsonRecord): void {
     const fields: Record<ManagedOperation, string[]> = {
-        approve: ['id', 'confirmedDecisions', 'waivedDecisions', 'commitMessage', 'commitDetail', 'expectedFindingVersion'], comments: ['id', 'content', 'revision', 'file', 'line', 'side', 'anchor'],
-        'comments-batch': ['id', 'comments'], 'comment-status': ['id', 'commentId', 'status'], takeover: ['id'], reject: ['id', 'reason', 'category'], resume: ['id'],
-        rebase: ['id'], 'ai-fix': ['id'], reopen: ['id', 'from', 'reason'], 'archive-stale': ['id'],
-        audit: ['targetPath', 'note', 'findingWorkflow'], 'audit-finalize': ['auditId'], 'audit-release': ['auditId', 'confirmStopped'], 'candidate-finalize': ['id'],
+        approve: ['id', 'confirmedDecisions', 'waivedDecisions', 'commitMessage', 'commitDetail', 'expectedFindingVersion', 'optionId', 'patchId'], comments: ['id', 'content', 'revision', 'file', 'line', 'side', 'anchor', 'optionId', 'patchId'],
+        'comments-batch': ['id', 'comments', 'optionId', 'patchId'], 'comment-status': ['id', 'commentId', 'status'], takeover: ['id'], reject: ['id', 'reason', 'category'], resume: ['id'],
+        rebase: ['id', 'optionId', 'patchId'], 'ai-fix': ['id', 'optionId', 'patchId'], reopen: ['id', 'from', 'reason'], 'archive-stale': ['id'],
+        audit: ['targetPath', 'note', 'findingWorkflow', 'issueWorkflow'], 'audit-finalize': ['auditId'], 'audit-release': ['auditId', 'confirmStopped'], 'candidate-finalize': ['id', 'optionId', 'patchId'],
         convert: ['auditId', 'findingId', 'candidateId'], 'dismiss-finding': ['auditId', 'findingId', 'reason'], sync: [], test: [],
         'finding-decision': ['findingId', 'expectedFindingVersion', 'action', 'reason', 'reviewAfter', 'reviewWhen', 'hint'],
     };
@@ -267,14 +269,18 @@ function validatePayload(operation: ManagedOperation, payload: JsonRecord): void
         if (payload[key] !== undefined && typeof payload[key] !== 'string') throw new ProtocolError(`payload.${key}`);
     }
     if (payload.revision !== undefined) positiveInteger(payload.revision, 'payload.revision');
+    if (payload.patchId !== undefined) positiveInteger(payload.patchId, 'payload.patchId');
+    if (payload.optionId !== undefined && (typeof payload.optionId !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(payload.optionId))) throw new ProtocolError('payload.optionId');
     if (payload.line !== undefined && (typeof payload.line !== 'number' || !Number.isSafeInteger(payload.line) || payload.line < 0 || (payload.file && payload.line === 0))) throw new ProtocolError('payload.line');
     for (const key of ['comments', 'confirmedDecisions', 'waivedDecisions']) if (payload[key] !== undefined && !Array.isArray(payload[key])) throw new ProtocolError(`payload.${key}`);
     if (payload.confirmStopped !== undefined && typeof payload.confirmStopped !== 'boolean') throw new ProtocolError('payload.confirmStopped');
+    if (payload.issueWorkflow !== undefined && payload.issueWorkflow !== true) throw new ProtocolError('payload.issueWorkflow');
     if (payload.findingWorkflow !== undefined && payload.findingWorkflow !== true) throw new ProtocolError('payload.findingWorkflow');
 }
 
 export function validateSnapshot(value: unknown): ProjectSnapshot {
     const input = record(value, 'snapshot');
+    if (input.issueWorkflow !== undefined && typeof input.issueWorkflow !== 'boolean') throw new ProtocolError('issueWorkflow');
     if (input.findingWorkflow !== undefined && typeof input.findingWorkflow !== 'boolean') throw new ProtocolError('findingWorkflow');
     entityId(input.projectId, 'projectId');
     positiveInteger(input.bindingGeneration, 'bindingGeneration');
@@ -288,6 +294,7 @@ export function validateSnapshot(value: unknown): ProjectSnapshot {
     for (const key of ['queue', 'findings', 'audits']) {
         for (const item of input[key] as unknown[]) record(item, key);
     }
+    if ((input.queue as JsonRecord[]).some(item => Number(item.schemaVersion) >= 3) && input.issueWorkflow !== true) throw new ProtocolError('issueWorkflow');
     if (input.artifacts !== undefined) {
         if (!Array.isArray(input.artifacts)) throw new ProtocolError('artifacts');
         for (const item of input.artifacts) {
@@ -309,7 +316,7 @@ export function validateRegistration(value: unknown): NodeRegistration {
     const ids = new Set<string>();
     for (const item of input.workspaces) {
         const workspace = record(item, 'workspace');
-        if (Object.keys(workspace).some(key => !['workspaceId', 'label', 'vcsType', 'target', 'executionConfigHash', 'supportsScheduledAudit', 'findingWorkflow', 'auditSelfTest'].includes(key))) throw new ProtocolError('workspace');
+        if (Object.keys(workspace).some(key => !['workspaceId', 'label', 'vcsType', 'target', 'executionConfigHash', 'supportsScheduledAudit', 'findingWorkflow', 'issueWorkflow', 'auditSelfTest'].includes(key))) throw new ProtocolError('workspace');
         const id = entityId(workspace.workspaceId, 'workspaceId');
         if (ids.has(id)) throw new ProtocolError('重复 workspaceId');
         ids.add(id);
@@ -319,6 +326,7 @@ export function validateRegistration(value: unknown): NodeRegistration {
         if (workspace.executionConfigHash !== undefined && (typeof workspace.executionConfigHash !== 'string' || !/^[a-f0-9]{64}$/.test(workspace.executionConfigHash))) throw new ProtocolError('workspace.executionConfigHash');
         if (workspace.auditSelfTest !== undefined && workspace.auditSelfTest !== true) throw new ProtocolError('workspace.auditSelfTest');
         if (workspace.supportsScheduledAudit !== undefined && workspace.supportsScheduledAudit !== true) throw new ProtocolError('workspace.supportsScheduledAudit');
+        if (workspace.issueWorkflow !== undefined && workspace.issueWorkflow !== true) throw new ProtocolError('workspace.issueWorkflow');
         if (workspace.findingWorkflow !== undefined && workspace.findingWorkflow !== true) throw new ProtocolError('workspace.findingWorkflow');
     }
     return structuredClone(input) as unknown as NodeRegistration;

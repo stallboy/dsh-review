@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
 export interface ProcessResult {
   code: number | null;
@@ -78,14 +79,17 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
       return;
     }
     let child;
+    const job = process.platform === 'win32' && options.killTreeOnExit === true;
+    let jobResult = '';
     try {
-      child = spawn(exe, args, {
+      child = spawn(job ? process.execPath : exe, job ? [fileURLToPath(new URL('./win32-job-runner.js', import.meta.url)),
+        JSON.stringify({ command: exe, args, cwd: options.cwd })] : args, {
         cwd: options.cwd,
         windowsHide: true,
         // 独立的 POSIX 进程组可在取消时一次停止所有后代进程。
         detached: process.platform !== 'win32',
         env: options.inheritEnv === false ? options.env ?? {} : { ...process.env, ...options.env },
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio: job ? ['pipe', 'pipe', 'pipe', 'ipc'] : ['pipe', 'pipe', 'pipe'],
       });
     } catch (error) {
       resolve({
@@ -110,7 +114,15 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
     let stdinError: string | undefined;
     let termination: Promise<boolean> | undefined;
     let settled = false;
-    const terminate = () => (termination ??= killTree(child.pid));
+    const terminate = () => (termination ??= (async () => {
+      if (!job) return killTree(child.pid);
+      if (child.connected) child.send?.({ stop: true }, () => {});
+      const deadline = Date.now() + 12_000;
+      while (!jobResult && Date.now() < deadline && child.exitCode === null) await delay(25);
+      if (!jobResult) await killTree(child.pid);
+      try { return (JSON.parse(jobResult) as { stopped?: boolean }).stopped === true; } catch { return false; }
+    })());
+    if (job) child.on('message', value => { jobResult = JSON.stringify(value); });
     const exchange = typeof options.input === 'object' ? options.input : undefined;
     let replied = false;
 
@@ -135,19 +147,19 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
       }
     };
 
-    child.stdout?.on('data', (data: Buffer) => {
-      const chunk = data.toString('utf8');
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk: string) => {
       if (stdoutBytes < maxBytes) {
         stdout += chunk;
-        stdoutBytes += data.length;
+        stdoutBytes += Buffer.byteLength(chunk);
       }
       emit('stdout', chunk);
     });
-    child.stderr?.on('data', (data: Buffer) => {
-      const chunk = data.toString('utf8');
+    child.stderr?.on('data', (chunk: string) => {
       if (stderrBytes < maxBytes) {
         stderr += chunk;
-        stderrBytes += data.length;
+        stderrBytes += Buffer.byteLength(chunk);
       }
       emit('stderr', chunk);
     });
@@ -180,7 +192,12 @@ export function runProcess(exe: string, args: string[], options: ProcessOptions)
       void cleanup.then((processTreeStopped) => {
         if (pendingStdout) options.onLine?.(pendingStdout, 'stdout');
         if (pendingStderr) options.onLine?.(pendingStderr, 'stderr');
-        resolve({ code, signal, timedOut, aborted, stdout, stderr, ...(error ? { error } : {}),
+        let runnerError: string | undefined;
+        if (job) {
+          try { runnerError = (JSON.parse(jobResult) as { error?: string }).error; }
+          catch { runnerError = 'Windows 进程 Job 未返回可核验的停止结果'; }
+        }
+        resolve({ code, signal, timedOut, aborted, stdout, stderr, ...((error ?? runnerError) ? { error: error ?? runnerError } : {}),
           ...(stdinError ? { stdinError } : {}), ...(timedOut || aborted || options.killTreeOnExit ? { processTreeStopped } : {}) });
       });
     };

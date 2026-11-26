@@ -121,7 +121,9 @@ test('Git 合并后的组合门禁失败只撤销本次修改', async (t) => {
     assert.equal(result.status, 'FALLBACK_TO_PENDING', JSON.stringify(result));
     assert.equal(result.reason, 'GATE_CHECK_FAILED');
     assert.ok(log.some(line => line.includes('待交付差异与已审修改相符')));
-    assert.equal(await vcs.getCurrentBase(), first.commitRevision);
+    assert.notEqual(result.commitRevision, first.commitRevision);
+    assert.equal(await vcs.getCurrentBase(), result.commitRevision);
+    assert.deepEqual(await vcs.listCommitPaths(result.commitRevision), ['.ai-review/2026-11/second/review.md']);
     assert.equal((await vcs.ensureCleanWorkspace()).clean, true);
     const expected = [...baseLines];
     expected[4] = 'first edit';

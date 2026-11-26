@@ -8,7 +8,7 @@ import { reviewersPath } from './reviewers.js';
 import { runAgent, wrapAgentPrompt } from './runner.js';
 import { AuditStopUnknown } from './audit-stage-runner.js';
 import { compatibleAuditBase, type StageSeal } from './audit-stage-artifacts.js';
-import { captureReviewWorktree, reviewWorktreeFingerprint, scheduledGateState, scheduledPatch, undoScheduledGatePatch,
+import { captureReviewWorktree, reviewWorktreeFingerprint, scheduledPatch,
   type ReviewWorktreeState } from './scheduled-audit-vcs.js';
 import { ReviewStore } from './store.js';
 import type { CandidateSource } from './store.js';
@@ -442,12 +442,12 @@ function fallbackReport(input: {
 
 
 export interface AuditFinalizeInput {
+  issueWorkflow?: true;
   auditId: string;
   beforeIds: Set<string>;
   phasedItems?: AuditItem[];
   phasedSeal?: StageSeal;
   svnUrl?: string;
-  phasedGate?: (patch: string, commands: string[]) => ReturnType<typeof import('./validator.js').runGateChecks>;
   beforeCommit?: () => Promise<unknown>;
   baseRevision: string;
   targetPath: string;
@@ -478,12 +478,21 @@ export interface AuditFinalizeResult {
 
 export function permittedScanOutputs(
     before: ReviewWorktreeState, after: ReviewWorktreeState, auditId: string, candidates: readonly string[],
+    seal?: StageSeal,
 ): boolean {
     if (before.versionControl !== after.versionControl
-        || [...before.paths].some(([entry, fingerprint]) => after.paths.get(entry) !== fingerprint)) return false;
+        || [...before.paths].some(([entry, fingerprint]) => after.paths.get(entry) !== fingerprint && !seal?.[entry])) return false;
     const reportDir = `.ai-review/audits/${auditId}`;
     const directories = new Set(['.ai-review', '.ai-review/audits', reportDir]);
     const files = new Set([`${reportDir}/audit.md`]);
+    for (const file of Object.keys(seal ?? {})) {
+      files.add(file);
+      let parent = path.posix.dirname(file);
+      while (parent.startsWith('.ai-review')) {
+        directories.add(parent);
+        parent = path.posix.dirname(parent);
+      }
+    }
     for (const id of candidates) {
         const dir = `.ai-review/${id}`;
         directories.add(dir.slice(0, dir.lastIndexOf('/')));
@@ -891,6 +900,7 @@ export class Auditor {
 
   /** 自动运行与人工收尾共用此事务。无效候选不进入共享提交，复核块须保留剔除原因。 */
   async finalize(input: AuditFinalizeInput): Promise<AuditFinalizeResult> {
+    if (input.issueWorkflow) return (await import('./issue-finalize.js')).finalizeIssueAudit(this.deps, input);
     const { store, vcs } = this.deps;
     const warnings = [...(input.extraWarnings ?? [])];
     const reportPath = `.ai-review/audits/${input.auditId}/audit.md`;
@@ -928,7 +938,6 @@ export class Auditor {
         reason, detail, message: '审查收尾需要核验现场',
     });
     const cancelled = () => input.scheduledScan ? recovery('SCHEDULE_SCAN_DIRTY', '全仓扫描收尾已取消，现场保留待核验') : aborted();
-    const gateRecovery = (detail: string) => recovery(input.scheduledScan ? 'SCHEDULE_SCAN_DIRTY' : 'SYNC_STATE_UNKNOWN', detail);
     const baseSafe = async () => await this.scheduledBaseSafe(input.baseRevision)
       && ((input.scheduledScan !== undefined && !input.svnUrl)
         || await compatibleAuditBase(vcs, input.baseRevision, input.svnUrl).catch(() => false));
@@ -973,103 +982,6 @@ export class Auditor {
     body = body.replace(/^\uFEFF/, '').replace(/^---\n[\s\S]*?\n---\n?/, '');
     const deferredItems = parseAuditReport(body).deferred;
 
-    // G42：配置启用时，先在临时应用补丁的工作区复算门禁。
-    const { loadReviewers } = await import('./reviewers.js');
-    const { runGateChecks } = await import('./validator.js');
-    const reviewersConfig = await loadReviewers(store.repoRoot, this.deps.candidateSource);
-    const gateMode: 'none' | 'smoke' | 'declared' = reviewersConfig.verifyGateOnAuditFinalize;
-    if (gateMode === 'smoke' && reviewersConfig.auditSmokeCommands.length === 0) {
-      warnings.push('verify_gate_on_audit_finalize=smoke 但 audit_smoke_commands 为空；相关候选不得提交');
-      for (const candidate of created) {
-        if (candidate.errors.length === 0) candidate.errors.push('smoke 模式必须配置非空 audit_smoke_commands');
-      }
-    }
-    const gateRechecked: string[] = [];
-    if (gateMode !== 'none') {
-      for (const candidate of created) {
-        if (candidate.errors.length > 0) continue;
-        this.log(`收尾门禁复算：候选 ${candidate.id}（${gateMode}）`);
-        let gatePatch: { path: string; targetFiles: string[]; appliedState: string; base: string; hash: string } | undefined;
-        let applying = false;
-        try {
-          const detail = await store.get(candidate.id, null);
-          const current = detail.candidate.meta.revisions.find((revision) => revision.id === detail.candidate.meta.currentRevision);
-          if (!current) continue;
-          const patchPath = path.join(detail.candidate.dirPath, current.patch);
-          const targetFiles = detail.candidate.meta.targetFiles;
-          const commands = gateMode === 'smoke' ? reviewersConfig.auditSmokeCommands : detail.candidate.meta.gateChecks;
-          if (input.phasedItems) {
-            if (!input.phasedGate) throw new Error('缺少受限门禁环境');
-            const report = await input.phasedGate(patchPath, commands);
-            if (report.allPassed) gateRechecked.push(candidate.id);
-            else candidate.errors.push('收尾门禁（' + gateMode + '）未通过：\n' + report.formattedEvidenceMarkdown);
-            continue;
-          }
-          if (input.scheduledScan) {
-            const review = await captureReviewWorktree(store.repoRoot, vcs.type, true);
-            if (!sameReviewWorktree(input.scheduledScan, review)) {
-              return recovery('SCHEDULE_SCAN_DIRTY', '门禁应用补丁前工作区状态发生变化，现场保留待核验');
-            }
-          }
-          if (!await baseSafe() || !await businessClean()) {
-            return gateRecovery('门禁应用补丁前基线或业务工作区发生变化，现场保留待核验');
-          }
-          const cleanBase = await vcs.getCurrentBase();
-          if (!cleanBase) return recovery();
-          const relativePatch = `.ai-review/${candidate.id}/${current.patch}`;
-          const { entries } = await auditFiles(store.repoRoot, { op: 'snapshot', paths: [relativePatch] });
-          const patchHash = entries?.[0]?.blobHash;
-          if (!patchHash) return recovery();
-          applying = true;
-          const applied = await scheduledPatch(vcs, patchPath, false);
-          if (!applied.ok) {
-            if (input.scheduledScan || !await businessClean()) return gateRecovery('无法确认门禁补丁已完整应用，现场保留待核验');
-            candidate.errors.push(`收尾门禁：补丁无法应用——${applied.message}`);
-            continue;
-          }
-          if (await vcs.getCurrentBase() !== cleanBase) return recovery();
-          gatePatch = { path: patchPath, targetFiles, appliedState: await scheduledGateState(vcs, targetFiles), base: cleanBase, hash: patchHash };
-          const report = await runGateChecks(commands, {
-            cwd: store.repoRoot,
-            baseRevision: input.baseRevision,
-            timeoutMs: this.deps.settings.gateTimeoutMs,
-            onLine: (line: string, _stream: 'stdout' | 'stderr', command: string) => {
-              if (line.trim()) this.log(`  [${candidate.id}] ${command.slice(0, 80)}: ${line.slice(0, 300)}`);
-            },
-            ...(this.deps.signal ? { signal: this.deps.signal } : {}),
-          });
-          if (!report.allPassed) {
-            candidate.errors.push(`收尾门禁（${gateMode}）未通过：\n${report.formattedEvidenceMarkdown}`);
-          } else {
-            gateRechecked.push(candidate.id);
-          }
-        } catch (error) {
-          if (input.phasedItems && (error instanceof AuditStopUnknown || this.deps.signal?.aborted)) return recovery();
-          if (applying && !gatePatch) return gateRecovery('无法核验门禁应用的补丁，现场保留待核验');
-          candidate.errors.push(`收尾门禁执行异常：${error instanceof Error ? error.message : String(error)}`);
-        }
-        if (!await baseSafe()) return recovery();
-        if (gatePatch) {
-          const worktree = await scheduledGateState(vcs, gatePatch.targetFiles).catch(() => null);
-          const relativePatch = path.relative(store.repoRoot, gatePatch.path).split(path.sep).join('/');
-          const patch = await auditFiles(store.repoRoot, { op: 'snapshot', paths: [relativePatch] }).catch(() => null);
-          if (worktree !== gatePatch.appliedState || await vcs.getCurrentBase() !== gatePatch.base
-            || patch?.entries?.[0]?.blobHash !== gatePatch.hash) {
-            return gateRecovery('门禁期间出现本轮补丁以外的工作区改动，现场保留待核验');
-          }
-          if (input.scheduledScan) {
-            const review = await captureReviewWorktree(store.repoRoot, vcs.type, true).catch(() => null);
-            if (!review || !sameReviewWorktree(input.scheduledScan, review)) {
-              return recovery('SCHEDULE_SCAN_DIRTY', '门禁期间评审数据发生变化，现场保留待核验');
-            }
-          }
-          const undone = await undoScheduledGatePatch(vcs, gatePatch.path, gatePatch.targetFiles).catch(() => false);
-          if (!undone || !await businessClean()) {
-            return gateRecovery('无法完整还原门禁的补丁，现场保留待核验');
-          }
-        }
-      }
-    }
     if (!await baseSafe() || !await businessClean()) return recovery();
     if (input.scheduledScan) {
         const afterChecks = await captureReviewWorktree(store.repoRoot, vcs.type, true).catch(() => null);
@@ -1146,10 +1058,7 @@ export class Auditor {
     });
     const finalBody = upsertVerificationBlock(body, block);
     const filteredBody = filterAClassSection(finalBody, validAfterGates, created.map((item) => item.id));
-    const gateFailed = created.filter((item) => item.errors.some((error) => error.startsWith('收尾门禁'))).length;
-    const gateNote = gateMode === 'none'
-      ? '门禁未由 Host 复算（audit 期门禁为 AI 报告；批准时 Host 仍会重新执行全部门禁）'
-      : `门禁已由 Host 复算（${gateMode}）：${String(gateRechecked.length)} 通过，${String(gateFailed)} 失败（失败候选已从 candidates 与 A 类列表剔除）`;
+    const gateNote = '审查阶段未应用修复补丁；仅校验提案格式与只读应用预检，修复效果留待人工批准后验证。';
     const bodyWithGateNote = `${filteredBody.replace(/\s+$/, '')}\n\n> 收尾说明：${gateNote}\n`;
     let items = (reportedItems ?? buildAuditItems(deferredItems, warnings, input.targetPath || '.')).map(item => {
       if (!item.options) return item;

@@ -31,7 +31,12 @@ export class Commands {
 
     private supportsFindingWorkflow(project: ProjectRecord): boolean {
         return this.database.getNode(project.nodeId).workspaces.some(workspace =>
-            workspace.workspaceId === project.workspaceId && workspace.findingWorkflow === true);
+            workspace.workspaceId === project.workspaceId && (workspace.findingWorkflow === true || workspace.issueWorkflow === true));
+    }
+
+    private supportsIssueWorkflow(project: ProjectRecord): boolean {
+        return this.database.getNode(project.nodeId).workspaces.some(workspace =>
+            workspace.workspaceId === project.workspaceId && workspace.issueWorkflow === true);
     }
 
     private supportsSelfTest(project: ProjectRecord): boolean {
@@ -66,8 +71,13 @@ export class Commands {
             const node = db.getNode(project.nodeId);
             if (!project.enabled || !node.online || !node.compatible) throw new CentralError(503, 'node_unavailable', '执行节点离线、停用或协议不兼容');
             const supportsFindings = this.supportsFindingWorkflow(project);
+            const supportsIssues = this.supportsIssueWorkflow(project);
             const payload = record(input.payload, 'payload');
             if ('findingWorkflow' in payload) throw new ProtocolError('payload.findingWorkflow');
+            if ('issueWorkflow' in payload) throw new ProtocolError('payload.issueWorkflow');
+            if ((input.operation === 'audit' || 'optionId' in payload || 'patchId' in payload || payload.action === 'external_completed') && !supportsIssues) {
+                throw new CentralError(409, 'conflict', '节点尚未声明问题记录与方案选择能力，请先升级节点');
+            }
             if ((input.operation === 'finding-decision' || (input.operation === 'approve' && 'expectedFindingVersion' in payload)) && !supportsFindings) {
                 throw new CentralError(409, 'conflict', '节点尚未声明新版发现能力');
             }
@@ -77,8 +87,8 @@ export class Commands {
                 throw new CentralError(409, 'conflict', '节点尚未声明审查流程自检能力');
             }
             this.schedules.yieldToManual(projectId, now);
-            const command = input.operation === 'audit' && supportsFindings
-                ? { ...input, payload: { ...payload, findingWorkflow: true } } : input;
+            const command = input.operation === 'audit' && (supportsFindings || supportsIssues)
+                ? { ...input, payload: { ...payload, findingWorkflow: true, ...(supportsIssues ? { issueWorkflow: true } : {}) } } : input;
             return this.insert(project, key, command, { userId: user.userId, reviewIdentity: user.reviewIdentity }, requestHash);
         });
     }
@@ -107,12 +117,13 @@ export class Commands {
             const unavailable = (command: CommandRecord) => Object.hasOwn(issues, db.getProject(command.projectId).workspaceId);
             const all = (db.sql.prepare("SELECT command_id FROM commands WHERE node_id=? AND active_state!='completed' ORDER BY created_at").all(nodeId) as Row[])
                 .map(row => this.get(row.command_id));
-            const supports = (command: CommandRecord) => command.operation === 'test'
+            const supports = (command: CommandRecord) => (command.payload.issueWorkflow !== true && !('optionId' in command.payload)
+                || this.supportsIssueWorkflow(db.getProject(command.projectId))) && (command.operation === 'test'
                 ? this.supportsSelfTest(db.getProject(command.projectId))
                 : !(
                 command.operation === 'finding-decision' || (command.operation === 'approve' && 'expectedFindingVersion' in command.payload)
                 || (command.operation === 'audit' && command.payload.findingWorkflow === true)
-            ) || this.supportsFindingWorkflow(db.getProject(command.projectId));
+            ) || this.supportsFindingWorkflow(db.getProject(command.projectId)));
             const relevant = all.filter(command => {
                 if (command.state !== 'queued' && command.state !== 'dispatched') {
                     return command.state === 'accepted' || command.state === 'executing' || !unavailable(command);
@@ -134,12 +145,13 @@ export class Commands {
                 return false;
             });
             if (!relevant.length && node.online) {
-                const ready = new Set([...scheduledAuditWorkspaces].filter(workspaceId => !Object.hasOwn(issues, workspaceId)));
+                const ready = new Set([...scheduledAuditWorkspaces].filter(workspaceId => !Object.hasOwn(issues, workspaceId)
+                    && node.workspaces.some(workspace => workspace.workspaceId === workspaceId && workspace.issueWorkflow === true)));
                 const due = this.schedules.due(nodeId, ready, supportsScheduledAuditNotes)[0];
                 if (due) {
                     const { key, ...schedule } = due.slot;
                     const input = { operation: 'audit', payload: {
-                        targetPath: '.', note: due.note, ...(this.supportsFindingWorkflow(due.project) ? { findingWorkflow: true } : {}),
+                        targetPath: '.', note: due.note, findingWorkflow: true, issueWorkflow: true,
                     } };
                     const actor = { userId: SCHEDULED_AUDIT_ACTOR, reviewIdentity: due.reviewIdentity };
                     relevant.push(this.insert(due.project, key, input, actor, digest(stableJson({ ...input, actor, schedule })), schedule));
