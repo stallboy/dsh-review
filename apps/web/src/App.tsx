@@ -267,10 +267,9 @@ function FindingCard({ finding, projectId, writable, selected, selectedOption }:
         finding.deferred
         || finding.issueStatus === 'rejected'
         || finding.issueStatus === 'human_takeover'
-        || finding.issueStatus === 'awaiting_verification'
         || (finding.issueStatus === 'repair_failed' && canResumeFromRepairFailed)
     );
-    const reasonRequired = ['accept_as_is', 'defer', 'resume_review', 'add_repair_hint'].includes(action)
+    const reasonRequired = ['accept_as_is', 'defer', 'resume_review', 'add_repair_hint', 'external_completed'].includes(action)
         || (action === 'human_takeover' && finding.issueStatus === 'awaiting_verification');
 
     return (
@@ -343,7 +342,7 @@ function FindingCard({ finding, projectId, writable, selected, selectedOption }:
                         }}
                     >
                         <label>
-                            {action === 'add_repair_hint' ? '修复线索' : action === 'external_completed' ? '外部完成说明（可选）' : '处置理由'}
+                            {action === 'add_repair_hint' ? '修复线索' : action === 'external_completed' ? '外部完成说明' : '处置理由'}
                             <textarea required={reasonRequired} value={reason} onChange={event => setReason(event.target.value)} />
                         </label>
                         {action === 'defer' && (
@@ -1297,16 +1296,24 @@ function CandidatePage() {
                                     <button
                                         className={s.primary}
                                         disabled={!canApprove}
-                                        onClick={() => run.mutate({
-                                            operation: 'approve',
-                                            payload: {
-                                                confirmedDecisions: confirmed,
-                                                waivedDecisions: decisions
-                                                    .filter(d => !confirmed.includes(d.id) && (waived[d.id] ?? '').trim().length > 0)
-                                                    .map(d => ({ id: d.id, reason: (waived[d.id] ?? '').trim() })),
-                                                commitDetail: 'detailed',
-                                            },
-                                        })}
+                                        onClick={() => {
+                                            const activeConfirmed = decisionVersion === version
+                                                ? decisions.filter(d => confirmed.includes(d.id)).map(d => d.id)
+                                                : [];
+                                            const activeWaived = decisionVersion === version
+                                                ? decisions
+                                                    .filter(d => !activeConfirmed.includes(d.id) && (waived[d.id] ?? '').trim().length > 0)
+                                                    .map(d => ({ id: d.id, reason: (waived[d.id] ?? '').trim() }))
+                                                : [];
+                                            run.mutate({
+                                                operation: 'approve',
+                                                payload: {
+                                                    confirmedDecisions: activeConfirmed,
+                                                    waivedDecisions: activeWaived,
+                                                    commitDetail: 'detailed',
+                                                },
+                                            });
+                                        }}
                                     >
                                         确认批准并交付
                                     </button>

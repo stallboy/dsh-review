@@ -94,7 +94,7 @@ export function registerAuditStageTools(
         properties: {
           disposition: {
             type: 'string',
-            enum: ['undecided', 'accept_as_is', 'defer', 'human_takeover', 'applied', 'resolved'],
+            enum: ['undecided', 'accept_as_is', 'defer', 'human_takeover', 'awaiting_verification', 'applied', 'resolved'],
           },
         },
         additionalProperties: false,

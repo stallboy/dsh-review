@@ -33,7 +33,7 @@ import {
   publishAuditStagesForSession,
   runAuditStageForSession,
 } from './api-audit.js';
-import { FixSessionRegistry, handleCreateFixSession } from './api-fix-session.js';
+import { FixSessionRegistry, handleCreateFixSession, handleReleaseFixSession } from './api-fix-session.js';
 import {
   handleAudits,
   handleCandidate,
@@ -364,27 +364,7 @@ export class ReviewApi implements ApiHost {
         switch (`${route.method} ${route.path}`) {
           case 'GET /health': return handleHealth(this, req, res, url);
           case 'GET /settings': return handleGetSettings(this, req, res, url);
-          case 'PUT /settings': {
-            const prevSave = this.deps.saveSettings;
-            const origHandle = async () => {
-              const wrappedHost = this;
-              await handlePutSettings(wrappedHost, req, res);
-            };
-            void prevSave;
-            // 确保内部 settings 同步更新
-            const origSave = this.deps.saveSettings;
-            this.deps.saveSettings = async (next) => {
-              const saved = await origSave(next);
-              this.updateSettings(saved);
-              return saved;
-            };
-            try {
-              await origHandle();
-            } finally {
-              this.deps.saveSettings = origSave;
-            }
-            return;
-          }
+          case 'PUT /settings': return handlePutSettings(this, req, res);
           case 'GET /queue': return handleQueue(this, req, res, url, this.caches);
           case 'GET /candidate': return handleCandidate(this, req, res, url, this.caches);
           case 'GET /patch': return handlePatch(this, req, res, url);
@@ -423,6 +403,7 @@ export class ReviewApi implements ApiHost {
           case 'POST /ai-fix': return handleAiFix(this, req, res, url);
           case 'POST /rebase': return handleRebase(this, req, res, url);
           case 'POST /fix-session': return handleCreateFixSession(this, req, res, url, this.fixSessionRegistry);
+          case 'POST /fix-session/release': return handleReleaseFixSession(this, req, res, url, this.fixSessionRegistry);
           case 'POST /candidate/finalize': return handleCandidateFinalize(this, req, res, url);
           case 'POST /sync': return handleSync(this, req, res, url);
 

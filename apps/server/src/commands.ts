@@ -93,6 +93,18 @@ export class Commands {
             if (input.operation === 'audit-self-test' && !this.supportsSelfTest(project)) {
                 throw new CentralError(409, 'conflict', '节点尚未声明审查流程自检能力');
             }
+            if (input.operation === 'takeover') {
+                const rawOwner = (input.payload as JsonRecord)?.owner;
+                if (typeof rawOwner === 'string' && rawOwner.trim()) {
+                    const targetOwner = rawOwner.trim();
+                    const found = db.sql
+                        .prepare('SELECT 1 FROM users WHERE review_identity=? AND disabled=0 LIMIT 1')
+                        .get(targetOwner);
+                    if (!found) {
+                        throw new CentralError(422, 'bad_request', `转派目标负责人 ${targetOwner} 不是有效的活跃评审用户`);
+                    }
+                }
+            }
             this.schedules.yieldToManual(projectId, now);
             return this.insert(project, key, input, { userId: user.userId, reviewIdentity: user.reviewIdentity }, requestHash);
         });

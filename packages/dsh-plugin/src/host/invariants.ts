@@ -263,9 +263,18 @@ export function quickReviewInvariants(input: QuickInvariantInput): string[] {
     patchById.set(patch.id, patch);
   });
 
-  // 收集历史批准用过的 option_id 与 patch_id（用于重开后退役校验）
+  // 收集历史批准周期全部退役的 option_id（含已批准方案及同周期未合入的旧备选方案）与 patch_id（I6）
   const historicApprovedOptionIds = new Set(meta.approvalHistory.map((h) => h.optionId));
   const historicApprovedPatchIds = new Set(meta.approvalHistory.map((h) => h.patchId));
+  const historicBaseRevisions = new Set(meta.approvalHistory.map((h) => h.baseRevision));
+  const maxHistoricPatchId = meta.approvalHistory.reduce((max, h) => Math.max(max, h.patchId), 0);
+  if (meta.approvalHistory.length > 0) {
+    for (const patch of meta.patches) {
+      if (patch.id <= maxHistoricPatchId || historicBaseRevisions.has(patch.baseRevision)) {
+        historicApprovedOptionIds.add(patch.optionId);
+      }
+    }
+  }
 
   // I6: options[]
   if (meta.issueKind === 'repair') {
@@ -498,6 +507,9 @@ export async function fullReviewInvariants(input: FullInvariantInput): Promise<s
     const parsed = parsePatch(text);
     if (parsed.paths.length === 0) {
       errors.push(`补丁 ${entry.patch} 未包含任何有效文件变更`);
+    }
+    if (parsed.unsafeModes.length > 0) {
+      errors.push(`补丁 ${entry.patch} 包含禁止的文件模式（${parsed.unsafeModes.join(', ')}）`);
     }
     for (const file of parsed.paths) {
       validateSafeBusinessPath(file, `补丁 ${entry.patch}`, errors);

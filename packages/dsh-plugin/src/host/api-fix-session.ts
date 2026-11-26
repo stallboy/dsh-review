@@ -1,8 +1,8 @@
 /**
- * 交互式 Mode B 提案会话（POST /fix-session）与持久化工作副本占用（SPEC §5.4 / D06）：
+ * 交互式 Mode B 提案会话（POST /fix-session、POST /fix-session/release）与持久化工作副本占用（AC-API-01 / SPEC §5.4）：
  * - 受理前强制校验完整 ConcurrencyGuard、显式 optionId/patchId、Owner、合法状态、总体/本方案未解决评论与干净工作区；
  * - 占用记录持久化到 DSH_HOME 状态目录（重启后仍阻塞并发写，绝不靠 1 小时盲超时自动释放）；
- * - 仅在核验会话停止且业务工作区干净还原后才释放占用。
+ * - 仅在核验会话停止且业务工作区干净还原后才释放占用（支持回合结束自动核验与显式释放）。
  */
 
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
@@ -237,7 +237,7 @@ export async function handleCreateFixSession(
     throw error;
   }
 
-  // 回合结束时必须核验停止并还原清理工作区后才释放占用（绝不盲目释放或按固定时钟超时清除）。
+  // 回合结束或会话空闲时必须核验停止并还原清理工作区后才释放占用（绝不盲目释放或按固定时钟超时清除）。
   if (host.deps.onAuditTurnEnd) {
     const unsubscribe = host.deps.onAuditTurnEnd(sessionId, () => {
       void host.withWriteLock(runtime.root, async () => {
@@ -245,6 +245,19 @@ export async function handleCreateFixSession(
       }).catch(() => undefined);
     });
     registry.attachTurnListener(runtime.root, unsubscribe);
+  } else if (host.deps.withAuditSessionIdle) {
+    const idleController = new AbortController();
+    registry.attachTurnListener(runtime.root, () => idleController.abort());
+    void host.deps.withAuditSessionIdle(
+      sessionId,
+      `fix-session-${sessionId}`,
+      idleController.signal,
+      async () => {
+        await host.withWriteLock(runtime.root, async () => {
+          await registry.releaseVerified(runtime.root, runtime, host.deps.stopAuditSession);
+        });
+      },
+    ).catch(() => undefined);
   }
 
   sendJson(res, 202, {
@@ -255,5 +268,39 @@ export async function handleCreateFixSession(
     optionId: prepared.option.id,
     patchId: prepared.patch.id,
     prompt: prepared.prompt,
+  });
+}
+
+/** POST /fix-session/release — 人工确认提案会话已停止后，经宿主核验停止并还原工作区干净才释放持久化占用。 */
+export async function handleReleaseFixSession(
+  host: ApiHost,
+  req: ApiRequest,
+  res: ApiResponse,
+  url: URL,
+  registry: FixSessionRegistry,
+): Promise<void> {
+  const body = await readJson(req);
+  if (body['confirmStopped'] !== true) {
+    throw new ApiError(422, 'bad_request', '释放提案会话占用前必须显式确认 confirmStopped=true');
+  }
+  const runtime = await host.runtimeFor(url);
+  const current = registry.activeFor(runtime.root);
+  if (!current) {
+    sendJson(res, 200, { released: true, message: '当前仓库无活跃的提案会话占用' });
+    return;
+  }
+  const released = await registry.releaseVerified(runtime.root, runtime, host.deps.stopAuditSession);
+  if (!released) {
+    throw new ApiError(
+      409,
+      'conflict',
+      `无法核验提案会话 ${current.sessionId || '(未知)'} 已完全停止且工作区已还原干净，保留占用阻塞并发写`,
+    );
+  }
+  sendJson(res, 200, {
+    released: true,
+    sessionId: current.sessionId,
+    candidateId: current.candidateId,
+    message: '已核验提案会话停止且工作区干净，工作副本占用已释放',
   });
 }

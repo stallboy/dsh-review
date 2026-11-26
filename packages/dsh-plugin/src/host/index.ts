@@ -363,6 +363,12 @@ export function apply(ctx: HostContext): void {
       },
       resolveCredential,
       ...auditSessions,
+      onAuditTurnEnd: (sessionId, callback) => {
+        const off = ctx.on?.('session.idle', (event: { sessionId?: string }) => {
+          if (event?.sessionId === sessionId) callback();
+        });
+        return typeof off === 'function' ? off : () => {};
+      },
       createFixSession: (input) => createDshFixSession(ctx, input),
       resolveSessionCwd: (sessionId) => {
         const sessions = ctx.get('sessions') as {

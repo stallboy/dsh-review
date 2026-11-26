@@ -4,7 +4,7 @@
  * 门禁全过落地并关闭（保留补丁），门禁失败还原并记 repair_failed（永久封禁该补丁，绝不自动调用 Agent）。
  */
 
-import { lstat, readFile, realpath, writeFile } from 'node:fs/promises';
+import { lstat, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { mergeApprovedText, supportedApprovalMergePatch } from './approval-merge.js';
@@ -228,9 +228,13 @@ export async function runApprovalTransaction(deps: ApprovalDeps, input: ApproveI
       return abort('INVALID_CANDIDATE', `补丁 ${patchEntry.patch} 缺失或 SHA-256 与账本不一致`);
     }
     const patchText = rawBytes.toString('utf8');
-    const approvedPatchPaths = parsePatch(patchText).paths;
+    const parsedPatch = parsePatch(patchText);
+    const approvedPatchPaths = parsedPatch.paths;
     if (approvedPatchPaths.length === 0) {
       return abort('INVALID_CANDIDATE', `补丁 ${patchEntry.patch} 未包含任何业务文件路径`);
+    }
+    if (parsedPatch.unsafeModes.length > 0) {
+      return abort('INVALID_CANDIDATE', `补丁 ${patchEntry.patch} 包含禁止的文件模式（${parsedPatch.unsafeModes.join(', ')}）`);
     }
 
     const duplicate = await store.findDuplicateForCandidate(candidate, source, source);
@@ -342,6 +346,8 @@ export async function runApprovalTransaction(deps: ApprovalDeps, input: ApproveI
     const preHead = currentBase;
     const preBranch = vcs.type === 'git' ? (await vcs.getCurrentBranch?.()) ?? null : null;
     const preRemoteTip = vcs.type === 'git' ? (await vcs.getRemoteTip?.(preBranch ?? undefined)) ?? null : null;
+    const preAllRefTips = vcs.type === 'git' ? (await vcs.listAllRefTips?.()) ?? new Map<string, string>() : new Map<string, string>();
+    const preRemoteRefTips = vcs.type === 'git' ? (await vcs.listRemoteRefTips?.()) ?? new Map<string, string>() : new Map<string, string>();
     const preAiReviewDigest = await digestAiReviewDir(vcs.root);
 
     // Step 7: 程序优先应用（严格应用 → 确定性三方合并）→ 受阻则 Mode C
@@ -464,18 +470,48 @@ export async function runApprovalTransaction(deps: ApprovalDeps, input: ApproveI
       const postRemoteTip = (vcs.type === 'git' && preRemoteTip)
         ? (await vcs.getRemoteTip?.(preBranch ?? undefined)) ?? null
         : null;
-      const remoteAdvanced = Boolean(preRemoteTip && postRemoteTip && postRemoteTip.tip !== preRemoteTip.tip);
+      const postRemoteRefTips = vcs.type === 'git'
+        ? (await vcs.listRemoteRefTips?.()) ?? new Map<string, string>()
+        : new Map<string, string>();
+      const changedRemoteRefs: Array<{ ref: string; before: string | undefined; after: string }> = [];
+      for (const [refName, afterTip] of postRemoteRefTips) {
+        const beforeTip = preRemoteRefTips.get(refName);
+        if (beforeTip !== afterTip) {
+          changedRemoteRefs.push({ ref: refName, before: beforeTip, after: afterTip });
+        }
+      }
+      const remoteAdvanced = Boolean(
+        (preRemoteTip && postRemoteTip && postRemoteTip.tip !== preRemoteTip.tip)
+        || changedRemoteRefs.length > 0,
+      );
+      const primaryRemoteRef = postRemoteTip?.remoteRef
+        ?? changedRemoteRefs[0]?.ref
+        ?? 'origin';
+      // 仅采信 Mode C 启动前已存在的本地/远端引用，以及未被本次 Mode C 推进的远端引用（防伪造侧分支绕过护栏）
+      const trustedUpstreamTips = new Set<string>([
+        ...preAllRefTips.values(),
+        ...preRemoteRefTips.values(),
+      ]);
+      for (const [refName, tip] of postRemoteRefTips) {
+        if (preRemoteRefTips.get(refName) === tip) trustedUpstreamTips.add(tip);
+      }
+      const branchSwitched = vcs.type === 'git' && preBranch !== null && postBranch !== preBranch;
       const postAiReviewDigest = await digestAiReviewDir(vcs.root);
       const aiReviewTampered = postAiReviewDigest !== preAiReviewDigest;
       const activeGitOp = vcs.type === 'git' ? Boolean(await vcs.hasActiveGitOperation?.()) : false;
       const allowedSet = new Set(approvedPatchPaths);
 
       const safeRevertToPreHead = async (): Promise<void> => {
-        if (vcs.type === 'git' && vcs.resetHard) {
-          await vcs.resetHard(preHead);
-        } else {
-          await vcs.revertBusinessWorkspace();
+        if (vcs.type === 'git') {
+          if (preBranch && postBranch !== preBranch) {
+            await vcs.checkoutBranch?.(preBranch).catch(() => undefined);
+          }
+          if (vcs.resetHard) {
+            await vcs.resetHard(preHead);
+            return;
+          }
         }
+        await vcs.revertBusinessWorkspace();
       };
 
       const exportNewPatchAndFallback = async (summary: string): Promise<ApprovalOutcome> => {
@@ -499,8 +535,12 @@ export async function runApprovalTransaction(deps: ApprovalDeps, input: ApproveI
           return abort('RUNNER_FAILED', 'Mode C 声明实质变化但未产生有效业务 diff');
         }
         const parsedNew = parsePatch(exportedDiff);
-        if (parsedNew.paths.length === 0 || parsedNew.paths.some((p) => !isRepoRelativePath(p) || isAiReviewPath(p))) {
-          return abort('RUNNER_FAILED', 'Mode C 导出的新补丁包含非法或禁止路径');
+        if (
+          parsedNew.paths.length === 0
+          || parsedNew.paths.some((p) => !isRepoRelativePath(p) || isAiReviewPath(p))
+          || parsedNew.unsafeModes.length > 0
+        ) {
+          return abort('RUNNER_FAILED', 'Mode C 导出的新补丁包含非法路径或禁止文件模式');
         }
 
         const { id: newPatchId, patch: newPatchName } = store.nextPatchNumber(candidate.meta);
@@ -509,6 +549,7 @@ export async function runApprovalTransaction(deps: ApprovalDeps, input: ApproveI
         await writeFile(newPatchAbs, newPatchBytes);
         const check = await vcs.checkPatch(newPatchAbs);
         if (!check.ok) {
+          await rm(newPatchAbs, { force: true }).catch(() => undefined);
           await safeRevertToPreHead().catch(() => undefined);
           return abort('RUNNER_FAILED', `Mode C 导出的新补丁未通过只读预检：${check.message}`);
         }
@@ -595,12 +636,13 @@ export async function runApprovalTransaction(deps: ApprovalDeps, input: ApproveI
           return abort('RUNNER_FAILED', '非 Git 环境不支持 Mode C 拓扑变更');
         }
 
-        const topology = await vcs.computeModeCNetChangedPaths(preHead, postHead);
+        const topology = await vcs.computeModeCNetChangedPaths(preHead, postHead, [...trustedUpstreamTips]);
         const hasForbidden = topology.netChangedPaths.some((p) => !isRepoRelativePath(p) || isAiReviewPath(p));
         const symlinkBad = !hasForbidden && (await hasSymlinkEscape(vcs.root, topology.netChangedPaths));
         const outOfScope = topology.netChangedPaths.filter((p) => !allowedSet.has(p));
         const severeViolation = !modeCResult.ok
           || !verdict
+          || branchSwitched
           || !topology.ok
           || topology.aiReviewTouched
           || aiReviewTampered
@@ -615,8 +657,8 @@ export async function runApprovalTransaction(deps: ApprovalDeps, input: ApproveI
           if (severeViolation || isMaterial) {
             const detail = [
               `已推送提交：${postHead}`,
-              `远端引用：${postRemoteTip?.remoteRef ?? '(未知)'}（${preRemoteTip?.tip.slice(0, 12) ?? ''} -> ${postRemoteTip?.tip.slice(0, 12) ?? ''}）`,
-              `原因：${severeViolation ? (topology.diagnostic ?? (aiReviewTampered ? '篡改 .ai-review' : !verdict ? '缺少合法 JSON 裁决' : '硬护栏违例')) : (verdict?.verdict === 'material_change' ? verdict.summary : `越界路径 ${outOfScope.join(', ')}`)}`,
+              `远端引用：${primaryRemoteRef}（${preRemoteTip?.tip.slice(0, 12) ?? ''} -> ${postRemoteTip?.tip.slice(0, 12) ?? changedRemoteRefs[0]?.after.slice(0, 12) ?? ''}）`,
+              `原因：${severeViolation ? (branchSwitched ? `当前分支被切换（${preBranch} -> ${postBranch ?? 'detached'}）` : topology.diagnostic ?? (aiReviewTampered ? '篡改 .ai-review' : !verdict ? '缺少合法 JSON 裁决' : '硬护栏违例')) : (verdict?.verdict === 'material_change' ? verdict.summary : `越界路径 ${outOfScope.join(', ')}`)}`,
             ].join('；');
             return recover('REMOTE_PUSH_UNREVERTIBLE', detail, 'Mode C 已推送远端但未通过硬护栏，严禁强推覆盖，已保留现场待人工恢复');
           }
@@ -630,7 +672,7 @@ export async function runApprovalTransaction(deps: ApprovalDeps, input: ApproveI
           }
           pushedModeC = {
             commit: postHead,
-            remoteRef: postRemoteTip?.remoteRef ?? 'origin',
+            remoteRef: primaryRemoteRef,
             expectedTreeHash: await vcs.getTreeHash?.('HEAD') ?? null,
           };
           applySummary = `Mode C 分支合并/推送等价适配（${postHead.slice(0, 12)}）：${verdict!.summary}`;
@@ -641,7 +683,7 @@ export async function runApprovalTransaction(deps: ApprovalDeps, input: ApproveI
             await safeRevertToPreHead().catch(() => undefined);
             return abort(
               'RUNNER_FAILED',
-              `Mode C 本地提交未通过硬护栏并已回滚至 ${preHead.slice(0, 12)}：${topology.diagnostic ?? (aiReviewTampered ? '篡改 .ai-review' : !verdict ? '缺少合法 JSON' : '违例')}`,
+              `Mode C 本地提交未通过硬护栏并已回滚至 ${preHead.slice(0, 12)}：${branchSwitched ? `当前分支被切换（${preBranch} -> ${postBranch ?? 'detached'}）` : topology.diagnostic ?? (aiReviewTampered ? '篡改 .ai-review' : !verdict ? '缺少合法 JSON' : '违例')}`,
             );
           }
           if (isMaterial) {
@@ -1077,29 +1119,92 @@ async function landMetaClosingCommitForPushed(params: {
     now: new Date(approvedAt),
   });
   const expectedReviewBlob = gitBlobHash(await readFile(updatedCandidate.reviewPath));
-  const metaCommit = await vcs.atomicCommit({
-    message: `review(${candidate.id}): 关闭已推送业务提交 ${pushedHash.slice(0, 12)} 的审批记录 [skip ci]`,
-    paths: [relReviewPath],
-    verifyEntries: [{ path: relReviewPath, blobHash: expectedReviewBlob }],
-  });
+  const probeBefore = await vcs.getCommitProbe([relReviewPath]).catch(() => null);
+  let metaCommit;
+  let commitThrew = false;
+  try {
+    metaCommit = await vcs.atomicCommit({
+      message: `review(${candidate.id}): 关闭已推送业务提交 ${pushedHash.slice(0, 12)} 的审批记录 [skip ci]`,
+      paths: [relReviewPath],
+      verifyEntries: [{ path: relReviewPath, blobHash: expectedReviewBlob }],
+    });
+  } catch (error) {
+    commitThrew = true;
+    metaCommit = {
+      success: false,
+      commitRevision: null,
+      outOfDate: false,
+      errorOutput: error instanceof Error ? error.message : String(error),
+    };
+  }
 
-  if (metaCommit.success && metaCommit.commitRevision) {
+  const buildCommitted = (closingRev: string): { retry: false; outcome: ApprovalOutcome } => {
     const pushHint = deps.isManaged
       ? ''
-      : `（元数据关闭提交 ${metaCommit.commitRevision.slice(0, 12)} 尚未推送，请手动推送至远端）`;
+      : `（元数据关闭提交 ${closingRev.slice(0, 12)} 尚未推送，请手动推送至远端）`;
     return {
       retry: false,
       outcome: {
         status: 'COMMITTED',
         jobId,
-        commitRevision: metaCommit.commitRevision,
+        // SPEC §5.5 步骤 11：情况 B-已推送的 commitRevision 返回已推送业务提交 P（与派生一致），closingCommitRevision 记录 C_meta 供托管交付。
+        commitRevision: pushedHash,
+        closingCommitRevision: closingRev,
         gateResults,
-        message: `批准并关闭成功，业务提交：${pushedHash.slice(0, 12)}，关闭提交：${metaCommit.commitRevision.slice(0, 12)}${pushHint}`,
+        message: `批准并关闭成功，业务提交：${pushedHash.slice(0, 12)}，关闭提交：${closingRev.slice(0, 12)}${pushHint}`,
+      },
+    };
+  };
+
+  if (metaCommit.success && metaCommit.commitRevision) {
+    return buildCommitted(metaCommit.commitRevision);
+  }
+
+  if (metaCommit.verificationFailed) {
+    return {
+      retry: false,
+      outcome: {
+        status: 'RECOVERY_REQUIRED',
+        jobId,
+        reason: 'COMMIT_OUTCOME_UNKNOWN',
+        detail: `业务提交 ${pushedHash} 已推送，元数据关闭提交 C_meta 核验失败，现场保留：${metaCommit.errorOutput}`,
+        message: '已推送业务提交但元数据关闭提交核验失败，请人工确认',
       },
     };
   }
 
-  // 仅还原 C_meta 的 review.md 改动回到 P，绝不回滚至 preHead！
+  // SPEC §8.3 三分支探针：确认 C_meta 未落地后才允许恢复 review.md，绝不覆盖已落地提交或回滚至 preHead！
+  const probeAfter = await vcs.getCommitProbe([relReviewPath]).catch(() => null);
+  if (probeBefore !== null && probeAfter !== null && probeAfter !== probeBefore) {
+    const committedReview = await vcs.readFileAt(probeAfter, relReviewPath).catch(() => null);
+    if (committedReview !== null && gitBlobHash(committedReview) === expectedReviewBlob) {
+      return buildCommitted(probeAfter);
+    }
+    return {
+      retry: false,
+      outcome: {
+        status: 'RECOVERY_REQUIRED',
+        jobId,
+        reason: 'COMMIT_OUTCOME_UNKNOWN',
+        detail: `业务提交 ${pushedHash} 已推送，C_meta 提交探针已变化但内容无法核对一致：${metaCommit.errorOutput}`,
+        message: '已推送业务提交但元数据关闭提交状态不明，请人工确认',
+      },
+    };
+  }
+  if (commitThrew || probeBefore === null || probeAfter === null) {
+    return {
+      retry: false,
+      outcome: {
+        status: 'RECOVERY_REQUIRED',
+        jobId,
+        reason: 'COMMIT_OUTCOME_UNKNOWN',
+        detail: `业务提交 ${pushedHash} 已推送，C_meta 提交中断或探针不可读，现场保留：${metaCommit.errorOutput}`,
+        message: '已推送业务提交但元数据关闭提交结果不明，请人工确认',
+      },
+    };
+  }
+
+  // 已证明 C_meta 未落地：仅还原 review.md 回到 P，绝不回滚至 preHead！
   await metaCommit.restorePreparation?.().catch(() => undefined);
   await writeFile(candidate.reviewPath, reviewBackup, 'utf8').catch(() => undefined);
 

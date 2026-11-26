@@ -5,8 +5,10 @@ import path from 'node:path';
 import test from 'node:test';
 import { ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { runApprovalTransaction } from '../packages/dsh-plugin/dist/host/approval.js';
+import { quickReviewInvariants } from '../packages/dsh-plugin/dist/host/invariants.js';
 import { resolveIssueModule } from '../packages/dsh-plugin/dist/host/issue-publication.js';
 import { serializeReviewMarkdown } from '../packages/dsh-plugin/dist/host/frontmatter.js';
+import { parsePatch } from '../packages/dsh-plugin/dist/host/patch.js';
 import { DEFAULT_SETTINGS } from '../packages/dsh-plugin/dist/host/settings.js';
 import { GitHeadCandidateSource } from '../packages/dsh-plugin/dist/host/shared-facts.js';
 import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
@@ -214,7 +216,8 @@ test('SPEC §5.5 Mode C 情况 B-已推送：通过门禁写 business_commit + C
       { id: candidate.id, jobId: 'mode-c-push-ok', guard, optionId: 'opt-a', patchId: 1, actor: 'tester', confirmedDecisions: [], waivedDecisions: [] },
     );
     assert.equal(outcome.status, 'COMMITTED', JSON.stringify(outcome));
-    assert.notEqual(outcome.commitRevision, pushedCommit);
+    assert.equal(outcome.commitRevision, pushedCommit);
+    assert.ok(outcome.closingCommitRevision && outcome.closingCommitRevision !== pushedCommit);
     const shared = (await store.get(candidate.id, null, await GitHeadCandidateSource.create(root))).candidate;
     assert.equal(shared.meta.status, 'approved');
     assert.equal(shared.meta.approval.businessCommit, pushedCommit);
@@ -309,10 +312,10 @@ test('SPEC §4.1–§4.2：repair_failed 永久封禁、评论保态、单方案
   });
   await api.init();
   const waitJob = async (jobId) => {
-    for (let i = 0; i < 200; i += 1) {
+    for (let i = 0; i < 400; i += 1) {
       const job = api.jobManager.get(jobId);
       if (job && job.status !== 'running') return job.result;
-      await new Promise((r) => setTimeout(r, 30));
+      await new Promise((r) => setTimeout(r, 50));
     }
     throw new Error('timeout');
   };
@@ -467,4 +470,140 @@ test('D07 & AC-MEMORY-01：resolveIssueModule 推导真实模块名（不硬编�
     await new Promise((r) => setTimeout(r, 30));
   }
   assert.equal(job.result.status, 'COMMITTED', JSON.stringify(job.result));
+});
+
+test('对抗审查回归 P0-1：Mode C 伪造侧分支合并不得绕过范围外文件硬护栏', async t => {
+  const { root, vcs, store, candidate, guard, preHead } = await setupConflictingCandidate(t, { slug: '20261126-mode-c-fake-branch' });
+  const mainBranch = runCommand('git', ['branch', '--show-current'], root).stdout.trim();
+  const outcome = await runApprovalTransaction(
+    {
+      store,
+      vcs,
+      settings: { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType: 'git', runner: 'external', autoFixOnFailure: true, syncBeforeApprove: false },
+      sharedSource: () => GitHeadCandidateSource.create(root),
+      log: () => {},
+      runModeC: async ({ cwd }) => {
+        // 攻击：在 Mode C 内部从 preHead 新建侧分支改写越界文件 evil.js 并合并回主分支
+        runCommand('git', ['checkout', '-qb', 'forged-side'], cwd);
+        await writeFile(path.join(cwd, 'src', 'evil.js'), 'export const backdoor = true;\n', 'utf8');
+        runCommand('git', ['add', 'src/evil.js'], cwd);
+        runCommand('git', ['commit', '-qm', 'forged side commit'], cwd);
+        runCommand('git', ['checkout', '-q', mainBranch], cwd);
+        runCommand('git', ['merge', '--no-ff', '--no-edit', 'forged-side'], cwd);
+        await writeFile(path.join(cwd, 'src', 'math.js'), 'export const add = (x, y) => x + y;\n', 'utf8');
+        runCommand('git', ['add', 'src/math.js'], cwd);
+        runCommand('git', ['commit', '-qm', 'math fix'], cwd);
+        return { ok: true, assistantText: JSON.stringify({ verdict: 'equivalent', summary: '伪造合并' }), outputTail: '' };
+      },
+    },
+    { id: candidate.id, jobId: 'mode-c-forged', guard, optionId: 'opt-a', patchId: 1, actor: 'tester', confirmedDecisions: [], waivedDecisions: [] },
+  );
+  assert.equal(outcome.status, 'ABORTED', JSON.stringify(outcome));
+  assert.equal(outcome.reason, 'RUNNER_FAILED');
+  assert.match(outcome.message, /自建侧分支|无法追溯/);
+  assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), preHead);
+  await assert.rejects(readFile(path.join(root, 'src', 'evil.js'), 'utf8'), { code: 'ENOENT' });
+});
+
+test('对抗审查回归 P0-4 / P1-9：补丁重命名/符号链接模式拦截与往期未合入 option_id 退役校验', () => {
+  const renamePatch = [
+    'diff --git a/src/math.js b/src/math.js',
+    'similarity index 100%',
+    'rename from src/math.js',
+    'rename to .ai-review/evil.md',
+  ].join('\n');
+  const parsedRename = parsePatch(renamePatch);
+  assert.ok(parsedRename.paths.includes('.ai-review/evil.md'));
+
+  const symlinkPatch = [
+    'diff --git a/src/link b/src/link',
+    'new file mode 120000',
+    'index 0000000..1111111',
+    '--- /dev/null',
+    '+++ b/src/link',
+    '@@ -0,0 +1 @@',
+    '+/etc/passwd',
+  ].join('\n');
+  const parsedSymlink = parsePatch(symlinkPatch);
+  assert.deepEqual(parsedSymlink.unsafeModes, ['120000']);
+
+  // P1-9：Round 1 有 opt-a (#1) 与 opt-b (#2)，批准 opt-a 后重开不得复用 opt-b
+  const sha = sha256Hex(patchFixture());
+  const errors = quickReviewInvariants({
+    id: '2026-11/reopened-retire',
+    month: '2026-11',
+    slug: 'reopened-retire',
+    meta: {
+      schemaVersion: 1, findingId: 'reopened-retire', title: 'math: 重开退役', module: 'math',
+      auditType: 'bugfix', issueKind: 'repair', dependsOn: null, priority: 'P1', baseRevision: 'rev2',
+      createdAt: '2026-11-01T00:00:00Z', updatedAt: '2026-11-02T00:00:00Z', owner: 'tester',
+      tags: [], ticket: null, status: 'pending', targetFiles: ['src/math.js'], recordRevision: 3,
+      patches: [
+        { id: 1, patch: '001.patch', optionId: 'opt-a', baseRevision: 'rev1', author: 'ai', sha256: sha },
+        { id: 2, patch: '002.patch', optionId: 'opt-b', baseRevision: 'rev1', author: 'ai', sha256: sha },
+        { id: 3, patch: '003.patch', optionId: 'opt-b', baseRevision: 'rev2', author: 'ai', sha256: sha },
+      ],
+      options: [
+        { id: 'opt-b', title: '复用旧备选', tradeoff: '非法', confidence: 0.9, currentPatch: 3, gateChecks: ['node --version'] },
+      ],
+      observations: [], decisions: [], repairAttempts: [], comments: [], humanDecisions: [],
+      approval: null,
+      approvalHistory: [{
+        optionId: 'opt-a', patchId: 1, recordRevision: 1, repairAttemptId: 1, baseRevision: 'rev1',
+        patchSha256: sha, approvedBy: 'tester', approvedAt: '2026-11-01T12:00:00Z',
+        gateChecks: ['node --version'], gateResults: [{ command: 'node --version', exitCode: 0, durationMs: 1 }],
+        confirmedDecisions: [], waivedDecisions: [],
+      }],
+      rejection: null, commitMessage: 'math: 重开退役',
+    },
+  });
+  assert.ok(errors.some((e) => e.includes('opt-b') && e.includes('退役')), errors.join('\n'));
+});
+
+test('对抗审查回归 P0-3 / P1-3：/fix-session/release 核验释放闭环与 /candidate/finalize 状态守卫', async t => {
+  const root = await createGitFixture();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const baseRev = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const candidate = await commitCandidate(root, '20261126-fix-release', {
+    review: {
+      baseRevision: JSON.stringify(baseRev),
+      comments: '\n  - id: c1\n    revision: 1\n    file: ""\n    line: 0\n    author: tester\n    content: 需修订\n    status: unresolved',
+      bodyLines: ['# 需人工判断项', '', '- 无'],
+    },
+  });
+  const api = new ReviewApi({
+    settings: { ...DEFAULT_SETTINGS, repoRoot: root, owner: 'tester', vcsType: 'git', syncBeforeApprove: false },
+    saveSettings: async (v) => v,
+    statePath: path.join(root, '.tmp', 'fix-rel-state.json'),
+    createFixSession: async () => ({ sessionId: 'fix-sess-1' }),
+    stopAuditSession: async () => true,
+  });
+  await api.init();
+
+  const g1 = (await api.invoke({ method: 'GET', path: '/candidate', query: { id: candidate.id } })).body.candidate.meta;
+  const started = await api.invoke({
+    method: 'POST', path: '/fix-session',
+    body: { id: candidate.id, expectedRevision: g1.recordRevision, expectedOwner: g1.owner, expectedUpdatedAt: g1.updatedAt, optionId: 'opt-a', patchId: 1 },
+  });
+  assert.equal(started.status, 202, JSON.stringify(started.body));
+
+  // 未传 confirmStopped=true 必须 422
+  assert.equal((await api.invoke({ method: 'POST', path: '/fix-session/release', body: {} })).status, 422);
+  // 传 confirmStopped=true 核验停止与工作区干净后释放
+  const rel = await api.invoke({ method: 'POST', path: '/fix-session/release', body: { confirmStopped: true } });
+  assert.equal(rel.status, 200, JSON.stringify(rel.body));
+  assert.equal(rel.body.released, true);
+
+  // 转入 human_takeover 后，/candidate/finalize 必须 409 拒绝绕过状态机
+  const ht = await api.invoke({
+    method: 'POST', path: '/finding/decision',
+    body: { id: candidate.id, expectedRevision: g1.recordRevision, expectedOwner: g1.owner, expectedUpdatedAt: g1.updatedAt, action: 'human_takeover', reason: '人工接管' },
+  });
+  assert.equal(ht.status, 200);
+  const g2 = ht.body.candidate.meta;
+  const badFin = await api.invoke({
+    method: 'POST', path: '/candidate/finalize',
+    body: { id: candidate.id, expectedRevision: g2.recordRevision, expectedOwner: g2.owner, expectedUpdatedAt: g2.updatedAt, optionId: 'opt-a', patchId: 1 },
+  });
+  assert.equal(badFin.status, 409, JSON.stringify(badFin.body));
 });

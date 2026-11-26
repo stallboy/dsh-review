@@ -186,9 +186,11 @@ function normalizeTags(raw: string[]): string[] {
 function parseSvnApprovalSource(value: unknown, field: string): SvnApprovalSource | undefined {
   if (value === undefined) return undefined;
   if (!isPlainRecord(value)) throw new Error(`字段 ${field} 必须是对象`);
+  const extra = pickExtra(value, new Set(['uuid', 'relative_url']));
   return {
     uuid: asString(value['uuid'], `${field}.uuid`),
     relativeUrl: asString(value['relative_url'], `${field}.relative_url`),
+    ...(extra ? { extra } : {}),
   };
 }
 
@@ -610,7 +612,13 @@ export function serializeReviewMarkdown(meta: ReviewFrontmatter, body: string): 
       author: entry.author,
       sha256: entry.sha256,
       ...(entry.svnApprovalSource
-        ? { svn_approval_source: { uuid: entry.svnApprovalSource.uuid, relative_url: entry.svnApprovalSource.relativeUrl } }
+        ? {
+          svn_approval_source: {
+            uuid: entry.svnApprovalSource.uuid,
+            relative_url: entry.svnApprovalSource.relativeUrl,
+            ...(entry.svnApprovalSource.extra ?? {}),
+          },
+        }
         : {}),
       ...(entry.extra ?? {}),
     })),

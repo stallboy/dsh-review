@@ -58,6 +58,7 @@ export type RepairAttemptResult = 'applied' | 'verification_failed';
 export interface SvnApprovalSource {
   uuid: string;
   relativeUrl: string;
+  extra?: Record<string, unknown>;
 }
 
 export interface PatchEntry {
@@ -308,6 +309,7 @@ export interface CandidateSummary {
   owner: string;
   status: ReviewStatus | 'broken';
   tags: string[];
+  targetFiles?: string[];
   ticket: string | null;
   /** API 统一暴露的记录版本，等价于 record_revision。 */
   currentRevision: number;

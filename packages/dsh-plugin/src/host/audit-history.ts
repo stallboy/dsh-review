@@ -92,11 +92,14 @@ export async function queryAuditHistoryItems(
   disposition?: string,
 ): Promise<IssueFindingView[]> {
   const { candidates } = await store.listSharedCandidates(source);
-  const wanted = disposition as FindingDisposition | undefined;
   return candidates
     .filter((c) => !c.parseError)
     .filter((c) => scopeCovers(scope, c.meta.targetFiles))
     .map((c) => buildFindingView(c))
-    // 若调用方未显式查询 applied，默认排除已程序关闭的 approved 问题。
-    .filter((item) => (wanted ? item.disposition === wanted : item.disposition !== 'applied' && item.disposition !== 'resolved'));
+    // 若调用方未显式查询 applied，默认排除已程序关闭的 approved/resolved 问题；支持按 awaiting_verification 精准过滤。
+    .filter((item) => {
+      if (!disposition) return item.disposition !== 'applied' && item.disposition !== 'resolved';
+      if (disposition === 'awaiting_verification') return item.issueStatus === 'awaiting_verification';
+      return item.disposition === (disposition as FindingDisposition);
+    });
 }

@@ -319,6 +319,7 @@ export interface FixSessionOccupancy {
 export interface ApiHost {
   readonly deps: ApiDeps;
   currentSettings(): AppSettings;
+  updateSettings(next: AppSettings): void;
   readonly jobManager: JobManager;
   readonly lastConfigErrors: readonly string[];
   readonly detectedVcsType: VcsType | null;

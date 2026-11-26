@@ -336,7 +336,7 @@ export class ReviewStore {
     return errors;
   }
 
-  /** 读取共享快照中的全部合法问题记录（用于跨问题校验、负向记忆与 /findings 投影；排除有本地未提交改动的候选，遵循 SPEC §7.1）。 */
+  /** 读取共享快照中的全部合法问题记录（用于跨问题校验、负向记忆、KPI 统计与 /findings 投影；排除有本地未提交改动与补丁不完整的 broken 候选，遵循 AC-READ-01 / SPEC §5.1）。 */
   async listSharedCandidates(source?: CandidateSource): Promise<{ candidates: ReviewCandidate[]; errors: string[] }> {
     const activeSource: CandidateSource = source ?? this.fsSource();
     const ids = await this.listCandidateIds(activeSource);
@@ -352,6 +352,12 @@ export class ReviewStore {
       if (!localChanged && activeSource.hasLocalChanges && await activeSource.hasLocalChanges(month, slug)) continue;
       const candidate = await this.loadCandidate(month, slug, activeSource);
       if (!candidate) continue;
+      if (!candidate.parseError) {
+        const fullErrors = await this.validateFullCandidate(candidate, activeSource);
+        if (fullErrors.length > 0) {
+          candidate.parseError = fullErrors.join('；');
+        }
+      }
       if (!candidate.parseError && candidate.meta.findingId) {
         const list = findingIdMap.get(candidate.meta.findingId) ?? [];
         list.push(id);
@@ -555,6 +561,7 @@ export class ReviewStore {
         owner: meta.owner,
         status: meta.status,
         tags: [...meta.tags],
+        targetFiles: [...meta.targetFiles],
         ticket: meta.ticket,
         currentRevision: meta.recordRevision,
         recordRevision: meta.recordRevision,
@@ -1045,7 +1052,10 @@ function matchesFilter(item: CandidateSummary, filter: ReviewFilter): boolean {
   }
   if (filter.dir) {
     const prefix = filter.dir.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
-    const touched = item.patchStats.entries.some((e) => e.path === prefix || e.path.startsWith(`${prefix}/`));
+    const matchPath = (filePath: string): boolean => filePath === prefix || filePath.startsWith(`${prefix}/`);
+    const touched = item.patchStats.entries.some((e) => matchPath(e.path))
+      || (item.targetFiles?.some(matchPath) ?? false)
+      || item.options.some((opt) => opt.patchStats.entries.some((e) => matchPath(e.path)));
     if (!touched && item.module !== prefix) return false;
   }
   if (filter.text) {

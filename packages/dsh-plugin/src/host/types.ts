@@ -171,7 +171,7 @@ export type ApprovalRecoveryReason =
   | 'REMOTE_PUSH_UNREVERTIBLE';
 
 export type ApprovalOutcome =
-  | { status: 'COMMITTED'; jobId: string; commitRevision: string; message: string; gateResults?: GateCheckResult[] }
+  | { status: 'COMMITTED'; jobId: string; commitRevision: string; closingCommitRevision?: string; message: string; gateResults?: GateCheckResult[] }
   | { status: 'REPAIR_FAILED'; jobId: string; reason: 'GATE_CHECK_FAILED'; commitRevision: string; message: string; gateResults: GateCheckResult[] }
   | { status: 'FALLBACK_TO_PENDING'; jobId: string; reason: ApprovalFallbackReason; newRevision?: number; manualPrompt?: string; message: string }
   | { status: 'ABORTED'; jobId: string; reason: ApprovalAbortReason; detail?: string; message: string }

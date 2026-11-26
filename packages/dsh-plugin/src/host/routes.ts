@@ -54,6 +54,7 @@ export const ROUTES: readonly RouteDefinition[] = [
   { method: 'POST', path: '/ai-fix', category: 'repo_write', blockedByActiveAudit: true, requiresRepoLock: true },
   { method: 'POST', path: '/rebase', category: 'repo_write', blockedByActiveAudit: true, requiresRepoLock: true },
   { method: 'POST', path: '/fix-session', category: 'repo_write', blockedByActiveAudit: true, requiresRepoLock: false },
+  { method: 'POST', path: '/fix-session/release', category: 'audit_control', blockedByActiveAudit: false, requiresRepoLock: true },
   { method: 'POST', path: '/candidate/finalize', category: 'repo_write', blockedByActiveAudit: false, requiresRepoLock: true },
   { method: 'POST', path: '/sync', category: 'repo_write', blockedByActiveAudit: true, requiresRepoLock: true },
 ];

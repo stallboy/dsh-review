@@ -305,6 +305,9 @@ export async function finalizeIssueAudit(
             if (parsed.paths.some((p) => !isRepoRelativePath(p) || isAiReviewPath(p))) {
               result.errors.push(`补丁 ${patchEntry.patch} 触及禁止路径`);
             }
+            if (parsed.unsafeModes.length > 0) {
+              result.errors.push(`补丁 ${patchEntry.patch} 包含禁止的文件模式（${parsed.unsafeModes.join(', ')}）`);
+            }
             const check = await vcs.checkPatch(patchAbs);
             if (!check.ok) {
               result.errors.push(`补丁 ${patchEntry.patch} 只读应用预检失败：${check.message}`);
@@ -316,14 +319,14 @@ export async function finalizeIssueAudit(
           }
         }
 
-        // 收集该问题目录的 review.md、所有 patches 与归档 evidence
+        // 先校验归档 evidence/（含符号链接拒绝），确认零错误后才将问题纳入共享提交清单（I12）
+        const issueEv = await collectEvidencePaths(store.repoRoot, `.ai-review/${id}/evidence`, result.errors);
         if (result.errors.length === 0) {
           validIssueIds.push(id);
           validCommitPaths.add(relReview);
           for (const patchEntry of meta.patches) {
             validCommitPaths.add(`.ai-review/${id}/${patchEntry.patch}`);
           }
-          const issueEv = await collectEvidencePaths(store.repoRoot, `.ai-review/${id}/evidence`, result.errors);
           for (const evFile of issueEv) validCommitPaths.add(evFile);
         }
       }
@@ -335,7 +338,8 @@ export async function finalizeIssueAudit(
   }
 
   if (evidenceErrors.length > 0) {
-    warnings.push(...evidenceErrors);
+    dataValidation.push({ path: `.ai-review/audits/${input.auditId}/evidence`, errors: evidenceErrors });
+    return aborted(`审查级归档证据校验失败（禁止符号链接或非法文件）：${evidenceErrors.join('；')}`);
   }
 
   // 当本轮存在候选问题且全部未通过校验时，拒绝推进共享提交并保留现场供修正

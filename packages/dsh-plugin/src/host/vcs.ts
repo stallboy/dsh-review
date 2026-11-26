@@ -108,10 +108,13 @@ export interface VcsAdapter {
   getApprovalTarget?(): Promise<GitApprovalTarget | null>;
   getCurrentBranch?(): Promise<string | null>;
   getRemoteTip?(branch?: string): Promise<{ remoteRef: string; tip: string } | null>;
+  listAllRefTips?(): Promise<Map<string, string>>;
+  listRemoteRefTips?(): Promise<Map<string, string>>;
+  checkoutBranch?(branch: string): Promise<void>;
   hasActiveGitOperation?(): Promise<boolean>;
   getTreeHash?(revision?: string): Promise<string | null>;
   isAncestor?(ancestor: string, descendant: string): Promise<boolean>;
-  computeModeCNetChangedPaths?(preHead: string, postHead: string): Promise<ModeCTopologyCheck>;
+  computeModeCNetChangedPaths?(preHead: string, postHead: string, trustedUpstreamTips?: readonly string[]): Promise<ModeCTopologyCheck>;
   resetHard?(revision: string): Promise<void>;
   amendCommitWithReview?(input: { reviewPath: string; expectedReviewBlob: string; message: string }): Promise<CommitResult>;
   collapseLocalCommitsWithReview?(input: {
@@ -563,6 +566,43 @@ export class GitAdapter implements VcsAdapter {
     return { remoteRef: `${remoteName}/${remoteBranch}`, tip };
   }
 
+  async listAllRefTips(): Promise<Map<string, string>> {
+    const result = await git(this.root, ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads', 'refs/remotes', 'refs/tags']);
+    const refs = new Map<string, string>();
+    if (result.code !== 0) return refs;
+    for (const line of result.stdout.split(/\r?\n/)) {
+      const parts = line.trim().split(/\s+/);
+      if (parts[0] && parts[1] && /^[0-9a-f]{40,64}$/i.test(parts[1])) {
+        refs.set(parts[0], parts[1]);
+      }
+    }
+    return refs;
+  }
+
+  async listRemoteRefTips(): Promise<Map<string, string>> {
+    const tips = new Map<string, string>();
+    const remotes = await git(this.root, ['remote']);
+    if (remotes.code !== 0 || !remotes.stdout.trim()) return tips;
+    for (const remoteName of remotes.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)) {
+      const ls = await git(this.root, ['ls-remote', '--heads', remoteName]);
+      if (ls.code !== 0) continue;
+      for (const line of ls.stdout.split(/\r?\n/)) {
+        const parts = line.trim().split(/\s+/);
+        const oid = parts[0];
+        const ref = parts[1];
+        if (oid && ref && /^[0-9a-f]{40,64}$/i.test(oid)) {
+          tips.set(`${remoteName}:${ref}`, oid);
+        }
+      }
+    }
+    return tips;
+  }
+
+  async checkoutBranch(branch: string): Promise<void> {
+    const res = await git(this.root, ['checkout', '-q', '--force', branch]);
+    if (res.code !== 0) throw new Error(`git checkout ${branch} 失败：${describe(res)}`);
+  }
+
   async hasActiveGitOperation(): Promise<boolean> {
     const sequencer = await git(this.root, [
       'rev-parse',
@@ -584,18 +624,24 @@ export class GitAdapter implements VcsAdapter {
     return result.code === 0;
   }
 
-  private async blobHashAtCommit(revision: string, relPath: string): Promise<string | null> {
+  /** 返回 mode:type:oid 完整树条目签名，避免忽略文件权限（100755/120000）或子模块（160000 commit）变更。 */
+  private async treeEntryAtCommit(revision: string, relPath: string): Promise<string | null> {
     const result = await git(this.root, ['ls-tree', '-r', '-z', revision, '--', relPath]);
     if (result.code !== 0 || !result.stdout) return null;
-    const match = /^\d{6} blob ([0-9a-f]+)\t/.exec(result.stdout);
-    return match?.[1] ?? null;
+    const match = /^(\d{6}) (blob|commit|tree) ([0-9a-f]+)\t/.exec(result.stdout);
+    return match ? `${match[1]}:${match[2]}:${match[3]}` : null;
   }
 
   /**
-   * AC-REPAIR-ASSIST / SPEC §5.5 情况 B：
-   * 校验 preHead 为 postHead 祖先，借助 mergeBase 排除本地与上游各自无冲突纯继承文件，精确计算 Mode C 净改动集合。
+   * AC-REPAIR-ASSIST / I19：
+   * 校验 preHead 为 postHead 祖先且所有 mergedParent 均可追溯至启动前既有分支或远端提交，
+   * 借助 mergeBase 排除本地与上游各自无冲突纯继承文件，精确计算 Mode C 净改动集合。
    */
-  async computeModeCNetChangedPaths(preHead: string, postHead: string): Promise<ModeCTopologyCheck> {
+  async computeModeCNetChangedPaths(
+    preHead: string,
+    postHead: string,
+    trustedUpstreamTips?: readonly string[],
+  ): Promise<ModeCTopologyCheck> {
     const fail = (diagnostic: string, aiReviewTouched = false): ModeCTopologyCheck => ({
       ok: false,
       preHead,
@@ -630,6 +676,18 @@ export class GitAdapter implements VcsAdapter {
         if (!inRange.has(parent) && parent !== preHead && !seenParents.has(parent)) {
           const exists = await git(this.root, ['cat-file', '-e', `${parent}^{commit}`]);
           if (exists.code !== 0) return fail(`合并父提交 ${parent} 无效或不可追溯`);
+          if (trustedUpstreamTips !== undefined) {
+            let traceable = false;
+            for (const tip of trustedUpstreamTips) {
+              if (tip === parent || (await this.isAncestor(parent, tip))) {
+                traceable = true;
+                break;
+              }
+            }
+            if (!traceable) {
+              return fail(`合并父提交 ${parent} 无法追溯至 Mode C 启动前既有分支或远端提交（禁止自建侧分支绕过护栏）`);
+            }
+          }
           seenParents.add(parent);
           mergedParents.push(parent);
         }
@@ -684,13 +742,13 @@ export class GitAdapter implements VcsAdapter {
     const netChangedPaths: string[] = [];
     for (const file of candidateFiles) {
       const [preBlob, postBlob] = await Promise.all([
-        this.blobHashAtCommit(preHead, file),
-        this.blobHashAtCommit(postHead, file),
+        this.treeEntryAtCommit(preHead, file),
+        this.treeEntryAtCommit(postHead, file),
       ]);
       const parentStates = await Promise.all(
         parentBases.map(async ({ parent, base }) => ({
-          parentBlob: await this.blobHashAtCommit(parent, file),
-          baseBlob: await this.blobHashAtCommit(base, file),
+          parentBlob: await this.treeEntryAtCommit(parent, file),
+          baseBlob: await this.treeEntryAtCommit(base, file),
         })),
       );
       const inheritedFromLocal = postBlob === preBlob

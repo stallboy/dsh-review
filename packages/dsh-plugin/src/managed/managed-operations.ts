@@ -319,7 +319,9 @@ export class ManagedOperations {
             body: {
                 ...command.payload,
                 ...command.guard,
-                ...(command.operation === 'takeover' ? { owner: command.actor.reviewIdentity } : {}),
+                ...(command.operation === 'takeover'
+                    ? { owner: typeof command.payload.owner === 'string' && command.payload.owner.trim() ? command.payload.owner.trim() : command.actor.reviewIdentity }
+                    : {}),
             },
             actor: {
                 ...command.actor,
@@ -384,7 +386,12 @@ export class ManagedOperations {
         const unverifiedAudit = command.operation === 'audit' && outcome.status === 'RECOVERY_REQUIRED';
         const stageLease = inSession && unverifiedAudit && session && outcome.stageFailure
             ? runtime.api.leaseLookup(session.auditId) : undefined;
-        let commit = typeof outcome.commitRevision === 'string' ? outcome.commitRevision : null;
+        // Mode C 情况 B-已推送返回 commitRevision=P、closingCommitRevision=C_meta，托管交付需推送最新关闭提交 C_meta
+        let commit = typeof outcome.closingCommitRevision === 'string'
+            ? outcome.closingCommitRevision
+            : typeof outcome.commitRevision === 'string'
+                ? outcome.commitRevision
+                : null;
         if (!commit && (!stageLease || stageLease.stageSeal || stageLease.commitOutcomeUnknown)) {
             commit = await runtime.delivery.findCommandCommit(command.commandId);
         }

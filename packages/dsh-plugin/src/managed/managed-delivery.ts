@@ -67,12 +67,22 @@ export class ManagedDelivery {
 }
 
 export function decorateManagedVcs(vcs: VcsAdapter): VcsAdapter {
+    const appendTrailer = (message: string): string => {
+        const commandId = currentTrustedActor()?.commandId;
+        return commandId ? `${message}\n\nDsh-Command: ${commandId}` : message;
+    };
     return new Proxy(vcs, {
         get(target, property) {
-            if (property === 'atomicCommit') return (input: Parameters<VcsAdapter['atomicCommit']>[0]) => {
-                const commandId = currentTrustedActor()?.commandId;
-                return target.atomicCommit(commandId ? { ...input, message: `${input.message}\n\nDsh-Command: ${commandId}` } : input);
-            };
+            if (property === 'atomicCommit') return (input: Parameters<VcsAdapter['atomicCommit']>[0]) =>
+                target.atomicCommit({ ...input, message: appendTrailer(input.message) });
+            if (property === 'amendCommitWithReview' && target.amendCommitWithReview) {
+                return (input: Parameters<NonNullable<VcsAdapter['amendCommitWithReview']>>[0]) =>
+                    target.amendCommitWithReview!({ ...input, message: appendTrailer(input.message) });
+            }
+            if (property === 'collapseLocalCommitsWithReview' && target.collapseLocalCommitsWithReview) {
+                return (input: Parameters<NonNullable<VcsAdapter['collapseLocalCommitsWithReview']>>[0]) =>
+                    target.collapseLocalCommitsWithReview!({ ...input, message: appendTrailer(input.message) });
+            }
             const value = Reflect.get(target, property, target);
             return typeof value === 'function' ? value.bind(target) : value;
         },

@@ -8,8 +8,10 @@ export function isRepoRelativePath(value: string): boolean {
 
 export interface ParsedPatch {
   stats: PatchStats;
-  /** 包含重命名和删除的旧路径，以便校验补丁触及的完整范围。 */
+  /** 包含重命名/复制的源与目标以及删除路径，以便校验补丁触及的完整范围。 */
   paths: string[];
+  /** 检测到的非普通文件模式（如 120000 符号链接、160000 子模块），供安全校验拦截。 */
+  unsafeModes: string[];
   text: string;
   binary: boolean;
 }
@@ -96,12 +98,16 @@ function diffHeaderPaths(value: string): { oldPath: string; newPath: string } | 
 export function parsePatch(text: string): ParsedPatch {
   const entries = new Map<string, PatchFileStat>();
   const touched = new Set<string>();
+  const unsafeModes = new Set<string>();
   let current: PatchFileStat | null = null;
   let binary = false;
   let inHunk = false;
   let inBinaryPayload = false;
-  const noteTouched = (path: string | null): void => {
-    if (path !== null && path.length > 0 && path !== '/dev/null') touched.add(path);
+  const noteTouched = (filePath: string | null): void => {
+    if (filePath !== null && filePath.length > 0 && filePath !== '/dev/null') touched.add(filePath);
+  };
+  const checkMode = (mode: string): void => {
+    if (mode !== '100644' && mode !== '100755') unsafeModes.add(mode);
   };
   for (const line of text.replace(/\r\n/g, '\n').split('\n')) {
     const diffHeader = /^diff --git (.+)$/.exec(line);
@@ -120,10 +126,10 @@ export function parsePatch(text: string): ParsedPatch {
     const indexHeader = /^Index: (.+)$/.exec(line);
     if (indexHeader) {
       inHunk = false;
-      const path = headerPath(indexHeader[1] ?? '');
-      noteTouched(path);
-      current = entries.get(path) ?? { path, additions: 0, deletions: 0, binary: false };
-      entries.set(path, current);
+      const filePath = headerPath(indexHeader[1] ?? '');
+      noteTouched(filePath);
+      current = entries.get(filePath) ?? { path: filePath, additions: 0, deletions: 0, binary: false };
+      entries.set(filePath, current);
       continue;
     }
     if (line.startsWith('@@')) {
@@ -139,23 +145,38 @@ export function parsePatch(text: string): ParsedPatch {
       }
       continue;
     }
+    const renameOrCopy = /^(?:rename|copy) (?:from|to) (.+)$/.exec(line);
+    if (renameOrCopy) {
+      noteTouched(unquoteGitPath(renameOrCopy[1] ?? ''));
+      continue;
+    }
+    const modeHeader = /^(?:new file mode|deleted file mode|old mode|new mode) (\d{6})$/.exec(line);
+    if (modeHeader?.[1]) {
+      checkMode(modeHeader[1]);
+      continue;
+    }
+    const gitIndexMode = /^index [0-9a-f]+\.\.[0-9a-f]+ (\d{6})$/.exec(line);
+    if (gitIndexMode?.[1]) {
+      checkMode(gitIndexMode[1]);
+      continue;
+    }
     const plusHeader = /^\+\+\+ (.+)$/.exec(line);
     if (plusHeader) {
-      const path = headerPath(plusHeader[1] ?? '');
-      noteTouched(path);
-      if (path !== '/dev/null') {
-        current = entries.get(path) ?? { path, additions: 0, deletions: 0, binary: false };
-        entries.set(path, current);
+      const filePath = headerPath(plusHeader[1] ?? '');
+      noteTouched(filePath);
+      if (filePath !== '/dev/null') {
+        current = entries.get(filePath) ?? { path: filePath, additions: 0, deletions: 0, binary: false };
+        entries.set(filePath, current);
       }
       continue;
     }
     const minusHeader = /^--- (.+)$/.exec(line);
     if (minusHeader) {
-      const path = headerPath(minusHeader[1] ?? '');
-      noteTouched(path);
-      if (path !== '/dev/null' && current === null) {
-        current = entries.get(path) ?? { path, additions: 0, deletions: 0, binary: false };
-        entries.set(path, current);
+      const filePath = headerPath(minusHeader[1] ?? '');
+      noteTouched(filePath);
+      if (filePath !== '/dev/null' && current === null) {
+        current = entries.get(filePath) ?? { path: filePath, additions: 0, deletions: 0, binary: false };
+        entries.set(filePath, current);
       }
       continue;
     }
@@ -177,7 +198,7 @@ export function parsePatch(text: string): ParsedPatch {
     deletions: list.reduce((total, entry) => total + entry.deletions, 0),
     entries: list,
   };
-  return { stats, paths: [...touched], text, binary };
+  return { stats, paths: [...touched], unsafeModes: [...unsafeModes], text, binary };
 }
 
 /** AC-MEMORY-01：合并补丁 hunk header 中的函数/结构体符号，去重截断，供负向记忆提示词辅助使用。 */

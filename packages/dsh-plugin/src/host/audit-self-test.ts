@@ -332,11 +332,16 @@ export async function runAuditSelfTest(input: AuditSelfTestInput): Promise<Audit
     }
     checks.schemaV1PublishReadback = true;
 
+    channel?.close();
+    channel = null;
+    await rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
+    checks.tempDirCleaned = !existsSync(tempRoot);
+
     return {
       status: 'SUCCEEDED',
       message: '审查流程自检通过（本 Harness 独立子代理与 schema_version: 1 全链路可用）',
       executors: executorReports,
-      checks: { ...checks, tempDirCleaned: true },
+      checks,
     };
   } catch (error) {
     return {

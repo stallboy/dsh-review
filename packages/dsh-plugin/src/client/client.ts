@@ -167,6 +167,7 @@
     configured: boolean; items: QueueItem[]; errors: string[]; currentBase: string | null;
     counts: Record<string, number>; owner: string; me: string; repoRoot?: string;
     auditLease?: AuditLeaseInfo;
+    fixSession?: { candidateId: string; optionId: string; patchId: number; sessionId: string; owner: string; createdAt: string; state: string };
   }
   interface PatchEntry {
     id: number; optionId: string; patch: string; baseRevision: string;
@@ -768,10 +769,9 @@
         finding.deferred
         || finding.issueStatus === 'rejected'
         || finding.issueStatus === 'human_takeover'
-        || finding.issueStatus === 'awaiting_verification'
         || (finding.issueStatus === 'repair_failed' && canResumeFromRepairFailed)
       );
-      const reasonRequired = ['accept_as_is', 'defer', 'resume_review', 'add_repair_hint'].includes(form)
+      const reasonRequired = ['accept_as_is', 'defer', 'resume_review', 'add_repair_hint', 'external_completed'].includes(form)
         || (form === 'human_takeover' && finding.issueStatus === 'awaiting_verification');
       const submit = (action: string, fields: Record<string, unknown> = {}): void => {
         save({
@@ -828,8 +828,8 @@
         form ? h('div', { style: { marginTop: 8 } },
           h('textarea', {
             className: 'dcr-textarea',
-            'aria-label': form === 'add_repair_hint' ? '修复线索' : form === 'external_completed' ? '外部完成说明（可选）' : '处置理由',
-            placeholder: form === 'add_repair_hint' ? '填写修复线索或提交编号…' : form === 'external_completed' ? '可选说明…' : '请填写处置理由…',
+            'aria-label': form === 'add_repair_hint' ? '修复线索' : form === 'external_completed' ? '外部完成说明' : '处置理由',
+            placeholder: form === 'add_repair_hint' ? '填写修复线索或提交编号…' : form === 'external_completed' ? '请填写外部完成说明或关联提交…' : '请填写处置理由…',
             value: reason, onChange: (event: any) => setReason(event.target.value),
           }),
           form === 'defer' ? h('div', { className: 'dcr-row', style: { marginTop: 6 } },
@@ -1681,12 +1681,15 @@
 
       const addComment = async (file: string, line: number, text: string, autoFix = false, side: 'LEFT' | 'RIGHT' = 'RIGHT', anchor?: { snippet: string; before?: string; after?: string }): Promise<void> => {
         if (!detail || !text.trim()) return;
+        const isInline = file !== '' && line !== 0;
         setBusy(true); setError('');
         try {
           const response = await api.post<{ job?: Job; autoFixError?: string }>('/comments', {
-            id: detail.candidate.id, ...guard(), ...(detail.selection ?? {}), file, line, content: text, autoFix,
-            ...(file !== '' && line !== 0 ? { side } : {}),
-            ...(file !== '' && line !== 0 && anchor ? { anchor } : {}),
+            id: detail.candidate.id, ...guard(),
+            ...(isInline || autoFix ? (detail.selection ?? {}) : {}),
+            file, line, content: text, autoFix,
+            ...(isInline ? { side } : {}),
+            ...(isInline && anchor ? { anchor } : {}),
           });
           dispatchDetail({ type: 'rebind' });
           await afterWrite();
@@ -1802,17 +1805,26 @@
         finally { setBusy(false); }
       };
 
-      /** 先保存并刷新意见，让修复会话或导出的提示词包含刚提交的反馈。 */
+      /** 先保存并刷新意见，并用写回的最新并发守卫启动修复会话或导出提示词，避免旧闭包 guard 导致 409。 */
       const submitFeedbackAndFix = async (drafts: string[]): Promise<void> => {
         if (!detail || drafts.length === 0) return;
         setBusy(true); setError('');
+        let nextGuard: { expectedRevision: number; expectedOwner: string; expectedUpdatedAt: string } | undefined;
         try {
-          if (drafts.length > 1) await api.post('/comments/batch', {
-            id: detail.candidate.id, ...guard(), comments: drafts.map((content) => ({ content })), autoFix: false,
-          });
-          else await api.post('/comments', {
-            id: detail.candidate.id, ...guard(), content: drafts[0], autoFix: false,
-          });
+          const res = drafts.length > 1
+            ? await api.post<{ candidate?: { meta: { recordRevision: number; owner: string; updatedAt: string } } }>('/comments/batch', {
+              id: detail.candidate.id, ...guard(), comments: drafts.map((content) => ({ content })), autoFix: false,
+            })
+            : await api.post<{ candidate?: { meta: { recordRevision: number; owner: string; updatedAt: string } } }>('/comments', {
+              id: detail.candidate.id, ...guard(), content: drafts[0], autoFix: false,
+            });
+          if (res?.candidate?.meta) {
+            nextGuard = {
+              expectedRevision: res.candidate.meta.recordRevision,
+              expectedOwner: res.candidate.meta.owner,
+              expectedUpdatedAt: res.candidate.meta.updatedAt,
+            };
+          }
           dispatchDetail({ type: 'rebind' });
           await afterWrite();
         } catch (e) {
@@ -1822,16 +1834,18 @@
         }
         setBusy(false);
         setFixCopied(false);
-        if (fixTarget === 'session') await launchFixSession();
-        else await exportFixPrompt();
+        if (fixTarget === 'session') await launchFixSession(nextGuard);
+        else await exportFixPrompt(nextGuard?.expectedRevision);
       };
 
-      const launchFixSession = async (): Promise<void> => {
+      const launchFixSession = async (
+        overrideGuard?: { expectedRevision: number; expectedOwner: string; expectedUpdatedAt: string },
+      ): Promise<void> => {
         if (!detail || !detail.selection) return;
         setFixLaunching(true); setError('');
         try {
           const value = await api.post<{ sessionId: string; title: string; revision: number }>('/fix-session', {
-            id: detail.candidate.id, ...guard(), ...detail.selection,
+            id: detail.candidate.id, ...(overrideGuard ?? guard()), ...detail.selection,
           });
           setFixSession({ sessionId: value.sessionId, title: value.title, revision: value.revision });
           setFixPrompt(null);
@@ -1842,14 +1856,18 @@
         }
       };
 
-      const exportFixPrompt = async (): Promise<void> => {
-        if (!detail) return;
+      const exportFixPrompt = async (overrideRevision?: number): Promise<void> => {
+        if (!detail || !detail.selection) return;
         setFixPromptLoading(true); setError('');
         try {
-          const query = new URLSearchParams({ id: detail.candidate.id, mode: 'session' });
-          if (detail.selection) { query.set('optionId', detail.selection.optionId); query.set('patchId', String(detail.selection.patchId)); }
+          const query = new URLSearchParams({
+            id: detail.candidate.id,
+            mode: 'session',
+            optionId: detail.selection.optionId,
+            patchId: String(detail.selection.patchId),
+          });
           const value = await api.get<{ prompt: string }>(`/fix-prompt?${query.toString()}`);
-          setFixPrompt({ text: value.prompt, revision: detail.candidate.meta.recordRevision });
+          setFixPrompt({ text: value.prompt, revision: overrideRevision ?? detail.candidate.meta.recordRevision });
         } catch (e) {
           setError(e instanceof Error ? e.message : String(e));
         } finally {
@@ -2034,8 +2052,38 @@
         void startJob('/audit/finalize', { auditId: info.auditId });
       };
 
+      const releaseFixSessionOccupancy = async (): Promise<void> => {
+        setBusy(true); setError('');
+        try {
+          await api.post('/fix-session/release', { confirmStopped: true });
+          await loadQueue();
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+        } finally {
+          setBusy(false);
+        }
+      };
+
       const renderLeaseBanner = (): any => {
         const info = queue?.auditLease;
+        const fixOcc = queue?.fixSession;
+        if (!info && !fixOcc) return null;
+        if (!info && fixOcc) {
+          return h('div', { className: 'dcr-card' },
+            h('div', { className: 'dcr-row' },
+              h('div', { className: 'dcr-grow' },
+                h('h3', { style: { margin: 0 } }, '提案修订会话占用工作副本'),
+                h('div', { className: 'dcr-small dcr-muted', style: { marginTop: 4 } },
+                  `${fixOcc.candidateId}（${fixOcc.optionId} / patch #${String(fixOcc.patchId)}）· 会话 ${short(fixOcc.sessionId)} · 始于 ${dateText(fixOcc.createdAt)}`),
+              ),
+              h('button', {
+                className: 'dcr-btn', disabled: busy, onClick: () => { void releaseFixSessionOccupancy(); },
+              }, '确认停止并释放占用'),
+            ),
+            h('div', { className: 'dcr-banner warn', style: { marginTop: 8 } },
+              '交互式 Mode B 提案会话正在占用工作副本（阻塞其他共享写与审查）。完成后请回详情页收尾提交，或确认会话已停止后点击释放占用（Host 将核验停止并还原非 .ai-review/ 改动）。'),
+          );
+        }
         if (!info) return null;
         const active = info.state === 'active' && !info.commitOutcomeUnknown;
         return h('div', { className: 'dcr-card' },

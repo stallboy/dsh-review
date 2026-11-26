@@ -1,5 +1,7 @@
 /** 只读接口处理器（SPEC §6.2）：/health /settings /queue /candidate /patch /diff /fix-prompt /reviewers /audits /findings。 */
 
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import {
   APP_VERSION,
@@ -355,7 +357,23 @@ export async function handleCandidate(
       currentBase,
     );
     if (!patchCheck) {
-      const check = await runtime.vcs.checkPatch(path.join(detail.candidate.dirPath, detail.patchEntry.patch)).catch(() => null);
+      let check = null;
+      const diskPatchPath = path.join(detail.candidate.dirPath, detail.patchEntry.patch);
+      // 仅对共享快照的 patchText 执行预检，避免本地未提交草稿污染共享详情的 patchCheck 口径
+      if (detail.patchText) {
+        const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'dsh-patch-check-')).catch(() => null);
+        if (tmpDir) {
+          try {
+            const tmpPatch = path.join(tmpDir, detail.patchEntry.patch);
+            await writeFile(tmpPatch, detail.patchText, 'utf8');
+            check = await runtime.vcs.checkPatch(tmpPatch).catch(() => null);
+          } finally {
+            await rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+          }
+        } else {
+          check = await runtime.vcs.checkPatch(diskPatchPath).catch(() => null);
+        }
+      }
       patchCheck = {
         optionId: detail.selection.optionId,
         patchId: detail.selection.patchId,
@@ -491,9 +509,12 @@ export async function handleDiff(host: ApiHost, _req: ApiRequest, res: ApiRespon
 
 export async function handleFixPrompt(host: ApiHost, _req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
   const id = idFrom(url);
-  const optionId = url.searchParams.get('optionId')?.trim() || undefined;
-  const rawPatchId = url.searchParams.get('patchId')?.trim();
-  const patchId = rawPatchId ? Number(rawPatchId) : undefined;
+  const optionId = url.searchParams.get('optionId')?.trim() || '';
+  const rawPatchId = url.searchParams.get('patchId')?.trim() || '';
+  const patchId = rawPatchId ? Number(rawPatchId) : 0;
+  if (!optionId || !Number.isInteger(patchId) || patchId <= 0) {
+    throw new ApiError(400, 'bad_request', '导出修订提示词必须显式提供合法的 optionId 与正整数 patchId');
+  }
   const mode = url.searchParams.get('mode') === 'session' ? 'session' : 'headless';
 
   const runtime = await host.runtimeFor(url);
@@ -504,7 +525,7 @@ export async function handleFixPrompt(host: ApiHost, _req: ApiRequest, res: ApiR
     base || null,
     view?.source,
     undefined,
-    optionId || patchId !== undefined ? { ...(optionId ? { optionId } : {}), ...(patchId !== undefined ? { patchId } : {}) } : undefined,
+    { optionId, patchId },
   );
   if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
   if (!detail.option || !detail.patchEntry) {
