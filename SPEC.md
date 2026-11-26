@@ -27,7 +27,7 @@
 ### 0.1 已确认的七项核心设计
 
 1. **总调度委派与完整 Harness**：总调度 Agent 委派独立的初审、逐条复核与方案 Agent。各阶段运行于完整 Harness Agent Loop（即 Agent 自主调用读文件、搜索、Shell 等工具进行多轮调查，而不是由 Host 提前裁剪代码拼进提示词的单轮问答）；Host 负责运行调度、校验与收尾。外部专业执行器（如 Codex、Claude Code）可用时优先调起以增强跨模型分工；不可用时优雅降级为当前 Harness 自身的独立子代理，不作为硬阻断。
-2. **共享工作目录与「软引导 + Host 强还原」策略**：整轮审查共用项目真实工作目录（cwd），期间不并行开展其他独立工作。审查与人审前提案阶段不通过沙箱硬拦截项目写入，而是通过提示词明确指引优先在 `.ai-review/` 和 `.tmp/` 工作、仅在必要取证时修改项目其他位置；Host 在阶段结束与收尾前强制核验执行停止、归档取证材料并彻底还原全部非 `.ai-review/` 改动。
+2. **共享工作目录与「软引导 + Host 强还原」策略**：整轮审查共用项目真实工作目录（cwd），期间不并行开展其他独立工作。审查与人审前提案阶段不通过沙箱硬拦截项目写入，而是通过提示词明确指引优先在 `.ai-review/` 和 `.tmp/` 工作、仅在必要取证时修改项目其他位置；Agent 负责在退出前将有效取证材料写入 `evidence/`，Host 在每个子阶段交接及整轮收尾前强制核验执行停止、校验已归档证据并彻底还原全部非 `.ai-review/` 改动与清空 `.tmp/`。
 3. **审查交付与不应用原则**：每个已确认问题必须提供修复建议；可收敛修复的明确问题推荐并生成置信度最高的 **1–2 个互斥完整补丁**，审查阶段不应用补丁验证修复效果；重大改动交付可直接交给外部执行人的完整文字方案（含步骤、利弊、推荐理由与验收条件）。
 4. **唯一问题记录与不可变补丁账本**：每个问题拥有跨轮稳定的 `finding_id` 与目录 `YYYY-MM/<slug>/`，由唯一一份 `review.md` 承载全部事实与历史。补丁在同目录递增编号（`001.patch`、`002.patch`…）且永不覆盖或删除；方案身份（`option_id`）、当前补丁与记录版本（`record_revision`）彼此独立。每轮 `audit.md` 仅作问题索引与覆盖记录。
 5. **人审后的获批修复与辅助应用**：人类显式选定方案与补丁并批准后，优先程序性应用（严格应用 → 确定性三方合并）。程序受阻时允许唤起修复 Agent 辅助；获批辅助与分支合并阶段**不额外限制 Harness 权限（允许本地编辑、分支合并及必要时的 `push`）**。保持获批方案（经 Agent 结构化声明 + Host 物理拓扑硬护栏核验）则继续门禁并落地；实质改变方案则还原并生成新版本补丁重新人审。
@@ -219,6 +219,7 @@ flowchart TD
 - **文本编码**：所有编排文件（YAML/Markdown）使用 UTF-8、LF、末尾保留单个换行；编排文本不使用 Tab，YAML 不使用锚点（`&`）或别名（`*`）。读取层对 BOM 与 CRLF 做归一化。
 - **补丁保真**：`.patch` 载荷及其中的业务文件内容必须原字节忠实保留，不受“无 Tab”或换行规范化约束。
 - **路径规则**：所有路径均为仓库相对正斜杠路径，禁止绝对路径、反斜杠、`..` 穿越与符号链接逃逸。
+- **非规范残留目录处理**：队列扫描仅识别 `reviewers.yml`、`YYYY-MM/<slug>/` 与 `audits/<audit_id>/`；若仓库中存在非规范目录或开发期遗留文件（如 `.ai-review/findings/`），读模型在 `errors` 中输出诊断提示用户手动清理，不参与共享流程且不阻断合法问题。
 
 ### 3.2 `reviewers.yml`
 
@@ -293,7 +294,7 @@ rejection, commit_message
 | `approval` | Approval \| null | 当前处于 `approved` 时必填非空，其他状态为 `null`。 |
 | `approval_history` | Approval[] | 既往关闭周期的历史批准快照，默认 `[]`。已 `approved` 问题因新代码证据重开时，必须将原 `approval` 追加至此数组后再清空 `approval: null`。 |
 | `rejection` | Rejection \| null | 当前处于 `rejected`（`accept_as_is`）时必填非空，其他状态为 `null`；历史拒绝理由同时永久留存于 `decisions[]`。 |
-| `commit_message` | string \| null | 当 `options` 非空及批准前必填非空多行字符串，且首行必须与 `title` 完全一致；纯文字零补丁问题可为 `null`。 |
+| `commit_message` | string \| null | 当 `options` 非空及批准前必填非空多行字符串，且首行必须与 `title` 完全一致；纯文字零补丁问题可为 `null`（若填写非 `null` 字符串，仍须非空且首行等于 `title`）。 |
 
 > **时间戳解析规范**：所有时间戳必须含时区（`Z` 或 `±HH:MM`）。解析器接受 YAML 裸日期时间对象并统一规范化为 UTC `Z`；所有比较、排序、过滤按时间戳瞬时值执行，禁止按字符串字典序比较。
 
@@ -696,9 +697,9 @@ Host 在收尾时必须 upsert 上述 `<!-- ai-review:audit-verification -->` �
 | `awaiting_verification` | 后续独立复核确认问题仍存在（`verdict: confirmed`） | `human_takeover` | 追加 `observations[]` |
 | `awaiting_verification` | 后续审查未覆盖或证据不足（`verdict: unverified`） | `awaiting_verification` | 保持待核验 |
 | 处于 `defer` 暂停态的开放问题 | 人工显式 `resume_review`（非空理由） | **保持 `defer` 前原状态** | 仅解除延期暂停（`repair_failed` 仍为 `repair_failed`，不可借此洗白为 `pending`） |
-| `rejected` / 未延期的 `human_takeover` | 人工显式 `resume_review`（非空理由） | `pending` 或 `repair_failed` | 清空 `rejection: null`（保留 `decisions[]`）。若为纯文字或至少存在一个未失败的当前方案 `current_patch` → 迁为 `pending`；若全部当前方案补丁均已被封禁 → 迁为 `repair_failed` |
+| `rejected` / `human_takeover` | 人工显式 `resume_review`（非空理由） | `pending` 或 `repair_failed` | 清空 `rejection: null`（保留 `decisions[]`）。若为纯文字或至少存在一个未失败的当前方案 `current_patch` → 迁为 `pending`；若全部当前方案补丁均已被封禁 → 迁为 `repair_failed` |
 | 未延期的 `repair_failed` | 人工显式 `resume_review`（非空理由，**仅当存在另一未失败方案的 `current_patch` 时合法**） | `pending` | 仅用于双方案问题中改选另一未失败方案审批；原失败补丁仍保持永久封禁。单方案或双方案均已失败时返回 409 `conflict` |
-| `approved` / `resolved` | 后续正常审查发现实质新代码证据再次确认同一问题 | `pending`（沿原记录重开） | 若原状态为 `approved`，将 `approval` 移入 `approval_history[]` 后置 `approval: null`；重开后若为 `repair` 须产出新编号补丁，否则置 `options: []`（不得保留已合入旧补丁作为活跃 `current_patch`） |
+| `approved` / `resolved` | 后续正常审查发现实质新代码证据再次确认同一问题 | `pending`（沿原记录重开） | 若原状态为 `approved`，将 `approval` 移入 `approval_history[]` 后置 `approval: null`；**原 `options[]` 整体清空（含往期未合入的旧备选方案），原 `option_id` 视为已退役不得复用**，旧补丁账本仍永久保留；重开后若为 `repair` 须使用新 `option_id` 并产出新编号补丁 |
 
 **评论状态允许边界**：仅 `pending`、`changes_requested`、`repair_failed` 允许调用 `/comments` 与 `/comments/batch`；其余 5 种状态返回 409 `conflict`（`human_takeover` 期间使用 `add_repair_hint` 记录线索）。
 
@@ -863,7 +864,7 @@ Host 必须按**任务意图与批准上下文**绑定 Runner，严禁混用提�
          - **严重违例或输出不可解析**（触犯禁止路径、篡改 `.ai-review/`、空 diff、残留冲突或非合法 JSON）→ 还原工作区与 `.ai-review/` 至 `preHead`，**不生成新补丁**，返回 `ABORTED / RUNNER_FAILED`。
        - **情况 B（Agent 执行了本地 `commit` / `merge` 使 `postHead !== preHead`，或执行了 `push` 使 `remoteAdvanced == true`）**：
          - 先校验拓扑完整性：`preHead` 必须是 `postHead` 的祖先（禁止改写历史）且无未完成 merge/rebase 态。
-         - 计算净业务修改集合 `netChangedPaths`：纯线性提交取 `diff(preHead..postState)` 全部变更路径；分支合并则定位引入的已知上游父提交 `mergedParent`，仅统计 `postState(f) !== mergedParent(f)` 的文件（自动排除纯继承自上游合并分支的无关文件，精准捕获本方案净改动）。要求 `netChangedPaths` 非空且 `⊆ approvedPatchPaths`、`.ai-review/` 零改动、无禁止路径。
+         - 计算净业务修改集合 `netChangedPaths`：纯线性提交取 `diff(preHead..postState)` 全部变更路径；若 `preHead..postHead` 含分支合并，定位所有引入的已知上游非第一父提交 `mergedParent`（必须为可追溯的既有分支/远端提交）及其公共祖先 `mergeBase = merge-base(preHead, mergedParent)`，**仅排除两类无冲突纯继承文件**：① 纯继承自本地分支 `preHead`（`postState(f) === preHead(f)` 且 `mergedParent(f) === mergeBase(f)`）；② 纯继承自上游分支 `mergedParent`（`postState(f) === mergedParent(f)` 且 `preHead(f) === mergeBase(f)`）——其余全部相对任一父提交有变化的文件均计入 `netChangedPaths`（既不误杀本地领先提交或上游合并的无关文件，又能精确捕获 Mode C 趁合并对无关文件的任何改动或回退）。要求 `netChangedPaths` 非空且 `⊆ approvedPatchPaths`、`.ai-review/` 零改动、无禁止路径。
          - **B-本地（未 `push`：`remoteAdvanced == false`）**：硬护栏全过则记录 `postHead` 树哈希与工作区快照进入步骤 8；若触发 `material_change`（先导出补丁再回滚）或严重违例，通过 `git reset --hard preHead` 安全撤回全部本地 commit/merge 并按情况 A 分流。
          - **B-已推送（已 `push`：`remoteAdvanced == true`）**：硬护栏全过则记录已推送业务提交 `P = postHead` 进入步骤 8；若触发 `material_change`、护栏违例或输出异常，**绝不强推覆盖远端**，立即保留现场并返回 `RECOVERY_REQUIRED / REMOTE_PUSH_UNREVERTIBLE`（`detail` 写明已推哈希、远端分支与失败原因）。
    - 对实际待交付业务内容记录存在性、内容哈希与文件模式快照（情况 B 同时记录 `postHead` 树哈希）。
@@ -874,10 +875,10 @@ Host 必须按**任务意图与批准上下文**绑定 Runner，严禁混用提�
 9. **门禁后二次防篡改核验**：重读共享事实与 guard、复检 §4.6 重复；重算业务快照（及情况 B 的 `HEAD` 树哈希）确认与步骤 7 完全一致且无额外业务文件改动（防止门禁或外部进程夹带未审代码）；不一致返回 `ABORTED / BUSINESS_CONTENT_CHANGED` 并在未推送前提下还原。
 10. **落地提交**：写入 `approval`、成功 `repair_attempts`（`result: applied, restored: false`），推进 `record_revision` 与 `updated_at`，置 `status = approved`，**保留全部补丁**：
     - **常规与情况 A**：与已核验业务内容执行单次原子提交；
-    - **情况 B-本地（未 `push`）**：若 Mode C 产生单次本地 commit/merge，Host 使用 `git commit --amend` 将更新后的 `review.md` 并入该提交（完整保留合并父关系），维持严格单次原子提交；多本地提交时同原则收敛并核验树哈希一致；
-    - **情况 B-已推送（已 `push`）**：严禁 `amend` 已推送历史；在已推业务提交 `P` 之上创建关闭提交 `C_meta` 仅包含更新后的 `review.md`，并在 `approval` 中写入 `business_commit: <P>`（核验 `P` 是 `C_meta` 祖先且触及 `approvedPatchPaths`）。
-    - 提交失败分类：确认撞车且无提交 → 还原重试（耗尽返回 `ABORTED / MAX_RETRIES_EXCEEDED`）；确认非撞车失败且无提交 → 撤销暂存并还原返回 `ABORTED / COMMIT_FAILED`（还原不完整进 `RECOVERY_REQUIRED`）；超时/断连/结果不明 → 探测 VCS 核对内容（存在则 `COMMITTED`，证明不存在才还原返 `COMMIT_FAILED`，仍不明返 `RECOVERY_REQUIRED / COMMIT_OUTCOME_UNKNOWN`）。
-11. **返回结果**：立即返回本次业务提交的 `commitRevision`；后续读取按 §4.4 派生，绝不产生仅用于回填哈希的第二次提交。
+    - **情况 B-本地（未 `push`）**：若 Mode C 产生单次本地 commit/merge，Host 使用 `git commit --amend` 将更新后的 `review.md` 并入该提交（完整保留合并父关系）；若产生多个本地提交，Host 使用 `git commit-tree`（以 `preHead` 及引入的合并父提交作为父列表、以已验证的 `postHead` 业务树合入更新后的 `review.md` 作为最终树）构造单一原子提交并推进目标引用，严格维持单次原子提交与树哈希一致；
+    - **情况 B-已推送（已 `push`）**：严禁 `amend` 已推送历史；在已推业务提交 `P` 之上创建关闭提交 `C_meta` 仅包含更新后的 `review.md`，并在 `approval` 中写入 `business_commit: <P>`（核验 `P` 是 `C_meta` 祖先且触及 `approvedPatchPaths`）。纯本地模式下遵循 §5.2 不自动 `push`，在结果 `message` 中提示用户推送 `C_meta`；中央托管模式下由 Host 按 §9.7 推送 `C_meta` 并核验 `delivered`。
+    - 提交失败分类：确认撞车且无提交 → 还原重试（常规与情况 A/B-本地还原到 `preHead`；**情况 B-已推送仅还原 `C_meta` 的元数据改动回到 `P` 上重试，绝不回滚至 `preHead`**；耗尽返回 `ABORTED / MAX_RETRIES_EXCEEDED`）；确认非撞车失败且无提交 → 撤销暂存并还原返回 `ABORTED / COMMIT_FAILED`（还原不完整进 `RECOVERY_REQUIRED`）；超时/断连/结果不明 → 探测 VCS 核对内容（存在则 `COMMITTED`，证明不存在才还原返 `COMMIT_FAILED`，仍不明返 `RECOVERY_REQUIRED / COMMIT_OUTCOME_UNKNOWN`）。
+11. **返回结果**：立即返回本次**业务提交**的 `commitRevision`（情况 B-已推送返回已推送业务提交 `P`，与 §4.4 派生结果一致）；后续读取按 §4.4 派生，绝不产生仅用于回填哈希的第二次提交。
 
 #### `ApprovalOutcome`（仅属于 `approve` Job 的封闭判别联合）
 
@@ -905,7 +906,7 @@ Job 正常返回任一 `ApprovalOutcome` 时外层 `job.status` 为 `succeeded`�
 - 启动前强制检查 `reviewers.yml` 与有效 `default_owner`（§3.2）；不合法直接返回 412 `not_configured` 阻断。
 - 总调度通过 Host 受租约约束的阶段工具（DSH 工具绑定审查会话；进程/外部 Agent 通过本轮专属回环入口 + 一次性凭据，结束即撤销）依次派发初审、逐条独立复核、方案与发布；缺失阶段能力须报错，严禁退化为源码裁剪拼接或跳过独立复核。
 - **跨轮方案身份前置校验**：派发方案任务时，Host 必须显式注入既有 `finding_id`、已有 `option_id` 列表、各自 `current_patch` 及共享 guard；产物登记前即核验 `option_id` 归属、编号与 2 方案名额上限，畸形产物立即拒绝并允许修正重交，绝不把无效产物留到发布失败或占死名额。
-- **阶段结束与收尾核验**：确认总调度及全部子进程/子任务树退出 → 核验起始基线未漂移 → 核验取证已归档至 `evidence/`、所有非 `.ai-review/` 业务改动已彻底还原且 `.tmp/` 已清空 → 对所有新/更新问题的 `review.md` 与新补丁执行完整性、哈希与只读预检 → 对既有共享问题做 CAS 比对（比较并交换，确认写入前原文未被并发改动）并严格递增 `updated_at` → 原子提交本轮 `audit.md`、归档证据及合法问题更新。
+- **子阶段交接与整轮收尾核验**：每个独立子阶段（初审 / 复核 / 方案）结束后、进入下一阶段前，Host 即确认该阶段进程退出并还原全部非 `.ai-review/` 业务改动与清空 `.tmp/`，防止前序临时取证日志污染后续独立复核 Agent。整轮收尾前：确认总调度及全部子进程/子任务树退出 → 核验起始基线未漂移 → 核验 Agent 已写入 `evidence/`（问题级 `YYYY-MM/<slug>/evidence/` 或本轮级 `audits/<audit_id>/evidence/`）的归档证据合法，并再次确认非 `.ai-review/` 零残留且 `.tmp/` 已清空（Host 不代猜搬运 `.tmp/` 内的未归档文件）→ 对所有新/更新问题的 `review.md` 与新补丁执行完整性、哈希与只读预检 → 对既有共享问题做 CAS 比对（比较并交换，确认写入前原文未被并发改动）并严格递增 `updated_at` → 原子提交本轮 `audit.md`、归档证据及合法问题更新。
 - 已有问题更新保留原路径与当前共享 `owner`；部分产物校验失败时合法产物可提交但 `audit` Job 必须返回 `VALIDATION_FAILED` 附逐项错误，不得伪报全部成功。审查总预算上限 3 小时。
 - **交互式外部提案收尾（`POST /candidate/finalize`）**：仅用于已有问题的 Mode B 外部/会话提案修订，必须携带原共享 guard、以及**修订前的原 `optionId` 与原 `patchId`**（用于并发与目标核对）；核验恰好追加一个新补丁、仅推进所选方案、保留历史且业务工作区干净后，仅提交 `review.md` 与该新补丁；失败保留本地产物供排查，绝不作为获批辅助收尾入口。
 
@@ -1168,7 +1169,7 @@ Host 进程崩溃不承诺自动还原未知工作区；重启后若检测到未
 
 ### 9.8 HTTP 与持久化
 
-- 用户 API 前缀 `/api/v1`，节点 API 前缀 `/node-api/v1`，分别鉴权。写操作受理与详情回源返回 202；版本、绑定、幂等或占用冲突返回 409；明确区分节点不可用与资源不存在。
+- 用户 API 前缀 `/api/v1`（项目级业务端点统一挂载于 `/api/v1/projects/:projectId/...`，请求参数、业务语义与 `ConcurrencyGuard` 均与 §6 本地 API 对齐，写操作另带项目上下文与幂等键），节点 API 前缀 `/node-api/v1`，分别鉴权。写操作受理与详情回源返回 202；版本、绑定、幂等或占用冲突返回 409；明确区分节点不可用与资源不存在。
 - 中央数据库持久化账号、节点、项目、绑定、指令、事件与查询视图，附件存受控数据目录；节点运行时记录、租约与未确认回报存于本机 `DSH_HOME` 独立目录，严禁进入被审仓库。
 
 ### 9.9 正式发布后的双向滚动升级
@@ -1262,7 +1263,7 @@ Host 进程崩溃不承诺自动还原未知工作区；重启后若检测到未
 | **I15** | 档案纯索引 | `audit.md` 的 `issues[]` 仅保存唯一、真实存在且证据落在 `scope` 内的目录 ID（`YYYY-MM/<slug>`），正文仅含唯一插件核验块，不复制可编辑问题/方案/处置事实。 |
 | **I16** | 状态机与补丁封禁 | `changes_requested` 不由未解决评论派生；`repair_failed` 新增评论保持 `repair_failed`；`/resume` 仅适用于 `changes_requested`；凡曾 `verification_failed` 的 `(option_id, patch_id)` 永久禁止再次作为批准目标；单方案或全失败的 `repair_failed` 禁止 `resume_review` 退回 `pending`。 |
 | **I17** | 审查完整 Harness | 总调度委派独立初审、复核与方案 Agent，共享真实项目 cwd 与完整 Harness 能力（不预裁源码、不以最终 JSON 上限拒绝工具事件流）；外部执行器不可用时可降级至本 Harness 独立子代理。 |
-| **I18** | 审查不应用与强还原 | 审查及 Mode A/B 提案（含 `/fix-session`）不应用待审补丁验证修复、不执行修复门禁、不建修复基线副本、不执行 VCS 历史写操作；遵循「软引导 + Host 强还原」策略（优先写 `.ai-review/` 与 `.tmp/`），Host 在结束与收尾前核验进程停止、归档取证并彻底还原全部非 `.ai-review/` 改动。 |
+| **I18** | 审查不应用与强还原 | 审查及 Mode A/B 提案（含 `/fix-session`）不应用待审补丁验证修复、不执行修复门禁、不建修复基线副本、不执行 VCS 历史写操作；遵循「软引导 + Host 强还原」策略（优先写 `.ai-review/` 与 `.tmp/`），由 Agent 将有效证据归档至 `evidence/`，Host 在每个子阶段交接及整轮收尾前核验进程停止、校验证据并彻底还原全部非 `.ai-review/` 改动且清空 `.tmp/`。 |
 | **I19** | 获批修复与辅助边界 | 批准优先程序应用（严格 → 确定性三方合并）；受阻唤起 Mode C Agent 时不额外设限（允许分支合并及必要 `push`），仅禁止修改 `.ai-review/`。`equivalent` 须过 Host 物理拓扑硬护栏（净修改 `⊆ approvedPatchPaths`）方可直接门禁关闭；否则未推送先导出新补丁再还原重审、严重违例直接还原报错、已推送进 `RECOVERY_REQUIRED`。成功直接关闭不加复核；门禁失败还原记 `repair_failed` 且零 Agent 重试。 |
 | **I20** | 外部处理证据关闭 | `human_takeover`、`add_repair_hint`、`external_completed`（`awaiting_verification`）与后续独立代码证据确认的 `resolved` 严格分离；反馈完成本身绝不关闭问题。 |
 
@@ -1295,7 +1296,7 @@ node --test --test-concurrency=1 --test-reporter=tap tests/*.test.mjs
 | `AC-ROUTING-01` | `paths`/`tags` AND 逻辑、无效规则、去重、决胜与 `default_owner` 全覆盖；缺失 `reviewers.yml` 在审查启动前前置阻断并可通过 `/reviewers/init` 初始化；已有问题保留当前共享 Owner。 |
 | `AC-MEMORY-01` | 规范 JSON 数组指纹 + UTF-8 字节序无拼接碰撞；窗口内同指纹三处拦截；自问题合法恢复不被自身旧 `accept_as_is` 永久阻断，其他问题同指纹仍拦截；`related_symbols` 合并当前方案补丁提取并按 `category` 分组注入。 |
 | `AC-HARNESS-READ` | 总调度真实委派独立阶段 Agent，共用真实 cwd 读取未预注入的大文件尾部，跨 `scope` 读取与搜索可用，工具事件流不被最终 JSON 上限截断；外部执行器不可用时优雅降级至本 Harness 独立子代理。 |
-| `AC-AUDIT-NO-APPLY` | 审查与 Mode A/B（含 `/fix-session`）不应用待审补丁、不建修复副本、不跑修复门禁；遵循「软引导 + Host 强还原」策略，允许必要取证写入但 Host 强制归档并还原全部非 `.ai-review/` 改动；进程未停或还原不明阻断提交并保留租约。 |
+| `AC-AUDIT-NO-APPLY` | 审查与 Mode A/B（含 `/fix-session`）不应用待审补丁、不建修复副本、不跑修复门禁；遵循「软引导 + Host 强还原」策略，允许必要取证写入，由 Agent 归档至 `evidence/`、Host 在子阶段交接与收尾前强制还原全部非 `.ai-review/` 改动并清空 `.tmp/`；进程未停或还原不明阻断提交并保留租约。 |
 | `AC-ISSUE-RECORD` | A/B/Deferred 每问题唯一 `review.md`、跨轮跨月沿原目录，`audit.md` 纯索引；重复 `finding_id` 拒绝；`module` 正确写入不硬编码；Deferred `depends_on` 完整读写往返。 |
 | `AC-ISSUE-OPTIONS` | `A001/B002` 后修订 `A003`，记录版本独立、B 不变、原字节 `sha256` 校验；派发携带身份且登记前拦截缺失/错误 `optionId`，修正重交不占死 2 个方案名额。 |
 | `AC-ISSUE-APPROVAL` | 显式绑定 `optionId`、`patchId`、`record_revision` 与 `sha256`；拒绝过时选择、已封禁失败补丁与纯文字申请程序应用；批准关闭后同问题其他备选不可再批。 |

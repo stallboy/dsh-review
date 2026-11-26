@@ -118,7 +118,7 @@
 - **会导致什么坑**：本项目从未正式发布，历史兼容分支让代码和提示词极度臃肿，且不断把新逻辑带偏进旧分支；双套乐观锁字段（`guard` vs `expectedFindingVersion`）也让前端与 AI 极易传混。
 - **按新版 SPEC 应该怎么改**：
   - 唯一正式格式统一为 **`schema_version: 1`**（`review.md` 与 `audit.md` 一致），读端遇任何非 `1` 版本直接报错拒绝；
-  - 彻底移除 v1/v2 解析、写入、迁移代码、外置 `findings/<id>.yml`、`verify_gate_on_audit_finalize` / `audit_smoke_commands` 及所有废弃端点；
+  - 彻底移除 v1/v2 解析、写入、迁移代码、外置 `findings/<id>.yml`、`verify_gate_on_audit_finalize` / `audit_smoke_commands` 及所有废弃端点（磁盘残留非规范目录如 `.ai-review/findings/` 仅在读模型 `errors` 中提示人工清理）；
   - 彻底移除 `findingVersion` / `expectedFindingVersion`，让 `/finding/decision` 与 `/approve` 及全部 11 个问题写端点统一使用 `{id, ...guard}`；
   - 清理历史 v1/v2 夹具，把有效行为测试全面切换到 `schema_version: 1`。
 - **怎么验证改对了**：全仓仅存一套 `schema_version: 1` 模型；非 `1` 版本文件被拒绝；废弃端点不可达；全部 11 个问题写端点统一使用 `{id, ...guard}`；类型、构建与全量测试通过。
@@ -167,7 +167,7 @@
   - [issue-publication.ts](../packages/dsh-plugin/src/host/issue-publication.ts) 第 84 行把所有新建问题的 `module` 硬编码为 `'audit'`、标题硬拼 `'audit: '` 前缀；
   - 尚未落地 `issue_kind`、`approval_history`、`repair_attempts[].id` 及纯文字零补丁允许 `commit_message: null`。
 - **会导致什么坑**：延迟问题写完就丢依赖；按 `module` 分组的负向记忆和筛选全部失灵；已关闭问题重开时历史批准无处存放；纯文字问题被迫凑假提交信息。
-- **按新版 SPEC 应该怎么改**：在 `review.md` 正式读写 `issue_kind`、`depends_on`、`approval_history: []`、`repair_attempts[].id` 与可空 `commit_message`，并按真实模块名写入 `module` 与 `title` 前缀（不再硬编码 `'audit'`）；已 `approved` 问题重开时清空旧活跃补丁。
+- **按新版 SPEC 应该怎么改**：在 `review.md` 正式读写 `issue_kind`、`depends_on`、`approval_history: []`、`repair_attempts[].id` 与可空 `commit_message`，并按真实模块名写入 `module` 与 `title` 前缀（不再硬编码 `'audit'`）；已 `approved` 问题重开时整体清空原 `options[]`（含旧备选方案），原 `option_id` 视为退役不得复用。
 - **怎么验证改对了**：新建 A 类、B 类纯文字、Deferred 与重开问题，核对 Frontmatter 往返、`module` 准确性、`depends_on` 与 `approval_history` 保留。
 
 ---
