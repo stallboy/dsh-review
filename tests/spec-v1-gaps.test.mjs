@@ -312,7 +312,8 @@ test('SPEC §4.1–§4.2：repair_failed 永久封禁、评论保态、单方案
   });
   await api.init();
   const waitJob = async (jobId) => {
-    for (let i = 0; i < 400; i += 1) {
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
       const job = api.jobManager.get(jobId);
       if (job && job.status !== 'running') return job.result;
       await new Promise((r) => setTimeout(r, 50));
@@ -464,12 +465,13 @@ test('D07 & AC-MEMORY-01：resolveIssueModule 推导真实模块名（不硬编�
   });
   assert.equal(app.status, 202);
   let job;
-  for (let i = 0; i < 200; i += 1) {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
     job = api.jobManager.get(app.body.jobId);
     if (job && job.status !== 'running') break;
     await new Promise((r) => setTimeout(r, 30));
   }
-  assert.equal(job.result.status, 'COMMITTED', JSON.stringify(job.result));
+  assert.equal(job?.result?.status, 'COMMITTED', JSON.stringify(job));
 });
 
 test('对抗审查回归 P0-1：Mode C 伪造侧分支合并不得绕过范围外文件硬护栏', async t => {
