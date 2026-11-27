@@ -1,14 +1,14 @@
-import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, open, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { isRepoRelativePath } from './invariants.js';
+import { runProcessBuffer } from './shell.js';
 import type { PatchEntry } from '@dsh-review/protocol';
 import type { VcsAdapter } from './vcs.js';
 
-const MAX_INPUT_BYTES = 4 * 1024 * 1024;
-const COMMAND_TIMEOUT_MS = 30_000;
+const MAX_INPUT_BYTES = 8 * 1024 * 1024;
+const COMMAND_TIMEOUT_MS = 180_000;
 const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 export const SVN_APPROVAL_SOURCE = 'svn_approval_source';
@@ -29,13 +29,19 @@ export type ApprovalMergeSnapshots =
     | { status: 'ready'; files: ApprovalMergeFile[] }
     | { status: 'unsupported' | 'unavailable' | 'mismatch'; detail: string };
 
-function command(exe: string, args: string[], cwd: string, signal?: AbortSignal): Promise<Buffer> {
-    return new Promise((resolve, reject) => {
-        execFile(exe, args, {
-            cwd, windowsHide: true, timeout: COMMAND_TIMEOUT_MS, maxBuffer: MAX_INPUT_BYTES,
-            encoding: 'buffer', ...(signal ? { signal } : {}),
-        }, (error, stdout) => error ? reject(error) : resolve(stdout));
+async function command(exe: string, args: string[], cwd: string, signal?: AbortSignal): Promise<Buffer> {
+    const result = await runProcessBuffer(exe, args, {
+        cwd,
+        timeoutMs: COMMAND_TIMEOUT_MS,
+        maxBytes: MAX_INPUT_BYTES,
+        ...(signal ? { signal } : {}),
     });
+    if (result.overflowed) throw new Error(`命令输出超出大小上限：${exe}`);
+    if (result.timedOut) throw new Error(`命令执行超时：${exe}`);
+    if (result.aborted) throw new Error(`命令已取消：${exe}`);
+    if (result.error) throw new Error(result.error);
+    if (result.code !== 0) throw new Error(result.stderr.trim() || `${exe} 退出码 ${String(result.code)}`);
+    return result.stdout;
 }
 
 async function svn(root: string, args: string[], signal?: AbortSignal): Promise<Buffer> {
@@ -171,9 +177,12 @@ export async function readApprovalMergeSnapshots(
                 const beforeTarget = file + '@' + sourceRevision;
                 const workingTarget = file + '@';
                 const current = svnInfo((await svn(root, ['info', '--xml', '--', workingTarget], signal)).toString('utf8'));
-                const expectedPath = decodeURI(binding!.relativeUrl).replace(/\/$/, '') + '/' + file;
+                const decodeRel = (value: string): string => {
+                    try { return decodeURIComponent(value); } catch { return value; }
+                };
+                const expectedPath = decodeRel(binding!.relativeUrl).replace(/\/$/, '') + '/' + file;
                 if (!current || current.kind !== 'file' || current.uuid !== binding!.uuid
-                    || decodeURI(current.relativeUrl) !== expectedPath) {
+                    || decodeRel(current.relativeUrl) !== expectedPath) {
                     return { status: 'mismatch', detail: 'SVN 目标文件位于不同的仓库路径' };
                 }
                 const sourceInfo = svnInfo((await svn(root, ['info', '--xml', '-r', sourceRevision, '--', beforeTarget], signal)).toString('utf8'));

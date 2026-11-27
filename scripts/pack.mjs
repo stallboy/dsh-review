@@ -1,9 +1,23 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CENTRAL_ARCHIVE_PATH, CENTRAL_VERSION_PATH, servePreviewMarket } from './preview-market.mjs';
+
+function samePath(left, right) {
+    const norm = (value) => {
+        const resolved = path.resolve(value);
+        try {
+            const real = realpathSync.native ? realpathSync.native(resolved) : realpathSync(resolved);
+            return process.platform === 'win32' ? real.toLowerCase() : real;
+        } catch {
+            return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+        }
+    };
+    return norm(left) === norm(right);
+}
 
 const workspaces = {
     plugin: { name: 'dsh-code-review', directory: 'packages/dsh-plugin' },
@@ -49,11 +63,14 @@ async function stageWorkspace(workspace, stage) {
         await cp(path.join(source, entry), path.join(stage, entry), { recursive: true });
     }
     const modules = path.join(root, 'node_modules');
-    const dependencies = npm(['ls', '--all', '--omit=dev', '--parseable', '--workspace', workspace.name], root).trim().split(/\r?\n/);
+    const dependencies = npm(['ls', '--all', '--omit=dev', '--parseable', '--workspace', workspace.name], root).trim().split(/\r?\n/).filter(Boolean);
     for (const directory of dependencies) {
-        if (directory === root || directory === path.join(modules, workspace.name)) continue;
+        if (samePath(directory, root) || samePath(directory, path.join(modules, workspace.name))) continue;
+        const resolvedDir = process.platform === 'win32' ? path.resolve(directory).toLowerCase() : path.resolve(directory);
+        const resolvedModules = process.platform === 'win32' ? path.resolve(modules).toLowerCase() : path.resolve(modules);
+        const relativeLower = path.relative(resolvedModules, resolvedDir);
+        if (relativeLower.startsWith('..') || path.isAbsolute(relativeLower)) throw new Error(`运行依赖不在 node_modules 内：${directory}`);
         const relative = path.relative(modules, directory);
-        if (relative.startsWith('..') || path.isAbsolute(relative)) throw new Error(`运行依赖不在 node_modules 内：${directory}`);
         await cp(directory, path.join(stage, 'node_modules', relative), { recursive: true, dereference: true });
     }
     return manifest;

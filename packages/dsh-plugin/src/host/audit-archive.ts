@@ -1,7 +1,9 @@
 /** 本轮审查档案 audit.md 读写与不变量校验（唯一契约 schema_version: 1，纯索引模型）。 */
 
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { auditFiles } from './audit-files.js';
+import { ISO_TIMESTAMP_PATTERN } from './frontmatter.js';
 import { isRepoRelativePath, MONTH_PATTERN, parseTime, SLUG_PATTERN } from './invariants.js';
 import { isAiReviewPath } from './patch.js';
 import { dump, readMarkdownFrontmatter } from './yaml.js';
@@ -92,12 +94,21 @@ export function parseAuditMarkdown(text: string): { meta: AuditFrontmatter; body
   const auditId = doc['audit_id'];
   if (typeof auditId !== 'string' || !auditId.trim()) throw new Error('audit_id 必须是非空字符串');
   const rawCreated = doc['created_at'];
-  const createdAt = rawCreated instanceof Date
-    ? rawCreated.toISOString()
-    : typeof rawCreated === 'string'
-      ? rawCreated.trim()
-      : '';
-  if (!createdAt) throw new Error('created_at 必须是非空 ISO-8601 字符串');
+  let createdAt = '';
+  if (rawCreated instanceof Date) {
+    if (!Number.isFinite(rawCreated.getTime())) throw new Error('created_at 不是有效日期时间');
+    createdAt = rawCreated.toISOString();
+  } else if (typeof rawCreated === 'string') {
+    const trimmed = rawCreated.trim();
+    if (!trimmed || !ISO_TIMESTAMP_PATTERN.test(trimmed)) {
+      throw new Error('created_at 必须是含时区的 ISO-8601 时间戳');
+    }
+    const parsedMs = Date.parse(trimmed);
+    if (!Number.isFinite(parsedMs)) throw new Error('created_at 不是有效时间戳');
+    createdAt = new Date(parsedMs).toISOString();
+  } else {
+    throw new Error('created_at 必须是非空 ISO-8601 字符串');
+  }
   const baseRevision = doc['base_revision'];
   if (typeof baseRevision !== 'string' || !baseRevision.trim()) throw new Error('base_revision 必须是非空字符串');
   const scope = doc['scope'];
@@ -116,14 +127,11 @@ export function parseAuditMarkdown(text: string): { meta: AuditFrontmatter; body
   for (const [k, v] of Object.entries(doc)) {
     if (!KNOWN_AUDIT_KEYS.has(k)) extra[k] = v;
   }
-  const parsedMs = Date.parse(createdAt);
-  const normalizedCreated = Number.isFinite(parsedMs) ? new Date(parsedMs).toISOString() : createdAt;
-
   return {
     meta: {
       schemaVersion: 1,
       auditId,
-      createdAt: normalizedCreated,
+      createdAt,
       baseRevision,
       scope,
       trigger,
@@ -204,7 +212,7 @@ export function auditInvariantErrors(meta: AuditFrontmatter, dirName: string, bo
 export function upsertAuditVerificationBlock(text: string, block: string): string {
   const pattern = new RegExp(`${REPORT_MARKER_START}[\\s\\S]*?${REPORT_MARKER_END}`);
   const wrapped = `${REPORT_MARKER_START}\n${block.trim()}\n${REPORT_MARKER_END}`;
-  if (pattern.test(text)) return text.replace(pattern, wrapped);
+  if (pattern.test(text)) return text.replace(pattern, () => wrapped);
   return `${text.replace(/\s+$/, '')}\n\n${wrapped}\n`;
 }
 
@@ -268,9 +276,8 @@ export class AuditArchive {
   async writeAudit(meta: AuditFrontmatter, body: string): Promise<void> {
     const errors = auditInvariantErrors(meta, meta.auditId, body);
     if (errors.length > 0) throw new Error(`审查档案不变量失败：${errors.join('；')}`);
-    const dir = path.join(this.auditsDir, meta.auditId);
-    await mkdir(dir, { recursive: true });
-    await writeFile(path.join(dir, 'audit.md'), serializeAuditMarkdown(meta, body), 'utf8');
+    const relPath = `.ai-review/audits/${meta.auditId}/audit.md`;
+    await auditFiles(this.repoRoot, { op: 'write', paths: [relPath], text: serializeAuditMarkdown(meta, body) });
   }
 
   async list(source?: AuditSource): Promise<AuditRecord[]> {

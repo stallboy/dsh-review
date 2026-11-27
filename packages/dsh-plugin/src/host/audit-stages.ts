@@ -6,8 +6,9 @@
  * - I18：每个子阶段交接前强制还原所有非 .ai-review/ 业务改动并清空 .tmp/。
  */
 
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { rm } from 'node:fs/promises';
 import path from 'node:path';
+import { auditFiles } from './audit-files.js';
 import { AuditArchive, scopeCovers, type AuditTrigger } from './audit-archive.js';
 import { loadAuditHistory, queryAuditHistoryItems, type AuditHistorySnapshot } from './audit-history.js';
 import { renderAuditTemplate, type AuditStage } from './audit-prompts.js';
@@ -613,7 +614,8 @@ export class AuditStageSession {
       return { ok: false, stage, taskId, reason: 'invalid_output', diagnostic: `patchPath 必须位于本阶段产物目录内：${patchPathRel}` };
     }
 
-    const patchBytes = await readFile(patchAbs).catch(() => null);
+    const patchRead = await auditFiles(this.options.root, { op: 'read', paths: [patchPathRel] }).catch(() => null);
+    const patchBytes = patchRead?.bytes ?? null;
     if (!patchBytes || patchBytes.length === 0) {
       await rm(artifactAbs, { recursive: true, force: true }).catch(() => undefined);
       return { ok: false, stage, taskId, reason: 'invalid_output', diagnostic: '补丁文件不存在或为空' };
@@ -834,6 +836,3 @@ export class AuditStageSession {
     };
   }
 }
-
-void mkdir;
-void writeFile;

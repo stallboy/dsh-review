@@ -1,8 +1,22 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { AppSettings, RunnerType, VcsType } from './types.js';
+
+/** 原子写入 JSON 文件（UUID 临时文件防同毫秒碰撞，失败自动清理）。 */
+export async function atomicWriteJson(filePath: string, value: unknown): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const temp = `${filePath}.${String(process.pid)}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    await rename(temp, filePath);
+  } catch (error) {
+    await rm(temp, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
 
 export const DEFAULT_STAGE_EXECUTORS = ['codex', 'claude'] as const;
 
@@ -48,10 +62,12 @@ export function normalizeStageExecutors(value: unknown): string[] {
 }
 
 function clampTimeout(value: unknown): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 1000) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
     return DEFAULT_SETTINGS.gateTimeoutMs;
   }
-  return Math.min(Math.trunc(value), 3_600_000);
+  const truncated = Math.trunc(value);
+  if (truncated <= 1000) return DEFAULT_SETTINGS.gateTimeoutMs;
+  return Math.min(truncated, 3_600_000);
 }
 
 function normalizeVcs(value: unknown): 'auto' | VcsType {
@@ -98,11 +114,7 @@ export async function loadSettings(): Promise<AppSettings> {
 export async function saveSettings(partial: Partial<AppSettings>): Promise<AppSettings> {
   const current = await loadSettings();
   const next = normalizeSettings({ ...current, ...partial });
-  const file = settingsFilePath();
-  await mkdir(path.dirname(file), { recursive: true });
-  const temp = `${file}.${String(process.pid)}.${String(Date.now())}.tmp`;
-  await writeFile(temp, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
-  await rename(temp, file);
+  await atomicWriteJson(settingsFilePath(), next);
   return next;
 }
 

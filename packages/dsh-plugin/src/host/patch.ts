@@ -1,9 +1,14 @@
 import type { InterRevisionDiff, PatchFileStat, PatchStats } from './types.js';
 
 export function isRepoRelativePath(value: string): boolean {
-    if (!value || value.includes('\\') || value.includes('..') || value.startsWith('/') || value.endsWith('/')) return false;
-    if (value.includes('./')) return false;
-    return true;
+  if (!value || value.includes('\\') || value.startsWith('/') || value.endsWith('/')) return false;
+  if (/[\r\n\0]/.test(value)) return false;
+  if (/^[A-Za-z]:/.test(value)) return false;
+  const segments = value.split('/');
+  for (const segment of segments) {
+    if (segment.length === 0 || segment === '.' || segment === '..') return false;
+  }
+  return true;
 }
 
 export interface ParsedPatch {
@@ -90,9 +95,27 @@ function diffHeaderPaths(value: string): { oldPath: string; newPath: string } | 
   if (!rest.startsWith('a/')) return null;
   const same = splitSamePath(rest);
   if (same !== null) return { oldPath: same, newPath: same };
+  const quotedNew = rest.indexOf(' "b/');
+  if (quotedNew > 0) {
+    const second = readQuotedToken(rest, quotedNew + 1);
+    if (second) {
+      return { oldPath: headerPath(rest.slice(0, quotedNew)), newPath: headerPath(second.token) };
+    }
+  }
   const boundary = rest.indexOf(' b/');
   if (boundary <= 0) return null;
   return { oldPath: headerPath(rest.slice(0, boundary)), newPath: headerPath(rest.slice(boundary + 1)) };
+}
+
+function parseHunkHeader(line: string): { oldStart: number; oldCount: number; newStart: number; newCount: number } | null {
+  const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+  if (!match) return null;
+  return {
+    oldStart: Number(match[1] ?? 0),
+    oldCount: match[2] === undefined ? 1 : Number(match[2]),
+    newStart: Number(match[3] ?? 0),
+    newCount: match[4] === undefined ? 1 : Number(match[4]),
+  };
 }
 
 export function parsePatch(text: string): ParsedPatch {
@@ -102,7 +125,10 @@ export function parsePatch(text: string): ParsedPatch {
   let current: PatchFileStat | null = null;
   let binary = false;
   let inHunk = false;
+  let oldRemaining = 0;
+  let newRemaining = 0;
   let inBinaryPayload = false;
+  let inSvnPropertyBlock = false;
   const noteTouched = (filePath: string | null): void => {
     if (filePath !== null && filePath.length > 0 && filePath !== '/dev/null') touched.add(filePath);
   };
@@ -113,7 +139,10 @@ export function parsePatch(text: string): ParsedPatch {
     const diffHeader = /^diff --git (.+)$/.exec(line);
     if (diffHeader) {
       inHunk = false;
+      oldRemaining = 0;
+      newRemaining = 0;
       inBinaryPayload = false;
+      inSvnPropertyBlock = false;
       const paths = diffHeaderPaths(diffHeader[1] ?? '');
       if (!paths) continue;
       noteTouched(paths.oldPath);
@@ -126,24 +155,69 @@ export function parsePatch(text: string): ParsedPatch {
     const indexHeader = /^Index: (.+)$/.exec(line);
     if (indexHeader) {
       inHunk = false;
+      oldRemaining = 0;
+      newRemaining = 0;
+      inSvnPropertyBlock = false;
       const filePath = headerPath(indexHeader[1] ?? '');
       noteTouched(filePath);
       current = entries.get(filePath) ?? { path: filePath, additions: 0, deletions: 0, binary: false };
       entries.set(filePath, current);
       continue;
     }
-    if (line.startsWith('@@')) {
-      inHunk = true;
+    const hunkHeader = parseHunkHeader(line);
+    if (hunkHeader) {
+      inSvnPropertyBlock = false;
+      oldRemaining = hunkHeader.oldCount;
+      newRemaining = hunkHeader.newCount;
+      inHunk = oldRemaining > 0 || newRemaining > 0;
       continue;
     }
-    // 变更内容本身能产生以 --- 或 +++ 开头的行，hunk 内不能把它识别为文件头。
+    // 变更内容本身能产生以 --- 或 +++ 开头的行；仅在当前 hunk 剩余行数内消费，避免多文件纯 Unified Diff 逃逸。
     if (inHunk) {
+      if (line.startsWith('\\')) {
+        continue;
+      }
       if (line.startsWith('+')) {
         if (current) current.additions += 1;
+        if (newRemaining > 0) newRemaining -= 1;
       } else if (line.startsWith('-')) {
         if (current) current.deletions += 1;
+        if (oldRemaining > 0) oldRemaining -= 1;
+      } else if (line.startsWith(' ') || line === '') {
+        if (oldRemaining > 0) oldRemaining -= 1;
+        if (newRemaining > 0) newRemaining -= 1;
+      } else {
+        // 遇到非 hunk 语法行则结束当前 hunk 并按文件头继续解析。
+        inHunk = false;
+        oldRemaining = 0;
+        newRemaining = 0;
       }
+      if (inHunk) {
+        if (oldRemaining <= 0 && newRemaining <= 0) inHunk = false;
+        continue;
+      }
+    }
+    const svnPropHeader = /^Property changes on: (.+)$/.exec(line);
+    if (svnPropHeader) {
+      inSvnPropertyBlock = true;
+      const propPath = headerPath(svnPropHeader[1] ?? '');
+      noteTouched(propPath);
       continue;
+    }
+    if (inSvnPropertyBlock) {
+      const propMutation = /^(?:Added|Modified|Deleted): (.+)$/.exec(line);
+      if (propMutation) {
+        const propName = (propMutation[1] ?? '').trim();
+        if (propName.toLowerCase() === 'svn:special') {
+          unsafeModes.add('svn:special');
+        }
+        continue;
+      }
+      if (line.startsWith('--- ') || line.startsWith('+++ ')) {
+        inSvnPropertyBlock = false;
+      } else {
+        continue;
+      }
     }
     const renameOrCopy = /^(?:rename|copy) (?:from|to) (.+)$/.exec(line);
     if (renameOrCopy) {
@@ -174,7 +248,7 @@ export function parsePatch(text: string): ParsedPatch {
     if (minusHeader) {
       const filePath = headerPath(minusHeader[1] ?? '');
       noteTouched(filePath);
-      if (filePath !== '/dev/null' && current === null) {
+      if (filePath !== '/dev/null') {
         current = entries.get(filePath) ?? { path: filePath, additions: 0, deletions: 0, binary: false };
         entries.set(filePath, current);
       }
@@ -220,15 +294,14 @@ export function extractPatchSymbols(patchTexts: readonly string[]): string[] {
   return symbols;
 }
 
-const FORBIDDEN_PATH_PREFIXES = ['.ai-review/', '.tmp/', 'node_modules/', '.git/', '.svn/'];
+const FORBIDDEN_ROOT_SEGMENTS = new Set(['.ai-review', '.tmp', 'node_modules', '.git', '.svn']);
 
-export function isAiReviewPath(path: string): boolean {
-  const normalized = path.replaceAll('\\', '/');
-  if (FORBIDDEN_PATH_PREFIXES.some((prefix) => normalized === prefix.slice(0, -1) || normalized.startsWith(prefix))) {
-    return true;
-  }
-  // Git worktree 的 .git 是指向元数据目录的文件，也须拦截。
-  const segments = normalized.split('/');
+export function isAiReviewPath(filePath: string): boolean {
+  const normalized = filePath.replaceAll('\\', '/');
+  const segments = normalized.split('/').map((segment) => segment.toLowerCase());
+  const first = segments[0] ?? '';
+  if (FORBIDDEN_ROOT_SEGMENTS.has(first)) return true;
+  // Git worktree 的 .git 与 SVN 的 .svn 在任意层级都须大小写不敏感拦截。
   return segments.includes('.git') || segments.includes('.svn');
 }
 
@@ -241,10 +314,12 @@ export function anchorFromPatch(
 ): { snippet: string; before?: string; after?: string } | undefined {
   const target = file.replaceAll('\\', '/').replace(/^\.\//, '');
   const lines = patchText.split(/\r?\n/);
-  let currentFile = '';
+  let oldFile = '';
   let inTarget = false;
   let oldNo = 0;
   let newNo = 0;
+  let oldRemaining = 0;
+  let newRemaining = 0;
   let inHunk = false;
   const rows: { oldNo: number | null; newNo: number | null; text: string }[] = [];
   const flush = (): { snippet: string; before?: string; after?: string } | undefined => {
@@ -259,48 +334,83 @@ export function anchorFromPatch(
     };
   };
   for (const raw of lines) {
-    if (raw.startsWith('diff --git ')) {
+    if (raw.startsWith('diff --git ') || raw.startsWith('Index: ')) {
       if (inTarget) {
         const found = flush();
         if (found) return found;
       }
       rows.length = 0;
+      oldFile = '';
       inTarget = false;
       inHunk = false;
+      oldRemaining = 0;
+      newRemaining = 0;
+      continue;
+    }
+    const hunk = parseHunkHeader(raw);
+    if (hunk) {
+      if (inTarget) {
+        const found = flush();
+        if (found) return found;
+      }
+      rows.length = 0;
+      oldNo = hunk.oldStart;
+      newNo = hunk.newStart;
+      oldRemaining = hunk.oldCount;
+      newRemaining = hunk.newCount;
+      inHunk = oldRemaining > 0 || newRemaining > 0;
+      continue;
+    }
+    if (inHunk) {
+      if (raw.startsWith('\\')) continue;
+      let consumed = false;
+      if (raw.startsWith(' ') || raw === '') {
+        if (inTarget) rows.push({ oldNo, newNo, text: raw.startsWith(' ') ? raw.slice(1) : '' });
+        oldNo += 1;
+        newNo += 1;
+        if (oldRemaining > 0) oldRemaining -= 1;
+        if (newRemaining > 0) newRemaining -= 1;
+        consumed = true;
+      } else if (raw.startsWith('-')) {
+        if (inTarget) rows.push({ oldNo, newNo: null, text: raw.slice(1) });
+        oldNo += 1;
+        if (oldRemaining > 0) oldRemaining -= 1;
+        consumed = true;
+      } else if (raw.startsWith('+')) {
+        if (inTarget) rows.push({ oldNo: null, newNo, text: raw.slice(1) });
+        newNo += 1;
+        if (newRemaining > 0) newRemaining -= 1;
+        consumed = true;
+      } else {
+        inHunk = false;
+        oldRemaining = 0;
+        newRemaining = 0;
+      }
+      if (consumed) {
+        if (oldRemaining <= 0 && newRemaining <= 0) inHunk = false;
+        continue;
+      }
+    }
+    if (raw.startsWith('--- ')) {
+      if (inTarget) {
+        const found = flush();
+        if (found) return found;
+      }
+      rows.length = 0;
+      const minus = headerPath(raw.slice(4));
+      oldFile = minus === '/dev/null' ? '' : minus;
+      inTarget = oldFile === target;
       continue;
     }
     if (raw.startsWith('+++ ')) {
-      const plus = raw.slice(4).trim().replace(/^b\//, '');
-      inTarget = plus === target;
+      const plus = headerPath(raw.slice(4));
+      if (plus === '/dev/null') {
+        inTarget = side === 'LEFT' && oldFile === target;
+      } else {
+        inTarget = plus === target || (side === 'LEFT' && oldFile === target);
+      }
       rows.length = 0;
-      inHunk = false;
       continue;
-    }
-    if (raw.startsWith('--- ')) {
-      currentFile = raw.startsWith('--- /dev/null') ? '' : raw.slice(4).trim().replace(/^a\//, '');
-      if (currentFile === target) inTarget = true;
-      if (inTarget && currentFile !== '' && currentFile !== target) inTarget = false;
-      continue;
-    }
-    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
-    if (hunk) {
-      oldNo = Number(hunk[1] ?? 0);
-      newNo = Number(hunk[2] ?? 0);
-      inHunk = inTarget;
-      continue;
-    }
-    if (!inHunk) continue;
-    if (raw.startsWith('\\')) continue;
-    if (raw.startsWith(' ')) {
-      rows.push({ oldNo, newNo, text: raw.slice(1) });
-      oldNo += 1;
-      newNo += 1;
-    } else if (raw.startsWith('-')) {
-      rows.push({ oldNo, newNo: null, text: raw.slice(1) });
-      oldNo += 1;
-    } else if (raw.startsWith('+')) {
-      rows.push({ oldNo: null, newNo, text: raw.slice(1) });
-      newNo += 1;
     }
   }
   return inTarget ? flush() : undefined;

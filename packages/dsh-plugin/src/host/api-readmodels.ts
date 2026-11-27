@@ -230,10 +230,14 @@ export async function handleQueue(
   const currentBase = await runtime.vcs.getCurrentBase();
   const isBehind = await businessBehindChecker(runtime);
 
-  const [{ items, errors }, counts] = await Promise.all([
-    runtime.store.list(filter, currentBase, isBehind, Date.now(), view?.source, view?.source),
-    runtime.store.listStatusCounts(ownerParam || undefined, view?.source),
-  ]);
+  const { items, errors, counts } = await runtime.store.list(
+    filter,
+    currentBase,
+    isBehind,
+    Date.now(),
+    view?.source,
+    view?.source,
+  );
 
   // 填充 approved 派生提交与分方案 patchCheck 缓存（/queue 仅读缓存并异步调度未命中项，绝不同步阻塞！）
   for (const item of items) {

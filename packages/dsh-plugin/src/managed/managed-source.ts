@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { GitHeadCandidateSource, SvnBaseCandidateSource, type SharedCandidateSource } from '../host/shared-facts.js';
-import { runProcess } from '../host/shell.js';
+import { runProcess, runProcessBuffer } from '../host/shell.js';
 
 export class SvnRevisionSource extends SvnBaseCandidateSource {
   constructor(private readonly cwd: string, private readonly url: string, private readonly revision: string) {
@@ -26,41 +25,17 @@ export class SvnRevisionSource extends SvnBaseCandidateSource {
 
   private async remoteBytes(relative: string): Promise<Buffer | null> {
     const url = `${this.url}/${relative.split('/').map(encodeURIComponent).join('/')}@${this.revision}`;
-    return new Promise((resolve, reject) => {
-      const child = spawn('svn', ['--non-interactive', 'cat', '-r', this.revision, '--', url], {
-        cwd: this.cwd,
-        windowsHide: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      const out: Buffer[] = [];
-      const err: Buffer[] = [];
-      let total = 0;
-      const limit = 16 * 1024 * 1024;
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL');
-        reject(new Error(`读取 SVN 固定版本字节超时：${relative}`));
-      }, 180000);
-      child.stdout.on('data', (chunk: Buffer) => {
-        total += chunk.length;
-        if (total <= limit) out.push(chunk);
-      });
-      child.stderr.on('data', (chunk: Buffer) => err.push(chunk));
-      child.once('error', (error) => {
-        clearTimeout(timer);
-        reject(error);
-      });
-      child.once('close', (code) => {
-        clearTimeout(timer);
-        if (code === 0) {
-          if (total > limit) reject(new Error(`SVN 文件超过大小限制：${relative}`));
-          else resolve(Buffer.concat(out));
-          return;
-        }
-        const stderr = Buffer.concat(err).toString('utf8');
-        if (/E160013|W160013|E200009/.test(stderr)) resolve(null);
-        else reject(new Error(`读取 SVN 固定版本失败：${stderr.trim()}`));
-      });
+    const result = await runProcessBuffer('svn', ['--non-interactive', 'cat', '-r', this.revision, '--', url], {
+      cwd: this.cwd,
+      timeoutMs: 180_000,
+      maxBytes: 16 * 1024 * 1024,
     });
+    if (result.timedOut) throw new Error(`读取 SVN 固定版本字节超时：${relative}`);
+    if (result.overflowed) throw new Error(`SVN 文件超过大小限制：${relative}`);
+    if (result.error) throw new Error(result.error);
+    if (result.code === 0) return result.stdout;
+    if (/E160013|W160013|E200009/.test(result.stderr)) return null;
+    throw new Error(`读取 SVN 固定版本失败：${result.stderr.trim()}`);
   }
 
   override async listCandidateDirs(): Promise<string[]> {

@@ -148,6 +148,29 @@ export function reviewFixture(slug, overrides = {}) {
     '无。',
   ];
 
+  let decisionsValue = base.decisions;
+  if (overrides.decisions === undefined && base.status === 'rejected' && base.rejection && base.rejection !== 'null') {
+    const rejText = String(base.rejection);
+    const byMatch = /rejected_by:\s*(?:"([^"]*)"|'([^']*)'|([^,\r\n}]+))/.exec(rejText);
+    const atMatch = /rejected_at:\s*(?:"([^"]*)"|'([^']*)'|([^,\r\n}]+))/.exec(rejText);
+    const reasonMatch = /reason:\s*(?:"([^"]*)"|'([^']*)'|([^,\r\n}]+))/.exec(rejText);
+    const catMatch = /category:\s*(?:"([^"]*)"|'([^']*)'|([^,\r\n}]+))/.exec(rejText);
+    const actor = (byMatch?.[1] ?? byMatch?.[2] ?? byMatch?.[3] ?? base.owner).trim();
+    const at = (atMatch?.[1] ?? atMatch?.[2] ?? atMatch?.[3] ?? base.updatedAt).trim();
+    const reason = (reasonMatch?.[1] ?? reasonMatch?.[2] ?? reasonMatch?.[3] ?? '').trim();
+    const category = (catMatch?.[1] ?? catMatch?.[2] ?? catMatch?.[3] ?? '').trim();
+    if (actor && at && reason) {
+      decisionsValue = [
+        '',
+        '  - action: accept_as_is',
+        `    actor: ${JSON.stringify(actor)}`,
+        `    at: ${JSON.stringify(at)}`,
+        `    reason: ${JSON.stringify(reason)}`,
+        ...(category ? [`    category: ${category}`] : []),
+      ].join('\n');
+    }
+  }
+
   return [
     '---',
     `schema_version: ${String(base.schemaVersion)}`,
@@ -170,7 +193,7 @@ export function reviewFixture(slug, overrides = {}) {
     patchesBlock,
     optionsBlock,
     `observations:${String(base.observations).startsWith('\n') ? '' : ' '}${base.observations}`,
-    `decisions:${String(base.decisions).startsWith('\n') ? '' : ' '}${base.decisions}`,
+    `decisions:${String(decisionsValue).startsWith('\n') ? '' : ' '}${decisionsValue}`,
     `repair_attempts:${String(base.repairAttempts).startsWith('\n') ? '' : ' '}${base.repairAttempts}`,
     `comments:${String(base.comments).startsWith('\n') ? '' : ' '}${base.comments}`,
     `human_decisions: ${base.humanDecisions}`,

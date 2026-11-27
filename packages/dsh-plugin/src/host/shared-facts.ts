@@ -1,8 +1,7 @@
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { FilesystemCandidateSource, type CandidateSource } from './store.js';
-import { runProcess, type ProcessResult } from './shell.js';
-import { spawn } from 'node:child_process';
+import { runProcess, runProcessBuffer, type ProcessResult } from './shell.js';
 
 function listWorktreeCandidateDirs(root: string): Promise<string[]> {
   return new FilesystemCandidateSource(root).listCandidateDirs();
@@ -21,53 +20,20 @@ async function git(root: string, args: string[]): Promise<ProcessResult> {
 
 /** 读取二进制精确字节（不做 UTF-8 解码，确保补丁 sha256 与原始字节一致）。 */
 async function gitShowBytes(root: string, spec: string): Promise<Buffer | null> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('git', ['--no-optional-locks', 'show', spec], {
-      cwd: root,
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const out: Buffer[] = [];
-    const err: Buffer[] = [];
-    let total = 0;
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill('SIGKILL');
-      reject(new Error(`读取共享字节超时：${spec}`));
-    }, VCS_TIMEOUT_MS);
-
-    child.stdout.on('data', (chunk: Buffer) => {
-      total += chunk.length;
-      if (total <= MAX_BYTES) out.push(chunk);
-    });
-    child.stderr.on('data', (chunk: Buffer) => {
-      err.push(chunk);
-    });
-    child.once('error', (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.once('close', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (code === 0) {
-        if (total > MAX_BYTES) reject(new Error(`共享文件超出大小上限：${spec}`));
-        else resolve(Buffer.concat(out));
-        return;
-      }
-      const diagnostic = Buffer.concat(err).toString('utf8').trim();
-      if (/does not exist|exists on disk, but not in|not in .*snapshot/i.test(diagnostic)) {
-        resolve(null);
-        return;
-      }
-      reject(new Error(`无法读取共享文件 ${spec}：${diagnostic}`));
-    });
+  const result = await runProcessBuffer('git', ['--no-optional-locks', 'show', spec], {
+    cwd: root,
+    timeoutMs: VCS_TIMEOUT_MS,
+    maxBytes: MAX_BYTES,
   });
+  if (result.timedOut) throw new Error(`读取共享字节超时：${spec}`);
+  if (result.overflowed) throw new Error(`共享文件超出大小上限：${spec}`);
+  if (result.error) throw new Error(result.error);
+  if (result.code === 0) return result.stdout;
+  const diagnostic = result.stderr.trim();
+  if (/does not exist|exists on disk, but not in|not in .*snapshot/i.test(diagnostic)) {
+    return null;
+  }
+  throw new Error(`无法读取共享文件 ${spec}：${diagnostic}`);
 }
 
 async function svn(root: string, args: string[]): Promise<ProcessResult> {
@@ -75,48 +41,18 @@ async function svn(root: string, args: string[]): Promise<ProcessResult> {
 }
 
 async function svnCatBytes(root: string, revision: string, url: string): Promise<Buffer | null> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('svn', ['--non-interactive', 'cat', '-r', revision, '--', `${url}@${revision}`], {
-      cwd: root,
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const out: Buffer[] = [];
-    const err: Buffer[] = [];
-    let total = 0;
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill('SIGKILL');
-      reject(new Error(`读取 SVN 共享字节超时：${url}`));
-    }, VCS_TIMEOUT_MS);
-
-    child.stdout.on('data', (chunk: Buffer) => {
-      total += chunk.length;
-      if (total <= MAX_BYTES) out.push(chunk);
-    });
-    child.stderr.on('data', (chunk: Buffer) => {
-      err.push(chunk);
-    });
-    child.once('error', (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.once('close', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (code === 0) {
-        if (total > MAX_BYTES) reject(new Error(`SVN 共享文件超出大小上限：${url}`));
-        else resolve(Buffer.concat(out));
-        return;
-      }
-      resolve(null);
-    });
+  const result = await runProcessBuffer('svn', ['--non-interactive', 'cat', '-r', revision, '--', `${url}@${revision}`], {
+    cwd: root,
+    timeoutMs: VCS_TIMEOUT_MS,
+    maxBytes: MAX_BYTES,
   });
+  if (result.timedOut) throw new Error(`读取 SVN 共享字节超时：${url}`);
+  if (result.overflowed) throw new Error(`SVN 共享文件超出大小上限：${url}`);
+  if (result.error) throw new Error(result.error);
+  if (result.code === 0) return result.stdout;
+  const diagnostic = result.stderr.trim();
+  if (/E160013|W160013|E200009|E155010/i.test(diagnostic)) return null;
+  throw new Error(`无法读取 SVN 共享文件 ${url}：${diagnostic}`);
 }
 
 export interface AuditSnapshotSource {
@@ -258,7 +194,8 @@ export class SvnBaseCandidateSource implements SharedCandidateSource {
   constructor(private readonly root: string) {}
 
   async snapshotId(): Promise<string | null> {
-    return null;
+    const snapshot = await this.sharedSnapshot();
+    return snapshot ? `${snapshot.url}@${snapshot.revision}` : null;
   }
 
   async listCandidateDirs(): Promise<string[]> {

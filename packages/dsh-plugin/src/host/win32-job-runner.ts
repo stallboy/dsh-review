@@ -27,7 +27,18 @@ try {
         try { await access(name); executable = name; break; } catch {}
     }
     if (!executable) throw new Error('无法找到进程执行文件：' + input.command);
-    child = spawnCurrentTokenJobProcess(api, { applicationName: executable, command: input.command, args: input.args,
+    const isBatch = /\.(?:cmd|bat)$/i.test(executable);
+    let spawnApp = executable;
+    let spawnCmd = input.command;
+    let spawnArgs = input.args;
+    if (isBatch) {
+        const comspec = process.env['ComSpec'] ?? process.env['COMSPEC'] ?? 'C:\\Windows\\System32\\cmd.exe';
+        spawnApp = comspec;
+        spawnCmd = comspec;
+        // 通过 cmd.exe /d /c call 包装 .cmd/.bat，避免 CreateProcessW 触发 ERROR_BAD_EXE_FORMAT 且保留引号边界。
+        spawnArgs = ['/d', '/c', 'call', executable, ...input.args];
+    }
+    child = spawnCurrentTokenJobProcess(api, { applicationName: spawnApp, command: spawnCmd, args: spawnArgs,
         cwd: input.cwd, env: Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined
             && !['NODE_CHANNEL_FD', 'NODE_CHANNEL_SERIALIZATION_MODE'].includes(entry[0]))),
         stdio: { stdin: 0, stdout: 1, stderr: 2 } });

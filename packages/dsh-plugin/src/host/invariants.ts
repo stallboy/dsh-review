@@ -175,20 +175,21 @@ export function quickReviewInvariants(input: QuickInvariantInput): string[] {
   const { month, slug, meta } = input;
   const errors: string[] = [];
 
-  // I1 & I2
   if (!MONTH_PATTERN.test(month)) errors.push(`目录月份格式非法：${month}`);
   if (!SLUG_PATTERN.test(slug)) errors.push(`问题目录 slug 必须为小写 ASCII（^[a-z0-9][a-z0-9._-]*$）：${slug}`);
   if (meta.schemaVersion !== 1) errors.push(`schema_version 必须为 1，当前为 ${String(meta.schemaVersion)}`);
   if (!FINDING_ID_PATTERN.test(meta.findingId)) errors.push(`finding_id 格式非法：${meta.findingId}`);
 
-  // title / module / audit_type / priority / status
   if (!meta.module.trim() || !/^[a-z0-9][a-z0-9._-]*$/.test(meta.module)) {
     errors.push(`module 必须是非空小写模块标志：${meta.module}`);
   }
   if (!meta.title.trim()) {
     errors.push('title 不能为空');
-  } else if (meta.module && !meta.title.startsWith(`${meta.module}: `)) {
-    errors.push(`title 必须以 "${meta.module}: " 开头`);
+  } else if (meta.module) {
+    const prefix = `${meta.module}: `;
+    if (!meta.title.startsWith(prefix) || !meta.title.slice(prefix.length).trim()) {
+      errors.push(`title 必须以 "${prefix}" 开头且包含非空标题正文`);
+    }
   }
   if (!AUDIT_TYPES.includes(meta.auditType as (typeof AUDIT_TYPES)[number])) {
     errors.push(`audit_type 非法：${meta.auditType}`);
@@ -263,15 +264,22 @@ export function quickReviewInvariants(input: QuickInvariantInput): string[] {
     patchById.set(patch.id, patch);
   });
 
-  // 收集历史批准周期全部退役的 option_id（含已批准方案及同周期未合入的旧备选方案）与 patch_id（I6）
+  // 收集历史批准周期明确退役的 option_id（避免用 baseRevision 启发式误杀同基线重开的新方案，I6）。
   const historicApprovedOptionIds = new Set(meta.approvalHistory.map((h) => h.optionId));
   const historicApprovedPatchIds = new Set(meta.approvalHistory.map((h) => h.patchId));
-  const historicBaseRevisions = new Set(meta.approvalHistory.map((h) => h.baseRevision));
   const maxHistoricPatchId = meta.approvalHistory.reduce((max, h) => Math.max(max, h.patchId), 0);
+  const maxHistoricAttemptId = meta.approvalHistory.reduce((max, h) => Math.max(max, h.repairAttemptId), 0);
+  const maxHistoricRevision = meta.approvalHistory.reduce((max, h) => Math.max(max, h.recordRevision), 0);
   if (meta.approvalHistory.length > 0) {
     for (const patch of meta.patches) {
-      if (patch.id <= maxHistoricPatchId || historicBaseRevisions.has(patch.baseRevision)) {
-        historicApprovedOptionIds.add(patch.optionId);
+      if (patch.id <= maxHistoricPatchId) historicApprovedOptionIds.add(patch.optionId);
+    }
+    for (const attempt of meta.repairAttempts) {
+      if (attempt.id <= maxHistoricAttemptId) historicApprovedOptionIds.add(attempt.optionId);
+    }
+    for (const comment of meta.comments) {
+      if (comment.optionId && comment.revision <= maxHistoricRevision) {
+        historicApprovedOptionIds.add(comment.optionId);
       }
     }
   }
@@ -338,12 +346,35 @@ export function quickReviewInvariants(input: QuickInvariantInput): string[] {
     });
   });
 
-  // decisions[]
   meta.decisions.forEach((decision, idx) => {
-    if (!decision.actor.trim()) errors.push(`decisions[${String(idx)}].actor 不能为空`);
-    parseTime(decision.at, `decisions[${String(idx)}].at`, errors);
+    const field = `decisions[${String(idx)}]`;
+    if (!decision.actor.trim()) errors.push(`${field}.actor 不能为空`);
+    parseTime(decision.at, `${field}.at`, errors);
     if (decision.action !== 'human_takeover' && !decision.reason.trim()) {
-      errors.push(`decisions[${String(idx)}]（${decision.action}）的 reason 不能为空`);
+      errors.push(`${field}（${decision.action}）的 reason 不能为空`);
+    }
+    if (decision.action !== 'defer') {
+      if (decision.reviewAfter !== undefined) errors.push(`${field}.review_after 仅允许用于 defer`);
+      if (decision.reviewWhen !== undefined) errors.push(`${field}.review_when 仅允许用于 defer`);
+    } else if (decision.reviewWhen !== undefined && !decision.reviewWhen.trim()) {
+      errors.push(`${field}.review_when 若提供则不能为空`);
+    }
+    if (decision.action !== 'accept_as_is') {
+      if (decision.category !== undefined) errors.push(`${field}.category 仅允许用于 accept_as_is`);
+      if (decision.relatedSymbols !== undefined) errors.push(`${field}.related_symbols 仅允许用于 accept_as_is`);
+    } else if (decision.relatedSymbols !== undefined) {
+      if (decision.relatedSymbols.length > 16) {
+        errors.push(`${field}.related_symbols 最多允许 16 条`);
+      }
+      const seenSymbols = new Set<string>();
+      for (const sym of decision.relatedSymbols) {
+        const trimmed = sym.trim();
+        if (!trimmed || trimmed.length > 120 || trimmed !== sym || seenSymbols.has(trimmed)) {
+          errors.push(`${field}.related_symbols 包含空值、超长或重复符号`);
+          break;
+        }
+        seenSymbols.add(trimmed);
+      }
     }
   });
 
@@ -444,8 +475,23 @@ export function quickReviewInvariants(input: QuickInvariantInput): string[] {
 
   if (meta.rejection !== null) {
     if (!meta.rejection.rejectedBy.trim()) errors.push('rejection.rejected_by 不能为空');
-    parseTime(meta.rejection.rejectedAt, 'rejection.rejected_at', errors);
+    const rejMs = parseTime(meta.rejection.rejectedAt, 'rejection.rejected_at', errors);
     if (!meta.rejection.reason.trim()) errors.push('rejection.reason 不能为空');
+    if (meta.status === 'rejected') {
+      const latestAcceptAsIs = [...meta.decisions].reverse().find((d) => d.action === 'accept_as_is');
+      if (!latestAcceptAsIs) {
+        errors.push('I8: status 为 rejected 时 decisions[] 必须包含同步的 accept_as_is 记录');
+      } else {
+        const decMs = Date.parse(latestAcceptAsIs.at);
+        if (
+          latestAcceptAsIs.actor !== meta.rejection.rejectedBy
+          || latestAcceptAsIs.reason !== meta.rejection.reason
+          || (rejMs !== null && Number.isFinite(decMs) && decMs !== rejMs)
+        ) {
+          errors.push('I8: rejection 必须与 decisions[] 中最新 accept_as_is 决定保持同步');
+        }
+      }
+    }
   }
 
   // I9: commit_message

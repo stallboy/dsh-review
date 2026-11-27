@@ -78,7 +78,7 @@ export class JobManager {
     if (this.jobs.size <= MAX_JOBS) return;
     const finished = [...this.jobs.values()]
       .filter((job) => job.status !== 'running')
-      .sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+      .sort((left, right) => (left.finishedAt ?? left.startedAt).localeCompare(right.finishedAt ?? right.startedAt));
     for (const job of finished.slice(0, this.jobs.size - MAX_JOBS)) this.jobs.delete(job.id);
   }
 
@@ -86,13 +86,13 @@ export class JobManager {
     return this.jobs.get(id);
   }
 
-  /** SPEC §5.7：单调递增绝对行序号，窗口截断时提示 logResetRequired 而非丢行。 */
+  /** 单调递增绝对行序号，窗口截断时提示 logResetRequired 而非丢行。 */
   getIncremental(id: string, since?: number): JobIncrementalView | undefined {
     const job = this.jobs.get(id);
     if (!job) return undefined;
     const earliest = job.logStartOffset ?? 0;
     const total = earliest + job.log.length;
-    if (since === undefined || since < 0) {
+    if (since === undefined || !Number.isFinite(since) || since < 0) {
       return {
         job,
         log: [...job.log],

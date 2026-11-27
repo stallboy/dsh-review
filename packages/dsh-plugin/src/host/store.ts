@@ -3,10 +3,11 @@
  * 管理 .ai-review/ 下的问题记录读写、快照一致性、不变量校验、评论/接管/处置/批准落盘与 8 状态统计。
  */
 
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { auditFiles } from './audit-files.js';
 import { parseReviewMarkdown, serializeReviewMarkdown } from './frontmatter.js';
-import { fullReviewInvariants, MONTH_PATTERN, quickReviewInvariants, SLUG_PATTERN } from './invariants.js';
+import { fullReviewInvariants, MONTH_PATTERN, quickReviewInvariants, SLUG_PATTERN, validateSafeBusinessPath } from './invariants.js';
 import {
   applyIssueDecision,
   bannedOptionPatches,
@@ -49,7 +50,7 @@ export interface CandidateSource {
   listDirEntries(month: string, slug: string): Promise<string[] | null>;
   readReviewText(month: string, slug: string): Promise<string | null>;
   readPatchText(month: string, slug: string, patchName: string): Promise<string | null>;
-  readPatchBytes?(month: string, slug: string, patchName: string): Promise<Buffer | null>;
+  readPatchBytes(month: string, slug: string, patchName: string): Promise<Buffer | null>;
   hasLocalChanges?(month: string, slug: string): Promise<boolean>;
   localChangedCandidateIds?(): Promise<Set<string> | null>;
   listLocalOnlyDirs?(): Promise<string[]>;
@@ -125,6 +126,8 @@ export class FilesystemCandidateSource implements CandidateSource {
 
 export interface CandidateDetail {
   candidate: ReviewCandidate;
+  /** 仅当问题目录相对共享快照存在未提交改动时为 true（AC-READ-01）。 */
+  local?: boolean;
   selection?: IssueSelection;
   option?: RepairOption;
   patchEntry?: PatchEntry;
@@ -141,6 +144,7 @@ export interface CandidateDetail {
 export interface ListResult {
   items: CandidateSummary[];
   errors: string[];
+  counts: Record<ReviewStatus, number>;
 }
 
 export interface AddCommentInput {
@@ -254,11 +258,7 @@ export class ReviewStore {
 
   async readPatchBytes(month: string, slug: string, patchName: string, source?: CandidateSource): Promise<Buffer | null> {
     const activeSource = source ?? this.fsSource();
-    if (activeSource.readPatchBytes) {
-      return activeSource.readPatchBytes(month, slug, patchName);
-    }
-    const text = await activeSource.readPatchText(month, slug, patchName);
-    return text === null ? null : Buffer.from(text, 'utf8');
+    return activeSource.readPatchBytes(month, slug, patchName);
   }
 
   async readPatch(id: string, name: string, source?: CandidateSource): Promise<string> {
@@ -464,6 +464,14 @@ export class ReviewStore {
       .filter((entry) => !entry.local && !entry.candidate.parseError)
       .map((entry) => entry.candidate);
 
+    const counts = emptyStatusCounts();
+    for (const candidate of cleanSharedCandidates) {
+      if (filter.owner && candidate.meta.owner !== filter.owner) continue;
+      if (REVIEW_STATUSES.includes(candidate.meta.status)) {
+        counts[candidate.meta.status] += 1;
+      }
+    }
+
     const summaries: CandidateSummary[] = [];
 
     const toSummary = async (
@@ -602,7 +610,7 @@ export class ReviewStore {
       return rMs - lMs || left.id.localeCompare(right.id);
     });
 
-    return { items: filtered, errors };
+    return { items: filtered, errors, counts };
   }
 
   /** SPEC §6.2：counts 必须包含全部 8 个规范状态键，仅统计非 local 共享问题。 */
@@ -623,6 +631,38 @@ export class ReviewStore {
     return counts;
   }
 
+  /** AC-READ-01 / I1：校验目标问题记录处于合法、非 local 且全仓 finding_id 唯一的共享可写状态。 */
+  assertWritableSharedCandidate(detail: CandidateDetail): void {
+    if (detail.candidate.parseError) {
+      throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
+    }
+    if (detail.local) {
+      throw new ApiError(409, 'conflict', `问题目录 ${detail.candidate.id} 存在未提交本地改动（local 视图），请先提交或清理本地改动后再写入`);
+    }
+  }
+
+  /** 检测目标问题是否与仓库中其他共享问题共用同一 finding_id（I1）。 */
+  private async findDuplicateFindingIdDirs(id: string, findingId: string, activeSource: CandidateSource): Promise<string[]> {
+    if (!findingId) return [];
+    const allIds = await this.listCandidateIds(activeSource);
+    const localChanged = activeSource.localChangedCandidateIds ? await activeSource.localChangedCandidateIds() : null;
+    const duplicates: string[] = [];
+    for (const otherId of allIds) {
+      if (otherId === id) continue;
+      if (localChanged?.has(otherId)) continue;
+      const [otherMonth, otherSlug] = otherId.split('/');
+      if (!otherMonth || !otherSlug) continue;
+      if (!localChanged && activeSource.hasLocalChanges && await activeSource.hasLocalChanges(otherMonth, otherSlug).catch(() => true)) {
+        continue;
+      }
+      const other = await this.loadCandidate(otherMonth, otherSlug, activeSource);
+      if (other && !other.parseError && other.meta.findingId === findingId) {
+        duplicates.push(otherId);
+      }
+    }
+    return duplicates;
+  }
+
   async get(
     id: string,
     currentBase: string | null,
@@ -631,11 +671,23 @@ export class ReviewStore {
     requestedSelection?: { optionId?: string; patchId?: number },
   ): Promise<CandidateDetail> {
     const [month, slug] = splitAndValidateId(id);
-    const activeSource = source ?? this.fsSource();
+    const activeSource: CandidateSource = source ?? this.fsSource();
     const candidate = await this.loadCandidate(month, slug, activeSource);
     if (!candidate) throw new ApiError(404, 'not_found', `问题不存在：${id}`);
 
+    const isLocal = activeSource.hasLocalChanges
+      ? await activeSource.hasLocalChanges(month, slug).catch(() => true)
+      : false;
     const validation = await this.validateFullCandidate(candidate, activeSource);
+    if (!candidate.parseError && !isLocal && candidate.meta.findingId && source) {
+      const dupDirs = await this.findDuplicateFindingIdDirs(candidate.id, candidate.meta.findingId, activeSource);
+      if (dupDirs.length > 0) {
+        validation.push(`重复的 finding_id（${candidate.meta.findingId}）同时存在于：${dupDirs.join(', ')}`);
+      }
+    }
+    if (!candidate.parseError && validation.length > 0) {
+      candidate.parseError = validation.join('；');
+    }
     const meta = candidate.meta;
 
     let selection: IssueSelection | undefined;
@@ -681,6 +733,7 @@ export class ReviewStore {
 
     return {
       candidate,
+      ...(isLocal ? { local: true } : {}),
       ...(selection ? { selection } : {}),
       ...(option ? { option } : {}),
       ...(patchEntry ? { patchEntry } : {}),
@@ -720,9 +773,12 @@ export class ReviewStore {
     const updatedMeta: ReviewFrontmatter = touch
       ? { ...candidate.meta, updatedAt: nextUpdatedAt(candidate.meta.updatedAt, now) }
       : candidate.meta;
-    await mkdir(candidate.dirPath, { recursive: true });
     const serialized = serializeReviewMarkdown(updatedMeta, candidate.body);
-    await writeFile(candidate.reviewPath, serialized, 'utf8');
+    await auditFiles(this.repoRoot, {
+      op: 'write',
+      paths: [`.ai-review/${candidate.id}/review.md`],
+      text: serialized,
+    });
     const parsed = parseReviewMarkdown(serialized);
     return {
       ...candidate,
@@ -775,6 +831,10 @@ export class ReviewStore {
     if (!file || !Number.isInteger(line) || line < 1) {
       throw new ApiError(422, 'bad_request', '行内评论必须提供非空 file 与正整数 line');
     }
+    const pathErrors: string[] = [];
+    if (!validateSafeBusinessPath(file, 'file', pathErrors)) {
+      throw new ApiError(422, 'bad_request', pathErrors[0] ?? `行内评论 file 路径非法：${file}`);
+    }
     if (input.side !== 'LEFT' && input.side !== 'RIGHT') {
       throw new ApiError(422, 'bad_request', '行内评论必须提供合法 side（LEFT 或 RIGHT）');
     }
@@ -813,7 +873,7 @@ export class ReviewStore {
   ): Promise<{ candidate: ReviewCandidate; added: ReviewComment[] }> {
     if (inputs.length === 0) throw new ApiError(400, 'bad_request', '评论列表不能为空');
     const detail = await this.get(id, null, source);
-    if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
+    this.assertWritableSharedCandidate(detail);
     const meta = detail.candidate.meta;
     this.checkGuard(meta, guard);
 
@@ -864,7 +924,7 @@ export class ReviewStore {
     now: Date = new Date(),
   ): Promise<ReviewCandidate> {
     const detail = await this.get(id, null, source);
-    if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
+    this.assertWritableSharedCandidate(detail);
     const meta = detail.candidate.meta;
     this.checkGuard(meta, guard);
     if (!COMMENTABLE_STATUSES.has(meta.status)) {
@@ -893,7 +953,7 @@ export class ReviewStore {
     const owner = newOwner.trim();
     if (!owner) throw new ApiError(422, 'bad_request', '目标负责人不能为空');
     const detail = await this.get(id, null, source);
-    if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
+    this.assertWritableSharedCandidate(detail);
     const meta = detail.candidate.meta;
     this.checkGuard(meta, guard);
     if (meta.status === 'approved' || meta.status === 'resolved') {
@@ -917,7 +977,7 @@ export class ReviewStore {
     now: Date = new Date(),
   ): Promise<ReviewCandidate> {
     const detail = await this.get(id, null, source);
-    if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
+    this.assertWritableSharedCandidate(detail);
     const meta = detail.candidate.meta;
     this.checkGuard(meta, guard);
     if (meta.status !== 'changes_requested') {
@@ -942,7 +1002,7 @@ export class ReviewStore {
     now: Date = new Date(),
   ): Promise<ReviewCandidate> {
     const detail = await this.get(id, null, source);
-    if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
+    this.assertWritableSharedCandidate(detail);
     const meta = detail.candidate.meta;
     this.checkGuard(meta, guard);
 
