@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { readFile, writeFile, mkdir, rm, stat } from 'node:fs/promises';
+import { readFile, realpath, writeFile, mkdir, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { AuditStageSession } from '../packages/dsh-plugin/dist/host/audit-stages.js';
 import { GitAdapter } from '../packages/dsh-plugin/dist/host/vcs.js';
@@ -168,7 +168,7 @@ test('UTF-8 JSON 跨输出 chunk 保留中文原文', async () => {
 
 for (const mode of ['normal', 'timeout', 'cancel']) test(`原生进程组结束并清理遗留子进程：${mode}`, async () => {
     const controller = new AbortController();
-    // POSIX 上 detached:true 会调用 setsid() 脱离父进程组，与 SPEC §8.2 的 POSIX 进程组契约相悖；Windows 下需 detached:true 保持在 Job Object 内越过父退出
+    // POSIX 上 detached:true 会调用 setsid() 脱离父进程组，与 SPEC §5.3 的 POSIX 进程组契约相悖；Windows 下需 detached:true 保持在 Job Object 内越过父退出
     const program = `const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',detached:process.platform==='win32'});console.log(child.pid);child.unref();${mode === 'normal' ? '' : 'setInterval(()=>{},1000);'}`;
     let timer;
     if (mode === 'cancel') timer = setTimeout(() => controller.abort(), 1500);
@@ -209,13 +209,15 @@ test('I18 / D02：patch 阶段未复核拒绝、畸形 optionId 不占死 2 方�
             };
         }
         const patchFile = path.join(input.artifactDir, `opt-${callIdx}.patch`);
+        const realRoot = await realpath(fixture.root);
+        const patchRel = path.relative(realRoot, patchFile);
         if (callIdx === 2) {
             // 第二次返回越界路径（.ai-review/reviewers.yml）
             await writeFile(patchFile, 'diff --git a/.ai-review/reviewers.yml b/.ai-review/reviewers.yml\n--- a/.ai-review/reviewers.yml\n+++ b/.ai-review/reviewers.yml\n@@ -1 +1 @@\n-default_owner: tester\n+default_owner: evil\n', 'utf8');
             return {
                 ok: true,
                 executorUsed: 'codex',
-                output: { status: 'ready', optionId: 'opt-evil', patchPath: path.relative(fixture.root, patchFile), summary: 'evil', tradeoff: 't', confidence: 80, humanDecisions: [], reason: 'r' },
+                output: { status: 'ready', optionId: 'opt-evil', patchPath: patchRel, summary: 'evil', tradeoff: 't', confidence: 80, humanDecisions: [], reason: 'r' },
             };
         }
         // 第三、四次返回两个合法互斥方案，仍能成功占满 2 方案名额
@@ -228,7 +230,7 @@ test('I18 / D02：patch 阶段未复核拒绝、畸形 optionId 不占死 2 方�
                 status: 'ready',
                 optionId: callIdx === 3 ? 'opt-a' : 'opt-b',
                 title: callIdx === 3 ? '直接修正' : '显式数值转换',
-                patchPath: path.relative(fixture.root, patchFile),
+                patchPath: patchRel,
                 summary: '修复加法',
                 tradeoff: '权衡说明',
                 confidence: 90,

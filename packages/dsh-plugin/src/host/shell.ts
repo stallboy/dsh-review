@@ -61,7 +61,8 @@ async function waitProcessGroupGone(pid: number): Promise<boolean> {
     try {
       process.kill(-pid, 0);
     } catch (error) {
-      return (error as NodeJS.ErrnoException).code === 'ESRCH';
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
+      // macOS (XNU) 在进程组仅剩尚未被 waitpid 回收的退出中/僵尸进程时可能短暂返回 EPERM，需继续等待回收直至 ESRCH。
     }
     await delay(50);
   }
