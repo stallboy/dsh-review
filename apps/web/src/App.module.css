@@ -139,6 +139,14 @@ a.projectCard:hover { text-decoration: none; border-color: #8fc4c5; }
 .loginCard small { text-align: center; font-size: 11px; }
 .diffTools { display: flex; align-items: center; gap: 8px; padding: 10px 18px; border-bottom: 1px solid #e1e6ed; }
 .diffTools small { margin-right: auto; color: #697787; }
+.diffFileTree { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 18px; background: #fafbfc; border-bottom: 1px solid #e1e6ed; font: 11px Consolas, monospace; }
+.diffFileTree a { color: #087e83; padding: 2px 6px; border-radius: 4px; background: #edf6f5; }
+.inlineCommentRow td { background: #f8fbfb; border-top: 1px solid #e1e6ed; border-bottom: 1px solid #e1e6ed; padding: 8px 16px; }
+.inlineComment { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.inlineComment p { margin: 0; white-space: pre-wrap; color: #233243; }
+.statusBar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 18px; }
+.statusChip { border: 1px solid #dce3e8; border-radius: 6px; background: #fff; color: #455665; padding: 5px 10px; font-size: 11px; cursor: pointer; }
+.statusChipActive { border-color: #087e83; background: #e7f3f1; color: #086466; font-weight: 600; }
 .diff > details > summary { padding: 14px 18px; background: #f6f8fa; border-bottom: 1px solid #e1e6ed; font: 12px Consolas, monospace; overflow-wrap: anywhere; cursor: pointer; }
 .diff > details > summary > span:first-of-type { margin-right: 14px; }
 .diff > details > summary:focus-visible { outline: 2px solid #258b62; outline-offset: -2px; }

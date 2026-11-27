@@ -257,7 +257,7 @@ test('执行器提前退出、取消或超时时，输入管道错误不会终�
   assert.match(missing.error, /ENOENT/);
 });
 
-test('D11：外部执行器名称归一化、可用性探测与优雅降级至 dsh-subagent', async () => {
+test('AC-AUDIT-03：外部执行器名称归一化、可用性探测与优雅降级至 dsh-subagent', async () => {
   assert.equal(normalizeExecutorName('codex'), 'codex');
   assert.equal(normalizeExecutorName('claude-code'), 'claude');
   assert.equal(normalizeExecutorName('claude'), 'claude');
@@ -287,4 +287,95 @@ test('D11：外部执行器名称归一化、可用性探测与优雅降级至 d
     assert.equal(degraded.executorUsed, 'dsh-subagent');
     assert.equal(degraded.degradedFrom, 'codex');
   }
+});
+
+test('AC-AUDIT-04：verify 阶段严格拒绝越权字段并仅传递白名单定位事实', async () => {
+  const { AuditStageSession } = await import('../packages/dsh-plugin/dist/host/audit-stages.js');
+  const root = await createGitFixture();
+  const baseRevision = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  let capturedVerifyPrompt = '';
+  const session = new AuditStageSession({
+    auditId: '20261127-verify-leak-check',
+    root,
+    scope: '.',
+    baseRevision,
+    trigger: 'manual',
+    owner: 'tester',
+    note: '',
+    deadlineAt: new Date(Date.now() + 3600_000).toISOString(),
+    vcs: new GitAdapter(root),
+    store: new ReviewStore(root),
+    stageExecutors: ['codex'],
+    executor: async ({ stage, prompt }) => {
+      if (stage === 'scan') {
+        return {
+          ok: true,
+          executorUsed: 'codex',
+          output: {
+            leads: [{
+              leadId: 'lead-1',
+              entry: 'add',
+              path: 'src/math.js',
+              line: 1,
+              precondition: 'a=1, b=2',
+              expected: '返回 3',
+              impact: 'SECRET_SCAN_IMPACT_DO_NOT_LEAK',
+            }],
+            coverage: ['src/math.js'],
+            limits: [],
+          },
+          logs: [],
+          durationMs: 10,
+        };
+      }
+      capturedVerifyPrompt = prompt;
+      return {
+        ok: true,
+        executorUsed: 'codex',
+        output: {
+          verdict: 'confirmed',
+          reason: 'add 实际执行了减法',
+          evidence: [{ path: 'src/math.js', line: 1, excerpt: 'a - b', reason: '操作符错误' }],
+        },
+        logs: [],
+        durationMs: 10,
+      };
+    },
+  });
+
+  const scanRes = await session.runStage('scan', 'codex', { taskScope: ['src'], scenarios: [], questions: [], constraints: [] }, new AbortController().signal);
+  assert.equal(scanRes.ok, true);
+
+  // 试图向 verify 传入非白名单字段（如 reasoning / fixSuggestion / priority）必须被拦截
+  await assert.rejects(
+    session.runStage('verify', 'codex', {
+      subjectId: 'lead-1',
+      scenario: 'add(1,2)',
+      reasoning: 'SECRET_SCAN_REASONING_DO_NOT_LEAK',
+      fixSuggestion: 'SECRET_SCAN_FIX_SUGGESTION_DO_NOT_LEAK',
+    }, new AbortController().signal),
+    /verify/,
+  );
+
+  // 试图向 verify.navigation 传入非白名单字段同样必须被拦截
+  await assert.rejects(
+    session.runStage('verify', 'codex', {
+      subjectId: 'lead-1',
+      scenario: 'add(1,2)',
+      navigation: { path: 'src/math.js', line: 1, rootCause: 'SECRET_NAV_ROOT_CAUSE_DO_NOT_LEAK' },
+    }, new AbortController().signal),
+    /navigation/,
+  );
+
+  // 仅传合法白名单字段时成功执行，且提示词中不含任何初审推理/影响字段
+  const verifyRes = await session.runStage('verify', 'codex', {
+    subjectId: 'lead-1',
+    scenario: 'add(1,2)',
+    navigation: { path: 'src/math.js', line: 1 },
+  }, new AbortController().signal);
+  assert.equal(verifyRes.ok, true, JSON.stringify(verifyRes));
+  assert.ok(capturedVerifyPrompt.includes('src/math.js:1'));
+  assert.doesNotMatch(capturedVerifyPrompt, /SECRET_SCAN_IMPACT_DO_NOT_LEAK/);
+  assert.doesNotMatch(capturedVerifyPrompt, /SECRET_SCAN_REASONING_DO_NOT_LEAK/);
+  assert.doesNotMatch(capturedVerifyPrompt, /SECRET_SCAN_FIX_SUGGESTION_DO_NOT_LEAK/);
 });

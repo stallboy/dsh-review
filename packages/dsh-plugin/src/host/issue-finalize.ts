@@ -37,7 +37,7 @@ const EMPTY_STATS: PatchStats = { files: 0, additions: 0, deletions: 0, entries:
 export interface IssueFinalizeDeps {
   store: ReviewStore;
   vcs: VcsAdapter;
-  log: (line: string) => void;
+  log?: (line: string) => void;
   candidateSource?: SharedCandidateSource;
   signal?: AbortSignal;
   scheduledBaseMatches?: () => Promise<boolean>;
@@ -106,7 +106,8 @@ export async function finalizeIssueAudit(
   deps: IssueFinalizeDeps,
   input: IssueFinalizeInput,
 ): Promise<IssueFinalizeResult> {
-  const { store, vcs, log } = deps;
+  const { store, vcs } = deps;
+  const log = deps.log ?? (() => undefined);
   const now = input.now ?? new Date();
   const warnings = [...(input.extraWarnings ?? [])];
   const dataValidation: ReviewDataFileValidation[] = [];
@@ -178,6 +179,23 @@ export async function finalizeIssueAudit(
     return recovery('SYNC_STATE_UNKNOWN', detail);
   }
   const reviewersConfig = await loadReviewers(store.repoRoot, deps.candidateSource).catch(() => null);
+  if (!reviewersConfig || !reviewersConfig.exists || !reviewersConfig.valid) {
+    const errors = reviewersConfig?.errors?.length
+      ? reviewersConfig.errors
+      : ['缺少已提交到共享快照的有效 .ai-review/reviewers.yml，禁止直接提交审查结果'];
+    dataValidation.push({ path: '.ai-review/reviewers.yml', errors });
+    return {
+      status: 'VALIDATION_FAILED',
+      commitRevision: null,
+      reportPath,
+      body: '',
+      issues: [],
+      created: [],
+      dataValidation,
+      warnings,
+      message: `共享 reviewers.yml 校验未通过：${errors.join('；')}`,
+    };
+  }
   let auditMeta: AuditFrontmatter;
   let auditBody: string;
 

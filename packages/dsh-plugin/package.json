@@ -23,7 +23,7 @@
         }
     },
     "scripts": {
-        "build": "tsc -p tsconfig.host.json && tsc -p tsconfig.client.json",
+        "build": "tsc -p tsconfig.host.json && esbuild src/client/index.ts --bundle --format=iife --target=es2022 --outfile=dist/client.js",
         "typecheck": "tsc -p tsconfig.host.json --noEmit && tsc -p tsconfig.client.json --noEmit"
     },
     "dependencies": { "@deepseek-ai/dsh-win32-process": "0.1.5-rc.3", "@dsh-review/protocol": "0.1.0", "tar": "7.5.23" },

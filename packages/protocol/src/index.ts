@@ -1,4 +1,7 @@
 export * from './review.js';
+export * from './diff.js';
+export * from './filter.js';
+import type { CandidateSummary, IssueFindingView } from './review.js';
 
 export const PROTOCOL_VERSION = 1;
 export const SCHEDULED_AUDIT_WAIT_MS = 30 * 60_000;
@@ -159,9 +162,9 @@ export interface ProjectSnapshot {
   collectedAt: string;
   currentBase: string | null;
   counts: Record<string, number>;
-  queue: JsonRecord[];
+  queue: CandidateSummary[];
   audits: AuditSummary[];
-  findings: JsonRecord[];
+  findings: IssueFindingView[];
   errors: string[];
   artifacts?: { hash: string; size: number }[];
 }
@@ -316,7 +319,7 @@ export function validateSnapshot(value: unknown): ProjectSnapshot {
     collectedAt,
     currentBase: input.currentBase === undefined || input.currentBase === null ? null : textValue(input.currentBase, 'currentBase', 200),
     counts: normalizedCounts,
-    queue: input.queue.map((item, index) => record(item, `queue[${index}]`)),
+    queue: input.queue.map((item, index) => record(item, `queue[${index}]`) as unknown as CandidateSummary),
     audits: input.audits.map((item, index) => {
       const entry = record(item, `audits[${index}]`);
       const issues = Array.isArray(entry.issues) ? entry.issues.map((v, i) => textValue(v, `audits[${index}].issues[${i}]`, 200)) : [];
@@ -330,7 +333,7 @@ export function validateSnapshot(value: unknown): ProjectSnapshot {
         issues,
       };
     }),
-    findings: findings.map((item, index) => record(item, `findings[${index}]`)),
+    findings: findings.map((item, index) => record(item, `findings[${index}]`) as unknown as IssueFindingView),
     errors: input.errors.map((item, index) => textValue(item, `errors[${index}]`, 2000)),
     ...(artifacts ? { artifacts } : {}),
   };

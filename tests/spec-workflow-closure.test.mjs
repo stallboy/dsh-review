@@ -15,6 +15,7 @@ import { previewAuditPrompt } from '../packages/dsh-plugin/dist/host/auditor.js'
 import { finalizeIssueAudit } from '../packages/dsh-plugin/dist/host/issue-finalize.js';
 import { ReviewStore } from '../packages/dsh-plugin/dist/host/store.js';
 import { GitHeadCandidateSource } from '../packages/dsh-plugin/dist/host/shared-facts.js';
+import { assertAppendOnlyHistory } from '../packages/dsh-plugin/dist/host/history-guard.js';
 import { ManagedJournal } from '../packages/dsh-plugin/dist/managed/managed-journal.js';
 import { ManagedOperations } from '../packages/dsh-plugin/dist/managed/managed-operations.js';
 import { createGitFixture, runCommand } from './helpers.mjs';
@@ -644,10 +645,10 @@ test('§11/AC-PROMPT-01：系统提示词与审查提示词包含完整 9 种 au
 test('§10/AC-UI-01：Client 包含统一入口且不包含已移除的历史遗留入口', async () => {
   const source = await readFile(new URL('../packages/dsh-plugin/dist/client.js', import.meta.url), 'utf8');
   for (const endpoint of ['/audit/manual', '/audit/finalize', '/audit/release', '/fix-session', '/fix-prompt', '/finding/decision', '/reviewers/init']) {
-    assert.ok(source.includes(`'${endpoint}'`) || source.includes(`${endpoint}?`), `Client 缺少 ${endpoint}`);
+    assert.ok(source.includes(`'${endpoint}'`) || source.includes(`"${endpoint}"`) || source.includes(`${endpoint}?`), `Client 缺少 ${endpoint}`);
   }
   for (const removed of ['/manual-revision', '/archive-stale', '/reopen', '/convert', '/dismiss-finding']) {
-    assert.ok(!source.includes(`'${removed}'`), `Client 不应再调用已移除入口 ${removed}`);
+    assert.ok(!source.includes(`'${removed}'`) && !source.includes(`"${removed}"`), `Client 不应再调用已移除入口 ${removed}`);
   }
 });
 
@@ -744,4 +745,195 @@ test('§8.2：SVN 在非 SVN 目录 checkPatch 返回非 ok 状态', async () =>
   await writeFile(patchPath, patchFixture(), 'utf8');
   const checked = await svn.checkPatch(patchPath);
   assert.equal(checked.ok, false);
+});
+
+test('AC-DATA-03：数值字段不得用字符串或 null 冒充', () => {
+  assert.throws(() => parseReviewMarkdown(reviewFixture('20261111-number-type', { recordRevision: '"1"' })), /record_revision/);
+  assert.throws(() => parseReviewMarkdown(reviewFixture('20261111-schema-type', { schemaVersion: '"1"' })), /schema_version/);
+});
+
+test('I4/I14：提交前校验拒绝篡改创建时间、重排补丁历史与删除嵌套未知键', async () => {
+  const root = await createGitFixture();
+  const candidate = await commitCandidate(root, '20261111-history-guard', {
+    review: {
+      humanDecisions: '[{id: h1, question: "是否接受", future_nested: {keep: true}}]',
+      bodyLines: ['# 需人工判断项', '', '- 无'],
+    },
+  });
+  const store = new ReviewStore(root);
+  const source = await GitHeadCandidateSource.create(root);
+  const previous = (await store.get(candidate.id, null, source)).candidate;
+
+  const badCreated = structuredClone(previous);
+  badCreated.meta.recordRevision = previous.meta.recordRevision + 1;
+  badCreated.meta.updatedAt = '2026-11-02T10:00:00Z';
+  badCreated.meta.createdAt = '2020-01-01T00:00:00Z';
+  const errCreated = assertAppendOnlyHistory(previous.meta, badCreated.meta, { mode: 'mode_b', targetOptionId: 'opt-a' });
+  assert.ok(errCreated.some((e) => /created_at/.test(e)), errCreated.join('; '));
+
+  const badPatches = structuredClone(previous);
+  badPatches.meta.recordRevision = previous.meta.recordRevision + 1;
+  badPatches.meta.updatedAt = '2026-11-02T10:00:00Z';
+  badPatches.meta.patches = [
+    { id: 2, optionId: 'opt-a', patch: '002.patch', baseRevision: previous.meta.baseRevision, author: 'ai', sha256: previous.meta.patches[0].sha256 },
+    previous.meta.patches[0],
+  ];
+  const errPatches = assertAppendOnlyHistory(previous.meta, badPatches.meta, { mode: 'mode_b', targetOptionId: 'opt-a' });
+  assert.ok(errPatches.some((e) => /历史补丁/.test(e)), errPatches.join('; '));
+
+  const badExtra = structuredClone(previous);
+  badExtra.meta.recordRevision = previous.meta.recordRevision + 1;
+  badExtra.meta.updatedAt = '2026-11-02T10:00:00Z';
+  badExtra.meta.humanDecisions[0].extra = {};
+  const errExtra = assertAppendOnlyHistory(previous.meta, badExtra.meta, { mode: 'mode_b', targetOptionId: 'opt-a' });
+  assert.ok(errExtra.some((e) => /未知键/.test(e)), errExtra.join('; '));
+});
+
+test('AC-UI-01：本地详情页不含已移除的上传人工补丁、超时归档与重开按钮且含服务端筛选参数', async () => {
+  const source = await readFile(new URL('../packages/dsh-plugin/dist/client.js', import.meta.url), 'utf8');
+  for (const label of ['上传人工补丁', '超时归档', '从重开来源恢复']) {
+    assert.ok(!source.includes(label), `详情页不应再出现按钮「${label}」`);
+  }
+  for (const filter of ['statuses', 'tag', 'dir', 'text', 'createdAfter', 'createdBefore']) {
+    assert.ok(source.includes(filter), `Client 缺少服务端筛选 ${filter}`);
+  }
+  assert.match(source, /\/jobs\/\$\{encodeURIComponent\(job\.id\)\}\/cancel/);
+});
+
+test('AC-UI-01：审查跟踪 Job 运行中面板内收尾按钮不被 busy 死锁', async () => {
+  const source = await readFile(new URL('../packages/dsh-plugin/dist/client.js', import.meta.url), 'utf8');
+  assert.match(source, /disabled:\s*auditLaunching,\s*onClick:\s*\(\)\s*=>\s*onFinalizeAudit\(auditLeaseId\)/);
+});
+
+test('AC-APPROVE-01：门禁期间候选本地 review.md 被修改时必须中止批准并保留现场', async () => {
+  const root = await createGitFixture();
+  await seedReviewers(root);
+  const baseRev = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const tamperScriptDir = await mkdtemp(path.join(os.tmpdir(), 'dcr-gate-tamper-'));
+  const tamperScript = path.join(tamperScriptDir, 'tamper.mjs');
+  const reviewFile = path.join(root, '.ai-review', '2026-11', '20261111-gate-tamper-review', 'review.md');
+  await writeFile(
+    tamperScript,
+    `import { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(reviewFile)}, '\\n<!-- tampered -->\\n');\n`,
+    'utf8',
+  );
+  const candidate = await commitCandidate(root, '20261111-gate-tamper-review', {
+    review: {
+      baseRevision: JSON.stringify(baseRev),
+      gateChecks: JSON.stringify([`${JSON.stringify(process.execPath)} ${JSON.stringify(tamperScript)}`]),
+      bodyLines: ['# 需人工判断项', '', '- 无'],
+    },
+  });
+  const headBefore = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const { base } = await startApi(root);
+  const res = await post(base, '/approve', {
+    ...guardFixture(candidate.id),
+    optionId: 'opt-a',
+    patchId: 1,
+    confirmedDecisions: [],
+    waivedDecisions: [],
+  });
+  assert.equal(res.status, 202);
+  const job = await waitJob(base, (await res.json()).jobId);
+  assert.equal(job.result?.status, 'ABORTED', JSON.stringify(job.result));
+  assert.equal(job.result?.reason, 'BUSINESS_CONTENT_CHANGED', JSON.stringify(job.result));
+  assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), headBefore);
+  await rm(tamperScriptDir, { recursive: true, force: true });
+});
+
+test('AC-AUDIT-01：finalize 只读预检期间取消不得提交档案或释放租约', { timeout: 15000 }, async t => {
+  const root = await createGitFixture();
+  await seedReviewers(root);
+  const checking = Promise.withResolvers();
+  const releaseCheck = Promise.withResolvers();
+  t.after(() => releaseCheck.resolve());
+  const { api, base } = await startApi(root, {}, {
+    decorateVcs(vcs) {
+      const check = vcs.checkPatch.bind(vcs);
+      vcs.checkPatch = async (...args) => { checking.resolve(); await releaseCheck.promise; return check(...args); };
+      vcs.applyPatch = async () => { throw new Error('审查预检不得实际应用补丁'); };
+      return vcs;
+    },
+  });
+  const manual = await post(base, '/audit/manual', { targetPath: '', note: '' });
+  assert.equal(manual.status, 202);
+  const { auditId } = await manual.json();
+  await commitCandidate(root, '20261111-finalize-cancel', {
+    review: {
+      baseRevision: JSON.stringify(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim()),
+      bodyLines: ['# 需人工判断项', '', '- 无'],
+    },
+    commit: false,
+  });
+  const head = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const response = await post(base, '/audit/finalize', { auditId });
+  assert.equal(response.status, 202);
+  const jobId = (await response.json()).jobId;
+  await checking.promise;
+  await post(base, `/jobs/${jobId}/cancel`, {});
+  releaseCheck.resolve();
+  const job = await waitJob(base, jobId);
+  assert.equal(job.result?.status, 'ABORTED', JSON.stringify(job.result));
+  assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), head);
+  assert.ok(api.auditLifecycle.blockingLeaseFor(root), '取消 finalize 后租约仍须保留');
+});
+
+test('AC-AUDIT-02：手动 finalize 不得用未提交的 reviewers.yml 让候选进入共享历史', async () => {
+  const root = await createGitFixture();
+  const baseRevision = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  await mkdir(path.join(root, '.ai-review'), { recursive: true });
+  await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\n', 'utf8');
+  await commitCandidate(root, '20261111-uncommitted-reviewers', {
+    review: { baseRevision: JSON.stringify(baseRevision), bodyLines: ['# 需人工判断项', '', '- 无'] },
+    commit: false,
+  });
+  const store = new ReviewStore(root);
+  const vcs = createVcs('git', root);
+  const result = await finalizeIssueAudit(
+    { store, vcs, candidateSource: await GitHeadCandidateSource.create(root), log: () => undefined },
+    {
+      auditId: '20261111-000000-uncommitted-reviewers',
+      beforeIds: new Set(),
+      baseRevision,
+      targetPath: '',
+      trigger: 'manual',
+      runError: null,
+    },
+  );
+  assert.equal(result.status, 'VALIDATION_FAILED', JSON.stringify(result));
+  assert.equal(runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim(), baseRevision);
+});
+
+test('AC-FIX-01：独立候选成功收尾仅提交 .ai-review 改动，不改动无关业务文件', async () => {
+  const root = await createGitFixture();
+  await seedReviewers(root);
+  const baseRev = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const candidate = await commitCandidate(root, '20261111-candidate-finalize-clean', {
+    review: { baseRevision: JSON.stringify(baseRev), bodyLines: ['# 需人工判断项', '', '- 无'] },
+  });
+  const headAfterCommit = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  const { base } = await startApi(root);
+  const p2 = patchFixture({ to: 'export const add = (a, b) => (a + b);' });
+  await writeFile(path.join(candidate.dir, '002.patch'), p2, 'utf8');
+  const existing = parseReviewMarkdown(await readFile(candidate.reviewPath, 'utf8'));
+  existing.meta.recordRevision = 2;
+  existing.meta.updatedAt = '2026-11-02T10:00:00Z';
+  existing.meta.patches.push({
+    id: 2, optionId: 'opt-a', patch: '002.patch', baseRevision: headAfterCommit, author: 'ai', sha256: sha256Hex(p2),
+  });
+  existing.meta.options[0].currentPatch = 2;
+  await writeFile(candidate.reviewPath, serializeReviewMarkdown(existing.meta, existing.body), 'utf8');
+  const origMath = await readFile(path.join(root, 'src', 'math.js'), 'utf8');
+
+  const res = await post(base, '/candidate/finalize', {
+    ...guardFixture(candidate.id),
+    optionId: 'opt-a',
+    patchId: 1,
+  });
+  assert.equal(res.status, 202);
+  const job = await waitJob(base, (await res.json()).jobId);
+  assert.equal(job.result?.status, 'COMMITTED', JSON.stringify(job.result));
+  assert.equal(await readFile(path.join(root, 'src', 'math.js'), 'utf8'), origMath, '无关业务文件不得被改动');
+  const changed = runCommand('git', ['show', '--name-only', '--pretty=format:', 'HEAD'], root).stdout.trim().split(/\r?\n/).filter(Boolean);
+  assert.ok(changed.every((f) => f.startsWith('.ai-review/')), `不得混入业务文件：${changed.join(', ')}`);
 });

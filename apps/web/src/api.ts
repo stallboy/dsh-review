@@ -25,17 +25,19 @@ export interface ProjectView {
     vcsSnapshot: string | null;
     snapshot?: ProjectSnapshot;
 }
-export interface AuditScheduleSettings { enabled: boolean; startTime: string; timeZone: string }
-export interface AuditSchedule extends AuditScheduleSettings {
-    nextRunAt: string | null;
-    lastRun: { scheduledAt: string; state: CommandRecord['state'] | 'waiting' | 'skipped'; reason: string | null; commandId: string | null } | null;
+export interface AuditPlanRun {
+    scheduledAt: string;
+    state: CommandRecord['state'] | 'waiting' | 'skipped';
+    reason: string | null;
+    commandId: string | null;
 }
-export interface AuditPlan extends AuditPlanSettings, Pick<AuditSchedule, 'nextRunAt' | 'lastRun'> {
+export interface AuditPlan extends AuditPlanSettings {
     planId: string;
     version: number;
+    nextRunAt: string | null;
+    lastRun: AuditPlanRun | null;
 }
 export interface ProjectDetail extends ProjectView {
-    auditSchedule: AuditSchedule | null;
     auditPlans: AuditPlan[];
 }
 export type QueueItem = CandidateSummary & { projectId: string; projectName: string };
@@ -81,10 +83,6 @@ export async function request<T>(path: string, method = 'GET', body?: unknown, s
     const value = await response.json();
     if (!response.ok) throw new ApiError(response.status, value.error?.code ?? 'http_error', value.error?.message ?? `请求失败（${response.status}）`);
     return value;
-}
-
-export function saveAuditSchedule(projectId: string, settings: AuditScheduleSettings) {
-    return request<{ auditSchedule: AuditSchedule }>(`/projects/${projectId}/audit-schedule`, 'PUT', settings);
 }
 
 export async function saveAuditPlan(projectId: string, settings: AuditPlanSettings, plan?: Pick<AuditPlan, 'planId' | 'version'>) {

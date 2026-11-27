@@ -14,16 +14,39 @@ async function scheduledProject(t, startTime = '02:00', initialTime = '2026-11-1
     const register = (workspaces) => setup.app.inject({ method: 'POST', url: '/node-api/v1/register', headers: node.headers,
         payload: { protocolVersion: 1, instanceId: node.instanceId, pluginVersion: '0.3.0', dshVersion: '0.2.1', platform: 'linux', workspaces } });
     const workspace = { workspaceId: node.workspaceId, label: node.workspaceId, vcsType: 'git', target: 'main' };
-    const put = (payload) => setup.app.inject({ method: 'PUT', url: `${path}/audit-schedule`, headers: setup.headers, payload });
-    const configured = await put({ enabled: true, startTime, timeZone });
-    assert.equal(configured.statusCode, 200, configured.body);
+    const created = await setup.app.inject({
+        method: 'POST',
+        url: `${path}/audit-plans`,
+        headers: setup.headers,
+        payload: { name: '每日全仓审查', enabled: true, startTime, timeZone, recurrence: { kind: 'daily' }, note: '' },
+    });
+    assert.equal(created.statusCode, 201, created.body);
+    let plan = created.json().auditPlan;
+    const put = async (payload) => {
+        const res = await setup.app.inject({
+            method: 'PUT',
+            url: `${path}/audit-plans/${plan.planId}`,
+            headers: setup.headers,
+            payload: {
+                name: plan.name,
+                enabled: payload.enabled ?? plan.enabled,
+                startTime: payload.startTime ?? plan.startTime,
+                timeZone: payload.timeZone ?? plan.timeZone,
+                recurrence: payload.recurrence ?? plan.recurrence,
+                note: payload.note ?? plan.note,
+                expectedVersion: plan.version,
+            },
+        });
+        if (res.statusCode === 200) plan = res.json().auditPlan;
+        return res;
+    };
     const poll = async (app = setup.app, capable = true, supportsNotes = true) => {
         const reply = await app.inject({ method: 'POST', url: '/node-api/v1/commands/poll', headers: node.headers,
             payload: { instanceId: node.instanceId, ...(capable ? { scheduledAuditWorkspaces: [node.workspaceId], ...(supportsNotes ? { supportsScheduledAuditNotes: true } : {}) } : {}) } });
         assert.equal(reply.statusCode, 200, reply.body);
         return reply.json().commands;
     };
-    const view = async () => (await setup.app.inject({ url: path, headers: setup.headers })).json().auditSchedule;
+    const view = async () => (await setup.app.inject({ url: path, headers: setup.headers })).json().auditPlans.find(item => item.planId === plan.planId);
     const ackResponse = (commandId, caller = node, supportsNotes = false) => setup.app.inject({ method: 'POST', url: `/node-api/v1/commands/${commandId}/ack`,
         headers: caller.headers, payload: { instanceId: caller.instanceId, ...(supportsNotes ? { supportsScheduledAuditNotes: true } : {}) } });
     const ack = async commandId => (await ackResponse(commandId)).json().command;
@@ -32,7 +55,7 @@ async function scheduledProject(t, startTime = '02:00', initialTime = '2026-11-1
             events: [{ commandId, sequence: 1, type: 'result', result: { outcome: { status: 'SUCCEEDED' }, delivery: { state: 'not_required' } } }] } });
         assert.equal(reply.statusCode, 200, reply.body);
     };
-    return { ...setup, node, project, workspace, register, path, put, poll, view, ack, ackResponse, finish, clock, configured: configured.json().auditSchedule,
+    return { ...setup, node, project, workspace, register, path, put, poll, view, ack, ackResponse, finish, clock, configured: plan, planId: plan.planId,
         moveClock: timestamp => { now = new Date(timestamp); } };
 }
 
@@ -89,21 +112,16 @@ test('AC-CENTRAL-SCHEDULE-05：周末和自然日间隔跨月，未来起始日�
     assert.equal(daily.scheduledAudit.scheduledAt, '2026-11-29T16:01:00.000Z');
 });
 
-test('旧每日计划数据库迁移保留原计划和已派发轮次的幂等记录', async t => {
+test('定时计划持久化：服务重启后保留已配置计划和已派发轮次的幂等记录', async t => {
     const { app, dataDir, headers, path, poll, moveClock, clock, createCentralApp } = await scheduledProject(t);
     moveClock('2026-11-17T18:00:00Z');
     const [command] = await poll();
-    app.database.sql.exec(`CREATE TABLE IF NOT EXISTS audit_schedules (project_id TEXT PRIMARY KEY REFERENCES projects,
-        enabled INTEGER NOT NULL, start_time TEXT NOT NULL, time_zone TEXT NOT NULL, effective_at TEXT NOT NULL,
-        review_identity TEXT NOT NULL, last_missed_at TEXT);
-        INSERT OR IGNORE INTO audit_schedules SELECT project_id,enabled,start_time,time_zone,effective_at,
-            review_identity,last_missed_at FROM audit_plans; DROP TABLE audit_plans;`);
     await app.close();
     const restarted = await createCentralApp({ dataDir, clock });
     const view = (await restarted.inject({ url: path, headers })).json();
     assert.equal(view.auditPlans.length, 1);
     assert.deepEqual(view.auditPlans[0].recurrence, { kind: 'daily' });
-    assert.equal(view.auditSchedule.lastRun.commandId, command.commandId);
+    assert.equal(view.auditPlans[0].lastRun.commandId, command.commandId);
     assert.equal((await poll(restarted))[0].commandId, command.commandId);
     assert.equal(restarted.database.sql.prepare('SELECT COUNT(*) AS count FROM commands').get().count, 1);
 });
@@ -111,7 +129,7 @@ test('旧每日计划数据库迁移保留原计划和已派发轮次的幂等�
 const dailyPlan = { name: '全仓复查', enabled: true, startTime: '02:00', timeZone: 'Asia/Shanghai', recurrence: { kind: 'daily' }, note: '' };
 
 for (const phase of ['dispatched', 'accepted']) {
-    test(`AC-CENTRAL-SCHEDULE-06：双端回退隔离 ${phase} 的定时要求，升级后保留原任务`, async t => {
+    test(`AC-CENTRAL-SCHEDULE-06：服务重启后保留 ${phase} 态的定时审查与补充要求并可正常收尾`, async t => {
         const { app, headers, path: url, dataDir, clock, createCentralApp, node, put, moveClock, poll, ackResponse } = await scheduledProject(t);
         await put({ enabled: false, startTime: '02:00', timeZone: 'Asia/Shanghai' });
         const created = await app.inject({ method: 'POST', url: `${url}/audit-plans`, headers, payload: { ...dailyPlan, note: '核对权限边界' } });
@@ -128,15 +146,6 @@ for (const phase of ['dispatched', 'accepted']) {
         assert.deepEqual(status.json().pendingCommands, [{ commandId: original.commandId, projectId: original.projectId, operation: 'audit', state: phase }]);
         await app.close();
 
-        const previous = new DatabaseSync(path.join(dataDir, 'central.sqlite'));
-        try {
-            const legacyPoll = previous.prepare("SELECT command_id FROM commands WHERE node_id=? AND state IN ('queued','dispatched','accepted')").all(node.nodeId);
-            assert.deepEqual(legacyPoll, []);
-            previous.prepare("UPDATE commands SET state='accepted' WHERE command_id=? AND state IN ('queued','dispatched')").run(original.commandId);
-            const replay = previous.prepare('SELECT state FROM commands WHERE command_id=?').get(original.commandId);
-            assert.equal(replay.state, phase === 'accepted' ? 'recovery_required' : 'completed');
-        } finally { previous.close(); }
-
         const restarted = await createCentralApp({ dataDir, clock });
         const [resumed] = await poll(restarted);
         assert.equal(resumed.commandId, original.commandId);
@@ -149,38 +158,26 @@ for (const phase of ['dispatched', 'accepted']) {
         const receipt = await restarted.inject({ method: 'POST', url: '/node-api/v1/events', headers: node.headers,
             payload: { instanceId: node.instanceId, events: [{ commandId: original.commandId, sequence: 1, type: 'result', result }] } });
         assert.equal(receipt.statusCode, 200, receipt.body);
-        const legacyFinal = restarted.database.sql.prepare('SELECT state,result FROM commands WHERE command_id=?').get(original.commandId);
-        assert.equal(legacyFinal.state, 'completed');
-        assert.deepEqual(JSON.parse(legacyFinal.result), result);
+        const finalRow = restarted.database.sql.prepare('SELECT state,result FROM commands WHERE command_id=?').get(original.commandId);
+        assert.equal(finalRow.state, 'completed');
+        assert.deepEqual(JSON.parse(finalRow.result), result);
     });
 }
 
-test('AC-CENTRAL-SCHEDULE-06：双端回退期间可手动写入，重新升级不会重新竞争同项目', async t => {
-    const { app, headers, project, path: url, dataDir, clock, createCentralApp, node, moveClock, poll } = await scheduledProject(t);
-    const created = await app.inject({ method: 'POST', url: `${url}/audit-plans`, headers,
-        payload: { ...dailyPlan, startTime: '01:59', note: '核对权限边界' } });
-    assert.equal(created.statusCode, 201, created.body);
-    const [focus] = await poll();
-    assert.equal(focus.payload.note, '核对权限边界');
+test('AC-CENTRAL-SCHEDULE-06：手动任务入队并重启后仍优先于待触发的定时计划', async t => {
+    const { app, headers, path: url, dataDir, clock, createCentralApp, moveClock, poll } = await scheduledProject(t);
+    const manual = await app.inject({ method: 'POST', url: `${url}/commands`, headers,
+        payload: { idempotencyKey: 'manual-before-restart', operation: 'sync', payload: {} } });
+    assert.equal(manual.statusCode, 202, manual.body);
+    const manualId = manual.json().command.commandId;
     await app.close();
-    const previous = new DatabaseSync(path.join(dataDir, 'central.sqlite'));
-    try {
-        const manual = { ...focus, commandId: 'legacy-manual', operation: 'sync', payload: {} };
-        delete manual.scheduledAudit;
-        assert.doesNotThrow(() => previous.prepare(`INSERT INTO commands
-            (command_id,project_id,node_id,idempotency_key,request_hash,envelope,state,created_at,updated_at) VALUES (?,?,?,?,?,?,'queued',?,?)`)
-            .run(manual.commandId, project.projectId, node.nodeId, 'legacy-key', manual.requestHash, JSON.stringify(manual), focus.createdAt, focus.updatedAt));
-    } finally { previous.close(); }
     moveClock('2026-11-17T18:00:00Z');
     const restarted = await createCentralApp({ dataDir, clock });
-    const [manual] = await poll(restarted);
-    assert.equal(manual.commandId, 'legacy-manual');
-    const focused = (await restarted.inject({ url: `/api/v1/commands/${focus.commandId}`, headers })).json().command;
-    assert.equal(focused.state, 'completed');
-    assert.equal(focused.result.outcome.reason, 'SCHEDULE_ROLLBACK_CONFLICT');
+    const [polled] = await poll(restarted);
+    assert.equal(polled.commandId, manualId);
 });
 
-test('AC-CENTRAL-SCHEDULE-06：升级隔离已有在途任务，并保留回退期间收到的正常收尾', async t => {
+test('AC-CENTRAL-SCHEDULE-06：已完成的定时审查在服务重启后保持终态且不重复派发', async t => {
     const { app, headers, path: url, dataDir, clock, createCentralApp, moveClock, poll, ackResponse, node } = await scheduledProject(t);
     const created = await app.inject({ method: 'POST', url: `${url}/audit-plans`, headers,
         payload: { ...dailyPlan, startTime: '01:59', note: '核对既有任务' } });
@@ -188,23 +185,11 @@ test('AC-CENTRAL-SCHEDULE-06：升级隔离已有在途任务，并保留回退�
     const [focus] = await poll();
     assert.equal(focus.payload.note, '核对既有任务');
     assert.equal((await ackResponse(focus.commandId, node, true)).json().command.state, 'accepted');
-    await app.close();
-    const writePrevious = action => {
-        const previous = new DatabaseSync(path.join(dataDir, 'central.sqlite'));
-        try { action(previous); } finally { previous.close(); }
-    };
-    writePrevious(previous => {
-        previous.exec('ALTER TABLE commands DROP COLUMN active_state; ALTER TABLE commands DROP COLUMN protected_state');
-        previous.prepare("UPDATE commands SET state='accepted' WHERE command_id=?").run(focus.commandId);
-    });
-    const migrated = await createCentralApp({ dataDir, clock });
-    assert.equal((await poll(migrated))[0].state, 'accepted');
-    await migrated.close();
     const result = { outcome: { status: 'SUCCEEDED' }, delivery: { state: 'not_required' } };
-    writePrevious(previous => {
-        assert.equal(previous.prepare('SELECT state FROM commands WHERE command_id=?').get(focus.commandId).state, 'recovery_required');
-        previous.prepare("UPDATE commands SET state='completed',result=? WHERE command_id=?").run(JSON.stringify(result), focus.commandId);
-    });
+    const receipt = await app.inject({ method: 'POST', url: '/node-api/v1/events', headers: node.headers,
+        payload: { instanceId: node.instanceId, events: [{ commandId: focus.commandId, sequence: 1, type: 'result', result }] } });
+    assert.equal(receipt.statusCode, 200, receipt.body);
+    await app.close();
     moveClock('2026-11-17T18:01:00Z');
     const restarted = await createCentralApp({ dataDir, clock });
     const detail = (await restarted.inject({ url: `/api/v1/commands/${focus.commandId}`, headers })).json().command;
@@ -213,20 +198,19 @@ test('AC-CENTRAL-SCHEDULE-06：升级隔离已有在途任务，并保留回退�
     assert.equal((await poll(restarted)).some(command => command.commandId === focus.commandId), false);
 });
 
-test('AC-CENTRAL-SCHEDULE-06：回退期间修改每日配置，重新升级不会派发旧窗口的补充要求', async t => {
-    const { app, headers, path: url, dataDir, clock, createCentralApp, moveClock, poll } = await scheduledProject(t);
+test('AC-CENTRAL-SCHEDULE-06：修改每日计划时刻后撤回旧窗口未受理任务，重启按新时刻生效', async t => {
+    const { app, headers, path: url, planId, dataDir, clock, createCentralApp, moveClock, poll } = await scheduledProject(t);
     const { version } = (await app.inject({ url, headers })).json().auditPlans[0];
-    const updated = await app.inject({ method: 'PUT', url: `${url}/audit-plans/legacy`, headers,
+    const updated = await app.inject({ method: 'PUT', url: `${url}/audit-plans/${planId}`, headers,
         payload: { ...dailyPlan, note: '核对旧窗口', expectedVersion: version } });
     assert.equal(updated.statusCode, 200, updated.body);
     moveClock('2026-11-17T18:00:00Z');
     const [focus] = await poll();
     assert.equal(focus.payload.note, '核对旧窗口');
+    const shifted = await app.inject({ method: 'PUT', url: `${url}/audit-plans/${planId}`, headers,
+        payload: { ...dailyPlan, startTime: '03:00', note: '核对旧窗口', expectedVersion: updated.json().auditPlan.version } });
+    assert.equal(shifted.statusCode, 200, shifted.body);
     await app.close();
-    const previous = new DatabaseSync(path.join(dataDir, 'central.sqlite'));
-    try {
-        previous.prepare("UPDATE audit_schedules SET start_time='03:00'").run();
-    } finally { previous.close(); }
     const restarted = await createCentralApp({ dataDir, clock });
     assert.deepEqual(await poll(restarted), []);
     const plan = (await restarted.inject({ url, headers })).json().auditPlans[0];
@@ -235,24 +219,21 @@ test('AC-CENTRAL-SCHEDULE-06：回退期间修改每日配置，重新升级不�
     assert.equal(plan.lastRun.state, 'skipped');
 });
 
-test('定时审查兼容计划可经旧中央读取和修改，重新升级保留其他计划', async t => {
-    const { app, dataDir, project, headers, path: url, clock, createCentralApp } = await scheduledProject(t);
+test('多计划独立编辑并重启后完整保留各自配置且不含旧 auditSchedule 字段', async t => {
+    const { app, dataDir, headers, path: url, planId, clock, createCentralApp } = await scheduledProject(t);
     const created = await app.inject({ method: 'POST', url: `${url}/audit-plans`, headers,
         payload: { ...dailyPlan, name: '额外周计划', recurrence: { kind: 'weekly', weekdays: [3] } } });
     assert.equal(created.statusCode, 201, created.body);
+    const current = (await app.inject({ url, headers })).json().auditPlans.find(p => p.planId === planId);
+    const edited = await app.inject({ method: 'PUT', url: `${url}/audit-plans/${planId}`, headers,
+        payload: { ...dailyPlan, startTime: '05:30', expectedVersion: current.version } });
+    assert.equal(edited.statusCode, 200, edited.body);
     await app.close();
-    const old = new DatabaseSync(path.join(dataDir, 'central.sqlite'));
-    try {
-        const legacy = old.prepare('SELECT start_time,enabled FROM audit_schedules WHERE project_id=?').get(project.projectId);
-        assert.equal(legacy.start_time, '02:00');
-        assert.equal(legacy.enabled, 1);
-        old.prepare('UPDATE audit_schedules SET start_time=?, effective_at=? WHERE project_id=?')
-            .run('05:30', '2026-11-17T17:59:30.000Z', project.projectId);
-    } finally { old.close(); }
     const restarted = await createCentralApp({ dataDir, clock });
     const detail = (await restarted.inject({ url, headers })).json();
-    assert.equal(detail.auditSchedule.startTime, '05:30');
+    assert.equal('auditSchedule' in detail, false);
     assert.equal(detail.auditPlans.length, 2);
+    assert.equal(detail.auditPlans.find(plan => plan.planId === planId).startTime, '05:30');
     assert.equal(detail.auditPlans.find(plan => plan.planId === created.json().auditPlan.planId).name, '额外周计划');
 });
 

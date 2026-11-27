@@ -54,11 +54,6 @@ export class Snapshots {
         if (!snapshot || snapshot.bindingGeneration !== project.bindingGeneration || snapshot.projectConfigRevision !== project.projectConfigRevision) throw new CentralError(503, 'not_synced', '项目配置尚未同步');
         const cacheKey = digest(stableJson({ projectId, generation: project.bindingGeneration, configRevision: project.projectConfigRevision, snapshot: snapshot.vcsSnapshot, kind, params }));
         let row = this.database.sql.prepare('SELECT query_id,state,result FROM queries WHERE cache_key=?').get(cacheKey) as Row | undefined;
-        if (!row && project.projectConfigRevision === 1) {
-            const legacyKey = digest(stableJson({ projectId, generation: project.bindingGeneration, snapshot: snapshot.vcsSnapshot, kind, params }));
-            row = this.database.sql.prepare('SELECT query_id,state,result FROM queries WHERE cache_key=?').get(legacyKey) as Row | undefined;
-            if (row) this.database.sql.prepare('UPDATE queries SET cache_key=? WHERE query_id=?').run(cacheKey, row.query_id);
-        }
         if (row?.state === 'ready') return { status: 200, body: { ...view, data: JSON.parse(row.result) } };
         if (!view.online) throw new CentralError(503, 'node_offline', '节点离线且该版本详情尚未缓存');
         if (view.workspaceIssue) throw new CentralError(503, 'workspace_unavailable', view.workspaceIssue);

@@ -60,6 +60,18 @@ export function assertAppendOnlyHistory(
     }
   }
 
+  // 嵌套未知扩展键（I14）：既有 human_decisions 的 extra 不可在更新时被静默丢弃
+  for (const oldDecision of oldMeta.humanDecisions) {
+    if (!oldDecision.extra || Object.keys(oldDecision.extra).length === 0) continue;
+    const nextDecision = newMeta.humanDecisions.find((item) => item.id === oldDecision.id);
+    if (!nextDecision) continue;
+    for (const [key, val] of Object.entries(oldDecision.extra)) {
+      if (!nextDecision.extra || !sameValue(nextDecision.extra[key], val)) {
+        errors.push(`human_decisions[${oldDecision.id}] 嵌套未知键 ${key} 被删改`);
+      }
+    }
+  }
+
   // patches[] 不可变追加账本
   if (newMeta.patches.length < oldMeta.patches.length) {
     errors.push('历史补丁账本 patches[] 不得删减');

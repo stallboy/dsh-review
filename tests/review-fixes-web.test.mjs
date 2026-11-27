@@ -18,7 +18,7 @@ function loadComponent(source, globals = {}) {
 }
 
 const { exports: { Diff } } = loadComponent(readFileSync(new URL('../apps/web/src/Diff.tsx', import.meta.url), 'utf8'));
-const appSource = readFileSync(new URL('../apps/web/src/App.tsx', import.meta.url), 'utf8');
+const appSource = readFileSync(new URL('../apps/web/src/views/CandidatePage.tsx', import.meta.url), 'utf8');
 const candidateSource = `${appSource.slice(appSource.indexOf('function CandidatePage()'))}\nglobalThis.Page = CandidatePage;`;
 const patch = String.raw`diff --git "a/src/\344\270\255\346\226\207.ts" "b/src/\344\270\255\346\226\207.ts"
 --- "a/src/\344\270\255\346\226\207.ts"

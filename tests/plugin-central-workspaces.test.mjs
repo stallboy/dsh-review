@@ -122,8 +122,13 @@ test('中央重新启用项目后，同一节点经真实轮询恢复定时审�
     const detail = async () => (await app.inject({ url, headers })).json();
     const disabled = await put(url, { enabled: false });
     assert.equal(disabled.statusCode, 200, disabled.body);
-    const schedule = await put(`${url}/audit-schedule`, { enabled: true, startTime: '18:00', timeZone: 'UTC' });
-    assert.equal(schedule.statusCode, 200, schedule.body);
+    const schedule = await app.inject({
+        method: 'POST',
+        url: `${url}/audit-plans`,
+        headers,
+        payload: { name: '每日审查', enabled: true, startTime: '18:00', timeZone: 'UTC', recurrence: { kind: 'daily' }, note: '' },
+    });
+    assert.equal(schedule.statusCode, 201, schedule.body);
     app.database.disconnectNode(credential.nodeId, instanceId);
     const centerUrl = await app.listen({ host: '127.0.0.1', port: 0 });
     const errors = [];
@@ -144,8 +149,9 @@ test('中央重新启用项目后，同一节点经真实轮询恢复定时审�
         await worker.drain();
         await worker.tick();
         const view = await detail();
-        assert.equal(view.auditSchedule.lastRun?.state, 'completed', JSON.stringify({ view, errors }));
-        const task = await app.inject({ url: `/api/v1/commands/${view.auditSchedule.lastRun.commandId}`, headers });
+        const plan = view.auditPlans?.[0];
+        assert.equal(plan?.lastRun?.state, 'completed', JSON.stringify({ view, errors }));
+        const task = await app.inject({ url: `/api/v1/commands/${plan.lastRun.commandId}`, headers });
         assert.equal(task.json().command.result.outcome.status, 'COMMITTED', task.body);
         assert.equal(task.json().command.result.delivery.state, 'delivered', task.body);
         assert.equal(app.database.getNode(credential.nodeId).instanceId, node.instanceId);

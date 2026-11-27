@@ -16,7 +16,7 @@ import {
     type ScheduledAudit,
 } from '@dsh-review/protocol';
 import { digest, stableJson } from './auth.js';
-import { assignCommandState, CentralDatabase, CentralError, type Row, type User } from './database.js';
+import { CentralDatabase, CentralError, type Row, type User } from './database.js';
 import { AuditSchedules } from './audit-schedule.js';
 
 function requiresAuditNotes(command: CommandRecord): boolean {
@@ -31,7 +31,7 @@ export class Commands {
         if (!row) throw new CentralError(404, 'not_found', '任务不存在');
         return {
             ...JSON.parse(row.envelope),
-            state: row.active_state,
+            state: row.state,
             cancelRequested: Boolean(row.cancel_requested),
             updatedAt: row.updated_at,
             ...(row.result ? { result: JSON.parse(row.result) } : {}),
@@ -62,7 +62,7 @@ export class Commands {
             delivery: { state: 'not_required' },
         };
         this.database.sql
-            .prepare(`UPDATE commands SET ${assignCommandState('completed')},result=?,updated_at=? WHERE command_id=?`)
+            .prepare("UPDATE commands SET state='completed',result=?,updated_at=? WHERE command_id=?")
             .run(JSON.stringify(result), this.database.now(), commandId);
         return this.get(commandId);
     }
@@ -87,22 +87,22 @@ export class Commands {
             if (this.schedules.blocksManual(projectId)) throw new CentralError(409, 'project_busy', '项目有未决操作');
             const node = db.getNode(project.nodeId);
             if (!project.enabled || !node.online || !node.compatible) throw new CentralError(503, 'node_unavailable', '执行节点离线、停用或协议不兼容');
-            record(input.payload, 'payload');
+            const payload = record(input.payload, 'payload');
             const issues = db.workspaceIssues(node.nodeId);
             if (Object.hasOwn(issues, project.workspaceId)) throw new CentralError(503, 'workspace_unavailable', issues[project.workspaceId]!);
             if (input.operation === 'audit-self-test' && !this.supportsSelfTest(project)) {
                 throw new CentralError(409, 'conflict', '节点尚未声明审查流程自检能力');
             }
-            if (input.operation === 'takeover') {
-                const rawOwner = (input.payload as JsonRecord)?.owner;
-                if (typeof rawOwner === 'string' && rawOwner.trim()) {
-                    const targetOwner = rawOwner.trim();
-                    const found = db.sql
-                        .prepare('SELECT 1 FROM users WHERE review_identity=? LIMIT 1')
-                        .get(targetOwner);
-                    if (!found) {
-                        throw new CentralError(422, 'bad_request', `转派目标负责人 ${targetOwner} 不是有效的评审用户`);
-                    }
+            if (input.operation === 'takeover' && 'owner' in payload && payload.owner !== undefined) {
+                if (typeof payload.owner !== 'string' || !payload.owner.trim()) {
+                    throw new CentralError(422, 'bad_request', '转派目标负责人 owner 必须是非空字符串');
+                }
+                const targetOwner = payload.owner.trim();
+                const found = db.sql
+                    .prepare('SELECT 1 FROM users WHERE review_identity=? LIMIT 1')
+                    .get(targetOwner);
+                if (!found) {
+                    throw new CentralError(422, 'bad_request', `转派目标负责人 ${targetOwner} 不是有效的评审用户`);
                 }
             }
             this.schedules.yieldToManual(projectId, now);
@@ -127,10 +127,9 @@ export class Commands {
             ...(scheduledAudit ? { scheduledAudit } : {}),
             createdAt,
         });
-        const protectedNotes = Boolean(scheduledAudit && command.payload.note);
         db.sql
-            .prepare(`INSERT INTO commands(command_id,project_id,node_id,idempotency_key,request_hash,envelope,state,protected_state,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?)`)
+            .prepare(`INSERT INTO commands(command_id,project_id,node_id,idempotency_key,request_hash,envelope,state,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?)`)
             .run(
                 command.commandId,
                 project.projectId,
@@ -138,8 +137,7 @@ export class Commands {
                 key,
                 requestHash,
                 JSON.stringify(command),
-                protectedNotes ? 'completed' : 'queued',
-                protectedNotes ? 'queued' : null,
+                'queued',
                 createdAt,
                 createdAt,
             );
@@ -158,7 +156,7 @@ export class Commands {
             this.schedules.expire();
             const issues = db.workspaceIssues(nodeId);
             const unavailable = (command: CommandRecord) => Object.hasOwn(issues, db.getProject(command.projectId).workspaceId);
-            const all = (db.sql.prepare("SELECT command_id FROM commands WHERE node_id=? AND active_state!='completed' ORDER BY created_at").all(nodeId) as Row[])
+            const all = (db.sql.prepare("SELECT command_id FROM commands WHERE node_id=? AND state!='completed' ORDER BY created_at").all(nodeId) as Row[])
                 .map(row => this.get(row.command_id));
             const relevant = all.filter(command => {
                 if (command.state !== 'queued' && command.state !== 'dispatched') {
@@ -196,11 +194,11 @@ export class Commands {
             const commands = accepted.length ? accepted : !running && next ? [next] : [];
             for (const command of commands) {
                 if (command.state === 'accepted') continue;
-                db.sql.prepare(`UPDATE commands SET ${assignCommandState('dispatched')},updated_at=? WHERE command_id=?`).run(db.now(), command.commandId);
+                db.sql.prepare("UPDATE commands SET state='dispatched',updated_at=? WHERE command_id=?").run(db.now(), command.commandId);
                 command.state = 'dispatched';
             }
             const recoveries = db.sql
-                .prepare("SELECT command_id FROM commands WHERE node_id=? AND active_state='recovery_required' AND recovery_requested=1")
+                .prepare("SELECT command_id FROM commands WHERE node_id=? AND state='recovery_required' AND recovery_requested=1")
                 .all(nodeId) as Row[];
             return {
                 commands,
@@ -233,14 +231,14 @@ export class Commands {
                 if (Object.hasOwn(issues, project.workspaceId)) return command;
                 if (command.operation === 'audit-self-test' && !this.supportsSelfTest(project)) return this.finishUnsupportedSelfTest(commandId);
                 if (command.scheduledAudit && db.sql
-                    .prepare(`SELECT projects.workspace_id,commands.active_state AS state FROM commands JOIN projects USING(project_id)
-                        WHERE commands.node_id=? AND commands.active_state!='completed'
+                    .prepare(`SELECT projects.workspace_id,commands.state FROM commands JOIN projects USING(project_id)
+                        WHERE commands.node_id=? AND commands.state!='completed'
                         AND json_extract(envelope,'$.scheduledAudit') IS NULL`)
                     .all(nodeId)
                     .some(row => row.state === 'accepted' || row.state === 'executing' || !Object.hasOwn(issues, String(row.workspace_id)))) {
                     return command;
                 }
-                db.sql.prepare(`UPDATE commands SET ${assignCommandState('accepted')},updated_at=? WHERE command_id=?`).run(now, commandId);
+                db.sql.prepare("UPDATE commands SET state='accepted',updated_at=? WHERE command_id=?").run(now, commandId);
             }
             return this.get(commandId);
         });
@@ -348,15 +346,16 @@ export class Commands {
             }
             const unresolved = event.result.outcome.status === 'RECOVERY_REQUIRED' || ['pending', 'conflict', 'unknown'].includes(event.result.delivery.state);
             db.sql
-                .prepare(`UPDATE commands SET ${assignCommandState(unresolved ? 'recovery_required' : 'completed')},result=?,updated_at=?,recovery_requested=0 WHERE command_id=?`)
-                .run(JSON.stringify(event.result), db.now(), commandId);
+                .prepare('UPDATE commands SET state=?,result=?,updated_at=?,recovery_requested=0 WHERE command_id=?')
+                .run(unresolved ? 'recovery_required' : 'completed', JSON.stringify(event.result), db.now(), commandId);
         } else {
             const state = event.type === 'recovery_required' ? 'recovery_required' : event.type === 'accepted' ? 'accepted' : 'executing';
             if (command.state === 'recovery_required') return;
-            db.sql.prepare(`UPDATE commands SET ${assignCommandState(state)},updated_at=? WHERE command_id=?`).run(db.now(), commandId);
+            db.sql.prepare('UPDATE commands SET state=?,updated_at=? WHERE command_id=?').run(state, db.now(), commandId);
         }
     }
 
+    /** 增量日志偏移口径与插件 /jobs/:id（SPEC §6.2）保持完全一致。 */
     logs(commandId: string, since = 0): JsonRecord {
         this.get(commandId);
         if (!Number.isSafeInteger(since) || since < 0) throw new CentralError(422, 'bad_request', '日志偏移无效');
@@ -366,6 +365,12 @@ export class Commands {
         const lines = this.database.sql
             .prepare('SELECT line FROM logs WHERE command_id=? AND offset>=? ORDER BY offset')
             .all(commandId, reset ? start : since) as Row[];
-        return { log: lines.map(item => item.line), logStartOffset: start, logNextOffset: end, logResetRequired: reset };
+        return {
+            log: lines.map(item => item.line),
+            logOffset: end,
+            totalLogLines: end,
+            earliestLogOffset: start,
+            logResetRequired: reset,
+        };
     }
 }

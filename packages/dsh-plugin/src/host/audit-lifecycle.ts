@@ -54,27 +54,43 @@ export class AuditLifecycle {
         changed = true;
       }
     }
-    const expired = await this.expireOverdue();
+    let expired = false;
+    try {
+      expired = await this.expireOverdue();
+    } catch {
+      // 磁盘写失败时保留原活动租约继续阻塞写入（fail-closed），避免启动崩溃。
+    }
     if (changed && !expired) {
-      await this.store.save(this.leases);
+      try {
+        await this.store.save(this.leases);
+      } catch {
+        // 同上：持久化失败不解除内存阻塞状态。
+      }
     }
   }
 
   /** 将超过 3 小时上限的活动租约转为 releasable（仍阻塞写入直至人工核验释放）。 */
   async expireOverdue(nowMs = Date.now()): Promise<boolean> {
-    let changed = false;
+    const mutated: Array<{ lease: AuditLeaseRecord; previous: AuditLeaseState }> = [];
     for (const lease of this.leases) {
       if (lease.state !== 'active') continue;
       const createdMs = Date.parse(lease.createdAt);
       if (Number.isFinite(createdMs) && createdMs + AUDIT_TIMEOUT_MS <= nowMs) {
+        mutated.push({ lease, previous: lease.state });
         lease.state = 'releasable';
-        changed = true;
       }
     }
-    if (changed) {
-      await this.store.save(this.leases);
+    if (mutated.length > 0) {
+      try {
+        await this.store.save(this.leases);
+      } catch (error) {
+        for (const item of mutated) {
+          item.lease.state = item.previous;
+        }
+        throw error;
+      }
     }
-    return changed;
+    return mutated.length > 0;
   }
 
   all(): readonly AuditLeaseRecord[] {

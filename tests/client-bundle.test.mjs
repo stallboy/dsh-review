@@ -227,9 +227,9 @@ test('plugin unload disposes the view, its styles and its dictionaries', () => {
 test('§10.2（A9）：详情页 id/detail/stale/guard 由单一 reducer 驱动，且不再用裸 ref 手工同步 guard', () => {
   // 此前刷新解锁与过期判定分散在多处赋值，容易漏掉一处并使用陈旧的 guard。
   assert.match(bundleSource, /function detailReducer\(state, action\)/, '详情页状态机必须存在');
-  assert.match(bundleSource, /dispatchDetail\(\{\s*type: 'loaded',\s*detail: value\s*\}\)/);
-  assert.match(bundleSource, /dispatchDetail\(\{\s*type: 'rebind'\s*\}\)/);
-  assert.match(bundleSource, /dispatchDetail\(\{\s*type: 'open',\s*id\s*\}\)/);
+  assert.match(bundleSource, /dispatchDetail\(\{\s*type:\s*['"]loaded['"],\s*detail:\s*value\s*\}\)/);
+  assert.match(bundleSource, /dispatchDetail\(\{\s*type:\s*['"]rebind['"]\s*\}\)/);
+  assert.match(bundleSource, /dispatchDetail\(\{\s*type:\s*['"]open['"],\s*id\s*\}\)/);
   assert.doesNotMatch(bundleSource, /guardRef\.current\s*=/, '不得再用裸 ref 手工同步 guard');
   assert.doesNotMatch(bundleSource, /setStale\(/, 'stale 只能由 reducer 迁移');
 });

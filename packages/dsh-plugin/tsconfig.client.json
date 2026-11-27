@@ -1,22 +1,21 @@
 {
-    "compilerOptions": {
-        "target": "ES2022",
-        "module": "none",
-        "lib": [
-            "ES2022",
-            "DOM",
-            "DOM.Iterable"
-        ],
-        "types": [],
-        "strict": true,
-        "noUncheckedIndexedAccess": true,
-        "skipLibCheck": true,
-        "forceConsistentCasingInFileNames": true,
-        "outDir": "dist",
-        "rootDir": "src/client",
-        "noEmitOnError": true
-    },
-    "include": [
-        "src/client/**/*.ts"
-    ]
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "types": [],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true
+  },
+  "include": [
+    "src/client/**/*.ts"
+  ]
 }

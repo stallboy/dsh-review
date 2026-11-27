@@ -91,7 +91,7 @@ test('增量差异仍禁用 LEFT 定位，空比较响应不清除折叠记录',
 });
 
 function candidateFixture() {
-    const source = readFileSync(new URL('../apps/web/src/App.tsx', import.meta.url), 'utf8');
+    const source = readFileSync(new URL('../apps/web/src/views/CandidatePage.tsx', import.meta.url), 'utf8');
     const script = ts.transpileModule(`${source.slice(source.indexOf('function CandidatePage()'))}\nglobalThis.Page = CandidatePage;`, {
         compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
     }).outputText;

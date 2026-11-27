@@ -3,6 +3,8 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import type {
     AuditSummary,
+    CandidateSummary,
+    IssueFindingView,
     JsonRecord,
     ManagedCommand,
     ManagedOperation,
@@ -572,8 +574,8 @@ export class ManagedOperations {
                 vcsSnapshot: pinned.identity,
                 currentBase: typeof queue.currentBase === 'string' ? queue.currentBase : null,
                 counts,
-                queue: (queue.items ?? []) as JsonRecord[],
-                findings: (findings.findings ?? []) as JsonRecord[],
+                queue: (queue.items ?? []) as CandidateSummary[],
+                findings: (findings.findings ?? []) as IssueFindingView[],
                 audits: (audits.audits ?? []) as AuditSummary[],
                 errors: [...(queue.errors as string[] ?? []), ...(findings.errors as string[] ?? []), ...(audits.errors as string[] ?? [])],
             };

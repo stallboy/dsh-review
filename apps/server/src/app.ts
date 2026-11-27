@@ -2,7 +2,18 @@ import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import { readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { PROTOCOL_VERSION, ProtocolError, entityId, record, textValue, validateRegistration, type JsonRecord, type QueryKind } from '@dsh-review/protocol';
+import {
+    PROTOCOL_VERSION,
+    ProtocolError,
+    entityId,
+    filterFindingViews,
+    filterQueueItems,
+    record,
+    textValue,
+    validateRegistration,
+    type JsonRecord,
+    type QueryKind,
+} from '@dsh-review/protocol';
 import { CentralDatabase, CentralError, type User } from './database.js';
 import { Commands } from './commands.js';
 import { Snapshots } from './snapshots.js';
@@ -143,11 +154,8 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
     app.get('/api/v1/projects/:projectId', async req => {
         const projectId = params(req).projectId!;
         const view = snapshots.view(projectId);
-        return { ...view, snapshot: snapshots.get(projectId), auditSchedule: schedules.view(view.project), auditPlans: schedules.list(view.project) };
+        return { ...view, snapshot: snapshots.get(projectId), auditPlans: schedules.list(view.project) };
     });
-    app.put('/api/v1/projects/:projectId/audit-schedule', async req => ({
-        auditSchedule: schedules.update(database.getProject(params(req).projectId!), body(req), (req as RequestContext).actor!),
-    }));
     app.post('/api/v1/projects/:projectId/audit-plans', async (req, reply) => {
         const auditPlan = schedules.createPlan(database.getProject(params(req).projectId!), body(req), (req as RequestContext).actor!, req.headers['idempotency-key']);
         return reply.code(201).send({ auditPlan });
@@ -164,20 +172,44 @@ async function buildCentralApp(options: CentralOptions, database: CentralDatabas
     });
     app.get('/api/v1/projects/:projectId/queue', async req => {
         const projectId = params(req).projectId!, snapshot = snapshots.get(projectId);
+        const query = (req.query ?? {}) as Record<string, string | undefined>;
+        const me = (req as RequestContext).actor?.reviewIdentity ?? '';
+        const owner = Object.hasOwn(query, 'owner') ? (query.owner ?? '') : me;
+        const { items, counts } = filterQueueItems(snapshot?.queue ?? [], {
+            owner,
+            ...(query.statuses ? { statuses: query.statuses } : {}),
+            ...(query.tag ? { tag: query.tag } : {}),
+            ...(query.dir ? { dir: query.dir } : {}),
+            ...(query.text ? { text: query.text } : {}),
+            ...(query.createdAfter ? { createdAfter: query.createdAfter } : {}),
+            ...(query.createdBefore ? { createdBefore: query.createdBefore } : {}),
+        });
         return {
             ...snapshots.view(projectId),
-            items: snapshot?.queue ?? [],
-            counts: snapshot?.counts ?? null,
+            items,
+            counts,
+            owner,
+            me,
             currentBase: snapshot?.currentBase ?? null,
             errors: snapshot?.errors ?? [],
         };
     });
-    for (const kind of ['findings', 'audits'] as const) {
-        app.get(`/api/v1/projects/:projectId/${kind}`, async req => {
-            const id = params(req).projectId!;
-            return { ...snapshots.view(id), items: snapshots.get(id)?.[kind] ?? [] };
+    app.get('/api/v1/projects/:projectId/findings', async req => {
+        const id = params(req).projectId!;
+        const query = (req.query ?? {}) as Record<string, string | undefined>;
+        const items = filterFindingViews(snapshots.get(id)?.findings ?? [], {
+            ...(query.scope ? { scope: query.scope } : {}),
+            ...(query.dispositions ? { dispositions: query.dispositions } : {}),
+            ...(query.owner ? { owner: query.owner } : {}),
+            ...(query.text ? { text: query.text } : {}),
+            ...(query.findingId ? { findingId: query.findingId } : {}),
         });
-    }
+        return { ...snapshots.view(id), items };
+    });
+    app.get('/api/v1/projects/:projectId/audits', async req => {
+        const id = params(req).projectId!;
+        return { ...snapshots.view(id), items: snapshots.get(id)?.audits ?? [] };
+    });
     app.get('/api/v1/workbench', async () => ({ projects: database.listProjects().map(p => ({ ...snapshots.view(p.projectId), snapshot: snapshots.get(p.projectId) })) }));
     app.get('/api/v1/tasks', async req => ({ tasks: commands.list((req.query as Record<string, string>).projectId) }));
     app.get('/api/v1/commands/:commandId', async req => ({ command: commands.get(params(req).commandId!) }));
