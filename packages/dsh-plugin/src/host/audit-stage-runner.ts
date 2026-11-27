@@ -121,7 +121,11 @@ async function runExternalExecutor(
       maxBytes: 256 * 1024,
       captureStdout: false,
       killTreeOnExit: true,
-      onLine: (line) => {
+      onLine: (line, stream) => {
+        if (stream === 'stderr') {
+          request.onLog?.(`[${executor}:stderr] ${line.slice(0, 400)}`);
+          return;
+        }
         if (stdoutTail.length >= 200) stdoutTail.shift();
         stdoutTail.push(line);
         if (executor === 'claude') streamParser.feedLine(line);
@@ -185,7 +189,11 @@ async function runNativeHarnessSubagent(request: StageRunRequest): Promise<Stage
     maxBytes: 256 * 1024,
     captureStdout: false,
     killTreeOnExit: true,
-    onLine: (line) => {
+    onLine: (line, stream) => {
+      if (stream === 'stderr') {
+        request.onLog?.(`[dsh-subagent:stderr] ${line.slice(0, 400)}`);
+        return;
+      }
       if (stdoutTail.length >= 200) stdoutTail.shift();
       stdoutTail.push(line);
       streamParser.feedLine(line);

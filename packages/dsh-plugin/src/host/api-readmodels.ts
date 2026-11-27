@@ -314,7 +314,7 @@ export async function handleQueue(
       if (month && slug) {
         const loaded = await runtime.store.loadCandidate(month, slug, view?.source);
         if (loaded && !loaded.parseError) {
-          const derived = await caches.resolveApprovalCommit(runtime, loaded, view?.snapshot ?? null);
+          const derived = await caches.resolveApprovalCommit(runtime, loaded, view?.snapshot ?? null, view?.source);
           if (derived) {
             if (derived.revision) item.approvalCommitRevision = derived.revision;
             item.approvalCommitLookup = derived.lookup;

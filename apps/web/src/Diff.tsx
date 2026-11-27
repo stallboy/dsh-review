@@ -6,7 +6,7 @@ export interface Anchor {
   file: string;
   line: number;
   side: 'LEFT' | 'RIGHT';
-  anchor: { snippet: string; before?: string; after?: string };
+  anchor?: { snippet: string; before?: string; after?: string };
 }
 
 export function Diff({
@@ -97,38 +97,46 @@ export function Diff({
                           ...commentsFor('LEFT', line.left),
                           ...commentsFor('RIGHT', line.right),
                         ];
-                    return (
-                      <>
-                        <tr key={lineIndex} className={s[line.kind]}>
-                          {(['LEFT', 'RIGHT'] as const).map((side) => {
-                            const number = side === 'LEFT' ? line.left : line.right;
-                            return (
-                              <td colSpan={2} key={side}>
-                                <button
-                                  disabled={number === undefined || (side === 'LEFT' && !allowLeft)}
-                                  className={s.codeLine}
-                                  onClick={() => number !== undefined && onSelect({ file: file.name, line: number, side, anchor: { snippet: line.text || ' ' } })}
-                                >
-                                  <span>{number}</span>
-                                  <code>{number === undefined ? '' : line.text || ' '}</code>
-                                </button>
-                              </td>
-                            );
-                          })}
-                        </tr>
-                        {lineComments.map((comment) => (
-                          <tr key={`${lineIndex}-comment-${comment.id}`} className={s.inlineCommentRow}>
-                            <td colSpan={4}>
-                              <div className={s.inlineComment}>
-                                <b>{comment.author}</b>
-                                <small>记录 {comment.revision} · {comment.status === 'resolved' ? '已解决' : comment.status === 'partial' ? '部分处理' : '未解决'}</small>
-                                <p>{comment.content}</p>
-                              </div>
+                    const row = (
+                      <tr key={lineIndex} className={s[line.kind]}>
+                        {(['LEFT', 'RIGHT'] as const).map((side) => {
+                          const number = side === 'LEFT' ? line.left : line.right;
+                          const trimmed = line.text.trim();
+                          return (
+                            <td colSpan={2} key={side}>
+                              <button
+                                disabled={number === undefined || (side === 'LEFT' && !allowLeft)}
+                                className={s.codeLine}
+                                onClick={() => number !== undefined && onSelect({
+                                  file: file.name,
+                                  line: number,
+                                  side,
+                                  ...(trimmed.length > 0 ? { anchor: { snippet: line.text } } : {}),
+                                })}
+                              >
+                                <span>{number}</span>
+                                <code>{number === undefined ? '' : line.text || ' '}</code>
+                              </button>
                             </td>
-                          </tr>
-                        ))}
-                      </>
+                          );
+                        })}
+                      </tr>
                     );
+                    if (lineComments.length === 0) return row;
+                    return [
+                      row,
+                      ...lineComments.map((comment) => (
+                        <tr key={`${lineIndex}-comment-${comment.id}`} className={s.inlineCommentRow}>
+                          <td colSpan={4}>
+                            <div className={s.inlineComment}>
+                              <b>{comment.author}</b>
+                              <small>记录 {comment.revision} · {comment.status === 'resolved' ? '已解决' : comment.status === 'partial' ? '部分处理' : '未解决'}</small>
+                              <p>{comment.content}</p>
+                            </div>
+                          </td>
+                        </tr>
+                      )),
+                    ];
                   })}
                 </tbody>
               </table>

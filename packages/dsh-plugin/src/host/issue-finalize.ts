@@ -256,12 +256,25 @@ export async function finalizeIssueAudit(
 
   if (deps.signal?.aborted) return aborted('审查收尾已取消');
 
-  // 预加载共享问题快照用于全仓 finding_id 唯一性与跨轮只追加防篡改核验
-  const sharedSnapshot = await store.listSharedCandidates(deps.candidateSource);
-  const sharedById = new Map(sharedSnapshot.candidates.filter((c) => !c.parseError).map((c) => [c.id, c]));
+  // 预加载共享历史快照（直接从 candidateSource 读取，不得因当前轮本地改写而跳过既有共享问题！）
+  const allSharedById = new Map<string, Awaited<ReturnType<ReviewStore['loadCandidate']>>>();
   const sharedFindingToId = new Map<string, string>();
-  for (const c of sharedById.values()) {
-    sharedFindingToId.set(c.meta.findingId, c.id);
+  if (deps.candidateSource) {
+    const sharedIds = await store.listCandidateIds(deps.candidateSource);
+    for (const sharedId of sharedIds) {
+      const [m, s] = sharedId.split('/');
+      if (!m || !s) continue;
+      const loaded = await store.loadCandidate(m, s, deps.candidateSource);
+      if (!loaded) continue;
+      if (!loaded.parseError) {
+        const fullErrs = await store.validateFullCandidate(loaded, deps.candidateSource);
+        if (fullErrs.length > 0) loaded.parseError = fullErrs.join('；');
+      }
+      allSharedById.set(sharedId, loaded);
+      if (!loaded.parseError && loaded.meta.findingId) {
+        sharedFindingToId.set(loaded.meta.findingId, sharedId);
+      }
+    }
   }
   const batchFindingToId = new Map<string, string>();
 
@@ -316,9 +329,12 @@ export async function finalizeIssueAudit(
           result.errors.push(`问题 ${id} 的观察证据路径超出本轮审查范围 ${scope}`);
         }
         if (input.beforeIds.has(id)) {
-          const priorShared = sharedById.get(id);
-          if (priorShared) {
-            result.errors.push(...assertAppendOnlyHistory(priorShared.meta, meta, { mode: 'audit' }));
+          const priorAny = allSharedById.get(id);
+          if (priorAny?.parseError) {
+            // SPEC §5.1：broken 问题仅允许 Owner 人工修复，禁止 AI 审查自动覆写
+            result.errors.push(`问题 ${id} 在共享快照中处于 broken 状态，禁止 AI 审查自动覆写`);
+          } else if (priorAny) {
+            result.errors.push(...assertAppendOnlyHistory(priorAny.meta, meta, { mode: 'audit' }));
           }
         } else if (reviewersConfig?.valid) {
           const expectedOwner = resolveOwner(reviewersConfig, { paths: meta.targetFiles, tags: meta.tags }).owner;

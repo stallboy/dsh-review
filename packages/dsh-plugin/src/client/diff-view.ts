@@ -297,7 +297,7 @@ export function createDiffView(React: ReactLike, RichText: RichTextComponent): D
                 const target = entry && idx >= 0 ? entry.lines[idx] : undefined;
                 const prevLine = entry && idx > 0 ? entry.lines[idx - 1] : undefined;
                 const nextLine = entry && idx >= 0 ? entry.lines[idx + 1] : undefined;
-                const anchor = target
+                const anchor = target && target.text.trim().length > 0
                   ? {
                       snippet: target.text,
                       ...(prevLine ? { before: prevLine.text } : {}),

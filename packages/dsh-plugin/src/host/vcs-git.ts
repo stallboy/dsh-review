@@ -511,7 +511,10 @@ export class GitAdapter implements VcsAdapter {
   async exportWorkingTreeDiff(base: string, paths: string[]): Promise<string> {
     const rel = [...new Set(paths.map((item) => normalizeCommitPath(this.root, item)).filter((item) => item.length > 0))];
     if (rel.length === 0) return '';
-    await git(this.root, ['add', '-N', '--', ...rel]).catch(() => undefined);
+    const existing = rel.filter((item) => existsSync(path.join(this.root, item)));
+    if (existing.length > 0) {
+      await git(this.root, ['add', '-N', '--', ...existing]).catch(() => undefined);
+    }
     const diff = await git(this.root, ['diff', '--binary', '--no-ext-diff', base, '--', ...rel]);
     await git(this.root, ['reset', '-q', '--', ...rel]).catch(() => undefined);
     if (diff.code !== 0) throw new Error(`导出工作区 diff 失败：${describeProcess(diff)}`);

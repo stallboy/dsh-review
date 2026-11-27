@@ -344,7 +344,10 @@ export function createApp(
               const ctx = pollContextRef.current;
               if (ctx.selectedId) {
                 let nextSelection: { optionId: string; patchId: number } | null | undefined;
-                if (value.type === 'ai-fix' || value.type === 'rebase' || value.type === 'candidate-finalize') {
+                if (
+                  value.type === 'ai_fix'
+                  || (value.type === 'approve' && value.result?.status === 'FALLBACK_TO_PENDING' && value.result?.reason === 'MATERIAL_CHANGE')
+                ) {
                   if (typeof value.result?.newPatchId === 'number') {
                     const optionId = value.result.optionId ?? ctx.selectedIssue?.optionId ?? '';
                     nextSelection = optionId ? { optionId, patchId: value.result.newPatchId } : null;

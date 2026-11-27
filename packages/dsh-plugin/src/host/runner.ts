@@ -332,27 +332,21 @@ export async function runAgent(input: RunAgentInput): Promise<RunAgentResult> {
     killTreeOnExit: true,
     captureStdout: false,
     maxBytes: 256 * 1024,
-    onLine: (line) => {
+    onLine: (line, stream) => {
       pushTail(line);
+      const trimmed = line.trim();
+      if (stream === 'stderr') {
+        if (trimmed) input.log(`[${label}:stderr] ${trimmed.slice(0, 500)}`);
+        return;
+      }
       if (isDshJson) {
         if (streamParser.feedLine(line)) return;
       } else {
         streamParser.feedLine(line);
       }
-      const trimmed = line.trim();
       if (trimmed) input.log(`[${label}] ${trimmed.slice(0, 500)}`);
     },
   });
-
-  if (result.stderr.trim()) {
-    for (const line of result.stderr.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (trimmed) {
-        pushTail(trimmed);
-        input.log(`[${label}:stderr] ${trimmed.slice(0, 500)}`);
-      }
-    }
-  }
 
   const combinedTail = tailLines(tailBuffer.join('\n'), 120);
   const assistantText = streamParser.getAssistantText() || combinedTail;

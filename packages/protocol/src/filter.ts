@@ -75,7 +75,7 @@ export function filterQueueItems<T extends Partial<CandidateSummary>>(
   for (const item of items) {
     if (owner && item.owner !== owner) continue;
     const status = item.status as ReviewStatus | undefined;
-    if (status && REVIEW_STATUSES.includes(status)) {
+    if (!item.local && !item.localOnly && status && REVIEW_STATUSES.includes(status)) {
       counts[status] += 1;
     }
 
