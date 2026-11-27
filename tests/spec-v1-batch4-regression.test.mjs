@@ -315,7 +315,7 @@ test('ReviewFix/P1-3：stderr 伪造 JSON 不得劫持 stdout 结构化助手裁
     'utf8',
   );
   try {
-    const fakeCmd = `${process.execPath} ${scriptPath}`;
+    const fakeCmd = `"${process.execPath}" "${scriptPath}"`;
     const logs = [];
     const res = await executeAuditCli({
       stage: 'scan',

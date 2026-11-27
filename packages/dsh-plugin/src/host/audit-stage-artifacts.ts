@@ -120,6 +120,7 @@ export async function publishStageArtifacts(
       artifacts.set(`${dir}/001.patch`, item.patch);
     }
   }
+  const realRoot = await realpath(root);
   const files: string[] = [];
   const dirs: string[] = [];
   try {
@@ -166,7 +167,7 @@ export async function publishStageArtifacts(
     await seal(manifest);
   } catch (error) {
     const cleanup = await Promise.allSettled(files.map(async (file) => {
-      const relative = path.relative(root, file).split(path.sep).join('/');
+      const relative = path.relative(realRoot, file).split(path.sep).join('/');
       const previous = replacements.get(relative);
       if (previous !== undefined) {
         if ((await readFile(file, 'utf8')) !== artifacts.get(relative)) throw new Error('清理前问题记录再次变化');

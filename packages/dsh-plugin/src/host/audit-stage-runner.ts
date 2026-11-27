@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AuditStage } from './audit-prompts.js';
 import { DshEventStreamParser, parseJsonPayload } from './dsh-stream.js';
+import { splitCommandLine } from './runner.js';
 import { commandExists, runProcess } from './shell.js';
 
 export type AuditExecutor = 'codex' | 'claude' | 'claude-code' | 'dsh-subagent';
@@ -80,7 +81,7 @@ export function probeStageExecutors(configured: readonly string[], dshCommand = 
     }
   }
 
-  const dshBin = dshCommand.trim().split(/\s+/)[0] || 'dsh';
+  const dshBin = splitCommandLine(dshCommand.trim())[0] || 'dsh';
   if (commandExists(dshBin)) {
     executors.push({ name: 'dsh-subagent', status: 'available' });
     availableRunners.push('dsh-subagent');
@@ -164,7 +165,7 @@ async function runExternalExecutor(
 }
 
 async function runNativeHarnessSubagent(request: StageRunRequest): Promise<StageRunOutcome> {
-  const tokens = (request.dshCommand?.trim() || 'dsh').split(/\s+/).filter(Boolean);
+  const tokens = splitCommandLine(request.dshCommand?.trim() || 'dsh');
   const bin = tokens[0] ?? 'dsh';
   if (!commandExists(bin)) {
     return { ok: false, reason: 'unavailable', diagnostic: `未检测到本 Harness 子代理入口：${bin}` };

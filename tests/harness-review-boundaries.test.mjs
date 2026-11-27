@@ -168,7 +168,8 @@ test('UTF-8 JSON 跨输出 chunk 保留中文原文', async () => {
 
 for (const mode of ['normal', 'timeout', 'cancel']) test(`原生进程组结束并清理遗留子进程：${mode}`, async () => {
     const controller = new AbortController();
-    const program = `const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',detached:true});console.log(child.pid);child.unref();${mode === 'normal' ? '' : 'setInterval(()=>{},1000);'}`;
+    // POSIX 上 detached:true 会调用 setsid() 脱离父进程组，与 SPEC §8.2 的 POSIX 进程组契约相悖；Windows 下需 detached:true 保持在 Job Object 内越过父退出
+    const program = `const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',detached:process.platform==='win32'});console.log(child.pid);child.unref();${mode === 'normal' ? '' : 'setInterval(()=>{},1000);'}`;
     let timer;
     if (mode === 'cancel') timer = setTimeout(() => controller.abort(), 1500);
     try {

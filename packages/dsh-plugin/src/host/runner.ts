@@ -249,7 +249,7 @@ export function parseModeCOutput(text: string): ModeCVerdict | null {
   return null;
 }
 
-function splitCommandLine(raw: string): string[] {
+export function splitCommandLine(raw: string): string[] {
   const args: string[] = [];
   let current = '';
   let quote: '"' | "'" | null = null;

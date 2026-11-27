@@ -2,7 +2,8 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { ReviewApi } from '../packages/dsh-plugin/dist/host/api.js';
 import { registerAuditStageTools } from '../packages/dsh-plugin/dist/host/audit-stage-tools.js';
@@ -257,7 +258,7 @@ test('执行器提前退出、取消或超时时，输入管道错误不会终�
   assert.match(missing.error, /ENOENT/);
 });
 
-test('AC-AUDIT-03：外部执行器名称归一化、可用性探测与优雅降级至 dsh-subagent', async () => {
+test('AC-AUDIT-03：外部执行器名称归一化、可用性探测与优雅降级至 dsh-subagent', async (t) => {
   assert.equal(normalizeExecutorName('codex'), 'codex');
   assert.equal(normalizeExecutorName('claude-code'), 'claude');
   assert.equal(normalizeExecutorName('claude'), 'claude');
@@ -267,8 +268,36 @@ test('AC-AUDIT-03：外部执行器名称归一化、可用性探测与优雅降
   assert.ok(probed.availableRunners.includes('dsh-subagent'));
   assert.ok(probed.executors.some((e) => e.name === 'dsh-subagent'));
 
-  // 请求外部执行器且外部不可用时，优雅降级尝试 dsh-subagent（此处用 node 模拟 headless 子代理）
-  const fakeSubagent = `${process.execPath} -e "process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({structured_output:{leads:[],coverage:['subagent-ok'],limits:[]}})))"`;
+  // 使用脚本入口模拟 dsh CLI，确保 --profile headless --json - 作为脚本参数而非 node 自身选项传递
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'dcr-ac-audit-03-'));
+  t.after(() => rm(tmpDir, { recursive: true, force: true }));
+  const mockDsh = path.join(tmpDir, 'mock-dsh.mjs');
+  await writeFile(
+    mockDsh,
+    [
+      "if (!process.argv.includes('--profile') || !process.argv.includes('headless')) process.exit(2);",
+      'process.stdin.resume();',
+      "process.stdin.on('end', () => console.log(JSON.stringify({ structured_output: { leads: [], coverage: ['subagent-ok'], limits: [] } })));",
+    ].join('\n'),
+    'utf8',
+  );
+  const fakeSubagent = `"${process.execPath}" "${mockDsh}"`;
+
+  // 直接走 dsh-subagent 路径验证 headless 参数与带引号路径解析
+  const direct = await executeAuditCli({
+    stage: 'scan',
+    runner: 'dsh-subagent',
+    cwd: process.cwd(),
+    prompt: 'test',
+    schema: { type: 'object' },
+    timeoutMs: 10_000,
+    signal: new AbortController().signal,
+    dshCommand: fakeSubagent,
+  });
+  assert.equal(direct.ok, true, JSON.stringify(direct));
+  assert.equal(direct.executorUsed, 'dsh-subagent');
+
+  // 请求外部执行器且外部不可用时，优雅降级至 dsh-subagent
   const logs = [];
   const degraded = await executeAuditCli({
     stage: 'scan',
@@ -281,7 +310,6 @@ test('AC-AUDIT-03：外部执行器名称归一化、可用性探测与优雅降
     dshCommand: fakeSubagent,
     onLog: (line) => logs.push(line),
   });
-  // 若本机恰好未装 codex，则自动降级至 dsh-subagent 并成功；若本机装了 codex 则由 codex 执行
   if (degraded.degradedFrom) {
     assert.equal(degraded.ok, true, JSON.stringify(degraded));
     assert.equal(degraded.executorUsed, 'dsh-subagent');

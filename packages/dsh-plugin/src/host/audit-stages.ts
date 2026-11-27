@@ -6,7 +6,7 @@
  * - I18：每个子阶段交接前强制还原所有非 .ai-review/ 业务改动、清空 .tmp/ 并核验工作区干净。
  */
 
-import { rm } from 'node:fs/promises';
+import { realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { auditFiles } from './audit-files.js';
 import { AuditArchive, scopeCovers, type AuditTrigger } from './audit-archive.js';
@@ -675,13 +675,33 @@ export class AuditStageSession {
       }
     }
 
-    const patchPathRel = typeof data['patchPath'] === 'string' ? data['patchPath'].trim().replaceAll('\\', '/') : '';
-    const patchAbs = path.resolve(this.options.root, patchPathRel);
-    if (!patchPathRel || !patchAbs.startsWith(path.resolve(artifactAbs) + path.sep)) {
+    const realRoot = await realpath(this.options.root);
+    const patchPathRaw = typeof data['patchPath'] === 'string' ? data['patchPath'].trim() : '';
+    let patchAbs = patchPathRaw ? path.resolve(realRoot, patchPathRaw) : '';
+    if (patchPathRaw && path.isAbsolute(patchPathRaw)) {
+      const relFromConfiguredRoot = path.relative(path.resolve(this.options.root), patchAbs);
+      if (
+        relFromConfiguredRoot
+        && relFromConfiguredRoot !== '..'
+        && !relFromConfiguredRoot.startsWith(`..${path.sep}`)
+        && !path.isAbsolute(relFromConfiguredRoot)
+      ) {
+        patchAbs = path.resolve(realRoot, relFromConfiguredRoot);
+      }
+    }
+    const relFromArtifact = patchAbs ? path.relative(artifactAbs, patchAbs) : '';
+    if (
+      !patchPathRaw
+      || !relFromArtifact
+      || relFromArtifact === '..'
+      || relFromArtifact.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relFromArtifact)
+    ) {
       await rm(artifactAbs, { recursive: true, force: true }).catch(() => undefined);
-      return { ok: false, stage, taskId, reason: 'invalid_output', diagnostic: `patchPath 必须位于本阶段产物目录内：${patchPathRel}` };
+      return { ok: false, stage, taskId, reason: 'invalid_output', diagnostic: `patchPath 必须位于本阶段产物目录内：${patchPathRaw}` };
     }
 
+    const patchPathRel = path.relative(realRoot, patchAbs).split(path.sep).join('/');
     const patchRead = await auditFiles(this.options.root, { op: 'read', paths: [patchPathRel] }).catch(() => null);
     const patchBytes = patchRead?.bytes ?? null;
     if (!patchBytes || patchBytes.length === 0) {
