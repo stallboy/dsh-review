@@ -91,7 +91,7 @@ async function applyAuditLeaseOutcome(
   runtime: Runtime,
   lease: AuditLeaseRecord,
   outcome: { status: string; commitRevision: string | null; reason?: string },
-  options: { releaseOnCleanAbort?: boolean } = {},
+  options: { releaseOnCleanAbort?: boolean; keepActiveOnAbort?: boolean } = {},
 ): Promise<void> {
   const { auditId, sessionId } = lease;
   if (outcome.status === 'COMMITTED' || (outcome.status === 'VALIDATION_FAILED' && outcome.commitRevision !== null)) {
@@ -115,6 +115,9 @@ async function applyAuditLeaseOutcome(
     return;
   }
   if (outcome.status === 'ABORTED') {
+    if (options.keepActiveOnAbort) {
+      return;
+    }
     if (options.releaseOnCleanAbort) {
       const cleanNow = await runtime.vcs.ensureCleanWorkspace().catch(() => null);
       if (cleanNow?.clean && !lease.stageProcessActive) {
@@ -851,7 +854,7 @@ export async function handleAuditFinalize(host: ApiHost, req: ApiRequest, res: A
         },
       );
 
-      await applyAuditLeaseOutcome(host, runtime, lease, result);
+      await applyAuditLeaseOutcome(host, runtime, lease, result, { keepActiveOnAbort: true });
 
       const outcome = {
         manual: false,

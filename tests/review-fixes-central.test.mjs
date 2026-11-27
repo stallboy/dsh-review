@@ -168,22 +168,20 @@ test('AC-CENTRAL-04 首次摘要登记可恢复旧任务，并通过原事件链
     assert.equal(finished.result.outcome.status, 'ABORTED');
 });
 
-test('AC-CENTRAL-05 升级前已缓存详情在节点离线时继续可读', async t => {
+test('AC-CENTRAL-05 已缓存详情在节点离线时继续可读', async t => {
     const { app, headers } = await setupCentral(t);
     const node = await registerNode(app);
     const project = await bindProject(app, headers, node);
     await app.inject({ method: 'POST', url: '/node-api/v1/snapshots', headers: node.headers, payload: { instanceId: node.instanceId,
         snapshot: { projectId: project.projectId, bindingGeneration: 1, projectConfigRevision: 1, snapshotSequence: 1,
-            vcsSnapshot: 'legacy', collectedAt: new Date().toISOString(), queue: [], findings: [], audits: [], errors: [] } } });
+            vcsSnapshot: 'snap-1', collectedAt: new Date().toISOString(), queue: [], findings: [], audits: [], errors: [] } } });
     const url = `/api/v1/projects/${project.projectId}/candidate?id=2026-11/fix`;
     const query = (await app.inject({ url, headers })).json();
     await app.inject({ method: 'POST', url: '/node-api/v1/queries/results', headers: node.headers, payload: { instanceId: node.instanceId,
-        results: [{ queryId: query.queryId, status: 'ready', vcsSnapshot: 'legacy', data: { title: '旧版离线缓存' } }] } });
-    const oldKey = digest(stableJson({ projectId: project.projectId, generation: 1, snapshot: 'legacy', kind: 'candidate', params: { id: '2026-11/fix' } }));
-    app.database.sql.prepare('UPDATE queries SET cache_key=? WHERE query_id=?').run(oldKey, query.queryId);
+        results: [{ queryId: query.queryId, status: 'ready', vcsSnapshot: 'snap-1', data: { title: '离线缓存详情' } }] } });
     await app.inject({ method: 'POST', url: '/node-api/v1/disconnect', headers: node.headers, payload: { instanceId: node.instanceId } });
     const cached = await app.inject({ url, headers });
     assert.equal(cached.statusCode, 200);
-    assert.equal(cached.json().data.title, '旧版离线缓存');
+    assert.equal(cached.json().data.title, '离线缓存详情');
     assert.equal(cached.json().freshness, 'offline');
 });

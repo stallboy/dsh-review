@@ -224,6 +224,8 @@ export async function landApprovalCommit(params: {
     }
   }
 
+  // 在触发提交探针前锁定 Git 目标符号引用，防止探针阶段发生同 SHA 切分支后误推进新分支。
+  const gitTarget = vcs.type === 'git' ? (await vcs.getApprovalTarget?.()) ?? undefined : undefined;
   const probePaths = [relReviewPath, ...businessPathsToVerify];
   const committed = await commitWithThreeBranchRecovery({
     vcs,
@@ -252,7 +254,6 @@ export async function landApprovalCommit(params: {
         ...preGateBusiness.entries,
         { path: relReviewPath, blobHash: expectedReviewBlob },
       ];
-      const gitTarget = vcs.type === 'git' ? (await vcs.getApprovalTarget?.()) ?? undefined : undefined;
       return vcs.atomicCommit({
         message: vcsCommitMessage,
         paths: [...businessPathsToVerify, relReviewPath],
@@ -318,7 +319,7 @@ export async function landApprovalCommit(params: {
     };
   }
 
-  if (committed.outOfDate || committed.targetChanged) {
+  if (committed.outOfDate) {
     if (attemptNumber < maxRetries) {
       log(`提交撞车（${committed.errorOutput}），已还原，准备重试`);
       return { retry: true };

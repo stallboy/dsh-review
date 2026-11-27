@@ -710,11 +710,24 @@ async function verifyAndCommitModeBProposal(params: {
   }
   const meta = localCandidate.meta;
   const oldMeta = sharedBefore.candidate.meta;
+  const addedPatch = meta.patches.length === oldMeta.patches.length + 1
+    ? meta.patches[meta.patches.length - 1]
+    : undefined;
+  // 仅包含 .ai-review/ 元数据提交时业务树未变化，新补丁沿用原业务基线视为合法（SPEC §4.5）。
+  let baseCompatible = false;
+  if (addedPatch) {
+    if (addedPatch.baseRevision === targetBase) {
+      baseCompatible = true;
+    } else {
+      const changes = await runtime.vcs.businessChangesBetween(addedPatch.baseRevision, targetBase).catch(() => null);
+      baseCompatible = Array.isArray(changes) && changes.length === 0;
+    }
+  }
   const errors: string[] = [
     ...assertAppendOnlyHistory(oldMeta, meta, {
       mode: 'mode_b',
       targetOptionId: selection.optionId,
-      targetBase,
+      ...(baseCompatible ? {} : { targetBase }),
     }),
   ];
 

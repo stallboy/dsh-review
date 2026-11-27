@@ -93,6 +93,11 @@ export async function commitWithThreeBranchRecovery(
     return markRecovery('COMMIT_OUTCOME_UNKNOWN', `提交后核验失败，现场保留待人工核对：${commit.errorOutput}`);
   }
 
+  if (commit.targetChanged) {
+    // 目标分支或基线引用在提交临界区发生变化：不得切回原分支或静默重试，立即保留现场进入恢复态。
+    return markRecovery('COMMIT_OUTCOME_UNKNOWN', `提交目标引用或分支发生变化，已停止提交并保留现场：${commit.errorOutput}`);
+  }
+
   const probeAfter = await vcs.getCommitProbe(probePaths).catch(() => null);
   if (probeBefore !== null && probeAfter !== null && probeAfter !== probeBefore) {
     const verified = await verifyOnProbeChange(probeAfter).catch(() => false);
