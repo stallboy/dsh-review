@@ -3,7 +3,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -23,7 +23,6 @@ import {
   type Runtime,
 } from './api-context.js';
 import {
-  closeManualAuditChannels,
   handleAuditFinalize,
   handleAuditManual,
   handleAuditPrompt,
@@ -69,10 +68,11 @@ import { runAuditSelfTest, type AuditSelfTestOutcome } from './audit-self-test.j
 import { AuditLifecycle, type AuditLeaseRecord, type LeaseStore } from './audit-lifecycle.js';
 import type { AuditStage } from './audit-prompts.js';
 import type { AuditExecutor } from './audit-stage-runner.js';
+import { DesktopAuditSessionCoordinator } from './desktop-audit-coordinator.js';
 import { JobManager } from './jobs.js';
 import { RepoRecoveryStore } from './recovery-store.js';
 import { matchRoute } from './routes.js';
-import { detectVcsType, dshHome, validateSettings } from './settings.js';
+import { atomicWriteJson, detectVcsType, dshHome, validateSettings } from './settings.js';
 import { ReviewStore } from './store.js';
 import { ApiError, type AppSettings, type ConcurrencyGuard, type IssueSelection, type JobRecord, type VcsType } from './types.js';
 import { createVcs } from './vcs.js';
@@ -100,16 +100,14 @@ class FileLeaseStore implements LeaseStore {
   }
 
   async save(leases: AuditLeaseRecord[]): Promise<void> {
-    await mkdir(path.dirname(this.filePath), { recursive: true });
-    const temp = `${this.filePath}.${String(process.pid)}.${String(Date.now())}.tmp`;
-    await writeFile(temp, `${JSON.stringify({ leases }, null, 2)}\n`, 'utf8');
-    await rename(temp, this.filePath);
+    await atomicWriteJson(this.filePath, { leases });
   }
 }
 
 export class ReviewApi implements ApiHost {
   readonly jobManager = new JobManager();
   readonly auditLifecycle: AuditLifecycle;
+  readonly auditCoordinator = new DesktopAuditSessionCoordinator();
   readonly recoveryStore: RepoRecoveryStore;
   readonly auditJobFinishes = new Map<string, (result?: unknown) => void>();
   readonly auditJobLeases = new Map<string, string>();
@@ -180,8 +178,8 @@ export class ReviewApi implements ApiHost {
     return this.auditLifecycle.all().some((lease) => lease.state !== 'released' && lease.sessionId === sessionId);
   }
 
-  isAuditStopping(_auditId: string): boolean {
-    return false;
+  isAuditStopping(auditId: string): boolean {
+    return this.auditCoordinator.isAuditStopping(auditId);
   }
 
   hasActiveAuditWork(auditId: string): boolean {
@@ -191,7 +189,8 @@ export class ReviewApi implements ApiHost {
 
   async closeAudit(): Promise<void> {
     this.closed = true;
-    closeManualAuditChannels(this.auditLifecycle.all().map((l) => l.auditId));
+    this.auditCoordinator.closeAll();
+    this.caches.close();
     for (const job of this.jobManager.list()) {
       if (job.status === 'running') this.jobManager.abort(job.id);
     }
@@ -225,16 +224,14 @@ export class ReviewApi implements ApiHost {
         { auditId: lease.auditId, leaseState: lease.state },
       );
     }
-    if (root) {
-      const fix = this.fixSessionRegistry.activeFor(root);
-      if (fix) {
-        throw new ApiError(
-          409,
-          'conflict',
-          `工作副本正被交互式提案会话占用（${fix.candidateId} / session ${fix.sessionId || '启动中'}），请先收尾或停止会话`,
-          { fixSession: fix },
-        );
-      }
+    const fix = root ? this.fixSessionRegistry.activeFor(root) : this.fixSessionRegistry.anyActive();
+    if (fix) {
+      throw new ApiError(
+        409,
+        'conflict',
+        `工作副本正被交互式提案会话占用（${fix.candidateId} / session ${fix.sessionId || '启动中'}），请先收尾或停止会话`,
+        { fixSession: fix },
+      );
     }
   }
 
@@ -264,8 +261,14 @@ export class ReviewApi implements ApiHost {
     }
 
     const expectedRoot = url.searchParams.get('expectedRepoRoot')?.trim();
-    if (expectedRoot && path.resolve(expectedRoot).toLowerCase() !== targetRoot.toLowerCase()) {
-      throw new ApiError(409, 'conflict', `仓库上下文已切换（期望 ${expectedRoot}，当前 ${targetRoot}），请刷新页面`);
+    if (expectedRoot) {
+      const resolvedExpected = path.resolve(expectedRoot);
+      const sameRoot = process.platform === 'win32'
+        ? resolvedExpected.toLowerCase() === targetRoot.toLowerCase()
+        : resolvedExpected === targetRoot;
+      if (!sameRoot) {
+        throw new ApiError(409, 'conflict', `仓库上下文已切换（期望 ${expectedRoot}，当前 ${targetRoot}），请刷新页面`);
+      }
     }
 
     const detected = detectVcsType(targetRoot);
@@ -371,6 +374,9 @@ export class ReviewApi implements ApiHost {
       const { route, params } = matched;
 
       const dispatch = async (): Promise<void> => {
+        if (route.blockedByActiveAudit || route.path === '/audit/release' || route.path === '/audit/finalize') {
+          await this.auditLifecycle.expireOverdue();
+        }
         if (route.blockedByActiveAudit || route.category === 'repo_write') {
           const runtime = await this.runtimeFor(url);
           if (route.category === 'repo_write') {

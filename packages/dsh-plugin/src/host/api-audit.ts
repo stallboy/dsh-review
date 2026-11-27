@@ -1,11 +1,14 @@
 /**
  * 审查编排与租约控制 API（SPEC §5.6 / §6.3 / §9.11）：
  * - 所有启动入口前置核验 reviewers.yml 与有效 default_owner（412 not_configured）；
- * - 手动、会话与定时审查完全共用统一 AuditStageSession + finalizeIssueAudit 流水线（零历史旁路）；
- * - 持久化租约互斥，超时/取消不自动释放手动租约。
+ * - 手动、会话与定时审查完全共用统一 AuditStageSession + finalizeIssueAudit 流水线；
+ * - 所有运行时阶段会话与手动回环通道归属 ReviewApi.auditCoordinator 实例，无模块级全局泄漏；
+ * - 持久化租约互斥，超时/取消/零合法问题失败均不盲目释放租约。
  */
 
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import {
   currentTrustedActor,
   readJson,
@@ -15,6 +18,7 @@ import {
   type ApiHost,
   type ApiRequest,
   type ApiResponse,
+  type Runtime,
 } from './api-context.js';
 import { AuditArchive } from './audit-archive.js';
 import { AUDIT_TIMEOUT_MS, type AuditLeaseRecord } from './audit-lifecycle.js';
@@ -32,24 +36,8 @@ import {
   scheduledReviewDataClean,
   syncScheduledAudit,
 } from './scheduled-audit-vcs.js';
+import type { SharedCandidateSource } from './shared-facts.js';
 import { ApiError } from './types.js';
-
-/** 活跃 DSH 审查会话与阶段状态机的内存映射（随会话与租约绑定）。 */
-const activeStageSessions = new Map<string, { auditId: string; session: AuditStageSession }>();
-/** 手动外部审查开启的本机一次性阶段通道（随租约结束或 Host 关闭撤销）。 */
-const manualStageChannels = new Map<string, () => void>();
-
-export function closeManualAuditChannels(auditIds?: Iterable<string>): void {
-  if (!auditIds) {
-    for (const close of manualStageChannels.values()) close();
-    manualStageChannels.clear();
-    return;
-  }
-  for (const id of auditIds) {
-    manualStageChannels.get(id)?.();
-    manualStageChannels.delete(id);
-  }
-}
 
 export function runAuditStageForSession(
   host: ApiHost,
@@ -59,7 +47,7 @@ export function runAuditStageForSession(
   task: unknown,
   signal: AbortSignal,
 ): Promise<unknown> {
-  const bound = activeStageSessions.get(sessionId);
+  const bound = host.auditCoordinator.getStageSession(sessionId);
   if (!bound) throw new Error('审查会话未绑定活跃阶段租约');
   const lease = host.leaseLookup(bound.auditId);
   if (!lease || lease.state !== 'active' || lease.sessionId !== sessionId) {
@@ -74,7 +62,7 @@ export function publishAuditStagesForSession(
   publication: unknown,
   signal: AbortSignal,
 ): Promise<unknown> {
-  const bound = activeStageSessions.get(sessionId);
+  const bound = host.auditCoordinator.getStageSession(sessionId);
   if (!bound) throw new Error('审查会话未绑定活跃阶段租约');
   const lease = host.leaseLookup(bound.auditId);
   if (!lease || lease.state !== 'active' || lease.sessionId !== sessionId) {
@@ -88,13 +76,144 @@ export function queryAuditHistoryForSession(
   sessionId: string,
   disposition?: string,
 ): Promise<unknown> {
-  const bound = activeStageSessions.get(sessionId);
+  const bound = host.auditCoordinator.getStageSession(sessionId);
   if (!bound) throw new Error('审查会话未绑定活跃阶段租约');
   const lease = host.leaseLookup(bound.auditId);
   if (!lease || lease.state === 'released' || lease.sessionId !== sessionId) {
     throw new Error('审查租约已释放，无法查询历史');
   }
   return bound.session.queryHistory(disposition);
+}
+
+/** 统一根据收尾结果迁移审查租约并清理通道：仅成功落盘共享提交才释放租约，0 合法问题或恢复态保留 releasable。 */
+async function applyAuditLeaseOutcome(
+  host: ApiHost,
+  runtime: Runtime,
+  lease: AuditLeaseRecord,
+  outcome: { status: string; commitRevision: string | null; reason?: string },
+  options: { releaseOnCleanAbort?: boolean } = {},
+): Promise<void> {
+  const { auditId, sessionId } = lease;
+  if (outcome.status === 'COMMITTED' || (outcome.status === 'VALIDATION_FAILED' && outcome.commitRevision !== null)) {
+    await host.auditLifecycle.transition(auditId, 'released', false);
+    host.auditCoordinator.closeManualChannel(auditId);
+    if (sessionId) host.auditCoordinator.unbindStageSession(sessionId);
+    host.auditCoordinator.clearStopping(auditId);
+    return;
+  }
+  if (outcome.status === 'VALIDATION_FAILED') {
+    await host.auditLifecycle.markReleasable(auditId);
+    host.auditCoordinator.closeManualChannel(auditId);
+    if (sessionId) host.auditCoordinator.unbindStageSession(sessionId);
+    return;
+  }
+  if (outcome.status === 'RECOVERY_REQUIRED') {
+    const commitOutcomeUnknown = outcome.reason === 'COMMIT_OUTCOME_UNKNOWN' ? true : undefined;
+    await host.auditLifecycle.transition(auditId, 'releasable', commitOutcomeUnknown);
+    host.auditCoordinator.closeManualChannel(auditId);
+    if (sessionId) host.auditCoordinator.unbindStageSession(sessionId);
+    return;
+  }
+  if (outcome.status === 'ABORTED') {
+    if (options.releaseOnCleanAbort) {
+      const cleanNow = await runtime.vcs.ensureCleanWorkspace().catch(() => null);
+      if (cleanNow?.clean && !lease.stageProcessActive) {
+        await host.auditLifecycle.transition(auditId, 'released', false);
+        host.auditCoordinator.closeManualChannel(auditId);
+        if (sessionId) host.auditCoordinator.unbindStageSession(sessionId);
+        return;
+      }
+    }
+    await host.auditLifecycle.markReleasable(auditId);
+    host.auditCoordinator.closeManualChannel(auditId);
+    if (sessionId) host.auditCoordinator.unbindStageSession(sessionId);
+  }
+}
+
+async function openManualStageChannel(params: {
+  host: ApiHost;
+  runtime: Runtime;
+  lease: AuditLeaseRecord;
+  note: string;
+  source?: SharedCandidateSource;
+  now: Date;
+}): Promise<string> {
+  const { host, runtime, lease, note, source, now } = params;
+  const auditId = lease.auditId;
+  let channelClose: (() => void) | undefined;
+  try {
+    const stageSession = new AuditStageSession({
+      auditId,
+      root: runtime.root,
+      scope: lease.targetPath || '.',
+      baseRevision: lease.baseRevision,
+      ...(lease.svnUrl ? { svnUrl: lease.svnUrl } : {}),
+      trigger: lease.trigger,
+      owner: lease.owner,
+      note,
+      deadlineAt: new Date(now.getTime() + AUDIT_TIMEOUT_MS).toISOString(),
+      vcs: runtime.vcs,
+      store: runtime.store,
+      ...(source ? { source } : {}),
+      stageExecutors: host.currentSettings().stageExecutors,
+      ...(host.currentSettings().dshCommand ? { dshCommand: host.currentSettings().dshCommand } : {}),
+      ...(host.deps.auditStageExecutor ? { executor: host.deps.auditStageExecutor } : {}),
+      onSeal: async (manifest, issueIds) => {
+        lease.stageSeal = manifest;
+        lease.publishedIssueIds = issueIds;
+        await host.auditLifecycle.create(lease);
+      },
+      onStageStateChange: async (active) => {
+        if (active) lease.stageProcessActive = true;
+        else delete lease.stageProcessActive;
+        await host.auditLifecycle.create(lease);
+      },
+    });
+    const orchestratorPrompt = await stageSession.buildOrchestratorPrompt('manual');
+    const memorySummary = await negativeMemoryLines(runtime.store, source);
+    const channel = await openAuditStageChannel(async (input, reqSignal) => {
+      const current = host.leaseLookup(auditId);
+      if (!current || current.state !== 'active') throw new Error('审查租约已失效，阶段入口已关闭');
+      const op = input['operation'];
+      if (op === 'runAuditStage') {
+        return stageSession.runStage(
+          input['stage'] as AuditStage,
+          (input['runner'] as AuditExecutor | undefined) ?? 'dsh-subagent',
+          input['task'],
+          reqSignal,
+        );
+      }
+      if (op === 'publishAuditArtifacts') {
+        return stageSession.publish(input['publication'], reqSignal);
+      }
+      if (op === 'queryAuditHistory') {
+        return stageSession.queryHistory(typeof input['disposition'] === 'string' ? input['disposition'] : undefined);
+      }
+      throw new Error(`未知阶段操作：${String(op ?? '')}`);
+    });
+    channelClose = channel.close;
+    host.auditCoordinator.registerManualChannel(auditId, channel.close);
+    const timer = setTimeout(() => {
+      host.auditCoordinator.closeManualChannel(auditId);
+      void host.auditLifecycle.markReleasable(auditId).catch(() => undefined);
+    }, AUDIT_TIMEOUT_MS);
+    timer.unref?.();
+    host.auditCoordinator.setTimer(auditId, timer);
+
+    return [
+      orchestratorPrompt,
+      '',
+      '## 近期负向记忆（供去重参考）',
+      memorySummary,
+      '',
+      channel.instructions,
+    ].join('\n');
+  } catch (error) {
+    channelClose?.();
+    host.auditCoordinator.closeManualChannel(auditId);
+    await host.leaseTransition(auditId, 'released').catch(() => undefined);
+    throw error;
+  }
 }
 
 export async function handleAuditPrompt(host: ApiHost, _req: ApiRequest, res: ApiResponse, url: URL): Promise<void> {
@@ -161,74 +280,14 @@ export async function handleAuditManual(host: ApiHost, req: ApiRequest, res: Api
     };
     await host.auditLifecycle.create(lease);
 
-    let channelClose: (() => void) | undefined;
-    let fullPrompt: string;
-    try {
-      const stageSession = new AuditStageSession({
-        auditId,
-        root: runtime.root,
-        scope: target.targetPath || '.',
-        baseRevision: base,
-        ...(svnUrl ? { svnUrl } : {}),
-        trigger: 'manual',
-        owner,
-        note,
-        deadlineAt: new Date(now.getTime() + AUDIT_TIMEOUT_MS).toISOString(),
-        vcs: runtime.vcs,
-        store: runtime.store,
-        ...(source ? { source } : {}),
-        stageExecutors: host.currentSettings().stageExecutors,
-        ...(host.currentSettings().dshCommand ? { dshCommand: host.currentSettings().dshCommand } : {}),
-        ...(host.deps.auditStageExecutor ? { executor: host.deps.auditStageExecutor } : {}),
-        onSeal: async (manifest, issueIds) => {
-          lease.stageSeal = manifest;
-          lease.publishedIssueIds = issueIds;
-          await host.auditLifecycle.create(lease);
-        },
-        onStageStateChange: async (active) => {
-          if (active) lease.stageProcessActive = true;
-          else delete lease.stageProcessActive;
-          await host.auditLifecycle.create(lease);
-        },
-      });
-      const orchestratorPrompt = await stageSession.buildOrchestratorPrompt('manual');
-      const memorySummary = await negativeMemoryLines(runtime.store, source);
-      const channel = await openAuditStageChannel(async (input, reqSignal) => {
-        const current = host.leaseLookup(auditId);
-        if (!current || current.state !== 'active') throw new Error('审查租约已失效，阶段入口已关闭');
-        const op = input['operation'];
-        if (op === 'runAuditStage') {
-          return stageSession.runStage(
-            input['stage'] as AuditStage,
-            (input['runner'] as AuditExecutor | undefined) ?? 'dsh-subagent',
-            input['task'],
-            reqSignal,
-          );
-        }
-        if (op === 'publishAuditArtifacts') {
-          return stageSession.publish(input['publication'], reqSignal);
-        }
-        if (op === 'queryAuditHistory') {
-          return stageSession.queryHistory(typeof input['disposition'] === 'string' ? input['disposition'] : undefined);
-        }
-        throw new Error(`未知阶段操作：${String(op ?? '')}`);
-      });
-      channelClose = channel.close;
-      manualStageChannels.set(auditId, channel.close);
-      fullPrompt = [
-        orchestratorPrompt,
-        '',
-        '## 近期负向记忆（供去重参考）',
-        memorySummary,
-        '',
-        channel.instructions,
-      ].join('\n');
-    } catch (error) {
-      channelClose?.();
-      manualStageChannels.delete(auditId);
-      await host.leaseTransition(auditId, 'released').catch(() => undefined);
-      throw error;
-    }
+    const fullPrompt = await openManualStageChannel({
+      host,
+      runtime,
+      lease,
+      note,
+      ...(source ? { source } : {}),
+      now,
+    });
 
     const job = host.jobManager.start('audit', async () => ({
       manual: true,
@@ -331,8 +390,41 @@ export async function handleAuditStart(host: ApiHost, req: ApiRequest, res: ApiR
       ...(trusted?.commandId ? { commandId: trusted.commandId } : {}),
     };
     await host.auditLifecycle.create(lease);
-    return { lease, target, owner, source };
+
+    if (host.currentSettings().runner === 'manual') {
+      const fullPrompt = await openManualStageChannel({
+        host,
+        runtime,
+        lease,
+        note,
+        ...(source ? { source } : {}),
+        now,
+      });
+      return { lease, target, owner, source, manualPrompt: fullPrompt };
+    }
+    return { lease, target, owner, source, manualPrompt: undefined as string | undefined };
   });
+
+  if (setup.manualPrompt !== undefined) {
+    const prompt = setup.manualPrompt;
+    const job = host.jobManager.start('audit', async () => ({
+      manual: true,
+      status: 'MANUAL_REQUIRED',
+      auditId: setup.lease.auditId,
+      prompt,
+      created: [],
+      issues: [],
+      report: null,
+      commitRevision: null,
+      baseRevision: setup.lease.baseRevision,
+      targetPath: setup.target.targetPath,
+      warnings: [],
+      message: '手动模式：已生成总调度审查提示词并建立租约，完成后请调用 /audit/finalize 收尾。',
+    }));
+    host.auditJobLeases.set(job.id, setup.lease.auditId);
+    sendJson(res, 202, { jobId: job.id, job, auditId: setup.lease.auditId, prompt });
+    return;
+  }
 
   const job = host.jobManager.start('audit', async (ctx) => {
     const combinedSignal = scheduled ? AbortSignal.any([ctx.signal, scheduled.signal]) : ctx.signal;
@@ -352,6 +444,7 @@ export async function handleAuditStart(host: ApiHost, req: ApiRequest, res: ApiR
         ...(host.deps.resolveCredential ? { resolveCredential: host.deps.resolveCredential } : {}),
         ...(host.deps.auditStageExecutor ? { stageExecutor: host.deps.auditStageExecutor } : {}),
         ...(scheduled ? { scheduledBaseMatches: () => matchesAuditTarget(runtime, scheduled.target) } : {}),
+        recoveryStore: host.recoveryStore,
         onSeal: async (manifest, issueIds) => {
           setup.lease.stageSeal = manifest;
           setup.lease.publishedIssueIds = issueIds;
@@ -364,18 +457,7 @@ export async function handleAuditStart(host: ApiHost, req: ApiRequest, res: ApiR
         },
       });
 
-      if (outcome.status === 'COMMITTED' || outcome.status === 'VALIDATION_FAILED') {
-        await host.auditLifecycle.transition(setup.lease.auditId, 'released');
-      } else if (outcome.status === 'ABORTED') {
-        const cleanNow = await runtime.vcs.ensureCleanWorkspace().catch(() => null);
-        if (cleanNow?.clean && !setup.lease.stageProcessActive) {
-          await host.auditLifecycle.transition(setup.lease.auditId, 'released');
-        } else {
-          await host.auditLifecycle.markReleasable(setup.lease.auditId);
-        }
-      } else if (outcome.status === 'RECOVERY_REQUIRED') {
-        await host.auditLifecycle.transition(setup.lease.auditId, 'releasable', true);
-      }
+      await applyAuditLeaseOutcome(host, runtime, setup.lease, outcome, { releaseOnCleanAbort: true });
       return outcome;
     } catch (error) {
       await host.auditLifecycle.markReleasable(setup.lease.auditId).catch(() => undefined);
@@ -487,15 +569,15 @@ export async function handleAuditSession(host: ApiHost, req: ApiRequest, res: Ap
         sessionId = sid;
         prepared.lease.sessionId = sid;
         await host.auditLifecycle.create(prepared.lease);
-        activeStageSessions.set(sid, { auditId: prepared.lease.auditId, session: prepared.stageSession });
+        host.auditCoordinator.bindStageSession(sid, prepared.lease.auditId, prepared.stageSession);
         trusted?.managedAuditSession?.onCreated(prepared.lease.auditId, sid);
       },
     });
     sessionId = created.sessionId;
-    if (!activeStageSessions.has(sessionId)) {
+    if (!host.auditCoordinator.getStageSession(sessionId)) {
       prepared.lease.sessionId = sessionId;
       await host.auditLifecycle.create(prepared.lease);
-      activeStageSessions.set(sessionId, { auditId: prepared.lease.auditId, session: prepared.stageSession });
+      host.auditCoordinator.bindStageSession(sessionId, prepared.lease.auditId, prepared.stageSession);
     }
   } catch (error) {
     if (!sessionId) {
@@ -517,16 +599,70 @@ export async function handleAuditSession(host: ApiHost, req: ApiRequest, res: Ap
 
   const job = host.jobManager.start('audit', async (ctx) => {
     host.auditJobFinishes.set(ctx.id, finishJob);
+    const auditId = prepared.lease.auditId;
     const managedSignal = trusted?.managedAuditSession?.signal;
+    const nodeShutdown = trusted?.managedAuditSession?.nodeShutdown;
     const watchSignal = managedSignal ? AbortSignal.any([ctx.signal, managedSignal]) : ctx.signal;
-    const onAbort = () => {
-      void host.auditLifecycle.markReleasable(prepared.lease.auditId).catch(() => undefined);
+
+    let stopTriggered = false;
+    const stopAndMarkRecovery = async (kind: 'cancel' | 'timeout'): Promise<void> => {
+      if (stopTriggered || settled) return;
+      stopTriggered = true;
+      host.auditCoordinator.clearTimer(auditId);
+
+      // 节点主动关闭时保留持久化租约原样，待重启后自动转 releasable 人工核验
+      if (kind === 'cancel' && nodeShutdown?.aborted) {
+        finishJob({
+          manual: false,
+          status: 'RECOVERY_REQUIRED',
+          reason: 'SYNC_STATE_UNKNOWN',
+          detail: '宿主节点正在关闭，审查租约已持久化保留待重启后核验',
+          auditId,
+          sessionId,
+          created: [],
+          issues: [],
+          report: null,
+          commitRevision: null,
+          baseRevision: prepared.lease.baseRevision,
+          targetPath: prepared.lease.targetPath,
+          warnings: ['宿主节点关闭中断跟踪'],
+          message: '宿主节点关闭，原审查租约已保留',
+        });
+        return;
+      }
+
+      const stoppingLine = kind === 'timeout'
+        ? `审查 ${auditId} 超过 3 小时上限，正在停止审查会话并保留现场`
+        : `收到取消信号，正在停止审查会话 ${sessionId}`;
+      host.auditCoordinator.markStopping(auditId);
+      ctx.log(stoppingLine);
+      await trusted?.managedAuditSession?.reportStopping?.(stoppingLine).catch(() => undefined);
+      let stoppedConfirmed = true;
+      if (host.deps.stopAuditSession) {
+        stoppedConfirmed = await host.deps.stopAuditSession(
+          sessionId,
+          AbortSignal.timeout(15_000),
+          Promise.resolve(true),
+        ).catch(() => false);
+      }
+      await host.auditLifecycle.markReleasable(auditId).catch(() => undefined);
+      host.auditCoordinator.unbindStageSession(sessionId);
+      host.auditCoordinator.clearStopping(auditId);
+
+      const detail = kind === 'timeout'
+        ? (stoppedConfirmed
+          ? '审查超过 3 小时上限，已停止会话并保留现场待核验释放'
+          : '审查超过 3 小时上限，未能确认会话完全停止，已保留租约待核验')
+        : (stoppedConfirmed
+          ? '审查跟踪已取消，已请求停止原会话并保留租约待核验释放'
+          : '审查跟踪已取消，未能确认原会话完全停止，已保留租约待核验');
+
       finishJob({
         manual: false,
         status: 'RECOVERY_REQUIRED',
         reason: 'SYNC_STATE_UNKNOWN',
-        detail: '审查跟踪已取消，原会话与租约已保留，请确认停止并核验后释放',
-        auditId: prepared.lease.auditId,
+        detail,
+        auditId,
         sessionId,
         created: [],
         issues: [],
@@ -534,22 +670,53 @@ export async function handleAuditSession(host: ApiHost, req: ApiRequest, res: Ap
         commitRevision: null,
         baseRevision: prepared.lease.baseRevision,
         targetPath: prepared.lease.targetPath,
-        warnings: ['审查跟踪已取消'],
-        message: '审查跟踪已取消，需核验现场',
+        warnings: [kind === 'timeout' ? '审查超过 3 小时上限' : '审查跟踪已取消'],
+        message: kind === 'timeout' ? '审查超时，需人工核验后释放租约' : '审查跟踪已取消，需核验现场',
       });
+    };
+
+    const onAbort = () => {
+      void stopAndMarkRecovery('cancel');
     };
     if (watchSignal.aborted) onAbort();
     else watchSignal.addEventListener('abort', onAbort, { once: true });
 
     const timeoutTimer = setTimeout(() => {
-      void host.auditLifecycle.markReleasable(prepared.lease.auditId).catch(() => undefined);
+      void stopAndMarkRecovery('timeout');
     }, AUDIT_TIMEOUT_MS);
     timeoutTimer.unref?.();
+    host.auditCoordinator.setTimer(auditId, timeoutTimer);
 
     if (host.deps.withAuditSessionIdle) {
       void host.deps.withAuditSessionIdle(sessionId, requestId, watchSignal, async (finalizeSignal) => {
-        const currentLease = host.leaseLookup(prepared.lease.auditId);
-        if (!currentLease || currentLease.state === 'released') return false;
+        const currentLease = host.leaseLookup(auditId);
+        if (!currentLease || currentLease.state === 'released' || stopTriggered) return false;
+
+        // 若阶段执行器均失败（0 次成功初审且未发布任何审查报告），绝不炮制空报告关闭租约
+        const reportDiskPath = path.join(runtime.root, '.ai-review', 'audits', currentLease.auditId, 'audit.md');
+        if (!prepared.stageSession.isPublished && prepared.stageSession.getScanCount() === 0 && prepared.stageSession.hasStageFailure() && !existsSync(reportDiskPath)) {
+          await host.auditLifecycle.markReleasable(currentLease.auditId);
+          host.auditCoordinator.unbindStageSession(sessionId);
+          finishJob({
+            manual: false,
+            status: 'RECOVERY_REQUIRED',
+            reason: 'SYNC_STATE_UNKNOWN',
+            stageFailure: true,
+            detail: '全部初审子阶段执行失败且未发布任何审查报告，已保留现场待核验',
+            auditId: currentLease.auditId,
+            sessionId,
+            created: [],
+            issues: [],
+            report: null,
+            commitRevision: null,
+            baseRevision: currentLease.baseRevision,
+            targetPath: currentLease.targetPath,
+            warnings: ['全部初审子阶段失败，未生成空报告'],
+            message: '审查子阶段全部失败，需人工核验',
+          });
+          return false;
+        }
+
         const result = await host.withWriteLock(runtime.root, () => finalizeIssueAudit(
           {
             store: runtime.store,
@@ -557,6 +724,7 @@ export async function handleAuditSession(host: ApiHost, req: ApiRequest, res: Ap
             log: ctx.log,
             ...(prepared.source ? { candidateSource: prepared.source } : {}),
             signal: finalizeSignal,
+            recoveryStore: host.recoveryStore,
           },
           {
             auditId: currentLease.auditId,
@@ -570,14 +738,7 @@ export async function handleAuditSession(host: ApiHost, req: ApiRequest, res: Ap
             runError: null,
           },
         ));
-        if (result.status === 'COMMITTED' || result.status === 'VALIDATION_FAILED') {
-          await host.auditLifecycle.transition(currentLease.auditId, 'released');
-          activeStageSessions.delete(sessionId);
-        } else if (result.status === 'RECOVERY_REQUIRED') {
-          await host.auditLifecycle.transition(currentLease.auditId, 'releasable', true);
-        } else {
-          await host.auditLifecycle.markReleasable(currentLease.auditId);
-        }
+        await applyAuditLeaseOutcome(host, runtime, currentLease, result);
         finishJob({
           manual: false,
           status: result.status,
@@ -596,7 +757,7 @@ export async function handleAuditSession(host: ApiHost, req: ApiRequest, res: Ap
           message: result.message,
         });
       }).catch(() => {
-        void host.auditLifecycle.markReleasable(prepared.lease.auditId).catch(() => undefined);
+        void host.auditLifecycle.markReleasable(auditId).catch(() => undefined);
       });
     }
 
@@ -604,7 +765,7 @@ export async function handleAuditSession(host: ApiHost, req: ApiRequest, res: Ap
       return await waitDone;
     } finally {
       watchSignal.removeEventListener('abort', onAbort);
-      clearTimeout(timeoutTimer);
+      host.auditCoordinator.clearTimer(auditId);
       host.auditJobFinishes.delete(ctx.id);
       host.auditJobLeases.delete(ctx.id);
     }
@@ -675,6 +836,7 @@ export async function handleAuditFinalize(host: ApiHost, req: ApiRequest, res: A
           log: ctx.log,
           ...(source ? { candidateSource: source } : {}),
           signal: ctx.signal,
+          recoveryStore: host.recoveryStore,
         },
         {
           auditId: lease.auditId,
@@ -689,14 +851,7 @@ export async function handleAuditFinalize(host: ApiHost, req: ApiRequest, res: A
         },
       );
 
-      if (result.status === 'COMMITTED' || result.status === 'VALIDATION_FAILED') {
-        await host.auditLifecycle.transition(auditId, 'released');
-        closeManualAuditChannels([auditId]);
-        if (lease.sessionId) activeStageSessions.delete(lease.sessionId);
-      } else if (result.status === 'RECOVERY_REQUIRED') {
-        await host.auditLifecycle.transition(auditId, 'releasable', true);
-        closeManualAuditChannels([auditId]);
-      }
+      await applyAuditLeaseOutcome(host, runtime, lease, result);
 
       const outcome = {
         manual: false,
@@ -732,6 +887,7 @@ export async function handleAuditRelease(host: ApiHost, req: ApiRequest, res: Ap
   const auditId = stringField(body, 'auditId').trim();
   if (!auditId) throw new ApiError(400, 'bad_request', '缺少 auditId');
   const runtime = await host.runtimeFor(url);
+  await host.auditLifecycle.expireOverdue();
   const lease = host.leaseLookup(auditId);
   if (!lease || lease.root !== runtime.root) {
     throw new ApiError(404, 'not_found', `审查租约不存在：${auditId}`);
@@ -762,8 +918,9 @@ export async function handleAuditRelease(host: ApiHost, req: ApiRequest, res: Ap
   }
 
   await host.auditLifecycle.transition(auditId, 'released', false);
-  closeManualAuditChannels([auditId]);
-  if (lease.sessionId) activeStageSessions.delete(lease.sessionId);
+  host.auditCoordinator.closeManualChannel(auditId);
+  if (lease.sessionId) host.auditCoordinator.unbindStageSession(lease.sessionId);
+  host.auditCoordinator.clearStopping(auditId);
   for (const [jid, lid] of host.auditJobLeases) {
     if (lid === auditId) {
       host.auditJobFinishes.get(jid)?.({

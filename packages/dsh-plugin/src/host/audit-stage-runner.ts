@@ -1,14 +1,15 @@
 /**
- * 分阶段审查执行器与多执行器降级策略（SPEC §5.4 / D11）：
+ * 分阶段审查执行器与多执行器降级策略（SPEC §5.4）：
  * - 支持外部专业执行器（codex / claude）优先调用以增强多模型分工；
- * - 遵循「软引导 + Host 强还原」策略，不再通过沙箱硬拦截项目目录写入；
- * - 外部执行器不可用、未配置、鉴权失败或启动失败时，优雅降级为本 Harness 独立子代理（dsh-subagent），绝不硬阻塞。
+ * - 遵循「软引导 + Host 强还原」策略，不在子阶段施加硬写拦截沙箱；
+ * - 外部执行器不可用、未配置、鉴权失败或启动失败时，优雅降级为本 Harness 独立子代理（dsh-subagent）。
  */
 
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AuditStage } from './audit-prompts.js';
+import { DshEventStreamParser, parseJsonPayload } from './dsh-stream.js';
 import { commandExists, runProcess } from './shell.js';
 
 export type AuditExecutor = 'codex' | 'claude' | 'claude-code' | 'dsh-subagent';
@@ -91,42 +92,6 @@ export function probeStageExecutors(configured: readonly string[], dshCommand = 
   return { executors, availableRunners };
 }
 
-function parseJsonPayload(text: string): unknown {
-  const trimmed = text.trim();
-  if (!trimmed) return undefined;
-  const fenced = [...trimmed.matchAll(/```(?:json)?\s*\r?\n([\s\S]*?)```/gi)];
-  for (let i = fenced.length - 1; i >= 0; i -= 1) {
-    try { return JSON.parse((fenced[i]?.[1] ?? '').trim()); } catch { }
-  }
-  try { return JSON.parse(trimmed); } catch { }
-  const lastBrace = trimmed.lastIndexOf('}');
-  if (lastBrace >= 0) {
-    for (let pos = trimmed.lastIndexOf('{', lastBrace); pos >= 0; pos = trimmed.lastIndexOf('{', pos - 1)) {
-      try { return JSON.parse(trimmed.slice(pos, lastBrace + 1)); } catch { }
-    }
-  }
-  return undefined;
-}
-
-function extractDshStreamOutput(stdout: string): unknown {
-  const assistantChunks: string[] = [];
-  for (const raw of stdout.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line) continue;
-    try {
-      const obj = JSON.parse(line) as Record<string, unknown>;
-      if (obj['structured_output'] !== undefined) return obj['structured_output'];
-      if (typeof obj['result'] === 'string') assistantChunks.push(obj['result']);
-      else if (typeof obj['text'] === 'string') assistantChunks.push(obj['text']);
-      else if (typeof obj['delta'] === 'string') assistantChunks.push(obj['delta']);
-      else if (typeof obj['content'] === 'string') assistantChunks.push(obj['content']);
-    } catch {
-      assistantChunks.push(line);
-    }
-  }
-  return parseJsonPayload(assistantChunks.join('\n') || stdout);
-}
-
 async function runExternalExecutor(
   executor: 'codex' | 'claude',
   request: StageRunRequest,
@@ -142,19 +107,26 @@ async function runExternalExecutor(
     const outputPath = path.join(tempDir, 'output.json');
     await writeFile(schemaPath, JSON.stringify(request.schema, null, 2), 'utf8');
 
-    // I18 / D11：不施加硬写拦截沙箱（采用软引导 + Host 子阶段交接强还原）
     const args = executor === 'codex'
       ? ['exec', '--output-schema', schemaPath, '-o', outputPath, '-']
       : ['-p', '--output-format', 'json', '--json-schema', JSON.stringify(request.schema), '-'];
 
+    const streamParser = new DshEventStreamParser();
+    const stdoutTail: string[] = [];
     const result = await runProcess(bin, args, {
       cwd: request.cwd,
       input: request.prompt,
       timeoutMs: request.timeoutMs,
       signal: request.signal,
-      maxBytes: 16 * 1024 * 1024,
+      maxBytes: 256 * 1024,
+      captureStdout: false,
       killTreeOnExit: true,
-      onLine: (line) => request.onLog?.(`[${executor}] ${line.slice(0, 400)}`),
+      onLine: (line) => {
+        if (stdoutTail.length >= 200) stdoutTail.shift();
+        stdoutTail.push(line);
+        if (executor === 'claude') streamParser.feedLine(line);
+        request.onLog?.(`[${executor}] ${line.slice(0, 400)}`);
+      },
     });
 
     if (result.processTreeStopped === false) {
@@ -163,7 +135,7 @@ async function runExternalExecutor(
     if (result.aborted) return { ok: false, reason: 'aborted', diagnostic: `${executor} 阶段已取消` };
     if (result.timedOut) return { ok: false, reason: 'timeout', diagnostic: `${executor} 阶段超时` };
 
-    const combined = `${result.stdout}\n${result.stderr}`;
+    const combined = `${stdoutTail.join('\n')}\n${result.stderr}`;
     if (result.code !== 0) {
       if (/unauthorized|auth|api[_ -]?key|login|token|credential|401|403/i.test(combined)) {
         return { ok: false, reason: 'auth', diagnostic: `${executor} 鉴权不可用：${combined.trim().slice(0, 300)}` };
@@ -174,9 +146,9 @@ async function runExternalExecutor(
     let parsed: unknown;
     if (executor === 'codex') {
       const fromFile = await readFile(outputPath, 'utf8').catch(() => '');
-      parsed = parseJsonPayload(fromFile) ?? parseJsonPayload(result.stdout);
+      parsed = parseJsonPayload(fromFile) ?? parseJsonPayload(stdoutTail.join('\n'));
     } else {
-      parsed = extractDshStreamOutput(result.stdout);
+      parsed = streamParser.extractJsonOutput();
     }
     if (parsed === undefined) {
       return { ok: false, reason: 'invalid_output', diagnostic: `${executor} 未输出合法结构化 JSON` };
@@ -202,15 +174,23 @@ async function runNativeHarnessSubagent(request: StageRunRequest): Promise<Stage
     '```',
   ].join('\n');
 
+  const streamParser = new DshEventStreamParser();
+  const stdoutTail: string[] = [];
   const args = [...tokens.slice(1), '--profile', 'headless', '--json', '-'];
   const result = await runProcess(bin, args, {
     cwd: request.cwd,
     input: promptWithSchema,
     timeoutMs: request.timeoutMs,
     signal: request.signal,
-    maxBytes: 16 * 1024 * 1024,
+    maxBytes: 256 * 1024,
+    captureStdout: false,
     killTreeOnExit: true,
-    onLine: (line) => request.onLog?.(`[dsh-subagent] ${line.slice(0, 400)}`),
+    onLine: (line) => {
+      if (stdoutTail.length >= 200) stdoutTail.shift();
+      stdoutTail.push(line);
+      streamParser.feedLine(line);
+      request.onLog?.(`[dsh-subagent] ${line.slice(0, 400)}`);
+    },
   });
 
   if (result.processTreeStopped === false) {
@@ -222,10 +202,10 @@ async function runNativeHarnessSubagent(request: StageRunRequest): Promise<Stage
     return {
       ok: false,
       reason: 'failed',
-      diagnostic: `dsh-subagent 退出码 ${String(result.code)}：${(result.stderr || result.stdout).trim().slice(0, 300)}`,
+      diagnostic: `dsh-subagent 退出码 ${String(result.code)}：${(result.stderr || stdoutTail.join('\n')).trim().slice(0, 300)}`,
     };
   }
-  const parsed = extractDshStreamOutput(result.stdout);
+  const parsed = streamParser.extractJsonOutput();
   if (parsed === undefined) {
     return { ok: false, reason: 'invalid_output', diagnostic: 'dsh-subagent 未输出合法结构化 JSON' };
   }

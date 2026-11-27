@@ -1,19 +1,19 @@
 /**
- * 正式问题发布与跨轮合并（SPEC §3.3 / §3.5 / §4.1 / D07 / D08）：
- * - 统一输出 schema_version: 1 的唯一 review.md（绝不硬编码 module='audit'）；
+ * 正式问题发布与跨轮合并（SPEC §3.3 / §3.5 / §4.1）：
+ * - 统一输出 schema_version: 1 的唯一 review.md（按显式/标题/路径推导真实模块名，绝不硬编码 'audit'）；
  * - 保留原目录、原 owner、人类评论、人工处置与补丁账本；
  * - 严格递增 updated_at；重开 approved 时转存 approval_history[] 并清空旧 options[] 退役旧 option_id；
  * - audit.md 仅作为纯索引（issues: YYYY-MM/<slug>[]）。
  */
 
-import { readFile } from 'node:fs/promises';
-import path from 'node:path';
+import { auditFiles } from './audit-files.js';
 import { auditIdTimestampUtc, serializeAuditMarkdown, type AuditFrontmatter, type AuditTrigger } from './audit-archive.js';
 import { parseReviewMarkdown, serializeReviewMarkdown } from './frontmatter.js';
 import { FINDING_ID_PATTERN, OPTION_ID_PATTERN, quickReviewInvariants, SLUG_PATTERN } from './invariants.js';
 import { formatPatchFilename, nextUpdatedAt, retiredOptionIds, sha256Hex } from './issue-review.js';
 import { parsePatch } from './patch.js';
 import { resolveOwner, type ReviewersConfig } from './reviewers.js';
+import type { SharedCandidateSource } from './shared-facts.js';
 import type { StageCandidate } from './audit-stage-artifacts.js';
 import type {
   AuditType,
@@ -75,6 +75,7 @@ export interface BuildIssuePublicationInput {
   reviewers: ReviewersConfig;
   existingByFindingId: ReadonlyMap<string, ReviewCandidate>;
   existingDirIds: ReadonlySet<string>;
+  source?: SharedCandidateSource;
   findings: readonly PublishedFindingInput[];
   reviewedExternal: readonly ReviewedExternalFindingInput[];
   coverageLines: readonly string[];
@@ -93,7 +94,22 @@ export interface BuiltIssuePublication {
 
 const PRIORITY_RANK: Record<ReviewPriority, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
 
-/** D07：按显式 module → title 前缀 → 首个证据文件路径推导出真实小写模块标志，绝不硬编码 'audit'。 */
+async function readExpectedReviewText(
+  repoRoot: string,
+  existing: ReviewCandidate,
+  source?: SharedCandidateSource,
+): Promise<string> {
+  if (source) {
+    const fromShared = await source.readReviewText(existing.month, existing.slug);
+    if (fromShared !== null) return fromShared;
+  }
+  const relReview = `.ai-review/${existing.id}/review.md`;
+  const readRes = await auditFiles(repoRoot, { op: 'read', paths: [relReview] });
+  if (!readRes.bytes) throw new Error(`既有问题共享记录不存在：${relReview}`);
+  return readRes.bytes.toString('utf8');
+}
+
+/** 按显式 module → title 前缀 → 首个证据文件路径推导出真实小写模块标志，绝不硬编码 'audit'。 */
 export function resolveIssueModule(input: { module?: string; title: string; targetFiles: readonly string[] }): string {
   const clean = (raw: string): string =>
     raw.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^[._-]+|[._-]+$/g, '').slice(0, 32);
@@ -158,12 +174,13 @@ function renderIssueBody(input: {
   finding: PublishedFindingInput;
   options: readonly RepairOption[];
   patches: readonly PatchEntry[];
+  humanDecisions: readonly HumanDecision[];
   recordRevision: number;
   auditId: string;
   baseRevision: string;
   existingBody?: string;
 }): string {
-  const { finding, options, patches, recordRevision, auditId, baseRevision, existingBody } = input;
+  const { finding, options, patches, humanDecisions, recordRevision, auditId, baseRevision, existingBody } = input;
   const patchById = new Map(patches.map((p) => [p.id, p]));
   const optionLines = options.length === 0
     ? [
@@ -178,9 +195,8 @@ function renderIssueBody(input: {
       ...(finding.repairPlan.trim() ? ['', finding.repairPlan.trim()] : []),
     ];
 
-  const allDecisions = finding.proposals.flatMap((p) => p.humanDecisions);
   const uniqueDecisions = new Map<string, HumanDecision>();
-  for (const d of allDecisions) uniqueDecisions.set(d.id, d);
+  for (const d of humanDecisions) uniqueDecisions.set(d.id, d);
   const decisionLines = uniqueDecisions.size === 0
     ? ['- 无']
     : [...uniqueDecisions.values()].map((d) => `- **${d.id}**：${d.question}${d.note ? `（${d.note}）` : ''}`);
@@ -384,7 +400,7 @@ export async function buildIssuePublication(
         commitMessage: buildCommitMessage(fullTitle, finding.reason, finding.issueKind),
       };
     } else {
-      expectedReview = await readFile(path.join(repoRoot, '.ai-review', existing.id, 'review.md'), 'utf8');
+      expectedReview = await readExpectedReviewText(repoRoot, existing, input.source);
       const prev = existing.meta;
       const isReopeningClosed = prev.status === 'approved' || prev.status === 'resolved';
       const nextApprovalHistory = isReopeningClosed && prev.approval
@@ -485,6 +501,7 @@ export async function buildIssuePublication(
       finding,
       options: meta.options,
       patches: meta.patches,
+      humanDecisions: meta.humanDecisions,
       recordRevision: meta.recordRevision,
       auditId: input.auditId,
       baseRevision: input.baseRevision,
@@ -526,7 +543,7 @@ export async function buildIssuePublication(
     if ((reviewed.verdict === 'resolved' || reviewed.verdict === 'confirmed') && reviewed.evidence.length === 0) {
       throw new Error(`外部复核 ${reviewed.findingId} 给出确定结论时必须提供真实代码证据`);
     }
-    const expectedReview = await readFile(path.join(repoRoot, '.ai-review', existing.id, 'review.md'), 'utf8');
+    const expectedReview = await readExpectedReviewText(repoRoot, existing, input.source);
     const obsAt = nextUpdatedAt(existing.meta.updatedAt, now);
     const mergedTargets = [...new Set([...existing.meta.targetFiles, ...reviewed.evidence.map((e) => e.path)])];
     const nextStatus: ReviewStatus = reviewed.verdict === 'resolved'

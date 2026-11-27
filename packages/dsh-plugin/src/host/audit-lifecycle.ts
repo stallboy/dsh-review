@@ -46,6 +46,35 @@ export class AuditLifecycle {
 
   async load(): Promise<void> {
     this.leases = await this.store.load();
+    // 重启后原宿主的子阶段进程必然已终止，清理残留 stageProcessActive，并对超 3 小时上限的活动租约自动迁为 releasable。
+    let changed = false;
+    for (const lease of this.leases) {
+      if (lease.stageProcessActive) {
+        delete lease.stageProcessActive;
+        changed = true;
+      }
+    }
+    const expired = await this.expireOverdue();
+    if (changed && !expired) {
+      await this.store.save(this.leases);
+    }
+  }
+
+  /** 将超过 3 小时上限的活动租约转为 releasable（仍阻塞写入直至人工核验释放）。 */
+  async expireOverdue(nowMs = Date.now()): Promise<boolean> {
+    let changed = false;
+    for (const lease of this.leases) {
+      if (lease.state !== 'active') continue;
+      const createdMs = Date.parse(lease.createdAt);
+      if (Number.isFinite(createdMs) && createdMs + AUDIT_TIMEOUT_MS <= nowMs) {
+        lease.state = 'releasable';
+        changed = true;
+      }
+    }
+    if (changed) {
+      await this.store.save(this.leases);
+    }
+    return changed;
   }
 
   all(): readonly AuditLeaseRecord[] {

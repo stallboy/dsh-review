@@ -1,5 +1,5 @@
 /**
- * 审查历史只读投影（SPEC §9.11 / D10）：
+ * 审查历史只读投影（SPEC §9.11）：
  * 直接从当前共享快照的 review.md 派生，供总调度了解开放问题、到期 defer、human_takeover 与 awaiting_verification；
  * 严禁主动拉起已程序修复关闭（approved）问题的复查（仅在正常扫描发现复发新证据时沿原记录重开）。
  */
@@ -11,8 +11,10 @@ import type { ReviewStore } from './store.js';
 import type { FindingDisposition, IssueFindingView, ReviewCandidate } from './types.js';
 
 export interface AuditHistorySnapshot {
-  /** 本轮 scope 内全部共享问题（按 findingId 索引，用于跨轮沿用目录与退役检查）。 */
+  /** 全部共享问题（按 findingId 索引，用于跨轮沿用目录与退役检查）。 */
   byFindingId: Map<string, ReviewCandidate>;
+  /** 全部共享问题（按目录 ID `YYYY-MM/<slug>` 索引，用于外部复核等按目录 ID 引用场景）。 */
+  byDirId: Map<string, ReviewCandidate>;
   /** 需要总调度在常规/定时审查中关注的活跃与待核验问题（绝不包含 approved）。 */
   activeForOrchestrator: IssueFindingView[];
   /** 等待代码证据核验的外部完成项（awaiting_verification）。 */
@@ -33,6 +35,7 @@ export async function loadAuditHistory(
 ): Promise<AuditHistorySnapshot> {
   const { candidates } = await store.listSharedCandidates(source);
   const byFindingId = new Map<string, ReviewCandidate>();
+  const byDirId = new Map<string, ReviewCandidate>();
   const activeForOrchestrator: IssueFindingView[] = [];
   const awaitingVerification: IssueFindingView[] = [];
   const dueDeferred: IssueFindingView[] = [];
@@ -44,12 +47,13 @@ export async function loadAuditHistory(
     if (candidate.parseError) continue;
     const meta = candidate.meta;
     byFindingId.set(meta.findingId, candidate);
+    byDirId.set(candidate.id, candidate);
     if (meta.status === 'approved' || meta.status === 'resolved') {
       closedFindingIds.add(meta.findingId);
     }
     if (!scopeCovers(scope, meta.targetFiles)) continue;
 
-    // D10 / SPEC §9.11：绝不将 approved 问题列入主动复查清单。
+    // 绝不将已关闭（approved / resolved）问题列入主动复查清单。
     if (meta.status === 'approved' || meta.status === 'resolved') continue;
 
     const view = buildFindingView(candidate);
@@ -77,6 +81,7 @@ export async function loadAuditHistory(
 
   return {
     byFindingId,
+    byDirId,
     activeForOrchestrator,
     awaitingVerification,
     dueDeferred,

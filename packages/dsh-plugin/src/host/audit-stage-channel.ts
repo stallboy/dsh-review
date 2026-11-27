@@ -4,7 +4,7 @@ import { readJson, sendJson } from './api-context.js';
 
 export type AuditStageRequest = (input: Record<string, unknown>, signal: AbortSignal) => Promise<unknown>;
 
-export async function openAuditStageChannel(dispatch: AuditStageRequest): Promise<{ instructions: string; redact(line: string): string; close(): void }> {
+export async function openAuditStageChannel(dispatch: AuditStageRequest): Promise<{ url: string; token: string; instructions: string; redact(line: string): string; close(): void }> {
     const secret = randomBytes(32).toString('base64url');
     const abort = new AbortController();
     const server = createServer(async (req, res) => {
@@ -39,11 +39,14 @@ export async function openAuditStageChannel(dispatch: AuditStageRequest): Promis
         server.close();
         throw new Error('无法启动本轮审查的本机阶段入口');
     }
+    const url = 'http://127.0.0.1:' + String(address.port) + '/';
     return {
+        url,
+        token: secret,
         instructions: [
             '## 本机 Host 阶段入口',
             '在执行器没有 DSH 工具时，通过下列 HTTP 调用完成同样的阶段。除调用此入口外，遵守总调度的工作区和工具限制。',
-            '向 http://127.0.0.1:' + String(address.port) + '/ 发送 POST JSON，请求头为 Content-Type: application/json 和 Authorization: Bearer ' + secret + '。',
+            '向 ' + url + ' 发送 POST JSON，请求头为 Content-Type: application/json 和 Authorization: Bearer ' + secret + '。',
             '只向这个本机入口发送本轮凭据。避免在报告、摘要和计划中输出凭据。',
             '运行阶段发送 {"operation":"runAuditStage","stage":"scan","runner":"codex","task":{...}}，按工具说明填写 task 对象。',
             '查询历史发送 {"operation":"queryAuditHistory"}，可加 disposition。发布发送 {"operation":"publishAuditArtifacts","publication":{...}}。',

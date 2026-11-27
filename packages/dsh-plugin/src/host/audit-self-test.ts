@@ -1,8 +1,8 @@
 /**
- * 节点审查流程自检（SPEC §9.12 / AC-SELF-TEST-01 / D11）：
- * - 在新建临时目录中验证「软引导 + Host 强还原」策略与完整 Harness 通道；
+ * 节点审查流程自检（SPEC §9.12 / AC-SELF-TEST-01）：
+ * - 在新建临时目录中验证「软引导 + Host 强还原」策略、真实回环阶段通道与完整 Harness 能力；
  * - 按 stageExecutors 依次尝试外部专业执行器（如 codex / claude）并如实报告每个执行器状态；
- * - 强制验证本 Harness 独立子代理（dsh-subagent）：外部执行器不可用时不作为硬阻断，只要本 Harness 子代理通过全部 5 项必验即返回 SUCCEEDED。
+ * - 强制验证本 Harness 独立子代理（dsh-subagent）：外部执行器不可用时不作为硬阻断，只要本 Harness 子代理与真实发布读写通过全部 5 项必验即返回 SUCCEEDED。
  */
 
 import { randomBytes } from 'node:crypto';
@@ -10,7 +10,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { serializeAuditMarkdown } from './audit-archive.js';
+import { publishStageArtifacts } from './audit-stage-artifacts.js';
 import { openAuditStageChannel } from './audit-stage-channel.js';
 import {
   executeAuditCli,
@@ -20,11 +20,9 @@ import {
   type ExecuteAuditStage,
   type ExecutorProbeStatus,
 } from './audit-stage-runner.js';
-import { serializeReviewMarkdown } from './frontmatter.js';
-import { sha256Hex } from './issue-review.js';
+import { buildIssuePublication } from './issue-publication.js';
 import { validateReviewData } from './review-data-validation.js';
 import { runProcess } from './shell.js';
-import type { ReviewFrontmatter } from './types.js';
 
 export const SELF_TEST_TIMEOUT_MS = 5 * 60_000;
 
@@ -74,61 +72,6 @@ async function initTempGitRepo(dir: string): Promise<string> {
   return tailToken;
 }
 
-function buildMockV1Review(baseRevision: string, nowIso: string, patchSha: string): string {
-  const meta: ReviewFrontmatter = {
-    schemaVersion: 1,
-    findingId: 'selftest-mock-issue',
-    title: 'core: 自检模拟问题',
-    module: 'core',
-    auditType: 'bugfix',
-    issueKind: 'repair',
-    dependsOn: null,
-    priority: 'P3',
-    baseRevision,
-    createdAt: nowIso,
-    updatedAt: nowIso,
-    owner: 'selftest',
-    tags: ['selftest'],
-    ticket: null,
-    status: 'pending',
-    targetFiles: ['large-sample.txt'],
-    recordRevision: 1,
-    patches: [{
-      id: 1,
-      patch: '001.patch',
-      optionId: 'mock-opt',
-      baseRevision,
-      author: 'ai',
-      sha256: patchSha,
-    }],
-    options: [{
-      id: 'mock-opt',
-      title: '自检模拟方案',
-      tradeoff: '仅用于验证 schema_version 1 读写往返',
-      confidence: 0.9,
-      currentPatch: 1,
-      gateChecks: ['echo ok'],
-    }],
-    observations: [{
-      auditId: '20261126-000000-selftest',
-      baseRevision,
-      at: nowIso,
-      verdict: 'confirmed',
-      reason: '自检模拟确认',
-      evidence: [{ path: 'large-sample.txt', line: 1, excerpt: '// padding', reason: '自检证据' }],
-    }],
-    decisions: [],
-    repairAttempts: [],
-    comments: [],
-    humanDecisions: [],
-    approval: null,
-    approvalHistory: [],
-    rejection: null,
-    commitMessage: 'core: 自检模拟问题\n\n自检验证提交说明',
-  };
-  return serializeReviewMarkdown(meta, '# 问题与影响\n自检。\n\n# 根因\n自检。\n\n# 当前修复方案\n自检。\n\n# 需人工判断项\n- 无\n\n# 验证证据\n自检。\n\n# 审核记录\n\n## 记录版本 1\n- 自检记录。');
-}
-
 export async function runAuditSelfTest(input: AuditSelfTestInput): Promise<AuditSelfTestOutcome> {
   const checks = {
     largeFileTailRead: false,
@@ -165,6 +108,7 @@ export async function runAuditSelfTest(input: AuditSelfTestInput): Promise<Audit
 
   const tempRoot = await mkdtemp(path.join(tmpdir(), 'dcr-audit-self-test-'));
   let channel: Awaited<ReturnType<typeof openAuditStageChannel>> | null = null;
+  const probeFile = path.join(tempRoot, '.ai-review', 'self-test-probe.txt');
 
   try {
     log(`[自检] 初始化临时工作区：${tempRoot}`);
@@ -181,7 +125,27 @@ export async function runAuditSelfTest(input: AuditSelfTestInput): Promise<Audit
       '4. 返回 JSON：`{"tailToken": "<读到的最后一行令牌>", "writtenPath": ".ai-review/self-test-probe.txt"}`。',
     ].join('\n');
 
-    channel = await openAuditStageChannel(async () => ({ ok: true }));
+    // 验证本机一次性回环阶段通道可真实鉴权通信
+    channel = await openAuditStageChannel(async (reqBody) => ({ ok: true, echo: reqBody['operation'] ?? null }));
+    const channelRes = await fetch(channel.url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${channel.token}`,
+      },
+      body: JSON.stringify({ operation: 'ping' }),
+      signal: combinedSignal,
+    });
+    const channelPayload = channelRes.ok ? (await channelRes.json().catch(() => null)) as { result?: { ok?: boolean } } | null : null;
+    if (!channelRes.ok || channelPayload?.result?.ok !== true) {
+      return {
+        status: 'ABORTED',
+        step: 'stageChannel',
+        message: '本机阶段回环通道鉴权连通自检失败',
+        executors: executorReports,
+        checks,
+      };
+    }
 
     // 1. 尝试配置的外部专业执行器（不可用或失败仅如实记录，不作为硬阻断）
     const externalNames = stageExecutors
@@ -195,6 +159,7 @@ export async function runAuditSelfTest(input: AuditSelfTestInput): Promise<Audit
         log(`[自检] 跳过外部执行器 ${ext}：${report.reason ?? '未安装'}`);
         continue;
       }
+      await rm(probeFile, { force: true }).catch(() => undefined);
       log(`[自检] 探测外部执行器 ${ext}`);
       const res = await execute({
         stage: 'verify',
@@ -217,7 +182,8 @@ export async function runAuditSelfTest(input: AuditSelfTestInput): Promise<Audit
       }
     }
 
-    // 2. 必验：本 Harness 独立子代理（dsh-subagent）完整链路
+    // 2. 必验：本 Harness 独立子代理（dsh-subagent）完整链路（先清理外部探测残留防假通过）
+    await rm(probeFile, { force: true }).catch(() => undefined);
     log('[自检] 执行本 Harness 独立子代理（dsh-subagent）必验检查');
     const subagentResult = await execute({
       stage: 'verify',
@@ -257,7 +223,6 @@ export async function runAuditSelfTest(input: AuditSelfTestInput): Promise<Audit
     }
 
     // 必验②：校验 .ai-review/ 写入并读回
-    const probeFile = path.join(tempRoot, '.ai-review', 'self-test-probe.txt');
     const written = await readFile(probeFile, 'utf8').catch(() => '');
     if (!written.includes(expectedTail)) {
       return {
@@ -295,37 +260,70 @@ export async function runAuditSelfTest(input: AuditSelfTestInput): Promise<Audit
     }
     checks.forensicRestoreCleanup = true;
 
-    // 必验④：写入并读回合法的 schema_version: 1 模拟 review.md 与 audit.md
-    const nowIso = '2026-11-26T00:00:00.000Z';
-    const mockIssueDir = path.join(tempRoot, '.ai-review', '2026-11', 'selftest-mock-issue');
-    const mockAuditDir = path.join(tempRoot, '.ai-review', 'audits', '20261126-000000-selftest');
-    await mkdir(mockIssueDir, { recursive: true });
-    await mkdir(mockAuditDir, { recursive: true });
-    const mockPatch = 'diff --git a/large-sample.txt b/large-sample.txt\n--- a/large-sample.txt\n+++ b/large-sample.txt\n@@ -1 +1 @@\n-// padding line\n+// padded line\n';
-    await writeFile(path.join(mockIssueDir, '001.patch'), mockPatch, 'utf8');
-    const mockReview = buildMockV1Review(baseRevision, nowIso, sha256Hex(mockPatch));
-    const mockReviewFile = path.join(mockIssueDir, 'review.md');
-    await writeFile(mockReviewFile, mockReview, 'utf8');
-    const mockAudit = serializeAuditMarkdown({
-      schemaVersion: 1,
+    // 必验④：经真实 buildIssuePublication + publishStageArtifacts 通道落盘并读回校验 schema_version: 1
+    const mockPatch = 'diff --git a/large-sample.txt b/large-sample.txt\n--- a/large-sample.txt\n+++ b/large-sample.txt\n@@ -1 +1 @@\n-// padding line for un-injected large file read verification\n+// padded line for un-injected large file read verification\n';
+    const built = await buildIssuePublication(tempRoot, {
       auditId: '20261126-000000-selftest',
-      createdAt: nowIso,
       baseRevision,
       scope: '.',
       trigger: 'manual',
       previousAudit: null,
-      issues: ['2026-11/selftest-mock-issue'],
-    }, '# 自检模拟审查报告\n');
-    const mockAuditFile = path.join(mockAuditDir, 'audit.md');
-    await writeFile(mockAuditFile, mockAudit, 'utf8');
+      reviewers: {
+        defaultOwner: 'selftest',
+        staleDays: 14,
+        rejectionMemoryDays: 90,
+        maxAntiPatterns: 50,
+        rules: [],
+        exists: true,
+        valid: true,
+        errors: [],
+      },
+      existingByFindingId: new Map(),
+      existingDirIds: new Set(),
+      findings: [{
+        findingId: 'selftest-mock-issue',
+        title: 'core: 自检模拟问题',
+        module: 'core',
+        auditType: 'bugfix',
+        issueKind: 'repair',
+        dependsOn: null,
+        priority: 'P3',
+        reason: '自检模拟确认',
+        problemSummary: '自检验证完整发布链路',
+        rootCause: '自检验证根因',
+        repairPlan: '自检修复方案',
+        tags: ['selftest'],
+        evidence: [{ path: 'large-sample.txt', line: 1, excerpt: '// padding', reason: '自检证据' }],
+        proposals: [{
+          optionId: 'mock-opt',
+          title: '自检模拟方案',
+          tradeoff: '仅用于验证 schema_version 1 发布与读写往返',
+          confidence: 0.9,
+          auditType: 'bugfix',
+          gateChecks: ['echo ok'],
+          humanDecisions: [],
+          patchText: mockPatch,
+          patchBytes: Buffer.from(mockPatch, 'utf8'),
+          summary: '自检模拟补丁',
+        }],
+      }],
+      reviewedExternal: [],
+      coverageLines: ['自检临时仓库全覆盖'],
+      requirementLines: [],
+      historyLines: [],
+      now: new Date('2026-11-26T00:00:00.000Z'),
+    });
+    await publishStageArtifacts(tempRoot, built.reportPath, built.reportText, built.candidates, async () => undefined);
 
+    const mockReviewFile = path.join(tempRoot, '.ai-review', built.candidates[0]!.id, 'review.md');
+    const mockAuditFile = path.join(tempRoot, built.reportPath);
     const reviewErrors = validateReviewData(mockReviewFile, await readFile(mockReviewFile));
     const auditErrors = validateReviewData(mockAuditFile, await readFile(mockAuditFile));
     if (reviewErrors.length > 0 || auditErrors.length > 0) {
       return {
         status: 'ABORTED',
         step: 'schemaV1PublishReadback',
-        message: `schema_version: 1 模拟读写校验失败：${[...reviewErrors, ...auditErrors].join('；')}`,
+        message: `schema_version: 1 模拟发布校验失败：${[...reviewErrors, ...auditErrors].join('；')}`,
         executors: executorReports,
         checks,
       };
@@ -336,6 +334,15 @@ export async function runAuditSelfTest(input: AuditSelfTestInput): Promise<Audit
     channel = null;
     await rm(tempRoot, { recursive: true, force: true }).catch(() => undefined);
     checks.tempDirCleaned = !existsSync(tempRoot);
+    if (!checks.tempDirCleaned) {
+      return {
+        status: 'ABORTED',
+        step: 'tempDirCleaned',
+        message: `自检临时目录未能彻底清理：${tempRoot}`,
+        executors: executorReports,
+        checks,
+      };
+    }
 
     return {
       status: 'SUCCEEDED',

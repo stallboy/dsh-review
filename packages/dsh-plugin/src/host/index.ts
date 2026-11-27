@@ -187,7 +187,14 @@ export async function createDshAuditSession(
 /** 与审查共用创建流程，单列动作标签以便失败提示指向用户刚选的入口。 */
 export async function createDshFixSession(
   host: AuditSessionHost,
-  input: { cwd: string; title: string; prompt: string; requestId?: string; ownerSessionId?: string },
+  input: {
+    cwd: string;
+    title: string;
+    prompt: string;
+    requestId?: string;
+    ownerSessionId?: string;
+    onCreated?: (sessionId: string) => Promise<void>;
+  },
 ): Promise<{ sessionId: string }> {
   return createDshSession(host, input, '修复');
 }

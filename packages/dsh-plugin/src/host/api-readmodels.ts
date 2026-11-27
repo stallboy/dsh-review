@@ -39,6 +39,22 @@ export class ReadModelCaches {
   private readonly patchChecks = new Map<string, OptionPatchCheck>();
   private readonly inflightChecks = new Set<string>();
   private readonly approvalCommits = new Map<string, ApprovalCommitLookup>();
+  private readonly shutdown = new AbortController();
+  private readonly pendingQueue: Array<() => void> = [];
+  private activeChecks = 0;
+  private readonly maxConcurrentChecks = 4;
+
+  close(): void {
+    this.shutdown.abort();
+    this.pendingQueue.length = 0;
+  }
+
+  private drainQueue(): void {
+    while (!this.shutdown.signal.aborted && this.activeChecks < this.maxConcurrentChecks && this.pendingQueue.length > 0) {
+      const next = this.pendingQueue.shift();
+      next?.();
+    }
+  }
 
   private patchKey(root: string, id: string, recordRevision: number, optionId: string, patchId: number, base: string): string {
     return `${root}\0${id}\0${String(recordRevision)}\0${optionId}\0${String(patchId)}\0${base}`;
@@ -54,23 +70,39 @@ export class ReadModelCaches {
     this.patchChecks.set(key, check);
   }
 
-  /** /queue 未命中缓存时调用：低优先级后台异步预检，绝不阻塞 /queue 响应。 */
+  /** /queue 未命中缓存时调用：低优先级后台异步预检（读共享快照临时文件、限制并发且随宿主关闭取消），绝不阻塞 /queue 响应。 */
   schedulePatchCheck(params: {
     runtime: Runtime;
     candidateId: string;
     recordRevision: number;
     optionId: string;
     patchId: number;
-    patchPath: string;
+    patchFile: string;
     base: string;
+    source?: SharedCandidateSource;
   }): void {
+    if (this.shutdown.signal.aborted) return;
     const key = this.patchKey(params.runtime.root, params.candidateId, params.recordRevision, params.optionId, params.patchId, params.base);
     if (this.patchChecks.has(key) || this.inflightChecks.has(key)) return;
     this.inflightChecks.add(key);
-    setImmediate(() => {
+
+    const run = () => {
+      if (this.shutdown.signal.aborted) {
+        this.inflightChecks.delete(key);
+        return;
+      }
+      this.activeChecks += 1;
       void (async () => {
+        let tmpDir: string | null = null;
         try {
-          const check = await params.runtime.vcs.checkPatch(params.patchPath);
+          const patchText = await params.runtime.store.readPatch(params.candidateId, params.patchFile, params.source);
+          if (this.shutdown.signal.aborted) return;
+          tmpDir = await mkdtemp(path.join(os.tmpdir(), 'dsh-q-check-'));
+          const tmpPatch = path.join(tmpDir, params.patchFile);
+          await writeFile(tmpPatch, patchText, 'utf8');
+          if (this.shutdown.signal.aborted) return;
+          const check = await params.runtime.vcs.checkPatch(tmpPatch);
+          if (this.shutdown.signal.aborted) return;
           this.setPatchCheck(params.runtime.root, params.candidateId, params.recordRevision, {
             optionId: params.optionId,
             patchId: params.patchId,
@@ -79,18 +111,29 @@ export class ReadModelCaches {
             checkedAt: new Date().toISOString(),
           });
         } catch {
-          this.setPatchCheck(params.runtime.root, params.candidateId, params.recordRevision, {
-            optionId: params.optionId,
-            patchId: params.patchId,
-            state: 'unknown',
-            checkedBase: params.base,
-            checkedAt: new Date().toISOString(),
-          });
+          if (!this.shutdown.signal.aborted) {
+            this.setPatchCheck(params.runtime.root, params.candidateId, params.recordRevision, {
+              optionId: params.optionId,
+              patchId: params.patchId,
+              state: 'unknown',
+              checkedBase: params.base,
+              checkedAt: new Date().toISOString(),
+            });
+          }
         } finally {
+          if (tmpDir) await rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
           this.inflightChecks.delete(key);
+          this.activeChecks -= 1;
+          this.drainQueue();
         }
       })();
-    });
+    };
+
+    if (this.activeChecks < this.maxConcurrentChecks) {
+      setImmediate(run);
+    } else {
+      this.pendingQueue.push(run);
+    }
   }
 
   async resolveApprovalCommit(
@@ -292,19 +335,17 @@ export async function handleQueue(
             checkedBase: currentBase,
             checkedAt: new Date().toISOString(),
           };
-          const [month, slug] = item.id.split('/');
-          if (month && slug) {
-            const patchFile = `${String(opt.currentPatch).padStart(3, '0')}.patch`;
-            caches.schedulePatchCheck({
-              runtime,
-              candidateId: item.id,
-              recordRevision: item.recordRevision,
-              optionId: opt.id,
-              patchId: opt.currentPatch,
-              patchPath: path.join(runtime.store.dirOf(month, slug), patchFile),
-              base: currentBase,
-            });
-          }
+          const patchFile = `${String(opt.currentPatch).padStart(3, '0')}.patch`;
+          caches.schedulePatchCheck({
+            runtime,
+            candidateId: item.id,
+            recordRevision: item.recordRevision,
+            optionId: opt.id,
+            patchId: opt.currentPatch,
+            patchFile,
+            base: currentBase,
+            ...(view?.source ? { source: view.source } : {}),
+          });
         }
       }
       if (item.options[0]?.patchCheck) {

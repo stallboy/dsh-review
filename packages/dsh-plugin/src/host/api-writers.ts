@@ -24,7 +24,10 @@ import {
   type Runtime,
 } from './api-context.js';
 import { runApprovalTransaction, validateHumanDecisionsCoverage } from './approval.js';
+import { auditFiles } from './audit-files.js';
 import { normalizeCommitDetail } from './commit-message.js';
+import { commitWithThreeBranchRecovery } from './commit-recovery.js';
+import { assertAppendOnlyHistory } from './history-guard.js';
 import {
   buildFindingView,
   COMMENTABLE_STATUSES,
@@ -44,6 +47,7 @@ import {
   wrapAgentPrompt,
 } from './runner.js';
 import { validateSettings } from './settings.js';
+import type { SharedCandidateSource } from './shared-facts.js';
 import type { AddCommentInput } from './store.js';
 import { gitBlobHash } from './vcs.js';
 import {
@@ -65,8 +69,25 @@ function assertOwner(metaOwner: string, actor: string, actionLabel: string): voi
   }
 }
 
-/** SPEC §8.3 同步写操作三分支提交恢复。 */
+/** 优先从共享快照读取恢复备份文本，避免未提交草稿覆盖共享备份；仅在非共享场景下经 auditFiles 读取。 */
+async function readSharedBackupText(
+  runtime: Runtime,
+  candidate: ReviewCandidate,
+  source?: SharedCandidateSource,
+): Promise<string> {
+  if (source) {
+    const shared = await source.readReviewText(candidate.month, candidate.slug);
+    if (shared !== null) return shared;
+  }
+  const relReview = `.ai-review/${candidate.id}/review.md`;
+  const readRes = await auditFiles(runtime.root, { op: 'read', paths: [relReview] });
+  if (!readRes.bytes) throw new ApiError(404, 'not_found', `问题记录不存在：${relReview}`);
+  return readRes.bytes.toString('utf8');
+}
+
+/** SPEC §8.3 同步写操作统一三分支提交恢复。 */
 async function commitSingleReviewWithRecovery(
+  host: ApiHost,
   runtime: Runtime,
   candidate: ReviewCandidate,
   backupText: string,
@@ -74,61 +95,34 @@ async function commitSingleReviewWithRecovery(
 ): Promise<string> {
   const relReview = `.ai-review/${candidate.id}/review.md`;
   const expectedBlob = gitBlobHash(await readFile(candidate.reviewPath));
-  const probeBefore = await runtime.vcs.getCommitProbe([relReview]).catch(() => null);
-
-  const commit = await runtime.vcs.atomicCommit({
-    message: commitMessage,
-    paths: [relReview],
-    verifyEntries: [{ path: relReview, blobHash: expectedBlob }],
+  const outcome = await commitWithThreeBranchRecovery({
+    vcs: runtime.vcs,
+    probePaths: [relReview],
+    commitInput: {
+      message: commitMessage,
+      paths: [relReview],
+      verifyEntries: [{ path: relReview, blobHash: expectedBlob }],
+    },
+    verifyOnProbeChange: async (probeAfter) => {
+      const committedText = await runtime.vcs.readFileAt(probeAfter, relReview).catch(() => null);
+      return committedText !== null && gitBlobHash(committedText) === expectedBlob;
+    },
+    restoreOnProvenNotCommitted: async () => {
+      await auditFiles(runtime.root, { op: 'write', paths: [relReview], text: backupText });
+    },
+    recoveryStore: host.recoveryStore,
+    recoveryContext: { repoRoot: runtime.root, kind: 'commit', candidateId: candidate.id },
   });
 
-  if (commit.success && commit.commitRevision) {
-    return commit.commitRevision;
-  }
-
-  if (commit.verificationFailed) {
-    throw new ApiError(409, 'conflict', `提交核验失败，现场保留待人工恢复：${commit.errorOutput}`, {
+  if (outcome.status === 'committed') return outcome.commitRevision;
+  if (outcome.status === 'recovery_required') {
+    throw new ApiError(409, 'conflict', `提交结果不明或恢复不完整，现场保留待人工核对：${outcome.detail}`, {
       status: 'RECOVERY_REQUIRED',
-      reason: 'COMMIT_OUTCOME_UNKNOWN',
-      detail: commit.errorOutput,
+      reason: outcome.reason,
+      detail: outcome.detail,
     });
   }
-
-  const probeAfter = await runtime.vcs.getCommitProbe([relReview]).catch(() => null);
-  if (probeBefore !== null && probeAfter !== null && probeAfter !== probeBefore) {
-    const committedText = await runtime.vcs.readFileAt(probeAfter, relReview).catch(() => null);
-    if (committedText !== null && gitBlobHash(committedText) === expectedBlob) {
-      return probeAfter;
-    }
-    throw new ApiError(409, 'conflict', `提交结果不明，现场保留待人工恢复：${commit.errorOutput}`, {
-      status: 'RECOVERY_REQUIRED',
-      reason: 'COMMIT_OUTCOME_UNKNOWN',
-      detail: commit.errorOutput,
-    });
-  }
-
-  if (probeBefore === null || probeAfter === null) {
-    throw new ApiError(409, 'conflict', `无法确认提交是否落地，现场保留待人工恢复：${commit.errorOutput}`, {
-      status: 'RECOVERY_REQUIRED',
-      reason: 'COMMIT_OUTCOME_UNKNOWN',
-      detail: commit.errorOutput,
-    });
-  }
-
-  // 证明未提交：先撤销暂存再恢复备份
-  try {
-    await commit.restorePreparation?.();
-    await writeFile(candidate.reviewPath, backupText, 'utf8');
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    throw new ApiError(409, 'conflict', `提交失败且无法完整恢复备份，请人工核对：${detail}`, {
-      status: 'RECOVERY_REQUIRED',
-      reason: 'RESTORE_INCOMPLETE',
-      detail,
-    });
-  }
-
-  throw new ApiError(409, 'conflict', `提交 .ai-review 失败并已还原：${commit.errorOutput}`);
+  throw new ApiError(409, 'conflict', `提交 .ai-review 失败并已还原：${outcome.errorOutput}`);
 }
 
 async function resolveAnchorForInlineComment(
@@ -196,60 +190,37 @@ export async function handleReviewersInit(host: ApiHost, req: ApiRequest, res: A
 
   const relPath = '.ai-review/reviewers.yml';
   const expectedBlob = gitBlobHash(Buffer.from(content, 'utf8'));
-  const probeBefore = await runtime.vcs.getCommitProbe([relPath]).catch(() => null);
-  let commit;
-  let commitThrew = false;
-  try {
-    commit = await runtime.vcs.atomicCommit({
+  const commitOutcome = await commitWithThreeBranchRecovery({
+    vcs: runtime.vcs,
+    probePaths: [relPath],
+    commitInput: {
       message: `review: 初始化 reviewers.yml（default_owner: ${requestedOwner}） [skip ci]`,
       paths: [relPath],
       verifyEntries: [{ path: relPath, blobHash: expectedBlob }],
-    });
-  } catch (error) {
-    commitThrew = true;
-    commit = {
-      success: false,
-      commitRevision: null,
-      outOfDate: false,
-      errorOutput: error instanceof Error ? error.message : String(error),
-    };
-  }
-
-  let commitRevision: string | null = commit.success && commit.commitRevision ? commit.commitRevision : null;
-  if (!commitRevision) {
-    if (commit.verificationFailed) {
-      throw new ApiError(409, 'conflict', `提交 reviewers.yml 核验失败，现场保留：${commit.errorOutput}`, {
-        status: 'RECOVERY_REQUIRED',
-        reason: 'COMMIT_OUTCOME_UNKNOWN',
-        detail: commit.errorOutput,
-      });
-    }
-    // SPEC §8.3 三分支探针：确认未产生共享提交后才允许清理本地文件
-    const probeAfter = await runtime.vcs.getCommitProbe([relPath]).catch(() => null);
-    if (probeBefore !== null && probeAfter !== null && probeAfter !== probeBefore) {
+    },
+    verifyOnProbeChange: async (probeAfter) => {
       const committedText = await runtime.vcs.readFileAt(probeAfter, relPath).catch(() => null);
-      if (committedText !== null && gitBlobHash(committedText) === expectedBlob) {
-        commitRevision = probeAfter;
-      } else {
-        throw new ApiError(409, 'conflict', `提交 reviewers.yml 探针变化但内容不符，现场保留：${commit.errorOutput}`, {
-          status: 'RECOVERY_REQUIRED',
-          reason: 'COMMIT_OUTCOME_UNKNOWN',
-          detail: commit.errorOutput,
-        });
-      }
-    } else if (commitThrew || probeBefore === null || probeAfter === null) {
-      throw new ApiError(409, 'conflict', `提交 reviewers.yml 结果不明，现场保留：${commit.errorOutput}`, {
-        status: 'RECOVERY_REQUIRED',
-        reason: 'COMMIT_OUTCOME_UNKNOWN',
-        detail: commit.errorOutput,
-      });
-    } else {
-      await commit.restorePreparation?.().catch(() => undefined);
-      await rm(diskPath, { force: true }).catch(() => undefined);
-      throw new ApiError(409, 'conflict', `提交 reviewers.yml 失败：${commit.errorOutput}`);
-    }
+      return committedText !== null && gitBlobHash(committedText) === expectedBlob;
+    },
+    restoreOnProvenNotCommitted: async () => {
+      await rm(diskPath, { force: true });
+    },
+    recoveryStore: host.recoveryStore,
+    recoveryContext: { repoRoot: runtime.root, kind: 'commit' },
+  });
+
+  if (commitOutcome.status === 'recovery_required') {
+    throw new ApiError(409, 'conflict', `提交 reviewers.yml 结果不明，现场保留：${commitOutcome.detail}`, {
+      status: 'RECOVERY_REQUIRED',
+      reason: commitOutcome.reason,
+      detail: commitOutcome.detail,
+    });
+  }
+  if (commitOutcome.status === 'failed_restored') {
+    throw new ApiError(409, 'conflict', `提交 reviewers.yml 失败：${commitOutcome.errorOutput}`);
   }
 
+  const commitRevision = commitOutcome.commitRevision;
   const config = await loadReviewers(runtime.root);
   sendJson(res, 200, { config, commitRevision });
 }
@@ -292,7 +263,7 @@ export async function handleComment(host: ApiHost, req: ApiRequest, res: ApiResp
   const isGeneral = !file && line === 0;
   // 总体评论启用 autoFix 时允许在请求顶层指定目标方案（仅用于触发修订，不绑定到总体评论本身）
   const commentSelection = isGeneral && body['autoFix'] === true ? undefined : selection;
-  const backupText = await readFile(detail.candidate.reviewPath, 'utf8');
+  const backupText = await readSharedBackupText(runtime, detail.candidate, source);
   const { candidate: updated, comment } = await runtime.store.addComment(
     id,
     guard,
@@ -310,6 +281,7 @@ export async function handleComment(host: ApiHost, req: ApiRequest, res: ApiResp
   );
 
   const commitRevision = await commitSingleReviewWithRecovery(
+    host,
     runtime,
     updated,
     backupText,
@@ -413,9 +385,10 @@ export async function handleCommentsBatch(host: ApiHost, req: ApiRequest, res: A
     });
   }
 
-  const backupText = await readFile(detail.candidate.reviewPath, 'utf8');
+  const backupText = await readSharedBackupText(runtime, detail.candidate, source);
   const { candidate: updated, added } = await runtime.store.addCommentsBatch(id, guard, inputs, source);
   const commitRevision = await commitSingleReviewWithRecovery(
+    host,
     runtime,
     updated,
     backupText,
@@ -470,9 +443,10 @@ export async function handleCommentStatus(host: ApiHost, req: ApiRequest, res: A
   runtime.store.checkGuard(detail.candidate.meta, guard);
   assertOwner(detail.candidate.meta.owner, actor, '修改评论状态');
 
-  const backupText = await readFile(detail.candidate.reviewPath, 'utf8');
+  const backupText = await readSharedBackupText(runtime, detail.candidate, source);
   const updated = await runtime.store.setCommentStatus(id, guard, commentId, status, source);
   const commitRevision = await commitSingleReviewWithRecovery(
+    host,
     runtime,
     updated,
     backupText,
@@ -496,9 +470,10 @@ export async function handleTakeover(host: ApiHost, req: ApiRequest, res: ApiRes
   if (detail.candidate.parseError) throw new ApiError(409, 'conflict', `问题记录损坏：${detail.candidate.parseError}`);
   runtime.store.checkGuard(detail.candidate.meta, guard);
 
-  const backupText = await readFile(detail.candidate.reviewPath, 'utf8');
+  const backupText = await readSharedBackupText(runtime, detail.candidate, source);
   const updated = await runtime.store.takeover(id, guard, targetOwner, source);
   const commitRevision = await commitSingleReviewWithRecovery(
+    host,
     runtime,
     updated,
     backupText,
@@ -522,9 +497,10 @@ export async function handleResume(host: ApiHost, req: ApiRequest, res: ApiRespo
   runtime.store.checkGuard(detail.candidate.meta, guard);
   assertOwner(detail.candidate.meta.owner, actor, '恢复待审核状态');
 
-  const backupText = await readFile(detail.candidate.reviewPath, 'utf8');
+  const backupText = await readSharedBackupText(runtime, detail.candidate, source);
   const updated = await runtime.store.resume(id, guard, source);
   const commitRevision = await commitSingleReviewWithRecovery(
+    host,
     runtime,
     updated,
     backupText,
@@ -550,9 +526,10 @@ export async function handleFindingDecision(host: ApiHost, req: ApiRequest, res:
   runtime.store.checkGuard(detail.candidate.meta, guard);
   assertOwner(detail.candidate.meta.owner, actor, `执行人工处置（${decisionRequest.action}）`);
 
-  const backupText = await readFile(detail.candidate.reviewPath, 'utf8');
+  const backupText = await readSharedBackupText(runtime, detail.candidate, source);
   const updated = await runtime.store.applyDecision(id, guard, decisionRequest, actor, source);
   const commitRevision = await commitSingleReviewWithRecovery(
+    host,
     runtime,
     updated,
     backupText,
@@ -667,18 +644,18 @@ export async function handleApprove(host: ApiHost, req: ApiRequest, res: ApiResp
 
 /** 校验并提交 Mode B 提案修订产物（用于 /ai-fix、/rebase 与 /candidate/finalize）。 */
 async function verifyAndCommitModeBProposal(params: {
+  host: ApiHost;
   runtime: Runtime;
   id: string;
   guard: ConcurrencyGuard;
   selection: IssueSelection;
   actor: string;
   beforePatchCount: number;
-  beforeReviewText: string;
   targetBase: string;
   revertBusinessBeforeVerify: boolean;
   log: (line: string) => void;
 }): Promise<AiFixOutcome> {
-  const { runtime, id, guard, selection, actor, beforePatchCount, beforeReviewText, targetBase, revertBusinessBeforeVerify, log } = params;
+  const { host, runtime, id, guard, selection, actor, beforePatchCount, targetBase, revertBusinessBeforeVerify, log } = params;
 
   if (revertBusinessBeforeVerify) {
     // I18：自动化 Mode B 在干净工作区启动后，退出前强制还原非 .ai-review/ 临时改动并清空 .tmp/
@@ -733,48 +710,18 @@ async function verifyAndCommitModeBProposal(params: {
   }
   const meta = localCandidate.meta;
   const oldMeta = sharedBefore.candidate.meta;
-  const errors: string[] = [];
+  const errors: string[] = [
+    ...assertAppendOnlyHistory(oldMeta, meta, {
+      mode: 'mode_b',
+      targetOptionId: selection.optionId,
+      targetBase,
+    }),
+  ];
 
-  if (meta.findingId !== oldMeta.findingId) errors.push('finding_id 不得变更');
-  if (meta.recordRevision !== oldMeta.recordRevision + 1) {
-    errors.push(`record_revision 必须推进为 ${String(oldMeta.recordRevision + 1)}，当前为 ${String(meta.recordRevision)}`);
-  }
-  // I13：updated_at 必须严格晚于共享旧记录时间
-  const oldMs = Date.parse(oldMeta.updatedAt);
-  const newMs = Date.parse(meta.updatedAt);
-  if (!Number.isFinite(newMs) || (Number.isFinite(oldMs) && newMs <= oldMs)) {
-    errors.push(`updated_at（${meta.updatedAt}）必须严格大于旧记录时间（${oldMeta.updatedAt}）`);
-  }
   if (meta.status !== 'pending') errors.push(`修订收尾后 status 必须为 pending，当前为 ${meta.status}`);
   if (meta.approval !== null) errors.push('修订收尾后 approval 必须为 null');
   if (meta.patches.length !== beforePatchCount + 1) {
     errors.push(`Mode B 必须恰好追加 1 份新补丁（期望 ${String(beforePatchCount + 1)} 份，实际 ${String(meta.patches.length)} 份）`);
-  }
-
-  // 确认历史补丁未被篡改，另一方案未被破坏
-  for (let i = 0; i < oldMeta.patches.length; i += 1) {
-    const oldP = oldMeta.patches[i]!;
-    const newP = meta.patches[i];
-    if (!newP || newP.id !== oldP.id || newP.patch !== oldP.patch || newP.optionId !== oldP.optionId || newP.sha256 !== oldP.sha256) {
-      errors.push(`历史补丁 #${String(oldP.id)} 被修改或删除`);
-    }
-  }
-  for (const oldOpt of oldMeta.options) {
-    if (oldOpt.id === selection.optionId) continue;
-    const sameOpt = meta.options.find((o) => o.id === oldOpt.id);
-    if (!sameOpt || sameOpt.currentPatch !== oldOpt.currentPatch) {
-      errors.push(`非目标方案 ${oldOpt.id} 被意外修改或移除`);
-    }
-  }
-  // 确认原人类评论原文与历史决策未被删除或篡改
-  for (const oldComment of oldMeta.comments) {
-    const nextComment = meta.comments.find((c) => c.id === oldComment.id);
-    if (!nextComment || nextComment.content !== oldComment.content || nextComment.author !== oldComment.author) {
-      errors.push(`历史人类评论 ${oldComment.id} 原文被篡改或删除`);
-    }
-  }
-  if (meta.decisions.length < oldMeta.decisions.length) {
-    errors.push('历史人工处置 decisions[] 不得被删减');
   }
 
   const newPatch = meta.patches[meta.patches.length - 1];
@@ -817,66 +764,49 @@ async function verifyAndCommitModeBProposal(params: {
   log(`Mode B 校验通过，提交 ${relReview} 与 ${relPatch}`);
 
   const probePaths = [relReview, relPatch];
-  const probeBefore = await runtime.vcs.getCommitProbe(probePaths).catch(() => null);
-  let commit;
-  let commitThrew = false;
-  try {
-    commit = await runtime.vcs.atomicCommit({
+  const commitOutcome = await commitWithThreeBranchRecovery({
+    vcs: runtime.vcs,
+    probePaths,
+    commitInput: {
       message: `review(${id}): 修订方案 ${selection.optionId}，追加补丁 ${newPatch!.patch} [skip ci]`,
       paths: probePaths,
       verifyEntries: [
         { path: relReview, blobHash: reviewBlob },
         { path: relPatch, blobHash: patchBlob },
       ],
-    });
-  } catch (error) {
-    commitThrew = true;
-    commit = {
-      success: false,
-      commitRevision: null,
-      outOfDate: false,
-      errorOutput: error instanceof Error ? error.message : String(error),
-    };
-  }
+    },
+    verifyOnProbeChange: async (probeAfter) => {
+      const committedReview = await runtime.vcs.readFileAt(probeAfter, relReview).catch(() => null);
+      return committedReview !== null && gitBlobHash(committedReview) === reviewBlob;
+    },
+    restoreOnProvenNotCommitted: async () => undefined,
+    recoveryStore: host.recoveryStore,
+    recoveryContext: { repoRoot: runtime.root, kind: 'commit', candidateId: id },
+  });
 
-  if (commit.success && commit.commitRevision) {
-    void beforeReviewText;
+  if (commitOutcome.status === 'committed') {
     return {
       status: 'COMMITTED',
       newRevision: meta.recordRevision,
       newPatchId: newPatch!.id,
       optionId: selection.optionId,
-      commitRevision: commit.commitRevision,
-      message: `提案已更新至记录版本 ${String(meta.recordRevision)}（补丁 ${newPatch!.patch}）`,
+      commitRevision: commitOutcome.commitRevision,
+      message: commitOutcome.recoveredFromProbe
+        ? `提交命令异常但核实提案已更新至记录版本 ${String(meta.recordRevision)}（${commitOutcome.commitRevision.slice(0, 12)}）`
+        : `提案已更新至记录版本 ${String(meta.recordRevision)}（补丁 ${newPatch!.patch}）`,
     };
   }
 
-  if (commit.verificationFailed) {
-    return { status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN', detail: commit.errorOutput, message: '提交核验失败，现场保留待人工核查' };
+  if (commitOutcome.status === 'recovery_required') {
+    return {
+      status: 'RECOVERY_REQUIRED',
+      reason: commitOutcome.reason,
+      detail: commitOutcome.detail,
+      message: '提交结果不明，现场保留待人工核查',
+    };
   }
 
-  // SPEC §8.3 三分支恢复探测
-  const probeAfter = await runtime.vcs.getCommitProbe(probePaths).catch(() => null);
-  if (probeBefore !== null && probeAfter !== null && probeAfter !== probeBefore) {
-    const committedReview = await runtime.vcs.readFileAt(probeAfter, relReview).catch(() => null);
-    if (committedReview !== null && gitBlobHash(committedReview) === reviewBlob) {
-      return {
-        status: 'COMMITTED',
-        newRevision: meta.recordRevision,
-        newPatchId: newPatch!.id,
-        optionId: selection.optionId,
-        commitRevision: probeAfter,
-        message: `提交命令异常但核实提案已更新至记录版本 ${String(meta.recordRevision)}（${probeAfter.slice(0, 12)}）`,
-      };
-    }
-    return { status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN', detail: commit.errorOutput, message: '提交探针变化但内容无法核对一致，现场保留' };
-  }
-  if (commitThrew || probeBefore === null || probeAfter === null) {
-    return { status: 'RECOVERY_REQUIRED', reason: 'COMMIT_OUTCOME_UNKNOWN', detail: commit.errorOutput, message: '提交命令异常或探针不可读，现场保留' };
-  }
-
-  await commit.restorePreparation?.().catch(() => undefined);
-  return { status: 'ABORTED', reason: 'COMMIT_FAILED', detail: commit.errorOutput, message: `提交新提案失败：${commit.errorOutput}` };
+  return { status: 'ABORTED', reason: 'COMMIT_FAILED', detail: commitOutcome.errorOutput, message: `提交新提案失败：${commitOutcome.errorOutput}` };
 }
 
 export async function runModeBJob(params: {
@@ -920,7 +850,13 @@ export async function runModeBJob(params: {
         return { status: 'ABORTED', reason: 'STATE_CONFLICT', message: `当前状态 ${candidate.meta.status} 不允许 Mode B 修订` };
       }
 
-      const { option, patch } = requireExplicitSelection(candidate.meta, selection);
+      let selected: ReturnType<typeof requireExplicitSelection>;
+      try {
+        selected = requireExplicitSelection(candidate.meta, selection);
+      } catch (error) {
+        return { status: 'ABORTED', reason: 'STATE_CONFLICT', message: error instanceof Error ? error.message : String(error) };
+      }
+      const { option, patch } = selected;
       if (intent === 'revise') {
         const unresolved = unresolvedCommentsForOption(candidate.meta.comments, option.id);
         if (unresolved.length === 0) {
@@ -966,7 +902,6 @@ export async function runModeBJob(params: {
         };
       }
 
-      const beforeReviewText = await readFile(candidate.reviewPath, 'utf8');
       const runResult = await runAgent({
         kind: settings.runner === 'dsh' ? 'dsh' : 'external',
         settings,
@@ -994,13 +929,13 @@ export async function runModeBJob(params: {
       }
 
       return verifyAndCommitModeBProposal({
+        host,
         runtime,
         id,
         guard,
         selection,
         actor,
         beforePatchCount: candidate.meta.patches.length,
-        beforeReviewText,
         targetBase: currentBase,
         revertBusinessBeforeVerify: true,
         log: ctx.log,
@@ -1067,10 +1002,18 @@ export async function handleCandidateFinalize(host: ApiHost, req: ApiRequest, re
   const selection = requireSelectionFrom(body);
 
   const runtime = await host.runtimeFor(url);
-  // 允许在提案会话占用期间收尾当前修订，但存在活动审查租约时仍必须互斥阻塞
+  // 允许在提案会话占用期间收尾当前修订，但存在活动审查租约或其他问题的提案占用时必须互斥阻塞
   const blockingAudit = host.auditLifecycle.blockingLeaseFor(runtime.root);
   if (blockingAudit) {
     throw new ApiError(409, 'conflict', `仓库审查进行中（${blockingAudit.auditId}），禁止并发执行提案收尾`);
+  }
+  const activeFix = host.fixSessionGuard.activeFor(runtime.root);
+  if (activeFix && activeFix.candidateId !== id) {
+    throw new ApiError(
+      409,
+      'conflict',
+      `当前工作副本被问题 ${activeFix.candidateId} 的提案会话占用，禁止收尾其他问题 ${id}`,
+    );
   }
   const actor = await host.ownerFor(runtime.root);
   const source = await sharedSourceFor(runtime);
@@ -1085,16 +1028,34 @@ export async function handleCandidateFinalize(host: ApiHost, req: ApiRequest, re
 
   const job = host.jobManager.start('ai_fix', async (ctx): Promise<AiFixOutcome> => {
     return host.withWriteLock(runtime.root, async (): Promise<AiFixOutcome> => {
+      const currentFix = host.fixSessionGuard.activeFor(runtime.root);
+      if (currentFix && currentFix.candidateId !== id) {
+        return {
+          status: 'ABORTED',
+          reason: 'STATE_CONFLICT',
+          message: `当前工作副本被问题 ${currentFix.candidateId} 的提案会话占用，禁止收尾 ${id}`,
+        };
+      }
+      if (currentFix?.sessionId && host.deps.stopAuditSession) {
+        const stopped = await host.deps.stopAuditSession(currentFix.sessionId, ctx.signal, Promise.resolve(true)).catch(() => false);
+        if (!stopped) {
+          return {
+            status: 'RECOVERY_REQUIRED',
+            reason: 'SYNC_STATE_UNKNOWN',
+            detail: `无法确认提案会话 ${currentFix.sessionId} 已完全停止`,
+            message: '提案会话未能确认停止，暂不收尾提交',
+          };
+        }
+      }
       const currentBase = (await runtime.vcs.getCurrentBase()) ?? '';
-      const beforeReviewText = (await source?.readReviewText(detail.candidate.month, detail.candidate.slug)) ?? '';
       const outcome = await verifyAndCommitModeBProposal({
+        host,
         runtime,
         id,
         guard,
         selection,
         actor,
         beforePatchCount: detail.candidate.meta.patches.length,
-        beforeReviewText,
         targetBase: currentBase,
         revertBusinessBeforeVerify: false,
         log: ctx.log,

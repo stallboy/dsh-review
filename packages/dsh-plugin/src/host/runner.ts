@@ -3,11 +3,11 @@
  * 严格隔离 Mode A/B（提案修订，软引导 + Host 强还原）与 Mode C（人审后获批辅助应用，完整权限但禁改 .ai-review）。
  */
 
-import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { killProcessTree, runProcess, tailLines } from './shell.js';
+import { DshEventStreamParser } from './dsh-stream.js';
 import { formatPatchFilename } from './issue-review.js';
+import { runProcess, tailLines } from './shell.js';
 import type { AppSettings, PatchEntry, RepairOption, ReviewCandidate, ReviewComment, VcsType } from './types.js';
 
 export interface RunAgentInput {
@@ -27,6 +27,7 @@ export interface RunAgentResult {
   exitCode: number | null;
   timedOut: boolean;
   aborted: boolean;
+  processTreeStopped?: boolean;
   outputTail: string;
   /** 从 DSH headless JSON 事件流或 stdout 中提取的最终助手文本，不受事件流大小截断。 */
   assistantText: string;
@@ -276,32 +277,6 @@ function splitCommandLine(raw: string): string[] {
   return args;
 }
 
-/** 从 DSH headless --json 事件流中抽取助手文本，避免大工具事件流撑爆或截断最终结果。 */
-function extractDshJsonEventText(line: string): string | null {
-  try {
-    const parsed = JSON.parse(line) as Record<string, unknown>;
-    if (typeof parsed['text'] === 'string') return parsed['text'];
-    if (typeof parsed['delta'] === 'string') return parsed['delta'];
-    if (typeof parsed['content'] === 'string') return parsed['content'];
-    if (typeof parsed['message'] === 'string') return parsed['message'];
-    const msg = parsed['message'];
-    if (msg && typeof msg === 'object' && !Array.isArray(msg)) {
-      const content = (msg as Record<string, unknown>)['content'];
-      if (typeof content === 'string') return content;
-      if (Array.isArray(content)) {
-        const texts = content
-          .filter((item): item is { type?: string; text?: string } => typeof item === 'object' && item !== null)
-          .map((item) => item.text ?? '')
-          .filter(Boolean);
-        if (texts.length > 0) return texts.join('\n');
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
 export async function runAgent(input: RunAgentInput): Promise<RunAgentResult> {
   const timeoutMs = input.timeoutMs ?? 30 * 60_000;
   const label = input.label ?? 'AI Runner';
@@ -333,8 +308,7 @@ export async function runAgent(input: RunAgentInput): Promise<RunAgentResult> {
     args = tokens.slice(1);
   }
 
-  // 解析外部命令中的凭据引用（如有需要仅经 Host credentials 服务）
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  const env: Record<string, string> = {};
   if (input.resolveCredential) {
     const token = await input.resolveCredential('dsh-code-review-runner').catch(() => undefined);
     if (token) env['DSH_REVIEW_RUNNER_TOKEN'] = token;
@@ -342,132 +316,68 @@ export async function runAgent(input: RunAgentInput): Promise<RunAgentResult> {
 
   input.log(`[${label}] 启动执行器：${executable} ${args.join(' ')}`);
 
-  return new Promise<RunAgentResult>((resolve) => {
-    let stdoutTail = '';
-    let stderrTail = '';
-    let lineBuffer = '';
-    const assistantParts: string[] = [];
-    let timedOut = false;
-    let aborted = false;
-    let settled = false;
+  const streamParser = new DshEventStreamParser();
+  const tailBuffer: string[] = [];
+  const pushTail = (line: string): void => {
+    tailBuffer.push(line);
+    if (tailBuffer.length > 240) tailBuffer.splice(0, tailBuffer.length - 240);
+  };
 
-    // Node.js 24+ 在 Windows 上直接 spawn .cmd/.bat 会抛出 EINVAL，需经 cmd.exe /d /s /c 执行。
-    const isWindowsBatch = process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(executable);
-    const quoteCmd = (value: string): string => `"${value.replaceAll('"', '""')}"`;
-    const spawnCommand = isWindowsBatch ? (process.env['ComSpec'] || 'cmd.exe') : executable;
-    const spawnArgs = isWindowsBatch
-      ? ['/d', '/s', '/c', `"${[executable, ...args].map(quoteCmd).join(' ')}"`]
-      : args;
-
-    const child = spawn(spawnCommand, spawnArgs, {
-      cwd: input.cwd,
-      env,
-      detached: process.platform !== 'win32',
-      windowsHide: true,
-      ...(isWindowsBatch ? { windowsVerbatimArguments: true } : {}),
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    const appendTail = (current: string, chunk: string, limit = 128 * 1024): string => {
-      const next = current + chunk;
-      return next.length > limit ? next.slice(next.length - limit) : next;
-    };
-
-    const stopTree = async (): Promise<void> => {
-      if (child.pid) await killProcessTree(child.pid, input.cwd).catch(() => undefined);
-    };
-
-    const onAbort = (): void => {
-      aborted = true;
-      void stopTree();
-    };
-    if (input.signal?.aborted) {
-      aborted = true;
-      void stopTree();
-    } else {
-      input.signal?.addEventListener('abort', onAbort, { once: true });
-    }
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      void stopTree();
-    }, timeoutMs);
-
-    const processLine = (line: string): void => {
-      const trimmed = line.trim();
-      if (!trimmed) return;
+  const result = await runProcess(executable, args, {
+    cwd: input.cwd,
+    env,
+    input: input.prompt,
+    timeoutMs,
+    ...(input.signal ? { signal: input.signal } : {}),
+    killTreeOnExit: true,
+    captureStdout: false,
+    maxBytes: 256 * 1024,
+    onLine: (line) => {
+      pushTail(line);
       if (isDshJson) {
-        const extracted = extractDshJsonEventText(trimmed);
-        if (extracted !== null) {
-          assistantParts.push(extracted);
-          return;
-        }
+        if (streamParser.feedLine(line)) return;
+      } else {
+        streamParser.feedLine(line);
       }
-      input.log(`[${label}] ${trimmed.slice(0, 500)}`);
-    };
-
-    child.stdout.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8');
-      stdoutTail = appendTail(stdoutTail, text);
-      lineBuffer += text;
-      let newlineIndex = lineBuffer.indexOf('\n');
-      while (newlineIndex >= 0) {
-        processLine(lineBuffer.slice(0, newlineIndex));
-        lineBuffer = lineBuffer.slice(newlineIndex + 1);
-        newlineIndex = lineBuffer.indexOf('\n');
-      }
-    });
-
-    child.stderr.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8');
-      stderrTail = appendTail(stderrTail, text);
-      for (const line of text.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (trimmed) input.log(`[${label}:stderr] ${trimmed.slice(0, 500)}`);
-      }
-    });
-
-    child.stdin.on('error', () => undefined);
-    child.stdin.end(input.prompt, 'utf8');
-
-    const finish = async (code: number | null, errorMessage?: string): Promise<void> => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      input.signal?.removeEventListener('abort', onAbort);
-      if (lineBuffer.trim()) processLine(lineBuffer);
-      // I18 / §5.3：确认进程及全部后代进程树已完全退出后再交还控制权。
-      await stopTree();
-      const combinedTail = tailLines([stdoutTail, stderrTail].filter(Boolean).join('\n'), 120);
-      const assistantText = assistantParts.length > 0 ? assistantParts.join('\n') : stdoutTail;
-      const ok = !timedOut && !aborted && !errorMessage && code === 0;
-      resolve({
-        ok,
-        exitCode: code,
-        timedOut,
-        aborted,
-        outputTail: combinedTail,
-        assistantText,
-        ...(!ok
-          ? {
-            errorMessage: errorMessage
-              ?? (aborted ? '执行已取消' : timedOut ? `执行超时（${String(timeoutMs)}ms）` : `执行器退出码 ${String(code ?? 'null')}`),
-          }
-          : {}),
-      });
-    };
-
-    child.once('error', (error) => {
-      void finish(null, error.message);
-    });
-    child.once('close', (code) => {
-      void finish(code);
-    });
+      const trimmed = line.trim();
+      if (trimmed) input.log(`[${label}] ${trimmed.slice(0, 500)}`);
+    },
   });
-}
 
-export async function probeCommandAvailable(command: string, cwd: string): Promise<boolean> {
-  const probeArgs = ['--version'];
-  const result = await runProcess(command, probeArgs, { cwd, timeoutMs: 8000, maxBytes: 16 * 1024 }).catch(() => null);
-  return Boolean(result && !result.error && result.code === 0);
+  if (result.stderr.trim()) {
+    for (const line of result.stderr.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed) {
+        pushTail(trimmed);
+        input.log(`[${label}:stderr] ${trimmed.slice(0, 500)}`);
+      }
+    }
+  }
+
+  const combinedTail = tailLines(tailBuffer.join('\n'), 120);
+  const assistantText = streamParser.getAssistantText() || combinedTail;
+  const treeStopped = result.processTreeStopped !== false;
+  const ok = !result.timedOut && !result.aborted && !result.error && result.code === 0 && treeStopped;
+
+  return {
+    ok,
+    exitCode: result.code,
+    timedOut: result.timedOut,
+    aborted: Boolean(result.aborted),
+    processTreeStopped: treeStopped,
+    outputTail: combinedTail,
+    assistantText,
+    ...(!ok
+      ? {
+        errorMessage: !treeStopped
+          ? '执行器退出后无法确认后代进程树已完全停止'
+          : result.error
+            ?? (result.aborted
+              ? '执行已取消'
+              : result.timedOut
+                ? `执行超时（${String(timeoutMs)}ms）`
+                : `执行器退出码 ${String(result.code ?? 'null')}`),
+      }
+      : {}),
+  };
 }

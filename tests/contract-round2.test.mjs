@@ -48,7 +48,8 @@ async function waitJob(base, jobId) {
 
 test('G29：/candidate/finalize 校验 Mode B 追加新补丁并原子提交', async () => {
   const root = await createGitFixture();
-  await writeCandidate(root, '20261109-solo');
+  const p1Base = runCommand('git', ['rev-parse', 'HEAD'], root).stdout.trim();
+  await writeCandidate(root, '20261109-solo', { base: p1Base });
   await writeFile(path.join(root, '.ai-review', 'reviewers.yml'), 'default_owner: tester\nrules: []\n', 'utf8');
   runCommand('git', ['add', '.ai-review'], root);
   runCommand('git', ['commit', '-q', '-m', 'fixture'], root);
@@ -68,7 +69,7 @@ test('G29：/candidate/finalize 校验 Mode B 追加新补丁并原子提交', a
       '  - id: 1',
       '    patch: 001.patch',
       '    option_id: opt-a',
-      `    base_revision: "${base}"`,
+      `    base_revision: "${p1Base}"`,
       '    author: ai',
       `    sha256: "${sha256Hex(p1)}"`,
       '  - id: 2',

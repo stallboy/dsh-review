@@ -1,9 +1,9 @@
 /**
  * 分阶段审查状态机（scan → verify → patch → publish）：
- * - D02：patch 阶段派发注入既有问题身份/optionIds/currentPatches/guard，并在登记前校验 optionId（畸形输出不占死 2 方案名额）；
- * - D04：彻底移除 allowed_gate_commands 白名单拦截；
- * - D11：支持外部专业执行器优先 + 本 Harness 独立子代理（dsh-subagent）优雅降级；
- * - I18：每个子阶段交接前强制还原所有非 .ai-review/ 业务改动并清空 .tmp/。
+ * - patch 阶段派发注入既有问题身份/optionIds/currentPatches/guard，并在登记前校验 optionId（畸形输出不占死 2 方案名额）；
+ * - verify 阶段强制白名单校验任务入参，阻断初审推理、分级或修复建议透传；
+ * - 外部专业执行器可用时优先调起，不可用时优雅降级为本 Harness 独立子代理（dsh-subagent）；
+ * - I18：每个子阶段交接前强制还原所有非 .ai-review/ 业务改动、清空 .tmp/ 并核验工作区干净。
  */
 
 import { rm } from 'node:fs/promises';
@@ -170,17 +170,67 @@ function asStrArray(value: unknown, field: string): string[] {
   return (value as string[]).map((s) => s.trim()).filter(Boolean);
 }
 
+const ALLOWED_VERIFY_TASK_KEYS = new Set(['subjectId', 'scenario', 'navigation', 'expectationIndexes']);
+const ALLOWED_NAVIGATION_KEYS = new Set(['path', 'line', 'symbol']);
+
+function validateNavigationItem(raw: unknown, field: string): { path: string; line?: number; symbol?: string } {
+  const obj = asObj(raw, field);
+  const extraKeys = Object.keys(obj).filter((k) => !ALLOWED_NAVIGATION_KEYS.has(k));
+  if (extraKeys.length > 0) {
+    throw new Error(`${field} 包含禁止字段（防初审推理泄漏）：${extraKeys.join(', ')}`);
+  }
+  const file = typeof obj['path'] === 'string' ? obj['path'].trim().replaceAll('\\', '/').replace(/^\.\//, '') : '';
+  if (!file || !validSourcePath(file)) {
+    throw new Error(`${field}.path 非法：${file}`);
+  }
+  const line = obj['line'];
+  if (line !== undefined && (typeof line !== 'number' || !Number.isInteger(line) || line < 1)) {
+    throw new Error(`${field}.line 必须是正整数`);
+  }
+  const symbol = obj['symbol'];
+  if (symbol !== undefined && (typeof symbol !== 'string' || symbol.trim().length === 0 || symbol.trim().length > 120 || /\r|\n/.test(symbol))) {
+    throw new Error(`${field}.symbol 必须是简短单行符号名`);
+  }
+  return {
+    path: file,
+    ...(typeof line === 'number' ? { line } : {}),
+    ...(typeof symbol === 'string' ? { symbol: symbol.trim() } : {}),
+  };
+}
+
+function validateVerifyNavigation(raw: unknown, fallback: { path: string; line: number }): unknown {
+  if (raw === undefined) return fallback;
+  if (Array.isArray(raw)) {
+    if (raw.length === 0 || raw.length > 12) throw new Error('verify.navigation 数组长度必须在 1–12 之间');
+    return raw.map((item, idx) => validateNavigationItem(item, `verify.navigation[${String(idx)}]`));
+  }
+  return validateNavigationItem(raw, 'verify.navigation');
+}
+
 export class AuditStageSession {
   private readonly leads = new Map<string, LeadRecord>();
   private readonly verified = new Map<string, VerifiedLead>();
   private readonly proposalsBySubject = new Map<string, RegisteredProposal[]>();
   private scanCount = 0;
+  private stageFailures = 0;
   private taskSeq = 0;
   private published = false;
   private historyCache: AuditHistorySnapshot | undefined;
   private reviewersCache: ReviewersConfig | undefined;
 
   constructor(private readonly options: AuditStageSessionOptions) {}
+
+  get isPublished(): boolean {
+    return this.published;
+  }
+
+  getScanCount(): number {
+    return this.scanCount;
+  }
+
+  hasStageFailure(): boolean {
+    return this.stageFailures > 0;
+  }
 
   private async getHistory(): Promise<AuditHistorySnapshot> {
     if (!this.historyCache) {
@@ -276,10 +326,14 @@ export class AuditStageSession {
     return { valid, errors };
   }
 
-  /** I18 / §5.6：子阶段交接前强制还原所有非 .ai-review/ 改动并清空 .tmp/。 */
+  /** I18 / SPEC §5.6：子阶段交接前强制还原所有非 .ai-review/ 改动、清空 .tmp/ 并核验业务工作区干净。 */
   private async cleanupAfterSubStage(): Promise<void> {
-    await this.options.vcs.revertBusinessWorkspace().catch(() => undefined);
-    await rm(path.join(this.options.root, '.tmp'), { recursive: true, force: true }).catch(() => undefined);
+    await this.options.vcs.revertBusinessWorkspace();
+    await rm(path.join(this.options.root, '.tmp'), { recursive: true, force: true });
+    const clean = await this.options.vcs.ensureCleanWorkspace();
+    if (!clean.clean) {
+      throw new Error(`子阶段交接还原后工作区仍存在非 .ai-review/ 残留：${clean.dirtyPaths.join(', ')}`);
+    }
   }
 
   async runStage(
@@ -313,7 +367,7 @@ export class AuditStageSession {
           ...(artifactDir ? { artifactDir } : {}),
           prompt,
           schema,
-          timeoutMs: Math.min(remainingMs, 30 * 60_000),
+          timeoutMs: Math.min(remainingMs, 60 * 60_000),
           signal,
           ...(this.options.dshCommand ? { dshCommand: this.options.dshCommand } : {}),
           ...(this.options.onLog ? { onLog: this.options.onLog } : {}),
@@ -344,7 +398,10 @@ export class AuditStageSession {
       });
 
       const outcome = await runWithHandoffCleanup(prompt, SCAN_SCHEMA);
-      if (!outcome.ok) return { ok: false, stage, taskId, reason: outcome.reason, diagnostic: outcome.diagnostic };
+      if (!outcome.ok) {
+        this.stageFailures += 1;
+        return { ok: false, stage, taskId, reason: outcome.reason, diagnostic: outcome.diagnostic };
+      }
 
       const data = asObj(outcome.output, 'scan.output');
       const rawLeads = Array.isArray(data['leads']) ? data['leads'] : [];
@@ -382,12 +439,20 @@ export class AuditStageSession {
     }
 
     if (stage === 'verify') {
+      // 防初审推理/分级/修复建议泄漏给独立复核阶段，仅放行白名单定位键
+      const forbiddenKeys = Object.keys(task).filter((k) => !ALLOWED_VERIFY_TASK_KEYS.has(k));
+      if (forbiddenKeys.length > 0) {
+        throw new Error(`verify.task 包含禁止透传的字段（防初审推理泄漏）：${forbiddenKeys.join(', ')}`);
+      }
       const subjectId = typeof task['subjectId'] === 'string' ? task['subjectId'].trim() : '';
       const lead = this.leads.get(subjectId);
       if (!lead) throw new Error(`verify.subjectId 未在初审阶段登记：${subjectId}`);
 
       const scenario = typeof task['scenario'] === 'string' ? task['scenario'].trim() : 'reachable_behavior';
-      const navigation = task['navigation'] ?? { path: lead.path, line: lead.line };
+      if (!scenario || scenario.length > 120 || /\r|\n/.test(scenario)) {
+        throw new Error('verify.scenario 必须是简短单行中性场景标识（不超过 120 字符）');
+      }
+      const navigation = validateVerifyNavigation(task['navigation'], { path: lead.path, line: lead.line });
       const extraReqs = this.options.note.trim()
         ? this.options.note.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
         : [];
@@ -412,7 +477,10 @@ export class AuditStageSession {
       });
 
       const outcome = await runWithHandoffCleanup(prompt, VERIFY_SCHEMA);
-      if (!outcome.ok) return { ok: false, stage, taskId, reason: outcome.reason, diagnostic: outcome.diagnostic };
+      if (!outcome.ok) {
+        this.stageFailures += 1;
+        return { ok: false, stage, taskId, reason: outcome.reason, diagnostic: outcome.diagnostic };
+      }
 
       const data = asObj(outcome.output, 'verify.output');
       const rawVerdict = data['verdict'];
@@ -453,7 +521,7 @@ export class AuditStageSession {
       };
     }
 
-    // stage === 'patch'（D02 + D04）
+    // stage === 'patch'
     const subjectId = typeof task['subjectId'] === 'string' ? task['subjectId'].trim() : '';
     const verified = this.verified.get(subjectId);
     if (!verified || verified.verdict !== 'confirmed') {
@@ -468,7 +536,6 @@ export class AuditStageSession {
       throw new Error('patch.allowedPaths 必须是非空且位于审查范围内的合法业务路径');
     }
 
-    // D04：不再做 allowedGateCommands 白名单拦截，仅要求非空命令列表。
     const gateCommands = asStrArray(task['gateCommands'], 'gateCommands');
     if (gateCommands.length === 0) {
       throw new Error('patch.gateCommands 必须至少包含一条非空门禁命令');
@@ -482,7 +549,7 @@ export class AuditStageSession {
       throw new Error(`patch.findingId 格式非法：${requestedFindingId}`);
     }
 
-    // D02：查询既有问题并把 findingId / optionIds / currentPatches / retiredOptionIds / guard 注入派发上下文！
+    // 查询既有问题并把 findingId / optionIds / currentPatches / retiredOptionIds / guard 注入派发上下文
     const history = await this.getHistory();
     const existing = requestedFindingId ? history.byFindingId.get(requestedFindingId) : undefined;
     const retiredSet = existing
@@ -543,6 +610,7 @@ export class AuditStageSession {
 
     const outcome = await runWithHandoffCleanup(prompt, PATCH_SCHEMA, artifactAbs);
     if (!outcome.ok) {
+      this.stageFailures += 1;
       await rm(artifactAbs, { recursive: true, force: true }).catch(() => undefined);
       return { ok: false, stage, taskId, reason: outcome.reason, diagnostic: outcome.diagnostic };
     }
@@ -561,7 +629,7 @@ export class AuditStageSession {
       };
     }
 
-    // D02：登记前即强校验 optionId、归属与 2 方案名额上限；畸形产物直接拒绝且不占死名额！
+    // 登记前即强校验 optionId、归属与 2 方案名额上限；畸形产物直接拒绝且不占死名额
     const optionId = typeof data['optionId'] === 'string' ? data['optionId'].trim() : '';
     if (!optionId || !OPTION_ID_PATTERN.test(optionId)) {
       await rm(artifactAbs, { recursive: true, force: true }).catch(() => undefined);
@@ -655,7 +723,9 @@ export class AuditStageSession {
     }
 
     const rawConf = typeof data['confidence'] === 'number' && Number.isFinite(data['confidence']) ? data['confidence'] : 80;
-    const confidence = rawConf > 1 ? Math.max(0, Math.min(1, rawConf / 100)) : Math.max(0, Math.min(1, rawConf));
+    const confidence = Number.isInteger(rawConf)
+      ? Math.max(0, Math.min(1, rawConf / 100))
+      : Math.max(0, Math.min(1, rawConf));
     const humanDecisions: HumanDecision[] = Array.isArray(data['humanDecisions'])
       ? (data['humanDecisions'] as unknown[])
         .filter((d): d is Record<string, unknown> => Boolean(d && typeof d === 'object' && !Array.isArray(d)))
@@ -771,12 +841,18 @@ export class AuditStageSession {
       });
     }
 
-    // 校验外部人工完成项复核结论（reviewedFindings）
+    // 校验外部人工完成项复核结论（reviewedFindings）：支持按 findingId 或目录 ID 查找，且证据必须落在本轮 scope 内
     const reviewedExternal: ReviewedExternalFindingInput[] = [];
     if (Array.isArray(pub['reviewedFindings'])) {
       for (const rawRev of pub['reviewedFindings']) {
         const rev = asObj(rawRev, 'reviewedFindings[]');
-        const findingId = typeof rev['id'] === 'string' ? rev['id'].trim() : '';
+        const rawRef = typeof rev['findingId'] === 'string' && rev['findingId'].trim()
+          ? rev['findingId'].trim()
+          : typeof rev['id'] === 'string'
+            ? rev['id'].trim()
+            : '';
+        const matchedExisting = history.byFindingId.get(rawRef) ?? history.byDirId.get(rawRef);
+        const findingId = matchedExisting?.meta.findingId ?? rawRef;
         const status = rev['status'];
         const verdict: ReviewedExternalFindingInput['verdict'] = status === 'resolved'
           ? 'resolved'
@@ -785,7 +861,8 @@ export class AuditStageSession {
             : 'unverified';
         const rawEv = rev['evidence'] ? (Array.isArray(rev['evidence']) ? rev['evidence'] : [rev['evidence']]) : [];
         const checked = await this.verifyEvidenceList(rawEv);
-        const finalVerdict = (verdict === 'resolved' || verdict === 'confirmed') && checked.valid.length === 0
+        const evidenceInScope = checked.valid.length > 0 && scopeCovers(this.options.scope, checked.valid.map((e) => e.path));
+        const finalVerdict = (verdict === 'resolved' || verdict === 'confirmed') && !evidenceInScope
           ? 'unverified'
           : verdict;
         reviewedExternal.push({
@@ -810,6 +887,7 @@ export class AuditStageSession {
       reviewers,
       existingByFindingId: history.byFindingId,
       existingDirIds,
+      ...(this.options.source ? { source: this.options.source } : {}),
       findings,
       reviewedExternal,
       coverageLines,

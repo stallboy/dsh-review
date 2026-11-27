@@ -49,6 +49,7 @@ export type FindingDisposition =
   | 'accept_as_is'
   | 'defer'
   | 'human_takeover'
+  | 'awaiting_verification'
   | 'applied'
   | 'resolved';
 

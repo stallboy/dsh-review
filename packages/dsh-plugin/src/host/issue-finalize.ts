@@ -19,10 +19,12 @@ import {
 import { auditFiles } from './audit-files.js';
 import { assertStageArtifacts, compatibleAuditBase, type StageSeal } from './audit-stage-artifacts.js';
 import { stampSvnApprovalSource } from './approval-merge-snapshots.js';
-import { parseReviewMarkdown } from './frontmatter.js';
+import { commitWithThreeBranchRecovery } from './commit-recovery.js';
+import { assertAppendOnlyHistory } from './history-guard.js';
 import { isRepoRelativePath } from './invariants.js';
 import { sha256Hex } from './issue-review.js';
 import { isAiReviewPath, parsePatch } from './patch.js';
+import type { RepoRecoveryStore } from './recovery-store.js';
 import { loadReviewers, resolveOwner } from './reviewers.js';
 import { validateReviewData } from './review-data-validation.js';
 import type { SharedCandidateSource } from './shared-facts.js';
@@ -39,6 +41,7 @@ export interface IssueFinalizeDeps {
   candidateSource?: SharedCandidateSource;
   signal?: AbortSignal;
   scheduledBaseMatches?: () => Promise<boolean>;
+  recoveryStore?: RepoRecoveryStore;
 }
 
 export interface IssueFinalizeInput {
@@ -233,8 +236,20 @@ export async function finalizeIssueAudit(
     validCommitPaths.add(evFile);
   }
 
-  // 逐问题核验：schema_version: 1 不变量、范围覆盖、补丁 sha256 与只读应用预检
+  if (deps.signal?.aborted) return aborted('审查收尾已取消');
+
+  // 预加载共享问题快照用于全仓 finding_id 唯一性与跨轮只追加防篡改核验
+  const sharedSnapshot = await store.listSharedCandidates(deps.candidateSource);
+  const sharedById = new Map(sharedSnapshot.candidates.filter((c) => !c.parseError).map((c) => [c.id, c]));
+  const sharedFindingToId = new Map<string, string>();
+  for (const c of sharedById.values()) {
+    sharedFindingToId.set(c.meta.findingId, c.id);
+  }
+  const batchFindingToId = new Map<string, string>();
+
+  // 逐问题核验：schema_version: 1 不变量、全仓 finding_id 唯一、跨轮只追加防篡改、范围覆盖、补丁 sha256 与只读应用预检
   for (const id of issueIds) {
+    if (deps.signal?.aborted) return aborted('审查收尾已取消');
     const relReview = `.ai-review/${id}/review.md`;
     const result: AuditCandidateResult = {
       id,
@@ -268,18 +283,26 @@ export async function finalizeIssueAudit(
         result.gateChecks = meta.options[0]?.gateChecks.length ?? 0;
         result.patch = detail.patchEntry?.patch ?? '';
 
+        const existingOtherId = sharedFindingToId.get(meta.findingId);
+        if (existingOtherId && existingOtherId !== id) {
+          result.errors.push(`finding_id "${meta.findingId}" 与仓库既有问题 ${existingOtherId} 冲突`);
+        }
+        const batchOtherId = batchFindingToId.get(meta.findingId);
+        if (batchOtherId && batchOtherId !== id) {
+          result.errors.push(`finding_id "${meta.findingId}" 与本轮问题 ${batchOtherId} 重复`);
+        } else {
+          batchFindingToId.set(meta.findingId, id);
+        }
+
         if (!scopeCovers(scope, meta.observations.flatMap((o) => o.evidence.map((e) => e.path)))) {
           result.errors.push(`问题 ${id} 的观察证据路径超出本轮审查范围 ${scope}`);
         }
-        if (input.beforeIds.has(id) && deps.candidateSource) {
-          const [priorMonth, priorSlug] = id.split('/');
-          if (priorMonth && priorSlug) {
-            const priorShared = await store.loadCandidate(priorMonth, priorSlug, deps.candidateSource);
-            if (priorShared && !priorShared.parseError && meta.owner !== priorShared.meta.owner) {
-              result.errors.push(`不能改写既有共享问题的负责人（当前共享负责人：${priorShared.meta.owner}，提交值：${meta.owner}）`);
-            }
+        if (input.beforeIds.has(id)) {
+          const priorShared = sharedById.get(id);
+          if (priorShared) {
+            result.errors.push(...assertAppendOnlyHistory(priorShared.meta, meta, { mode: 'audit' }));
           }
-        } else if (reviewersConfig?.valid && !input.beforeIds.has(id)) {
+        } else if (reviewersConfig?.valid) {
           const expectedOwner = resolveOwner(reviewersConfig, { paths: meta.targetFiles, tags: meta.tags }).owner;
           if (expectedOwner && meta.owner !== expectedOwner) {
             result.errors.push(`owner 应为 ${expectedOwner}（当前为 ${meta.owner}）`);
@@ -378,6 +401,8 @@ export async function finalizeIssueAudit(
     return aborted(`正式 audit.md 不变量校验失败：${auditErrors.join('；')}`);
   }
 
+  if (deps.signal?.aborted) return aborted('审查收尾已取消');
+
   await archive.writeAudit(finalAuditMeta, finalBody);
   const finalAuditText = serializeAuditMarkdown(finalAuditMeta, finalBody);
   dataValidation.push({ path: reportPath, errors: [] });
@@ -387,60 +412,53 @@ export async function finalizeIssueAudit(
   if (!snapshot?.entries) {
     return aborted('无法安全采集审查收尾提交快照');
   }
+  if (deps.signal?.aborted) return aborted('审查收尾已取消');
 
-  const probeBefore = await vcs.getCommitProbe(commitPathList).catch(() => null);
-  const commit = await vcs.atomicCommit({
-    message: `audit(${scope === '.' ? 'repo' : scope}): 仓库审查归档 ${String(validIssueIds.length)} 个问题 [skip ci]`,
-    paths: commitPathList,
-    verifyEntries: snapshot.entries,
+  const commitOutcome = await commitWithThreeBranchRecovery({
+    vcs,
+    probePaths: commitPathList,
+    commitInput: {
+      message: `audit(${scope === '.' ? 'repo' : scope}): 仓库审查归档 ${String(validIssueIds.length)} 个问题 [skip ci]`,
+      paths: commitPathList,
+      verifyEntries: snapshot.entries,
+    },
+    verifyOnProbeChange: async (probeAfter) => {
+      const committedReport = await vcs.readFileAt(probeAfter, reportPath).catch(() => null);
+      return committedReport !== null && gitBlobHash(committedReport) === gitBlobHash(finalAuditText);
+    },
+    restoreOnProvenNotCommitted: async () => undefined,
+    ...(deps.recoveryStore
+      ? { recoveryStore: deps.recoveryStore, recoveryContext: { repoRoot: store.repoRoot, kind: 'audit' as const } }
+      : {}),
   });
 
-  if (commit.verificationFailed) {
-    return recovery('COMMIT_OUTCOME_UNKNOWN', `审查收尾提交核验失败：${commit.errorOutput}`);
-  }
-  if (commit.success && commit.commitRevision) {
+  if (commitOutcome.status === 'committed') {
     const hasInvalid = created.some((item) => item.errors.length > 0);
     const status = hasInvalid ? 'VALIDATION_FAILED' : 'COMMITTED';
-    log(`审查收尾提交成功（${commit.commitRevision.slice(0, 12)}），状态 ${status}`);
+    log(`审查收尾提交成功（${commitOutcome.commitRevision.slice(0, 12)}），状态 ${status}`);
     return {
       status,
-      commitRevision: commit.commitRevision,
+      commitRevision: commitOutcome.commitRevision,
       reportPath,
       body: finalBody,
       issues: validIssueIds,
       created,
       dataValidation,
       warnings,
-      message: hasInvalid
-        ? `审查部分问题未通过校验，已提交 ${String(validIssueIds.length)} 个合法问题与报告`
-        : `审查收尾已提交（${String(validIssueIds.length)} 个问题，${commit.commitRevision.slice(0, 12)}）`,
+      message: commitOutcome.recoveredFromProbe
+        ? `提交命令异常但核实已落地（${commitOutcome.commitRevision.slice(0, 12)}）`
+        : hasInvalid
+          ? `审查部分问题未通过校验，已提交 ${String(validIssueIds.length)} 个合法问题与报告`
+          : `审查收尾已提交（${String(validIssueIds.length)} 个问题，${commitOutcome.commitRevision.slice(0, 12)}）`,
     };
   }
 
-  // 失败三分支判定（SPEC §8.3）
-  const probeAfter = await vcs.getCommitProbe(commitPathList).catch(() => null);
-  if (probeBefore !== null && probeAfter !== null && probeAfter !== probeBefore) {
-    const committedReport = await vcs.readFileAt(probeAfter, reportPath).catch(() => null);
-    if (committedReport !== null && gitBlobHash(committedReport) === gitBlobHash(finalAuditText)) {
-      const hasInvalid = created.some((item) => item.errors.length > 0);
-      return {
-        status: hasInvalid ? 'VALIDATION_FAILED' : 'COMMITTED',
-        commitRevision: probeAfter,
-        reportPath,
-        body: finalBody,
-        issues: validIssueIds,
-        created,
-        dataValidation,
-        warnings,
-        message: `提交命令异常但核实已落地（${probeAfter.slice(0, 12)}）`,
-      };
-    }
-    return recovery('COMMIT_OUTCOME_UNKNOWN', `提交探针变化但内容无法核实：${commit.errorOutput}`);
-  }
-  if (probeBefore === null || probeAfter === null) {
-    return recovery('COMMIT_OUTCOME_UNKNOWN', `无法读取提交探针核实结果：${commit.errorOutput}`);
+  if (commitOutcome.status === 'recovery_required') {
+    const auditReason = commitOutcome.reason === 'COMMIT_OUTCOME_UNKNOWN'
+      ? 'COMMIT_OUTCOME_UNKNOWN'
+      : 'SYNC_STATE_UNKNOWN';
+    return recovery(auditReason, commitOutcome.detail);
   }
 
-  await commit.restorePreparation?.().catch(() => undefined);
-  return aborted(`审查收尾提交失败（未产生共享提交）：${commit.errorOutput}`);
+  return aborted(`审查收尾提交失败（未产生共享提交）：${commitOutcome.errorOutput}`);
 }

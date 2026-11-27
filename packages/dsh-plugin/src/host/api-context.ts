@@ -17,6 +17,7 @@ import {
 } from './types.js';
 import type { JobManager } from './jobs.js';
 import type { AuditLifecycle, AuditLeaseRecord } from './audit-lifecycle.js';
+import type { DesktopAuditSessionCoordinator } from './desktop-audit-coordinator.js';
 import type { RepoRecoveryStore } from './recovery-store.js';
 import type { ReviewStore } from './store.js';
 import type { SharedCandidateSource } from './shared-facts.js';
@@ -116,6 +117,7 @@ export interface ApiDeps {
     prompt: string;
     requestId?: string;
     ownerSessionId?: string;
+    onCreated?: (sessionId: string) => Promise<void>;
   }) => Promise<{ sessionId: string }>;
   withAuditSessionIdle?: (
     sessionId: string,
@@ -331,6 +333,7 @@ export interface ApiHost {
   withWriteLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T>;
 
   readonly auditLifecycle: AuditLifecycle;
+  readonly auditCoordinator: DesktopAuditSessionCoordinator;
   readonly recoveryStore: RepoRecoveryStore;
   ensureNoAuditRunning(root?: string): void;
   leaseLookup(auditId: string): AuditLeaseRecord | undefined;

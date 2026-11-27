@@ -383,8 +383,9 @@ export class ManagedOperations {
             outcome = { ...data, status: typeof commitRevision === 'string' ? 'COMMITTED' : 'SUCCEEDED', ...(typeof commitRevision === 'string' ? { commitRevision } : {}) };
         }
         if (session) outcome = { ...outcome, ...session };
-        const unverifiedAudit = command.operation === 'audit' && outcome.status === 'RECOVERY_REQUIRED';
-        const stageLease = inSession && unverifiedAudit && session && outcome.stageFailure
+        // 任何操作进入 RECOVERY_REQUIRED 时（无论是否 audit），结果未经证实，严禁自动推送远端交付
+        const unverifiedRecovery = outcome.status === 'RECOVERY_REQUIRED';
+        const stageLease = inSession && unverifiedRecovery && session && outcome.stageFailure
             ? runtime.api.leaseLookup(session.auditId) : undefined;
         // Mode C 情况 B-已推送返回 commitRevision=P、closingCommitRevision=C_meta，托管交付需推送最新关闭提交 C_meta
         let commit = typeof outcome.closingCommitRevision === 'string'
@@ -397,12 +398,12 @@ export class ManagedOperations {
         }
         const result: ManagedResult = {
             outcome,
-            delivery: unverifiedAudit
+            delivery: unverifiedRecovery
                 ? { state: 'unknown', ...(commit ? { commitRevision: commit } : {}) }
-                : commit ? { state: 'pending', commitRevision: commit } : { state: outcome.status === 'RECOVERY_REQUIRED' ? 'unknown' : 'not_required' },
+                : commit ? { state: 'pending', commitRevision: commit } : { state: 'not_required' },
         };
         this.options.journal.checkpoint(command.commandId, { phase: 'business_finished', result, ...session });
-        if (commit && !unverifiedAudit) result.delivery = await runtime.api.withWriteLock(runtime.root, () => runtime.delivery.deliver(commit!));
+        if (commit && !unverifiedRecovery) result.delivery = await runtime.api.withWriteLock(runtime.root, () => runtime.delivery.deliver(commit!));
         this.options.journal.checkpoint(command.commandId, { phase: 'finished', result, ...session });
         return result;
     }
@@ -539,7 +540,7 @@ export class ManagedOperations {
                 delivery: { state: 'pending' as const, commitRevision: commit },
             };
             if (session) restored.outcome = { ...restored.outcome, ...session };
-            if (command.operation === 'audit' && restored.outcome.status === 'RECOVERY_REQUIRED') {
+            if (result?.outcome.status === 'RECOVERY_REQUIRED') {
                 return { ...restored, delivery: { state: 'unknown', commitRevision: commit } };
             }
             restored.delivery = await runtime.delivery.deliver(commit);

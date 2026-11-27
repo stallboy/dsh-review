@@ -366,7 +366,8 @@ export function deriveIssueDisposition(meta: ReviewFrontmatter): FindingDisposit
   if (meta.status === 'approved') return 'applied';
   if (meta.status === 'resolved') return 'resolved';
   if (meta.status === 'rejected') return 'accept_as_is';
-  if (meta.status === 'human_takeover' || meta.status === 'awaiting_verification') return 'human_takeover';
+  if (meta.status === 'awaiting_verification') return 'awaiting_verification';
+  if (meta.status === 'human_takeover') return 'human_takeover';
   if (isDeferred(meta)) return 'defer';
   return 'undecided';
 }

@@ -1,5 +1,5 @@
 /**
- * 仓库审查目标校验与统一总调度执行器（SPEC §5.6 / §9.11 / D10）：
+ * 仓库审查目标校验与统一总调度执行器（SPEC §5.6 / §9.11）：
  * 手动与定时审查完全共用同一套总调度 + 阶段通道 + finalizeIssueAudit 流水线，不设独立历史复查旁路。
  */
 
@@ -14,6 +14,7 @@ import type { AuditExecutor, ExecuteAuditStage } from './audit-stage-runner.js';
 import type { StageSeal } from './audit-stage-artifacts.js';
 import { finalizeIssueAudit } from './issue-finalize.js';
 import { formatMemorySummary, topPerModule } from './memory.js';
+import type { RepoRecoveryStore } from './recovery-store.js';
 import { requireValidReviewers } from './reviewers.js';
 import { runAgent } from './runner.js';
 import type { SharedCandidateSource } from './shared-facts.js';
@@ -87,6 +88,7 @@ export interface HeadlessAuditDeps {
   scheduledBaseMatches?: () => Promise<boolean>;
   onSeal?: (manifest: StageSeal, issueIds: string[]) => Promise<void>;
   onStageStateChange?: (active: boolean) => Promise<void>;
+  recoveryStore?: RepoRecoveryStore;
 }
 
 export async function runHeadlessPhasedAudit(deps: HeadlessAuditDeps): Promise<AuditOutcome> {
@@ -220,6 +222,7 @@ export async function runHeadlessPhasedAudit(deps: HeadlessAuditDeps): Promise<A
       ...(deps.candidateSource ? { candidateSource: deps.candidateSource } : {}),
       ...(deps.signal ? { signal: deps.signal } : {}),
       ...(deps.scheduledBaseMatches ? { scheduledBaseMatches: deps.scheduledBaseMatches } : {}),
+      ...(deps.recoveryStore ? { recoveryStore: deps.recoveryStore } : {}),
     },
     {
       auditId: lease.auditId,

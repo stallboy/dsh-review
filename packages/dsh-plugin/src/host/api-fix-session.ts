@@ -6,7 +6,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import {
   guardFrom,
@@ -23,7 +23,7 @@ import {
 } from './api-context.js';
 import { COMMENTABLE_STATUSES, requireExplicitSelection } from './issue-review.js';
 import { buildModeBPrompt, loadProposalSystemPrompt, unresolvedCommentsForOption, wrapAgentPrompt } from './runner.js';
-import { dshHome } from './settings.js';
+import { atomicWriteJson, dshHome } from './settings.js';
 import { ApiError } from './types.js';
 
 export class FixSessionRegistry {
@@ -63,14 +63,15 @@ export class FixSessionRegistry {
   }
 
   private async persist(): Promise<void> {
-    await mkdir(path.dirname(this.filePath), { recursive: true });
-    const temp = `${this.filePath}.${String(process.pid)}.${String(Date.now())}.tmp`;
-    await writeFile(temp, `${JSON.stringify([...this.entries.values()], null, 2)}\n`, 'utf8');
-    await rename(temp, this.filePath);
+    await atomicWriteJson(this.filePath, [...this.entries.values()]);
   }
 
   activeFor(root: string): FixSessionOccupancy | undefined {
     return this.entries.get(root);
+  }
+
+  anyActive(): FixSessionOccupancy | undefined {
+    return this.entries.values().next().value;
   }
 
   async acquire(entry: FixSessionOccupancy): Promise<void> {
@@ -228,6 +229,10 @@ export async function handleCreateFixSession(
       prompt: prepared.prompt,
       requestId,
       ...(ownerSessionId ? { ownerSessionId } : {}),
+      onCreated: async (sid) => {
+        sessionId = sid;
+        await registry.updateSessionId(runtime.root, sid);
+      },
     });
     sessionId = created.sessionId;
     await registry.updateSessionId(runtime.root, sessionId);
