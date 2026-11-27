@@ -161,8 +161,7 @@ export type ApprovalAbortReason =
   | 'BUSINESS_CONTENT_CHANGED'
   | 'COMMIT_FAILED'
   | 'MAX_RETRIES_EXCEEDED'
-  | 'RUNNER_FAILED'
-  | 'CANCELLED';
+  | 'RUNNER_FAILED';
 
 export type ApprovalRecoveryReason =
   | 'COMMIT_OUTCOME_UNKNOWN'
@@ -174,7 +173,7 @@ export type ApprovalOutcome =
   | { status: 'COMMITTED'; jobId: string; commitRevision: string; closingCommitRevision?: string; message: string; gateResults?: GateCheckResult[] }
   | { status: 'REPAIR_FAILED'; jobId: string; reason: 'GATE_CHECK_FAILED'; commitRevision: string; message: string; gateResults: GateCheckResult[] }
   | { status: 'FALLBACK_TO_PENDING'; jobId: string; reason: ApprovalFallbackReason; newRevision?: number; manualPrompt?: string; message: string }
-  | { status: 'ABORTED'; jobId: string; reason: ApprovalAbortReason; detail?: string; message: string }
+  | { status: 'ABORTED'; jobId: string; reason: ApprovalAbortReason; duplicateOf?: string; detail?: string; message: string }
   | { status: 'RECOVERY_REQUIRED'; jobId: string; reason: ApprovalRecoveryReason; detail: string; message: string };
 
 export type AiFixAbortReason =

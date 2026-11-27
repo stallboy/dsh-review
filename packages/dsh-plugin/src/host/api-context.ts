@@ -17,6 +17,7 @@ import {
 } from './types.js';
 import type { JobManager } from './jobs.js';
 import type { AuditLifecycle, AuditLeaseRecord } from './audit-lifecycle.js';
+import type { RepoRecoveryStore } from './recovery-store.js';
 import type { ReviewStore } from './store.js';
 import type { SharedCandidateSource } from './shared-facts.js';
 import { GitHeadCandidateSource, SvnBaseCandidateSource } from './shared-facts.js';
@@ -330,6 +331,7 @@ export interface ApiHost {
   withWriteLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<T>;
 
   readonly auditLifecycle: AuditLifecycle;
+  readonly recoveryStore: RepoRecoveryStore;
   ensureNoAuditRunning(root?: string): void;
   leaseLookup(auditId: string): AuditLeaseRecord | undefined;
   leaseTransition(auditId: string, state: 'released' | 'releasable'): Promise<void>;

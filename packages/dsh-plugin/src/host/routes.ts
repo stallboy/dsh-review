@@ -41,6 +41,7 @@ export const ROUTES: readonly RouteDefinition[] = [
   { method: 'POST', path: '/audit/manual', category: 'audit_control', blockedByActiveAudit: false, requiresRepoLock: false },
   { method: 'POST', path: '/audit/finalize', category: 'audit_control', blockedByActiveAudit: false, requiresRepoLock: true },
   { method: 'POST', path: '/audit/release', category: 'audit_control', blockedByActiveAudit: false, requiresRepoLock: true },
+  { method: 'POST', path: '/recovery/clear', category: 'audit_control', blockedByActiveAudit: false, requiresRepoLock: true },
   { method: 'POST', path: '/jobs/:id/cancel', pattern: /^\/jobs\/([^/]+)\/cancel$/, category: 'audit_control', blockedByActiveAudit: false, requiresRepoLock: false },
 
   // 11 个问题共享写端点 + sync（统一 {id, ...guard}）

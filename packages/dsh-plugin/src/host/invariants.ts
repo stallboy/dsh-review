@@ -264,15 +264,21 @@ export function quickReviewInvariants(input: QuickInvariantInput): string[] {
     patchById.set(patch.id, patch);
   });
 
-  // 收集历史批准周期明确退役的 option_id（避免用 baseRevision 启发式误杀同基线重开的新方案，I6）。
+  // 收集历史批准周期明确退役的 option_id（含历史周期未合入的备选方案；同基线重开新增的新方案不会误判，I6）。
   const historicApprovedOptionIds = new Set(meta.approvalHistory.map((h) => h.optionId));
   const historicApprovedPatchIds = new Set(meta.approvalHistory.map((h) => h.patchId));
   const maxHistoricPatchId = meta.approvalHistory.reduce((max, h) => Math.max(max, h.patchId), 0);
   const maxHistoricAttemptId = meta.approvalHistory.reduce((max, h) => Math.max(max, h.repairAttemptId), 0);
   const maxHistoricRevision = meta.approvalHistory.reduce((max, h) => Math.max(max, h.recordRevision), 0);
+  const historicBaseRevisions = new Set(meta.approvalHistory.map((h) => h.baseRevision));
   if (meta.approvalHistory.length > 0) {
     for (const patch of meta.patches) {
-      if (patch.id <= maxHistoricPatchId) historicApprovedOptionIds.add(patch.optionId);
+      if (
+        patch.id <= maxHistoricPatchId
+        || (historicBaseRevisions.has(patch.baseRevision) && patch.baseRevision !== meta.baseRevision)
+      ) {
+        historicApprovedOptionIds.add(patch.optionId);
+      }
     }
     for (const attempt of meta.repairAttempts) {
       if (attempt.id <= maxHistoricAttemptId) historicApprovedOptionIds.add(attempt.optionId);

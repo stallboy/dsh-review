@@ -16,9 +16,11 @@ import {
 } from './api-context.js';
 import { AuditArchive, scopeCovers } from './audit-archive.js';
 import { buildFindingView, isPatchBanned, resolveOptionSelection } from './issue-review.js';
+import { parsePatch } from './patch.js';
 import { buildModeBPrompt, loadProposalSystemPrompt, wrapAgentPrompt } from './runner.js';
 import { loadReviewers } from './reviewers.js';
 import { validateSettings } from './settings.js';
+import type { SharedCandidateSource } from './shared-facts.js';
 import { emptyStatusCounts } from './store.js';
 import {
   ApiError,
@@ -95,18 +97,37 @@ export class ReadModelCaches {
     runtime: Runtime,
     candidate: ReviewCandidate,
     snapshotKey: string | null,
+    source?: SharedCandidateSource,
   ): Promise<ApprovalCommitLookup | undefined> {
     if (candidate.meta.status !== 'approved' || !candidate.meta.approval) return undefined;
     const approval = candidate.meta.approval;
-    const cacheKey = `${runtime.root}\0${candidate.id}\0${snapshotKey ?? 'live'}\0${approval.optionId}\0${String(approval.patchId)}\0${approval.approvedAt}\0${approval.businessCommit ?? ''}`;
+    const cacheKey = [
+      runtime.root,
+      candidate.id,
+      snapshotKey ?? 'live',
+      approval.optionId,
+      String(approval.patchId),
+      String(approval.recordRevision),
+      approval.patchSha256,
+      String(approval.repairAttemptId),
+      approval.baseRevision,
+      approval.approvedAt,
+      approval.businessCommit ?? '',
+    ].join('\0');
     const cached = this.approvalCommits.get(cacheKey);
     if (cached) return cached;
 
     const patchPaths = candidate.meta.patches.map((p) => `.ai-review/${candidate.id}/${p.patch}`);
+    const approvedEntry = candidate.meta.patches.find((p) => p.id === approval.patchId && p.optionId === approval.optionId);
+    const approvedPatchText = approvedEntry
+      ? await runtime.store.readPatch(candidate.id, approvedEntry.patch, source).catch(() => null)
+      : null;
+    const approvedPatchPaths = approvedPatchText ? parsePatch(approvedPatchText).paths : undefined;
     const lookup = await runtime.vcs.deriveApprovalCommit({
       reviewPath: `.ai-review/${candidate.id}/review.md`,
       patchPaths,
       targetFiles: candidate.meta.targetFiles,
+      ...(approvedPatchPaths && approvedPatchPaths.length > 0 ? { approvedPatchPaths } : {}),
       approval,
     }).catch((error: unknown): ApprovalCommitLookup => ({
       revision: null,
@@ -143,10 +164,12 @@ export async function handleHealth(host: ApiHost, _req: ApiRequest, res: ApiResp
     const counts = await runtime.store.listStatusCounts(undefined, view?.source);
     const reviewers = await loadReviewers(runtime.root, view?.source).catch(() => null);
     const lease = host.auditLifecycle.blockingLeaseFor(runtime.root);
+    const recoveryBlocker = host.recoveryStore.blockerFor(runtime.root);
     const diagnostics = [
       ...host.lastConfigErrors,
       ...(reviewers && !reviewers.valid ? reviewers.errors : []),
       ...(lease ? [`审查租约阻塞中：${lease.auditId}（${lease.state}）`] : []),
+      ...(recoveryBlocker ? [`仓库待恢复阻塞（${recoveryBlocker.reason}）：${recoveryBlocker.detail}`] : []),
     ];
     sendJson(res, 200, {
       app: 'dsh-code-review',
@@ -158,6 +181,7 @@ export async function handleHealth(host: ApiHost, _req: ApiRequest, res: ApiResp
       currentBase,
       diagnostics,
       counts,
+      ...(recoveryBlocker ? { recoveryBlocker } : {}),
     });
   } catch {
     sendJson(res, 200, {
@@ -390,10 +414,10 @@ export async function handleCandidate(
   }
 
   const derived = !detail.candidate.parseError
-    ? await caches.resolveApprovalCommit(runtime, detail.candidate, view?.snapshot ?? null)
+    ? await caches.resolveApprovalCommit(runtime, detail.candidate, view?.snapshot ?? null, view?.source)
     : undefined;
 
-  const canAct = !detail.candidate.parseError && detail.candidate.meta.owner === me;
+  const canAct = !detail.candidate.parseError && !detail.local && detail.candidate.meta.owner === me;
   const finding = !detail.candidate.parseError ? buildFindingView(detail.candidate) : undefined;
   const selectedPatchBanned = !detail.candidate.parseError && detail.selection
     ? isPatchBanned(detail.candidate.meta, detail.selection.optionId, detail.selection.patchId)
@@ -417,6 +441,7 @@ export async function handleCandidate(
     comments: detail.comments,
     validation: detail.validation,
     revisionStats: detail.revisionStats,
+    ...(detail.local ? { local: true } : {}),
     canAct,
     me,
     jobs: host.jobManager.list(),

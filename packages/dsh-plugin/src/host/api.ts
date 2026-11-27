@@ -2,7 +2,9 @@
  * 评审 HTTP API 网关：串联声明式路由表、仓库解析、repo 锁、持久化租约/提案占用互斥与各子处理器。
  */
 
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import {
   API_PREFIX,
@@ -68,6 +70,7 @@ import { AuditLifecycle, type AuditLeaseRecord, type LeaseStore } from './audit-
 import type { AuditStage } from './audit-prompts.js';
 import type { AuditExecutor } from './audit-stage-runner.js';
 import { JobManager } from './jobs.js';
+import { RepoRecoveryStore } from './recovery-store.js';
 import { matchRoute } from './routes.js';
 import { detectVcsType, dshHome, validateSettings } from './settings.js';
 import { ReviewStore } from './store.js';
@@ -107,6 +110,7 @@ class FileLeaseStore implements LeaseStore {
 export class ReviewApi implements ApiHost {
   readonly jobManager = new JobManager();
   readonly auditLifecycle: AuditLifecycle;
+  readonly recoveryStore: RepoRecoveryStore;
   readonly auditJobFinishes = new Map<string, (result?: unknown) => void>();
   readonly auditJobLeases = new Map<string, string>();
   readonly fixSessionRegistry: FixSessionRegistry;
@@ -122,10 +126,21 @@ export class ReviewApi implements ApiHost {
   constructor(readonly deps: ApiDeps) {
     this.settings = { ...deps.settings };
     const stateFile = deps.statePath ?? path.join(dshHome(), 'dsh-code-review', 'runtime-state.json');
+    const resolvedState = path.resolve(stateFile);
+    const resolvedRepo = deps.settings.repoRoot ? path.resolve(deps.settings.repoRoot) : '';
+    const stateInsideRepo = Boolean(
+      resolvedRepo
+      && (resolvedState.toLowerCase().startsWith(`${resolvedRepo.toLowerCase()}${path.sep}`)),
+    );
+    const recoveryFile = stateInsideRepo
+      ? path.join(os.tmpdir(), 'dsh-code-review-recovery', `${createHash('sha256').update(resolvedState).digest('hex').slice(0, 16)}.json`)
+      : path.join(path.dirname(stateFile), `${path.basename(stateFile, '.json')}-recovery.json`);
     this.auditLifecycle = new AuditLifecycle(new FileLeaseStore(stateFile));
+    this.recoveryStore = new RepoRecoveryStore(recoveryFile);
     this.fixSessionRegistry = new FixSessionRegistry(stateFile);
     this.initPromise = Promise.all([
       this.auditLifecycle.load(),
+      this.recoveryStore.load(),
       this.fixSessionRegistry.load(),
     ]).then(() => undefined);
   }
@@ -356,9 +371,14 @@ export class ReviewApi implements ApiHost {
       const { route, params } = matched;
 
       const dispatch = async (): Promise<void> => {
-        if (route.blockedByActiveAudit) {
+        if (route.blockedByActiveAudit || route.category === 'repo_write') {
           const runtime = await this.runtimeFor(url);
-          this.ensureNoAuditRunning(runtime.root);
+          if (route.category === 'repo_write') {
+            this.recoveryStore.assertNotBlocked(runtime.root);
+          }
+          if (route.blockedByActiveAudit) {
+            this.ensureNoAuditRunning(runtime.root);
+          }
         }
 
         switch (`${route.method} ${route.path}`) {
@@ -412,6 +432,11 @@ export class ReviewApi implements ApiHost {
           case 'POST /audit/manual': return handleAuditManual(this, req, res, url);
           case 'POST /audit/finalize': return handleAuditFinalize(this, req, res, url);
           case 'POST /audit/release': return handleAuditRelease(this, req, res, url);
+          case 'POST /recovery/clear': {
+            const runtime = await this.runtimeFor(url);
+            const result = await this.recoveryStore.clearIfVerified(runtime.root, runtime.vcs);
+            return sendJson(res, 200, result);
+          }
           case 'POST /jobs/:id/cancel': return handleJobCancel(this, req, res, decodeURIComponent(params[0] ?? ''));
           default:
             throw new ApiError(404, 'not_found', `未实现的路由：${route.method} ${route.path}`);

@@ -646,6 +646,7 @@ export async function handleApprove(host: ApiHost, req: ApiRequest, res: ApiResp
         ...(host.deps.auditStageGates ? { runGates: host.deps.auditStageGates } : {}),
         ...(host.deps.runModeC ? { runModeC: host.deps.runModeC } : {}),
         isManaged,
+        recoveryStore: host.recoveryStore,
       },
       {
         id,
